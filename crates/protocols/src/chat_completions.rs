@@ -345,46 +345,107 @@ impl EndpointCodec for ChatCompletionsCodec {
                 },
             });
 
-            let content_parts: Vec<Value> = msg
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    Content::Text { text } => Some(json!({"type": "text", "text": text})),
+            // Aggregate text-bearing parts for the `content` field. Reasoning
+            // and tool-related parts are handled separately.
+            let mut text_parts: Vec<Value> = Vec::new();
+            let mut reasoning_text = String::new();
+            let mut tool_calls_json: Vec<Value> = Vec::new();
+
+            for content in &msg.content {
+                match content {
+                    Content::Text { text } => {
+                        text_parts.push(json!({"type": "text", "text": text}));
+                    }
+                    Content::Reasoning { text } => {
+                        // Per Deepseek thinking-mode spec, the assistant message
+                        // carries `reasoning_content` as a sibling of `content`.
+                        // When the same turn issues tool_calls, this MUST be
+                        // echoed back to the API in every subsequent request
+                        // (otherwise the API returns 400).
+                        if !reasoning_text.is_empty() {
+                            reasoning_text.push('\n');
+                        }
+                        reasoning_text.push_str(text);
+                    }
+                    Content::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => {
+                        // Re-emit the tool call on the assistant message so the
+                        // downstream API sees a self-consistent turn.
+                        let args_str = match arguments {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        tool_calls_json.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": args_str,
+                            }
+                        }));
+                    }
                     Content::Media {
                         source, mime_type, ..
                     } => match source {
-                        tiygate_core::ir::MediaSource::Url { url } => Some(json!({
+                        tiygate_core::ir::MediaSource::Url { url } => text_parts.push(json!({
                             "type": "image_url",
                             "image_url": {"url": url}
                         })),
-                        tiygate_core::ir::MediaSource::Inline { data } => Some(json!({
+                        tiygate_core::ir::MediaSource::Inline { data } => text_parts.push(json!({
                             "type": "image_url",
                             "image_url": {"url": format!("data:{};base64,{}", mime_type, data)}
                         })),
-                        _ => None,
+                        _ => {}
                     },
                     Content::ToolResult {
                         tool_call_id,
                         name: _,
                         content,
-                    } => Some(json!({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": content,
-                    })),
-                    _ => None,
-                })
-                .collect();
+                    } => {
+                        // Tool results are a separate message in OpenAI format;
+                        // emit them as their own {role:"tool", tool_call_id, content}
+                        // object. This branch intentionally produces a full
+                        // message, not a content part.
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": content,
+                        }));
+                    }
+                }
+            }
 
-            if content_parts.len() == 1 && content_parts[0].get("text").is_some() {
-                msg_json["content"] = content_parts[0]["text"].clone();
-            } else if !content_parts.is_empty() {
-                msg_json["content"] = json!(content_parts);
+            if text_parts.len() == 1 && text_parts[0].get("text").is_some() {
+                msg_json["content"] = text_parts[0]["text"].clone();
+            } else if !text_parts.is_empty() {
+                msg_json["content"] = json!(text_parts);
+            } else if !tool_calls_json.is_empty() || !reasoning_text.is_empty() {
+                // Allow null/empty content when the turn is purely reasoning
+                // + tool calls (Deepseek emits this exact shape).
+                msg_json["content"] = Value::Null;
             } else {
                 msg_json["content"] = json!("");
             }
 
-            messages.push(msg_json);
+            if !reasoning_text.is_empty() {
+                msg_json["reasoning_content"] = json!(reasoning_text);
+            }
+
+            if !tool_calls_json.is_empty() {
+                msg_json["tool_calls"] = json!(tool_calls_json);
+            }
+
+            // Avoid emitting a duplicate empty assistant message when the only
+            // contribution was a ToolResult (already pushed as its own message).
+            let has_real_content = !text_parts.is_empty()
+                || !reasoning_text.is_empty()
+                || !tool_calls_json.is_empty();
+            if has_real_content || msg.content.is_empty() {
+                messages.push(msg_json);
+            }
         }
 
         body["messages"] = json!(messages);
@@ -476,6 +537,18 @@ impl EndpointCodec for ChatCompletionsCodec {
                     if !text.is_empty() {
                         content.push(Content::Text {
                             text: text.to_string(),
+                        });
+                    }
+                }
+
+                // Reasoning content (Deepseek thinking mode + OpenAI-compatible
+                // models that expose CoT as a sibling of `content`).
+                // Per Deepseek spec, when a turn contains tool_calls this MUST be
+                // echoed back in subsequent requests, or the API returns 400.
+                if let Some(reasoning_text) = msg["reasoning_content"].as_str() {
+                    if !reasoning_text.is_empty() {
+                        content.push(Content::Reasoning {
+                            text: reasoning_text.to_string(),
                         });
                     }
                 }
@@ -585,9 +658,24 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                     })
                 )
             }
-            StreamPart::ReasoningDelta { text: _ } => {
-                // OpenAI doesn't have standard reasoning delta SSE
-                String::new()
+            StreamPart::ReasoningDelta { text } => {
+                // Deepseek thinking mode streams the CoT as `reasoning_content`
+                // in the SSE delta. Other OpenAI-compatible providers may use
+                // a different field; we always emit `reasoning_content` so
+                // downstream clients (and our own decoder) stay symmetric.
+                let id = self.response_id.as_deref().unwrap_or("");
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"reasoning_content": text},
+                            "finish_reason": null,
+                        }]
+                    })
+                )
             }
             StreamPart::ToolCallDelta {
                 id,
@@ -797,7 +885,17 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                             }
                         }
 
-                        if let Some(reasoning) = delta.get("reasoning_details") {
+                        // Deepseek thinking mode streams `reasoning_content` as
+                        // a sibling of `content` inside `delta`. OpenAI's
+                        // Responses API uses `reasoning_details`; we keep that
+                        // fallback for non-Deepseek providers that emit it.
+                        if let Some(text) = delta["reasoning_content"].as_str() {
+                            if !text.is_empty() {
+                                parts.push(StreamPart::ReasoningDelta {
+                                    text: text.to_string(),
+                                });
+                            }
+                        } else if let Some(reasoning) = delta.get("reasoning_details") {
                             if let Some(text) = reasoning["text"].as_str() {
                                 parts.push(StreamPart::ReasoningDelta {
                                     text: text.to_string(),

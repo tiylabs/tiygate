@@ -264,24 +264,91 @@ impl EndpointCodec for ResponsesCodec {
                         Role::Assistant => "assistant",
                         _ => "user",
                     };
-                    let mut item = json!({"role": role_str});
-                    let content_parts: Vec<Value> = msg.content.iter().filter_map(|c| match c {
-                        Content::Text { text } => Some(json!({"type": "input_text", "text": text})),
-                        Content::Media { source, mime_type, .. } => match source {
-                            tiygate_core::ir::MediaSource::Url { url } => Some(json!({"type": "input_image", "image_url": url})),
-                            tiygate_core::ir::MediaSource::Inline { data } => Some(json!({"type": "input_image", "image_url": format!("data:{};base64,{}", mime_type, data)})),
-                            _ => None,
-                        },
-                        _ => None,
-                    }).collect();
-                    if content_parts.len() == 1 && content_parts[0]["type"] == "input_text" {
-                        item["content"] = content_parts[0]["text"].clone();
-                    } else if !content_parts.is_empty() {
-                        item["content"] = json!(content_parts);
-                    } else {
-                        item["content"] = json!("");
+                    let mut text_parts: Vec<Value> = Vec::new();
+                    let mut reasoning_text = String::new();
+                    let mut tool_calls_json: Vec<Value> = Vec::new();
+
+                    for c in &msg.content {
+                        match c {
+                            Content::Text { text } => {
+                                text_parts.push(json!({"type": "input_text", "text": text}));
+                            }
+                            Content::Media { source, mime_type, .. } => match source {
+                                tiygate_core::ir::MediaSource::Url { url } => {
+                                    text_parts.push(json!({"type": "input_image", "image_url": url}));
+                                }
+                                tiygate_core::ir::MediaSource::Inline { data } => {
+                                    text_parts.push(json!({
+                                        "type": "input_image",
+                                        "image_url": format!("data:{};base64,{}", mime_type, data)
+                                    }));
+                                }
+                                _ => {}
+                            },
+                            Content::Reasoning { text } => {
+                                // Responses API treats reasoning as a sibling
+                                // output/input item, NOT as a content sub-part
+                                // of the message. The OpenAI Responses spec
+                                // (and the Deepseek thinking-mode spec it
+                                // mirrors) requires that the reasoning item be
+                                // echoed back alongside any function_call
+                                // item the same turn produced — otherwise
+                                // the request is rejected.
+                                if !reasoning_text.is_empty() {
+                                    reasoning_text.push('\n');
+                                }
+                                reasoning_text.push_str(text);
+                            }
+                            Content::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            } => {
+                                let args_str = match arguments {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                tool_calls_json.push(json!({
+                                    "type": "function_call",
+                                    "call_id": id,
+                                    "name": name,
+                                    "arguments": args_str,
+                                    "status": "completed",
+                                }));
+                            }
+                            Content::ToolResult { .. } => {
+                                // Tool results live in their own input item
+                                // and are pushed in the Role::Tool branch.
+                            }
+                        }
                     }
-                    input_items.push(item);
+
+                    if !reasoning_text.is_empty() {
+                        input_items.push(json!({
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": reasoning_text}],
+                        }));
+                    }
+
+                    for tc in tool_calls_json {
+                        input_items.push(tc);
+                    }
+
+                    // Only emit a message item if there is text/image content.
+                    // A turn that is purely reasoning + function_call (the
+                    // shape Responses actually returns) is fully represented
+                    // by the items above.
+                    if !text_parts.is_empty() {
+                        let mut item = json!({"role": role_str});
+                        if text_parts.len() == 1
+                            && text_parts[0].get("type").map(|v| v == "input_text").unwrap_or(false)
+                        {
+                            item["content"] = text_parts[0]["text"].clone();
+                        } else {
+                            item["content"] = json!(text_parts);
+                        }
+                        input_items.push(item);
+                    }
                 }
                 Role::Tool => {
                     for c in &msg.content {
@@ -758,5 +825,115 @@ mod tests {
             encoded["usage"]["output_tokens_details"]["reasoning_tokens"],
             10
         );
+    }
+
+    /// Reasoning + function_call on a single assistant turn must round-trip
+    /// through `encode_request` as siblings in the `input[]` array, so the
+    /// Responses API receives the reasoning item it requires to continue the
+    /// chain-of-thought. Regression test for the gap where Reasoning content
+    /// was silently dropped during request encoding.
+    #[test]
+    fn test_encode_request_echoes_reasoning_alongside_tool_call() {
+        let codec = ResponsesCodec::new();
+        let ir = tiygate_core::IrRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: vec![Content::Text {
+                        text: "杭州明天天气？".to_string(),
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        Content::Reasoning {
+                            text: "我需要先查日期再查天气。".to_string(),
+                        },
+                        Content::ToolCall {
+                            id: "call_1".to_string(),
+                            name: "get_weather".to_string(),
+                            arguments: serde_json::json!({"location": "杭州"}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![Content::ToolResult {
+                        tool_call_id: "call_1".to_string(),
+                        name: "get_weather".to_string(),
+                        content: "cloudy".to_string(),
+                    }],
+                },
+            ],
+            tools: vec![],
+            params: tiygate_core::GenerationParams::default(),
+            stream: false,
+            response_format: None,
+            extensions: Default::default(),
+        };
+        let (body, _) = codec.encode_request(&ir).unwrap();
+        let input = body["input"].as_array().expect("input[] present");
+
+        // Must contain, in order: user message, reasoning item, function_call
+        // item, function_call_output item. The reasoning item MUST sit
+        // *before* the function_call it justifies, matching the wire format
+        // Responses returns.
+        // (User/assistant message items have no `type` discriminator —
+        // they're identified by `role`. Reasoning/function_call items are
+        // identified by `type`.)
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input.len(), 4, "no extra items beyond the four above");
+
+        let reasoning = &input[1];
+        assert_eq!(reasoning["type"], "reasoning");
+        assert_eq!(reasoning["summary"][0]["type"], "summary_text");
+        assert_eq!(reasoning["summary"][0]["text"], "我需要先查日期再查天气。");
+
+        let fc = &input[2];
+        assert_eq!(fc["type"], "function_call");
+        assert_eq!(fc["call_id"], "call_1");
+        assert_eq!(fc["name"], "get_weather");
+    }
+
+    /// When an assistant turn is purely reasoning (no text, no tool call) the
+    /// encoder must still emit the reasoning item, and must NOT emit an empty
+    /// message item in its place.
+    #[test]
+    fn test_encode_request_emits_reasoning_only_turn() {
+        let codec = ResponsesCodec::new();
+        let ir = tiygate_core::IrRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![Content::Reasoning {
+                    text: "thinking...".to_string(),
+                }],
+            }],
+            tools: vec![],
+            params: tiygate_core::GenerationParams::default(),
+            stream: false,
+            response_format: None,
+            extensions: Default::default(),
+        };
+        let (body, _) = codec.encode_request(&ir).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "reasoning");
     }
 }
