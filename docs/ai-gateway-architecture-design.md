@@ -12,7 +12,7 @@
 
 > 采用 **Rust 单体内核 + 数据面/控制面可拆分** 架构：**协议层用 Nyro 的三段式身份 + canonical IR + 双向 codec**，**Provider 层用 inventory 注册 + 声明式元数据 + Executor 逃生舱（BitRouter Bedrock 模式）**，**请求链用 BitRouter 的 hook pipeline（含 PassThrough 短路）**，**配置走 DB 动态 + 零配置 bootstrap 混合**，**日志分析独立成异步旁路 + 可插拔日志 sink（默认 OLTP 分区表，OLAP 后置可选）**。三大质量目标分别由：稳定性=健康熔断/降级链/旁路日志、可扩展=trait+注册表、易维护=分层+协议隔离+canonical IR 来承载。
 >
-> 项目取材本地路径（均在可读范围）：BitRouter `/Users/jorbenzhu/Documents/Workplace/tiylabs/bitrouter`，Nyro Gateway `/Users/jorbenzhu/Documents/Workplace/tiylabs/nyro-gateway`。
+> 项目取材本地路径（均在可读范围）：BitRouter `../bitrouter`，Nyro Gateway `../nyro-gateway`。
 
 ---
 
