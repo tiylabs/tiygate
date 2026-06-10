@@ -1,0 +1,142 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/protocols",
+    "crates/providers",
+    "crates/provider-bedrock",
+    "crates/store",
+    "crates/cache",
+    "crates/admin",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.78"
+repository = "https://github.com/tiylabs/tiygate"
+
+[workspace.dependencies]
+# Internal crates
+tiygate-core = { path = "crates/core" }
+tiygate-protocols = { path = "crates/protocols" }
+tiygate-providers = { path = "crates/providers" }
+tiygate-provider-bedrock = { path = "crates/provider-bedrock" }
+tiygate-store = { path = "crates/store" }
+tiygate-cache = { path = "crates/cache" }
+tiygate-admin = { path = "crates/admin" }
+
+# Core
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+bytes = "1"
+uuid = { version = "1", features = ["v7"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+
+# HTTP & Server
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+http = "1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "migrate", "chrono", "uuid"] }
+
+# Registration
+inventory = "0.3"
+
+# Concurrency & State
+dashmap = "6"
+arc-swap = "1"
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+
+# Security
+aes-gcm = "0.10"
+hkdf = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+
+# Config
+figment = { version = "0.10", features = ["env", "toml"] }
+serde_yaml = "0.9"
+dotenvy = "0.15"
+
+# Caching
+moka = { version = "0.12", features = ["sync"] }
+
+# OAuth
+oauth2 = "4"
+
+# Random
+rand = "0.8"
+
+# Async streams
+async-stream = "0.3"
+
+# URL
+url = "2"
+indexmap = "2"
+
+# Testing
+wiremock = "0.6"
+mockall = "0.13"
+proptest = "1"
+insta = "1"
+criterion = "0.5"
+
+# Error handling
+anyhow = "1"
+async-trait = "0.1"
+
+# Pin projection
+pin-project = "1"
+
+# Backoff
+backoff = "0.4"
+
+# Crypto
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# Rate limiting
+governor = "0.6"
+
+# Histogram
+hdrhistogram = "7"
+
+# SSE parsing
+eventsource-stream = "0.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+
+# Speed up dev builds of large dependencies (axum, reqwest, sqlx, ...)
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

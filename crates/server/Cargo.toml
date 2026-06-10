@@ -1,0 +1,85 @@
+[package]
+name = "tiygate-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tiygate"
+path = "src/main.rs"
+
+[features]
+# ---------------------------------------------------------------------------
+# Integration features — control which tiygate sub-crates are linked in.
+# Disable these to produce a smaller binary that only contains the parts of
+# the system you actually deploy.
+# ---------------------------------------------------------------------------
+default = ["admin", "cache", "providers", "tracing", "dotenv"]
+
+# Control plane: config CRUD / admin HTTP surface from `tiygate-admin`.
+admin = ["dep:tiygate-admin"]
+
+# In-memory response cache from `tiygate-cache`.
+cache = ["dep:tiygate-cache"]
+
+# Generic LLM provider integrations (OpenAI-compatible, Anthropic, ...).
+providers = ["dep:tiygate-providers"]
+
+# AWS Bedrock provider — pulls in the heavy AWS SDK stack.
+# Keep this opt-in so deployments that do not need Bedrock do not pay for it.
+bedrock = ["dep:tiygate-provider-bedrock"]
+
+# ---------------------------------------------------------------------------
+# Runtime features — used by the default binary entry point (`main.rs`).
+# `lib.rs` (and downstream binaries) can opt out of any of these.
+# ---------------------------------------------------------------------------
+
+# Wire up `tracing-subscriber` with the `json` formatter.
+tracing = ["dep:tracing-subscriber"]
+
+# Load `.env` files at startup.
+dotenv = ["dep:dotenvy"]
+
+[dependencies]
+# Internal crates — most are opt-in via features above.
+tiygate-core.workspace = true
+tiygate-protocols.workspace = true
+tiygate-store.workspace = true
+tiygate-admin = { workspace = true, optional = true }
+tiygate-cache = { workspace = true, optional = true }
+tiygate-providers = { workspace = true, optional = true }
+tiygate-provider-bedrock = { workspace = true, optional = true }
+
+# HTTP server stack — required by the library surface.
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+# Always-on serialisation / runtime utilities.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+http.workspace = true
+dashmap.workspace = true
+arc-swap.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
+
+# Optional runtime helpers (see [features] above).
+tracing-subscriber = { workspace = true, optional = true }
+dotenvy = { workspace = true, optional = true }
+anyhow.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+
+[lints]
+workspace = true

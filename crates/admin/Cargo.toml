@@ -1,0 +1,20 @@
+[package]
+name = "tiygate-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tiygate-core.workspace = true
+tiygate-store.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+subtle.workspace = true
+
+[lints]
+workspace = true
