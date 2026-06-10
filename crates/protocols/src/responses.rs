@@ -39,6 +39,7 @@ impl ResponsesCodec {
                 parallel_tool_calls: true,
                 extended_reasoning: true,
                 deterministic_seed: false,
+                tool_choice_required: true,
                 stream: tiygate_core::StreamCaps {
                     server_sent_events: true,
                     usage_in_stream: true,
@@ -191,7 +192,7 @@ impl EndpointCodec for ResponsesCodec {
                     name,
                     arguments,
                 } => {
-                    tool_calls.push(json!({"id": id, "type": "function_call", "name": name, "arguments": serde_json::to_string(arguments).unwrap_or_default(), "status": "completed"}));
+                    tool_calls.push(json!({"call_id": id, "type": "function_call", "name": name, "arguments": serde_json::to_string(arguments).unwrap_or_default(), "status": "completed"}));
                 }
                 _ => {}
             }

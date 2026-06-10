@@ -49,6 +49,7 @@ impl ChatCompletionsCodec {
                 parallel_tool_calls: true,
                 extended_reasoning: false,
                 deterministic_seed: true,
+                tool_choice_required: true,
                 stream: tiygate_core::StreamCaps {
                     server_sent_events: true,
                     usage_in_stream: true,
@@ -82,7 +83,7 @@ impl EndpointCodec for ChatCompletionsCodec {
         if let Some(arr) = body["messages"].as_array() {
             for msg in arr {
                 let role: Role = match msg["role"].as_str().unwrap_or("user") {
-                    "system" => Role::System,
+                    "system" | "developer" => Role::System,
                     "user" => Role::User,
                     "assistant" => Role::Assistant,
                     "tool" => Role::Tool,
@@ -146,11 +147,15 @@ impl EndpointCodec for ChatCompletionsCodec {
             })
             .unwrap_or_default();
 
-        // Parse tool_choice
+        // Parse tool_choice — store in extensions so lossy checks can inspect it.
+        // https://developers.openai.com/api/docs/guides/function-calling#tool-choice
+        // Allowed forms: "none", "auto", "required", {"type":"function","function":{"name":"x"}}
+        let mut extensions = std::collections::HashMap::new();
         if let Some(tc) = body.get("tool_choice") {
-            if tc.as_str() == Some("required") {
-                // Mark all tools as required
-                // (in practice we'd store this in extensions)
+            if let Some(s) = tc.as_str() {
+                extensions.insert("tool_choice".to_string(), json!(s));
+            } else if tc.is_object() {
+                extensions.insert("tool_choice".to_string(), tc.clone());
             }
         }
 
@@ -199,7 +204,7 @@ impl EndpointCodec for ChatCompletionsCodec {
             response_format,
             stream,
             ingress_protocol: self.id.clone(),
-            extensions: Default::default(),
+            extensions,
         })
     }
 

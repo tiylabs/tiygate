@@ -40,6 +40,7 @@ impl EmbeddingsCodec {
                 parallel_tool_calls: false,
                 extended_reasoning: false,
                 deterministic_seed: false,
+                tool_choice_required: false,
                 stream: tiygate_core::StreamCaps {
                     server_sent_events: false,
                     usage_in_stream: false,

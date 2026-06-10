@@ -47,6 +47,9 @@ impl MessagesCodec {
                 parallel_tool_calls: false,
                 extended_reasoning: true,
                 deterministic_seed: false,
+                // Anthropic supports tool_choice={type:"any"} (equivalent to
+                // OpenAI's "required") but NOT openai-style concurrent fan-out.
+                tool_choice_required: true,
                 stream: tiygate_core::StreamCaps {
                     server_sent_events: true,
                     usage_in_stream: true,

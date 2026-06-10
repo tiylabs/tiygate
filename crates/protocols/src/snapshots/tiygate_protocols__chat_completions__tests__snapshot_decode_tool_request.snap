@@ -51,5 +51,7 @@ IrRequest {
         name: "chat-completions",
         version: "v1",
     },
-    extensions: {},
+    extensions: {
+        "tool_choice": String("auto"),
+    },
 }

@@ -108,17 +108,16 @@ pub fn check_lossy_conversion(
         ));
     }
 
-    // 3. tool_choice=required — IR exposes this via the `required` flag on at
-    // least one tool, captured from `tool_choice: "required"`. Distinct from
-    // (2) only when the request *also* disables parallel_tool_calls at the
-    // protocol level; we conservatively attribute to ToolChoiceRequired.
+    // 3. tool_choice=required — IR exposes this via extensions["tool_choice"].
+    // Gated on `tool_choice_required` (not `parallel_tool_calls`), because
+    // Anthropic supports required via `{type:"any"}` but not concurrent fan-out.
     let has_required_choice = request
         .extensions
         .get("tool_choice")
         .and_then(|v| v.as_str())
         .map(|s| s == "required")
         .unwrap_or(false);
-    if has_required_choice && !egress_caps.parallel_tool_calls {
+    if has_required_choice && !egress_caps.tool_choice_required {
         return Err((
             LossyDimension::ToolChoiceRequired,
             lossy_error(
@@ -138,7 +137,7 @@ pub fn check_lossy_conversion(
         .and_then(|v| v.as_str())
         .map(|s| s == "function")
         .unwrap_or(false);
-    if has_specific_choice && !egress_caps.parallel_tool_calls {
+    if has_specific_choice && !egress_caps.tool_choice_required {
         return Err((
             LossyDimension::ToolChoiceSpecific,
             lossy_error(

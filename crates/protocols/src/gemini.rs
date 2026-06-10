@@ -44,6 +44,8 @@ impl GeminiCodec {
                 parallel_tool_calls: false,
                 extended_reasoning: true,
                 deterministic_seed: false,
+                // Gemini does not support tool_choice=required (see §1 of matrix)
+                tool_choice_required: false,
                 stream: tiygate_core::StreamCaps {
                     server_sent_events: true,
                     usage_in_stream: true,
@@ -333,6 +335,20 @@ impl EndpointCodec for GeminiCodec {
         if !ir.params.stop.is_empty() {
             gc["stopSequences"] = json!(ir.params.stop);
             has_gc = true;
+        }
+        // Gemini structured output: responseSchema in generationConfig
+        // https://ai.google.dev/gemini-api/docs/structured-output
+        match &ir.response_format {
+            Some(tiygate_core::ResponseFormat::JsonSchema { schema, .. }) => {
+                gc["responseSchema"] = schema.clone();
+                gc["responseMimeType"] = json!("application/json");
+                has_gc = true;
+            }
+            Some(tiygate_core::ResponseFormat::JsonObject) => {
+                gc["responseMimeType"] = json!("application/json");
+                has_gc = true;
+            }
+            _ => {}
         }
         if has_gc {
             body["generationConfig"] = gc;

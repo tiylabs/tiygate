@@ -17,8 +17,8 @@
 |------|:---:|:---:|:---:|:---:|:---:|
 | `function_calling` | ✅ | ✅ | ✅ | ✅ | N/A |
 | `parallel_tool_calls` | ✅ | ⚠️ → chat→msg: 并行工具调用无法在 Anthropic 表达 | ✅ | ⚠️ | N/A |
-| `tool_choice=required` | ✅ | ✅ | ✅ | ⚠️ | N/A |
-| `tool_choice=具体函数` | ✅ | ⚠️ → 仅 Anthropic 支持 `tool_choice: {type:"tool", name:"x"}` | ✅ | ❌ | N/A |
+| `tool_choice=required` | ✅ | ✅ (via `{type:"any"}`) | ✅ | ⚠️ → Gemini 不支持 required | N/A |
+| `tool_choice=具体函数` | ✅ | ✅ (via `{type:"tool", name:"x"}`) | ✅ | ❌ → Gemini 不支持指定函数 | N/A |
 | `tool_result` 引用 | ✅ | ✅ | ✅ | ✅ | N/A |
 
 **有损组合（阶段 1-3 已知）**：
@@ -69,7 +69,7 @@
 
 | Ingress ↓ / Egress → | chat_completions | messages | responses | gemini |
 |----------------------|:---:|:---:|:---:|:---:|
-| **chat_completions** | PassThrough ✅ | ⚠️ parallel_tc/tool_choice 可能拒绝 | ✅ | ⚠️ tool_choice=required 拒绝 |
+| **chat_completions** | PassThrough ✅ | ⚠️ parallel_tc 可能拒绝 | ✅ | ⚠️ tool_choice=required 拒绝 |
 | **messages** | ✅ | PassThrough ✅ | ✅ | ⚠️ tool_use→functionCall 有损 |
 | **responses** | ⚠️ file_id 丢失 | ⚠️ file_id + structured_output 拒绝 | PassThrough ✅ | ⚠️ file_id+audio 拒绝 |
 | **gemini** | ⚠️ inline video/audio 拒绝 | ⚠️ inline video/audio 拒绝 | ⚠️ inline video/audio 拒绝 | PassThrough ✅ |

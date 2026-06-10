@@ -149,8 +149,10 @@ fn chat_to_gemini_with_tools_passes() {
 // --- Dimension 2/3/4: tool_choice forms ---
 
 #[test]
-fn required_tool_to_anthropic_rejected() {
-    // Anthropic parallel_tool_calls = false → reject.
+fn required_tool_flag_still_rejected_by_parallel_tool_calls() {
+    // Tool.required=true represents parallel_tool_calls semantics,
+    // which Anthropic does not support. This is a separate dimension
+    // from tool_choice=required, which Anthropic DOES support.
     let mut req = req_with_tools();
     with_required_tool(&mut req);
     let err = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps());
@@ -158,19 +160,24 @@ fn required_tool_to_anthropic_rejected() {
 }
 
 #[test]
-fn tool_choice_required_to_gemini_rejected() {
+fn required_tool_to_anthropic_passes_via_tool_choice_required() {
+    // Verify tool_choice=required is accepted by Anthropic
+    // (gated on tool_choice_required=true, not parallel_tool_calls=false).
     let mut req = req_with_tools();
     with_tool_choice_str(&mut req, "required");
-    let err = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps());
-    assert_eq!(extract_dim(&err), Some(LossyDimension::ToolChoiceRequired));
+    let msg_caps = messages_caps();
+    assert!(msg_caps.tool_choice_required);
+    assert!(!msg_caps.parallel_tool_calls);
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &msg_caps).is_ok());
 }
 
 #[test]
-fn specific_tool_choice_to_anthropic_rejected() {
+fn specific_tool_choice_to_anthropic_accepted() {
+    // Anthropic supports tool_choice={type:"tool", name:"x"} natively.
+    // This is gated on tool_choice_required (Anthropic=true).
     let mut req = req_with_tools();
     with_specific_tool_choice(&mut req);
-    let err = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps());
-    assert_eq!(extract_dim(&err), Some(LossyDimension::ToolChoiceSpecific));
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
 }
 
 #[test]
@@ -179,6 +186,24 @@ fn tool_choice_to_chat_completions_always_passes() {
     with_required_tool(&mut req);
     with_specific_tool_choice(&mut req);
     assert!(check_lossy_conversion(&req, &chat_endpoint(), &chat_caps()).is_ok());
+}
+
+#[test]
+fn specific_tool_choice_to_gemini_rejected() {
+    // Gemini does not support tool_choice=specific (❌ in §1 of matrix).
+    let mut req = req_with_tools();
+    with_specific_tool_choice(&mut req);
+    let err = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps());
+    assert_eq!(extract_dim(&err), Some(LossyDimension::ToolChoiceSpecific));
+}
+
+#[test]
+fn tool_choice_required_to_gemini_rejected() {
+    // Gemini tool_choice_required=false → reject.
+    let mut req = req_with_tools();
+    with_tool_choice_str(&mut req, "required");
+    let err = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps());
+    assert_eq!(extract_dim(&err), Some(LossyDimension::ToolChoiceRequired));
 }
 
 // --- Dimension 5: media sources ---

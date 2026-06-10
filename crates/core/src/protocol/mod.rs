@@ -136,6 +136,10 @@ pub struct EndpointCapabilities {
     pub extended_reasoning: bool,
     /// Whether this endpoint supports deterministic seeds.
     pub deterministic_seed: bool,
+    /// Whether this endpoint supports `tool_choice="required"` / `{type:"any"}`.
+    /// Separate from `parallel_tool_calls` because Anthropic supports
+    /// required tool choice but not OpenAI-style concurrent fan-out.
+    pub tool_choice_required: bool,
     /// Streaming-specific capabilities.
     pub stream: StreamCaps,
     /// How to handle unknown vendor fields.
@@ -160,6 +164,7 @@ impl EndpointCapabilities {
         parallel_tool_calls: false,
         extended_reasoning: false,
         deterministic_seed: false,
+        tool_choice_required: false,
         stream: StreamCaps {
             server_sent_events: false,
             usage_in_stream: false,
@@ -184,6 +189,7 @@ impl EndpointCapabilities {
         parallel_tool_calls: true,
         extended_reasoning: false,
         deterministic_seed: false,
+        tool_choice_required: true,
         stream: StreamCaps {
             server_sent_events: true,
             usage_in_stream: true,
