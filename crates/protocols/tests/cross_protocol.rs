@@ -245,15 +245,18 @@ fn lossy_capability_matrix_declares_rejection() {
 
 #[test]
 fn lossy_parallel_tool_calls_chat_to_messages() {
-    // OpenAI chat_completions and Anthropic messages both support
-    // parallel tool calls. So this combination is NOT lossy. Use it
-    // to verify that parallel_tool_calls is actually preserved.
+    // §1 of docs/protocol-capability-matrix.md: chat→messages parallel tool
+    // calls are lossy (⚠️). The chat-completions "fire N tools concurrently"
+    // semantics are not preserved on the Anthropic side. The runtime
+    // `check_lossy_conversion` rejects this crossing; this test pins the
+    // capability declaration that drives it.
     let ingress = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let egress = find_codec(ProtocolSuite::AnthropicMessages, "messages");
 
-    // Both protocols support parallel tool calls
+    // chat_completions supports parallel tool calls...
     assert!(ingress.capabilities().parallel_tool_calls);
-    assert!(egress.capabilities().parallel_tool_calls);
+    // ...but messages (Anthropic) does NOT, hence the lossy crossing.
+    assert!(!egress.capabilities().parallel_tool_calls);
 
     // Both must declare lossy_default_reject so the gateway can reject
     // any actually-lossy combination at runtime.

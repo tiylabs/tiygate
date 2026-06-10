@@ -34,6 +34,36 @@ use tiygate_protocols::embeddings::EmbeddingsCodec;
 use tiygate_protocols::gemini::GeminiCodec;
 use tiygate_protocols::messages::MessagesCodec;
 use tiygate_protocols::responses::ResponsesCodec;
+
+/// Construct a `Strategy` from the `RoutingStrategyName` carried on
+/// `AppState`. §3.4 names `Weighted` as the document-level default; we honor
+/// that here. The `Latency` strategy needs the `HealthRegistry` handle, so it
+/// is the only one with a non-trivial constructor.
+fn build_strategy(
+    name: crate::config::RoutingStrategyName,
+    health: Arc<HealthRegistry>,
+) -> (Box<dyn tiygate_core::routing::Strategy>, &'static str) {
+    use tiygate_core::routing::Strategy;
+    match name {
+        crate::config::RoutingStrategyName::Weighted => (
+            Box::new(tiygate_core::routing::WeightedStrategy),
+            "WeightedStrategy",
+        ),
+        crate::config::RoutingStrategyName::Priority => (
+            Box::new(tiygate_core::routing::PriorityStrategy),
+            "PriorityStrategy",
+        ),
+        crate::config::RoutingStrategyName::Cooldown => (
+            Box::new(tiygate_core::routing::CooldownStrategy::new(health)),
+            "CooldownStrategy",
+        ),
+        crate::config::RoutingStrategyName::Latency => (
+            Box::new(tiygate_core::routing::LatencyStrategy::new(health)),
+            "LatencyStrategy",
+        ),
+    }
+}
+
 use tiygate_store::config::ConfigStore;
 
 /// Shared application state.
@@ -59,6 +89,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Async telemetry bus — non-blocking send.
     pub telemetry: Arc<dyn TelemetryBus>,
+    /// Routing strategy selector (default `Weighted`, per §3.4).
+    pub routing_strategy: crate::config::RoutingStrategyName,
 }
 
 use crate::config::ServerConfig;
@@ -111,6 +143,7 @@ pub fn router_with_telemetry(
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
         telemetry,
+        routing_strategy: server_config.routing_strategy,
     };
 
     Router::new()
@@ -531,11 +564,10 @@ async fn handle_chat_completions(
     let mut last_error: Option<AppError> = None;
     let bytes_emitted: u64 = 0;
 
-    // Apply the routing strategy to order targets. LatencyStrategy is
-    // the default (orders by lowest recent latency) and re-orders at
-    // every iteration so a slow target is not retried first.
-    use tiygate_core::routing::Strategy;
-    let strategy = tiygate_core::routing::LatencyStrategy::new(state.health.clone());
+    // Apply the routing strategy chosen by config (default `Weighted` per §3.4).
+    // The strategy is consulted once at the top of the request — targets are
+    // re-ordered every iteration so a slow/unhealthy target is not retried first.
+    let (strategy, strategy_label) = build_strategy(state.routing_strategy, state.health.clone());
     let ordered_targets: Vec<&tiygate_core::RoutingTarget> = strategy.order(&targets);
 
     // Telemetry: emit a RequestStarted event so the event stream has
@@ -550,7 +582,7 @@ async fn handle_chat_completions(
             stage: "ingress".to_string(),
             payload: EventPayload::RouteResolved {
                 targets: ordered_targets.iter().map(|t| t.health_key()).collect(),
-                strategy: "LatencyStrategy".to_string(),
+                strategy: strategy_label.to_string(),
             },
         })
         .await;
@@ -814,10 +846,8 @@ async fn handle_messages(
     let mut last_error: Option<AppError> = None;
     let bytes_emitted: u64 = 0;
 
-    // Apply routing strategy — LatencyStrategy orders by lowest
-    // recent latency and re-orders at every iteration.
-    use tiygate_core::routing::Strategy;
-    let strategy = tiygate_core::routing::LatencyStrategy::new(state.health.clone());
+    // Apply the routing strategy chosen by config (default `Weighted` per §3.4).
+    let (strategy, _strategy_label) = build_strategy(state.routing_strategy, state.health.clone());
     let ordered_targets: Vec<&tiygate_core::RoutingTarget> = strategy.order(&targets);
 
     while target_index < ordered_targets.len() && attempt < max_attempts {
@@ -933,19 +963,25 @@ async fn execute_upstream(
             )
         })?;
 
-        // Check lossy conversion
+        // Check lossy conversion against the field-level capability matrix
+        // (§3.2 + docs/protocol-capability-matrix.md). Replaces the previous
+        // single-dimension tools+function_calling check with a full per-dimension
+        // sweep: tool_choice forms, parallel tool calls, media source kinds,
+        // structured output, extended reasoning. Each rejection message names
+        // the offending dimension so the caller can fix the request.
         let ingress_caps = codec.capabilities();
         let egress_caps = egress_codec.capabilities();
-
-        if (ingress_caps.lossy_default_reject || egress_caps.lossy_default_reject)
-            && !ir_request.tools.is_empty()
-            && !egress_caps.function_calling
-        {
-            return Err(AppError::new(
-                StatusCode::BAD_REQUEST,
-                "Lossy conversion rejected: tool calling not supported by target protocol"
-                    .to_string(),
-            ));
+        if (ingress_caps.lossy_default_reject || egress_caps.lossy_default_reject) {
+            if let Err((dim, err)) = tiygate_core::protocol::lossy::check_lossy_conversion(
+                ir_request,
+                &egress_protocol,
+                egress_caps,
+            ) {
+                return Err(AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("Lossy conversion rejected: {err} (dimension: {})", dim.label()),
+                ));
+            }
         }
 
         egress_codec.encode_request(ir_request).map_err(|e| {

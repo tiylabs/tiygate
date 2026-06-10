@@ -475,4 +475,56 @@ mod tests {
             FallbackDecision::Fail
         );
     }
+
+    /// §3.4 requires RateLimited to switch to the next target rather than
+    /// retry the same one. The handler honors `Retry-After` via
+    /// `HealthRegistry::apply_cooling` so the upstream isn't hammered.
+    /// Regression test for the previous behavior that retried the same target.
+    #[test]
+    fn test_fallback_policy_rate_limited_uses_try_next() {
+        let policy = DefaultFallbackPolicy::with_defaults();
+        let target = RoutingTarget {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            api_key: "sk".to_string(),
+            api_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+        };
+        let err = crate::Error::Routing("429 rate limit exceeded".to_string());
+
+        // RateLimited → TryNext, NOT Retry (the original bug)
+        assert_eq!(
+            policy.classify(&err, &target, 0, 4, 0),
+            FallbackDecision::TryNext
+        );
+
+        // Transient 5xx → TryNext (unchanged baseline)
+        let err_5xx = crate::Error::Routing("503 service unavailable".to_string());
+        assert_eq!(
+            policy.classify(&err_5xx, &target, 0, 4, 0),
+            FallbackDecision::TryNext
+        );
+
+        // Auth (401) → TryNext, with same-account skipping handled by the handler
+        let err_auth = crate::Error::Routing("401 unauthorized".to_string());
+        assert_eq!(
+            policy.classify(&err_auth, &target, 0, 4, 0),
+            FallbackDecision::TryNext
+        );
+
+        // BadRequest → Fail immediately
+        let err_400 = crate::Error::Routing("400 bad request".to_string());
+        assert_eq!(
+            policy.classify(&err_400, &target, 0, 4, 0),
+            FallbackDecision::Fail
+        );
+    }
 }

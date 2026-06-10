@@ -36,7 +36,12 @@ impl GeminiCodec {
                 multimodal: true,
                 structured_output: true,
                 function_calling: true,
-                parallel_tool_calls: true,
+                // §1 of docs/protocol-capability-matrix.md: chat→gemini
+                // parallel tool calls are lossy (Gemini's functionCall parts
+                // can carry multiple calls, but the chat-completions
+                // concurrent-fan-out semantics are not preserved). Mark as
+                // unsupported so `check_lossy_conversion` rejects the crossing.
+                parallel_tool_calls: false,
                 extended_reasoning: true,
                 deterministic_seed: false,
                 stream: tiygate_core::StreamCaps {

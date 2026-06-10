@@ -531,8 +531,15 @@ impl FallbackPolicy for DefaultFallbackPolicy {
                 FallbackDecision::TryNext
             }
             ErrorClass::RateLimited => {
-                // Retry same target after backoff (retry-after respected by caller)
-                FallbackDecision::Retry
+                // §3.4: RateLimited (429) → switch to the next target and
+                // apply cooling on the current one. The caller (handler)
+                // honors upstream `Retry-After` via HealthRegistry::apply_cooling
+                // before re-attempting the same target via a later iteration
+                // of the routing chain. We do *not* retry the same target
+                // immediately, because the upstream just told us it is
+                // saturated — hammering it again would amplify the pressure
+                // the gateway is supposed to be relieving.
+                FallbackDecision::TryNext
             }
             ErrorClass::Auth => {
                 // Don't retry same account; TryNext will skip same-account targets

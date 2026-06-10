@@ -14,6 +14,32 @@ pub enum DeployMode {
     Admin,
 }
 
+/// Routing strategy selector.
+///
+/// §3.4 names `Weighted` as the document-level default; we expose all four so
+/// operators can pick the one that matches their traffic shape without code
+/// changes. LatencyStrategy needs a `HealthRegistry` handle, which the
+/// `strategy_arg` config string captures statically — the corresponding
+/// strategy is constructed inside the handler where the registry is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingStrategyName {
+    /// Weighted random shuffle (default per §3.4).
+    Weighted,
+    /// Sort by weight desc — useful for tiered providers.
+    Priority,
+    /// Prefer healthy targets, then by weight.
+    Cooldown,
+    /// Prefer healthy + lowest EWMA latency.
+    Latency,
+}
+
+impl Default for RoutingStrategyName {
+    fn default() -> Self {
+        Self::Weighted
+    }
+}
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -36,6 +62,8 @@ pub struct ServerConfig {
     pub acquire_timeout_secs: u64,
     /// Drain timeout in seconds.
     pub drain_timeout_secs: u64,
+    /// Routing strategy (default `Weighted`, per §3.4).
+    pub routing_strategy: RoutingStrategyName,
 }
 
 impl Default for ServerConfig {
@@ -50,6 +78,7 @@ impl Default for ServerConfig {
             max_queue_depth: 256,
             acquire_timeout_secs: 5,
             drain_timeout_secs: 30,
+            routing_strategy: RoutingStrategyName::Weighted,
         }
     }
 }
@@ -77,6 +106,15 @@ impl ServerConfig {
             if let Ok(n) = v.parse() {
                 cfg.max_inflight_requests = n;
             }
+        }
+        if let Ok(v) = std::env::var("TIYGATE_ROUTING_STRATEGY") {
+            cfg.routing_strategy = match v.to_ascii_lowercase().as_str() {
+                "weighted" => RoutingStrategyName::Weighted,
+                "priority" => RoutingStrategyName::Priority,
+                "cooldown" => RoutingStrategyName::Cooldown,
+                "latency" => RoutingStrategyName::Latency,
+                _ => RoutingStrategyName::Weighted,
+            };
         }
 
         cfg

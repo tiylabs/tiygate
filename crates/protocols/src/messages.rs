@@ -38,7 +38,13 @@ impl MessagesCodec {
                 multimodal: true,
                 structured_output: false,
                 function_calling: true,
-                parallel_tool_calls: true,
+                // §1 of docs/protocol-capability-matrix.md: parallel tool
+                // calls are lossy when crossing chat→messages (Anthropic
+                // models can return multiple tool_use blocks in one response,
+                // but the chat-completions semantics of "fire N tools
+                // concurrently" are not preserved). Mark as unsupported so
+                // `check_lossy_conversion` rejects the crossing.
+                parallel_tool_calls: false,
                 extended_reasoning: true,
                 deterministic_seed: false,
                 stream: tiygate_core::StreamCaps {

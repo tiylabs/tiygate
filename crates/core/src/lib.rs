@@ -37,8 +37,8 @@ pub use provider::{
     AuthApplier, AuthMode, Executor, Provider, ProviderMetadata, ProviderRegistration,
 };
 pub use routing::{
-    classify_error, DefaultFallbackPolicy, ErrorClass, ErrorClassification, FallbackDecision,
-    FallbackPolicy, HealthRegistry, LatencyStrategy, RetryPolicy, RoutingTable, RoutingTarget,
-    RoutingTargetHealth, Strategy,
+    classify_error, CooldownStrategy, DefaultFallbackPolicy, ErrorClass, ErrorClassification,
+    FallbackDecision, FallbackPolicy, HealthRegistry, LatencyStrategy, PriorityStrategy,
+    RetryPolicy, RoutingTable, RoutingTarget, RoutingTargetHealth, Strategy, WeightedStrategy,
 };
 pub use telemetry::{EventSink, PipelineEvent, RequestEvent, TelemetryBus};

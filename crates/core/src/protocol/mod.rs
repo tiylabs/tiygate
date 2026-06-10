@@ -27,6 +27,18 @@ pub enum ProtocolSuite {
     GoogleGemini,
 }
 
+impl ProtocolSuite {
+    /// Lowercase, kebab-case label suitable for diagnostic strings.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "openai-compatible",
+            Self::OpenAiResponses => "openai-responses",
+            Self::AnthropicMessages => "anthropic-messages",
+            Self::GoogleGemini => "google-gemini",
+        }
+    }
+}
+
 /// Three-segment protocol identity: `{suite}/{name}/{version}`.
 ///
 /// Examples:
@@ -294,3 +306,5 @@ pub struct CodecRegistration {
 }
 
 inventory::collect!(CodecRegistration);
+
+pub mod lossy;
