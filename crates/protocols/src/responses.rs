@@ -213,7 +213,20 @@ impl EndpointCodec for ResponsesCodec {
             });
         }
         if let Some(usage) = &ir.usage {
-            response["usage"] = json!({"input_tokens": usage.prompt_tokens, "output_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens});
+            // OpenAI Responses 规范：input_tokens 必须含 cache 命中，所以从其他协议流入时
+            // codec 内部把 cache_* 累加进 input_tokens
+            let cache_read = usage.cache_read_tokens.unwrap_or(0);
+            let cache_write = usage.cache_write_tokens.unwrap_or(0);
+            let prompt_for_responses = usage.prompt_tokens + cache_read + cache_write;
+            let total_for_responses = prompt_for_responses + usage.completion_tokens;
+            response["usage"] = json!({
+                "input_tokens": prompt_for_responses,
+                "output_tokens": usage.completion_tokens,
+                "total_tokens": total_for_responses,
+            });
+            if cache_read > 0 {
+                response["usage"]["input_tokens_details"] = json!({"cached_tokens": cache_read});
+            }
             if let Some(rt) = usage.reasoning_tokens {
                 response["usage"]["output_tokens_details"] = json!({"reasoning_tokens": rt});
             }
@@ -371,6 +384,7 @@ impl EndpointCodec for ResponsesCodec {
             completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
             total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
             reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
+            cache_read_tokens: u["input_tokens_details"]["cached_tokens"].as_u64(),
             ..Default::default()
         });
         Ok(IrResponse {
@@ -708,5 +722,40 @@ mod tests {
         assert!(codec.capabilities().tools);
         assert!(codec.capabilities().structured_output);
         assert!(codec.capabilities().lossy_default_reject);
+    }
+
+    #[test]
+    fn test_encode_response_includes_cached_tokens() {
+        // IR 带 cache → Responses 输出 input_tokens_details.cached_tokens
+        let codec = ResponsesCodec::new();
+        let ir = IrResponse {
+            content: vec![Content::Text {
+                text: "ok".to_string(),
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                reasoning_tokens: Some(10),
+                cache_read_tokens: Some(80),
+                cache_write_tokens: None,
+            }),
+            finish_reason: Some(FinishReason::Stop),
+            response_id: Some("r1".to_string()),
+            stop_details: None,
+            extensions: std::collections::HashMap::new(),
+        };
+        let encoded = codec.encode_response(&ir).unwrap();
+        // OpenAI Responses 规范：input_tokens 含 cache
+        assert_eq!(encoded["usage"]["input_tokens"], 180);
+        assert_eq!(encoded["usage"]["total_tokens"], 230);
+        assert_eq!(
+            encoded["usage"]["input_tokens_details"]["cached_tokens"],
+            80
+        );
+        assert_eq!(
+            encoded["usage"]["output_tokens_details"]["reasoning_tokens"],
+            10
+        );
     }
 }

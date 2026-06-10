@@ -453,14 +453,36 @@ impl EndpointCodec for MessagesCodec {
             other => FinishReason::Other(other.to_string()),
         });
 
-        let usage = body.get("usage").map(|u| Usage {
-            prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
-            total_tokens: u["input_tokens"].as_u64().unwrap_or(0)
-                + u["output_tokens"].as_u64().unwrap_or(0),
-            cache_read_tokens: u["cache_read_input_tokens"].as_u64(),
-            cache_write_tokens: u["cache_creation_input_tokens"].as_u64(),
-            ..Default::default()
+        let usage = body.get("usage").map(|u| {
+            let input = u["input_tokens"].as_u64().unwrap_or(0);
+            let output = u["output_tokens"].as_u64().unwrap_or(0);
+            let cache_creation = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            // Anthropic 协议无 total_tokens；按官方 spec 派生：
+            //   total = input + cache_creation + cache_read + output
+            // 优先用上游响应里若带的 total_tokens（部分 SDK/代理会注入）
+            let total = u["total_tokens"]
+                .as_u64()
+                .unwrap_or(input + cache_creation + cache_read + output);
+            let reasoning = u["output_tokens_details"]["thinking_tokens"].as_u64();
+            let has_cache_creation_field = u.get("cache_creation_input_tokens").is_some();
+            let has_cache_read_field = u.get("cache_read_input_tokens").is_some();
+            Usage {
+                prompt_tokens: input,
+                completion_tokens: output,
+                total_tokens: total,
+                reasoning_tokens: reasoning,
+                cache_read_tokens: if has_cache_read_field {
+                    Some(cache_read)
+                } else {
+                    None
+                },
+                cache_write_tokens: if has_cache_creation_field {
+                    Some(cache_creation)
+                } else {
+                    None
+                },
+            }
         });
 
         let stop_details = body["stop_reason"]
@@ -570,10 +592,20 @@ impl StreamEncoder for MessagesStreamEncoder {
                 }
             }
             StreamPart::Usage { usage } => {
+                let mut usage_obj = json!({"output_tokens": usage.completion_tokens});
+                if usage.prompt_tokens > 0 {
+                    usage_obj["input_tokens"] = json!(usage.prompt_tokens);
+                }
+                if let Some(cw) = usage.cache_write_tokens {
+                    usage_obj["cache_creation_input_tokens"] = json!(cw);
+                }
+                if let Some(cr) = usage.cache_read_tokens {
+                    usage_obj["cache_read_input_tokens"] = json!(cr);
+                }
                 let data = json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": null, "stop_sequence": null},
-                    "usage": {"output_tokens": usage.completion_tokens},
+                    "usage": usage_obj,
                 });
                 format!(
                     "event: message_delta\ndata: {}\n\n",
@@ -676,6 +708,39 @@ impl StreamDecoder for MessagesStreamDecoder {
                     self.response_id = Some(id.to_string());
                     parts.push(StreamPart::ResponseStarted { id: id.to_string() });
                 }
+                // Anthropic 流式在 message_start 给一次完整 usage
+                if let Some(u) = event["message"]["usage"].as_object() {
+                    let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cache_creation = u
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cache_read = u
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let has_cc_field = u.get("cache_creation_input_tokens").is_some();
+                    let has_cr_field = u.get("cache_read_input_tokens").is_some();
+                    let reasoning = u
+                        .get("output_tokens_details")
+                        .and_then(|v| v.get("thinking_tokens"))
+                        .and_then(|v| v.as_u64());
+                    parts.push(StreamPart::Usage {
+                        usage: Usage {
+                            prompt_tokens: input,
+                            completion_tokens: output,
+                            total_tokens: input + cache_creation + cache_read + output,
+                            reasoning_tokens: reasoning,
+                            cache_read_tokens: if has_cr_field { Some(cache_read) } else { None },
+                            cache_write_tokens: if has_cc_field {
+                                Some(cache_creation)
+                            } else {
+                                None
+                            },
+                        },
+                    });
+                }
             }
             Some("content_block_start") => {
                 let block = &event["content_block"];
@@ -757,13 +822,43 @@ impl StreamDecoder for MessagesStreamDecoder {
             }
             Some("message_delta") => {
                 if let Some(usage) = event["usage"].as_object() {
+                    let output_tokens = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let input_tokens = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cache_creation = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cache_read = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let has_cc_field = usage.get("cache_creation_input_tokens").is_some();
+                    let has_cr_field = usage.get("cache_read_input_tokens").is_some();
+                    let reasoning = usage
+                        .get("output_tokens_details")
+                        .and_then(|v| v.get("thinking_tokens"))
+                        .and_then(|v| v.as_u64());
                     parts.push(StreamPart::Usage {
                         usage: Usage {
-                            completion_tokens: usage
-                                .get("output_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            ..Default::default()
+                            prompt_tokens: input_tokens,
+                            completion_tokens: output_tokens,
+                            total_tokens: input_tokens
+                                + cache_creation
+                                + cache_read
+                                + output_tokens,
+                            reasoning_tokens: reasoning,
+                            cache_read_tokens: if has_cr_field { Some(cache_read) } else { None },
+                            cache_write_tokens: if has_cc_field {
+                                Some(cache_creation)
+                            } else {
+                                None
+                            },
                         },
                     });
                 }
@@ -1058,5 +1153,37 @@ mod tests {
         let codec = MessagesCodec::new();
         assert_eq!(codec.id().suite, ProtocolSuite::AnthropicMessages);
         assert!(codec.id().full_id().contains("messages"));
+    }
+
+    #[test]
+    fn test_encode_response_with_cache() {
+        // Anthropic decode cache 字段后 encode 回原协议，验证 cache_* 与 input_tokens 都写入
+        let codec = MessagesCodec::new();
+        let body = json!({
+            "id": "msg",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 2000
+            }
+        });
+        let ir = codec.decode_response(body).unwrap();
+        // IR 必须完整保留 cache_*
+        let u = ir.usage.as_ref().unwrap();
+        assert_eq!(u.cache_read_tokens, Some(2000));
+        assert_eq!(u.cache_write_tokens, Some(100));
+        // total 派生公式：10 + 100 + 2000 + 5 = 2115
+        assert_eq!(u.total_tokens, 2115);
+        // encode 回协议体
+        let encoded = codec.encode_response(&ir).unwrap();
+        assert_eq!(encoded["usage"]["input_tokens"], 10);
+        assert_eq!(encoded["usage"]["output_tokens"], 5);
+        assert_eq!(encoded["usage"]["cache_read_input_tokens"], 2000);
+        assert_eq!(encoded["usage"]["cache_creation_input_tokens"], 100);
     }
 }

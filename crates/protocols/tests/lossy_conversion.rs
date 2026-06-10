@@ -97,11 +97,9 @@ fn with_file_id_media(req: &mut IrRequest) {
 }
 
 fn with_reasoning(req: &mut IrRequest) {
-    req.messages[0]
-        .content
-        .push(Content::Reasoning {
-            text: "thinking...".to_string(),
-        });
+    req.messages[0].content.push(Content::Reasoning {
+        text: "thinking...".to_string(),
+    });
 }
 
 fn chat_caps() -> EndpointCapabilities {
@@ -190,7 +188,10 @@ fn url_media_to_anthropic_rejected() {
     let mut req = text_only_req();
     with_media_url(&mut req);
     let err = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps());
-    assert_eq!(extract_dim(&err), Some(LossyDimension::MediaSourceUnsupported));
+    assert_eq!(
+        extract_dim(&err),
+        Some(LossyDimension::MediaSourceUnsupported)
+    );
 }
 
 #[test]
@@ -212,7 +213,10 @@ fn file_id_media_to_anthropic_rejected() {
     let mut req = text_only_req();
     with_file_id_media(&mut req);
     let err = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps());
-    assert_eq!(extract_dim(&err), Some(LossyDimension::MediaSourceUnsupported));
+    assert_eq!(
+        extract_dim(&err),
+        Some(LossyDimension::MediaSourceUnsupported)
+    );
 }
 
 // --- Dimension 6: structured output ---
@@ -275,7 +279,10 @@ fn text_only_round_trip_never_rejected() {
         ("responses", responses_endpoint(), responses_caps()),
     ] {
         let err = check_lossy_conversion(&req, &endpoint, &caps);
-        assert!(err.is_ok(), "text-only request rejected at {label}: {err:?}");
+        assert!(
+            err.is_ok(),
+            "text-only request rejected at {label}: {err:?}"
+        );
     }
 }
 

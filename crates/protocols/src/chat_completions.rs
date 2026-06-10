@@ -268,11 +268,21 @@ impl EndpointCodec for ChatCompletionsCodec {
         response["choices"] = json!(choices);
 
         if let Some(usage) = &ir.usage {
+            // OpenAI 规范的 prompt_tokens 必须包含 cache 命中部分（即使 IR.prompt_tokens 不含）
+            let cache_read = usage.cache_read_tokens.unwrap_or(0);
+            let cache_write = usage.cache_write_tokens.unwrap_or(0);
+            let prompt_for_openai = usage.prompt_tokens + cache_read + cache_write;
+            let total_for_openai = prompt_for_openai + usage.completion_tokens;
             response["usage"] = json!({
-                "prompt_tokens": usage.prompt_tokens,
+                "prompt_tokens": prompt_for_openai,
                 "completion_tokens": usage.completion_tokens,
-                "total_tokens": usage.total_tokens,
+                "total_tokens": total_for_openai,
             });
+            if cache_read > 0 {
+                let mut details = serde_json::Map::new();
+                details.insert("cached_tokens".to_string(), json!(cache_read));
+                response["usage"]["prompt_tokens_details"] = json!(details);
+            }
             if let Some(rt) = usage.reasoning_tokens {
                 response["usage"]["completion_tokens_details"] = json!({
                     "reasoning_tokens": rt,
@@ -608,6 +618,21 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
             }
             StreamPart::Usage { usage } => {
                 let id = self.response_id.as_deref().unwrap_or("");
+                let mut usage_obj = json!({
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                });
+                if let Some(cr) = usage.cache_read_tokens {
+                    if cr > 0 {
+                        usage_obj["prompt_tokens_details"] = json!({"cached_tokens": cr});
+                    }
+                }
+                if let Some(rt) = usage.reasoning_tokens {
+                    if rt > 0 {
+                        usage_obj["completion_tokens_details"] = json!({"reasoning_tokens": rt});
+                    }
+                }
                 format!(
                     "data: {}\n\n",
                     json!({
@@ -618,11 +643,7 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                             "delta": {},
                             "finish_reason": null,
                         }],
-                        "usage": {
-                            "prompt_tokens": usage.prompt_tokens,
-                            "completion_tokens": usage.completion_tokens,
-                            "total_tokens": usage.total_tokens,
-                        }
+                        "usage": usage_obj,
                     })
                 )
             }
@@ -814,11 +835,20 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
 
                 // Usage
                 if let Some(usage) = chunk.get("usage") {
+                    let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+                    let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
+                    let total = usage["total_tokens"]
+                        .as_u64()
+                        .unwrap_or(prompt + completion);
+                    let cache_read = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+                    let reasoning = usage["completion_tokens_details"]["reasoning_tokens"].as_u64();
                     parts.push(StreamPart::Usage {
                         usage: Usage {
-                            prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
-                            completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-                            total_tokens: usage["total_tokens"].as_u64().unwrap_or(0),
+                            prompt_tokens: prompt,
+                            completion_tokens: completion,
+                            total_tokens: total,
+                            reasoning_tokens: reasoning,
+                            cache_read_tokens: cache_read,
                             ..Default::default()
                         },
                     });
@@ -1150,5 +1180,58 @@ mod tests {
         let env = make_raw_envelope();
         let ir = codec.decode_request(make_tool_request(), &env).unwrap();
         insta::assert_debug_snapshot!(ir);
+    }
+
+    #[test]
+    fn test_encode_response_includes_cached_tokens() {
+        // IR 带 cache_read_tokens → Chat 输出 prompt_tokens_details.cached_tokens
+        let codec = ChatCompletionsCodec::new();
+        let ir = IrResponse {
+            content: vec![Content::Text {
+                text: "ok".to_string(),
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                reasoning_tokens: Some(10),
+                cache_read_tokens: Some(80),
+                cache_write_tokens: None,
+            }),
+            finish_reason: Some(FinishReason::Stop),
+            response_id: Some("r1".to_string()),
+            stop_details: None,
+            extensions: std::collections::HashMap::new(),
+        };
+        let encoded = codec.encode_response(&ir).unwrap();
+        // OpenAI 规范：prompt_tokens 含 cache
+        assert_eq!(encoded["usage"]["prompt_tokens"], 180);
+        assert_eq!(encoded["usage"]["total_tokens"], 230);
+        assert_eq!(
+            encoded["usage"]["prompt_tokens_details"]["cached_tokens"],
+            80
+        );
+        assert_eq!(
+            encoded["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            10
+        );
+    }
+
+    #[test]
+    fn test_stream_usage_includes_cached_tokens() {
+        // 流式 Usage 帧保留 cache + reasoning
+        let mut enc = ChatCompletionsStreamEncoder::new();
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            reasoning_tokens: Some(20),
+            cache_read_tokens: Some(80),
+            cache_write_tokens: None,
+        };
+        let bytes = enc.encode_part(&StreamPart::Usage { usage }).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\"cached_tokens\":80"));
+        assert!(s.contains("\"reasoning_tokens\":20"));
     }
 }

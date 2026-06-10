@@ -239,6 +239,11 @@ impl EndpointCodec for GeminiCodec {
             if let Some(rt) = usage.reasoning_tokens {
                 response["usageMetadata"]["thoughtsTokenCount"] = json!(rt);
             }
+            if let Some(cr) = usage.cache_read_tokens {
+                if cr > 0 {
+                    response["usageMetadata"]["cachedContentTokenCount"] = json!(cr);
+                }
+            }
         }
         Ok(response)
     }
@@ -434,10 +439,24 @@ impl StreamEncoder for GeminiStreamEncoder {
                     )
                 }
             }
-            StreamPart::Usage { usage } => format!(
-                "data: {}\n\n",
-                json!({"usageMetadata": {"promptTokenCount": usage.prompt_tokens, "candidatesTokenCount": usage.completion_tokens}})
-            ),
+            StreamPart::Usage { usage } => {
+                let mut um = json!({
+                    "promptTokenCount": usage.prompt_tokens,
+                    "candidatesTokenCount": usage.completion_tokens,
+                    "totalTokenCount": usage.total_tokens,
+                });
+                if let Some(rt) = usage.reasoning_tokens {
+                    if rt > 0 {
+                        um["thoughtsTokenCount"] = json!(rt);
+                    }
+                }
+                if let Some(cr) = usage.cache_read_tokens {
+                    if cr > 0 {
+                        um["cachedContentTokenCount"] = json!(cr);
+                    }
+                }
+                format!("data: {}\n\n", json!({"usageMetadata": um}))
+            }
             StreamPart::Finish { reason } => {
                 let fr = match reason {
                     FinishReason::Stop => "STOP",
@@ -718,5 +737,24 @@ mod tests {
         assert!(codec.capabilities().streaming);
         assert!(codec.capabilities().tools);
         assert!(codec.capabilities().lossy_default_reject);
+    }
+
+    #[test]
+    fn test_stream_usage_includes_total_and_cached() {
+        // Gemini 流式 Usage 帧带 totalTokenCount / thoughtsTokenCount / cachedContentTokenCount
+        let mut enc = GeminiStreamEncoder;
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            reasoning_tokens: Some(20),
+            cache_read_tokens: Some(8),
+            cache_write_tokens: None,
+        };
+        let bytes = enc.encode_part(&StreamPart::Usage { usage }).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\"totalTokenCount\":15"));
+        assert!(s.contains("\"thoughtsTokenCount\":20"));
+        assert!(s.contains("\"cachedContentTokenCount\":8"));
     }
 }
