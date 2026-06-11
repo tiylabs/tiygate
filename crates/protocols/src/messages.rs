@@ -422,6 +422,8 @@ impl EndpointCodec for MessagesCodec {
         let response_id = body["id"].as_str().map(String::from);
 
         let mut content = Vec::new();
+        let mut extensions = std::collections::HashMap::new();
+        let mut redacted_data: Vec<serde_json::Value> = Vec::new();
 
         if let Some(arr) = body["content"].as_array() {
             for block in arr {
@@ -436,6 +438,19 @@ impl EndpointCodec for MessagesCodec {
                             text: block["thinking"].as_str().unwrap_or("").to_string(),
                         });
                     }
+                    // Anthropic may return `redacted_thinking` blocks when portions
+                    // of thinking are safety-redacted. These carry an opaque `data`
+                    // field and must be preserved/echoed in multi-turn conversations
+                    // to avoid 400 errors.
+                    // https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+                    Some("redacted_thinking") => {
+                        if let Some(data) = block.get("data") {
+                            redacted_data.push(data.clone());
+                        }
+                        content.push(Content::Reasoning {
+                            text: String::new(),
+                        });
+                    }
                     Some("tool_use") => {
                         content.push(Content::ToolCall {
                             id: block["id"].as_str().unwrap_or("").to_string(),
@@ -448,11 +463,21 @@ impl EndpointCodec for MessagesCodec {
             }
         }
 
+        // Store redacted_thinking data in extensions so multi-turn
+        // conversations can echo them back without 400 errors.
+        if !redacted_data.is_empty() {
+            extensions.insert(
+                "anthropic_redacted_thinking".to_string(),
+                json!(redacted_data),
+            );
+        }
+
         let finish_reason = body["stop_reason"].as_str().map(|s| match s {
             "end_turn" => FinishReason::Stop,
             "max_tokens" => FinishReason::Length,
             "tool_use" => FinishReason::ToolCalls,
-            "content_filter" => FinishReason::ContentFilter,
+            "content_filter" | "refusal" => FinishReason::ContentFilter,
+            "pause_turn" => FinishReason::Stop,
             other => FinishReason::Other(other.to_string()),
         });
 
@@ -501,7 +526,7 @@ impl EndpointCodec for MessagesCodec {
             finish_reason,
             response_id,
             stop_details,
-            extensions: Default::default(),
+            extensions,
         })
     }
 

@@ -160,7 +160,11 @@ impl EndpointCodec for ChatCompletionsCodec {
         }
 
         let params = tiygate_core::GenerationParams {
-            max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
+            // OpenAI 已弃用 max_tokens，推荐使用 max_completion_tokens（o-series 必须）
+            max_tokens: body["max_completion_tokens"]
+                .as_u64()
+                .or_else(|| body["max_tokens"].as_u64())
+                .map(|v| v as u32),
             temperature: body["temperature"].as_f64().map(|v| v as f32),
             top_p: body["top_p"].as_f64().map(|v| v as f32),
             frequency_penalty: body["frequency_penalty"].as_f64().map(|v| v as f32),
@@ -472,6 +476,10 @@ impl EndpointCodec for ChatCompletionsCodec {
         // Generation params
         if let Some(mt) = ir.params.max_tokens {
             body["max_tokens"] = json!(mt);
+            // OpenAI o-series models require max_completion_tokens;
+            // max_tokens is deprecated in the Chat Completions spec.
+            // Emit both so the request works across all model families.
+            body["max_completion_tokens"] = json!(mt);
         }
         if let Some(t) = ir.params.temperature {
             body["temperature"] = json!(t);
@@ -541,16 +549,30 @@ impl EndpointCodec for ChatCompletionsCodec {
                     }
                 }
 
-                // Reasoning content (Deepseek thinking mode + OpenAI-compatible
-                // models that expose CoT as a sibling of `content`).
-                // Per Deepseek spec, when a turn contains tool_calls this MUST be
-                // echoed back in subsequent requests, or the API returns 400.
-                if let Some(reasoning_text) = msg["reasoning_content"].as_str() {
-                    if !reasoning_text.is_empty() {
-                        content.push(Content::Reasoning {
-                            text: reasoning_text.to_string(),
+                // Refusal content (OpenAI spec: message.refusal)
+                // https://platform.openai.com/docs/api-reference/chat/object
+                if let Some(refusal_text) = msg["refusal"].as_str() {
+                    if !refusal_text.is_empty() {
+                        content.push(Content::Text {
+                            text: refusal_text.to_string(),
                         });
                     }
+                }
+
+                // Reasoning content — supports multiple vendor-specific field names:
+                // - reasoning_content (DeepSeek, Moonshot/Kimi, Qwen)
+                // - reasoning (some OpenRouter passthroughs)
+                // - thinking (Aliyun)
+                // Per Deepseek spec, when a turn contains tool_calls this MUST be
+                // echoed back in subsequent requests, or the API returns 400.
+                // Reference: bitrouter chat_completions.rs #454-1
+                let reasoning_text = ["reasoning_content", "reasoning", "thinking"]
+                    .iter()
+                    .find_map(|key| msg[*key].as_str().filter(|s| !s.is_empty()));
+                if let Some(text) = reasoning_text {
+                    content.push(Content::Reasoning {
+                        text: text.to_string(),
+                    });
                 }
 
                 // Tool calls
@@ -584,6 +606,12 @@ impl EndpointCodec for ChatCompletionsCodec {
             }
         }
 
+        let has_refusal = body["choices"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|c| c["message"]["refusal"].as_str())
+            .is_some_and(|r| !r.is_empty());
+
         let finish_reason = body["choices"][0]["finish_reason"]
             .as_str()
             .map(|s| match s {
@@ -592,6 +620,15 @@ impl EndpointCodec for ChatCompletionsCodec {
                 "content_filter" => FinishReason::ContentFilter,
                 "tool_calls" => FinishReason::ToolCalls,
                 _ => FinishReason::Other(s.to_string()),
+            })
+            // A `refusal` field signals content-filter regardless of what
+            // `finish_reason` claims, so the caller can surface the refusal.
+            .map(|fr| {
+                if has_refusal {
+                    FinishReason::ContentFilter
+                } else {
+                    fr
+                }
             });
 
         let usage = body.get("usage").map(|u| Usage {

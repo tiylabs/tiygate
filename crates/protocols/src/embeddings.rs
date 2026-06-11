@@ -69,6 +69,21 @@ impl EndpointCodec for EmbeddingsCodec {
     ) -> Result<IrRequest, tiygate_core::Error> {
         let model = body["model"].as_str().unwrap_or("unknown").to_string();
 
+        // OpenAI embeddings API: `dimensions` parameter (text-embedding-3 and later)
+        // Controls the output embedding vector size. Preserved via extensions.
+        let mut extensions = HashMap::new();
+        if let Some(dims) = body.get("dimensions") {
+            extensions.insert("dimensions".to_string(), dims.clone());
+        }
+        // `encoding_format` — "float" or "base64" — preserved in extensions
+        if let Some(enc) = body.get("encoding_format").and_then(|v| v.as_str()) {
+            extensions.insert("encoding_format".to_string(), json!(enc));
+        }
+        // `user` — OpenAI's end-user identifier — preserved in extensions
+        if let Some(u) = body.get("user").and_then(|v| v.as_str()) {
+            extensions.insert("user".to_string(), json!(u));
+        }
+
         let input_text = if let Some(s) = body["input"].as_str() {
             s.to_string()
         } else if let Some(arr) = body["input"].as_array() {
@@ -98,7 +113,7 @@ impl EndpointCodec for EmbeddingsCodec {
                 "embeddings",
                 "v1",
             ),
-            extensions: HashMap::new(),
+            extensions,
         })
     }
 

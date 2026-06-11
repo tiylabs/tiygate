@@ -158,6 +158,23 @@ impl EndpointCodec for ResponsesCodec {
             ..Default::default()
         };
 
+        // Preserve protocol-specific fields in extensions for round-trip fidelity:
+        // - tool_choice: "auto" | "required" | {"type":"function","name":"x"}
+        // - text.format: structured output configuration
+        // - reasoning.effort: reasoning depth control
+        let mut extensions = std::collections::HashMap::new();
+        if let Some(tc) = body.get("tool_choice") {
+            extensions.insert("tool_choice".to_string(), tc.clone());
+        }
+        if let Some(tf) = body.get("text") {
+            extensions.insert("text".to_string(), tf.clone());
+        }
+        if let Some(re) = body.get("reasoning") {
+            if let Some(effort) = re.get("effort").and_then(|v| v.as_str()) {
+                extensions.insert("reasoning_effort".to_string(), json!(effort));
+            }
+        }
+
         Ok(IrRequest {
             model,
             system,
@@ -167,7 +184,7 @@ impl EndpointCodec for ResponsesCodec {
             response_format: None,
             stream,
             ingress_protocol: self.id.clone(),
-            extensions: Default::default(),
+            extensions,
         })
     }
 

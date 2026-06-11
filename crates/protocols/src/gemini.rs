@@ -370,11 +370,20 @@ impl EndpointCodec for GeminiCodec {
     fn decode_response(&self, body: Value) -> Result<IrResponse, tiygate_core::Error> {
         let response_id = body["responseId"].as_str().map(String::from);
         let mut content = Vec::new();
+        // Collect thoughtSignatures for Gemini 3 multi-turn preservation.
+        // Gemini 3 requires thoughtSignature on functionCalls;
+        // missing signatures cause 400 errors.
+        // https://ai.google.dev/gemini-api/docs/thought-signatures
+        let mut extensions = std::collections::HashMap::new();
+        let mut thought_signatures: Vec<serde_json::Value> = Vec::new();
         if let Some(candidates) = body["candidates"].as_array() {
             for candidate in candidates {
                 if let Some(c) = candidate.get("content") {
                     if let Some(parts) = c["parts"].as_array() {
                         for part in parts {
+                            if let Some(sig) = part.get("thoughtSignature") {
+                                thought_signatures.push(sig.clone());
+                            }
                             if let Some(text) = part["text"].as_str() {
                                 content.push(Content::Text {
                                     text: text.to_string(),
@@ -389,7 +398,7 @@ impl EndpointCodec for GeminiCodec {
                                 });
                             } else if let Some(fc) = part.get("functionCall") {
                                 content.push(Content::ToolCall {
-                                    id: String::new(),
+                                    id: fc["id"].as_str().unwrap_or("").to_string(),
                                     name: fc["name"].as_str().unwrap_or("").to_string(),
                                     arguments: fc["args"].clone(),
                                 });
@@ -398,6 +407,12 @@ impl EndpointCodec for GeminiCodec {
                     }
                 }
             }
+        }
+        if !thought_signatures.is_empty() {
+            extensions.insert(
+                "gemini_thought_signatures".to_string(),
+                json!(thought_signatures),
+            );
         }
         let finish_reason = body["candidates"]
             .as_array()
@@ -423,7 +438,7 @@ impl EndpointCodec for GeminiCodec {
             finish_reason,
             response_id,
             stop_details: None,
-            extensions: Default::default(),
+            extensions,
         })
     }
 }
