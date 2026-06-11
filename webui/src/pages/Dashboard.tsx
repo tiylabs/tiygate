@@ -2,15 +2,34 @@ import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
 import { healthApi, statsApi } from "@/api/resources";
 import type { StatBucket, StatsResponse } from "@/api/types";
-import { Badge, Card, CardHeader, ErrorBox, Spinner, Table, Td, Th } from "@/components/ui";
+import {
+  Badge,
+  Card,
+  CardHeader,
+  EmptyState,
+  ErrorBox,
+  Metric,
+  Table,
+  TableSkeleton,
+  Td,
+  Th,
+  Tr,
+} from "@/components/ui";
 import { PageHeader } from "@/components/PageHeader";
+
+const numberFmt = new Intl.NumberFormat();
 
 function StatsTable({
   title,
   query,
 }: {
   title: string;
-  query: { data?: StatsResponse; isLoading: boolean; error: unknown };
+  query: {
+    data?: StatsResponse;
+    isLoading: boolean;
+    error: unknown;
+    refetch: () => void;
+  };
 }) {
   const { t } = useTranslation();
   const buckets: StatBucket[] = query.data?.buckets ?? [];
@@ -18,41 +37,48 @@ function StatsTable({
     <Card>
       <CardHeader title={title} />
       {query.isLoading ? (
-        <Spinner />
+        <TableSkeleton rows={4} />
       ) : query.error ? (
         <div className="p-4">
-          <ErrorBox message={(query.error as Error).message} />
+          <ErrorBox
+            message={(query.error as Error).message}
+            onRetry={() => query.refetch()}
+            retryLabel={t("common.retry")}
+          />
         </div>
+      ) : buckets.length === 0 ? (
+        <EmptyState title={t("common.empty")} />
       ) : (
         <Table>
           <thead>
             <tr>
               <Th>{t("dashboard.bucket")}</Th>
-              <Th>{t("dashboard.requests")}</Th>
-              <Th>{t("dashboard.errors")}</Th>
-              <Th>{t("dashboard.tokens")}</Th>
+              <Th className="text-right">{t("dashboard.requests")}</Th>
+              <Th className="text-right">{t("dashboard.errors")}</Th>
+              <Th className="text-right">{t("dashboard.tokens")}</Th>
             </tr>
           </thead>
           <tbody>
             {buckets.map((b) => (
-              <tr key={b.bucket}>
-                <Td className="font-medium text-slate-800">{b.bucket || "—"}</Td>
-                <Td>{b.count}</Td>
-                <Td>
+              <Tr key={b.bucket}>
+                <Td className="font-medium text-text">{b.bucket || "—"}</Td>
+                <Td className="text-right tabular-nums">
+                  {numberFmt.format(b.count)}
+                </Td>
+                <Td className="text-right tabular-nums">
                   {b.error_count > 0 ? (
-                    <span className="text-red-600">{b.error_count}</span>
+                    <span className="text-danger">
+                      {numberFmt.format(b.error_count)}
+                    </span>
                   ) : (
-                    b.error_count
+                    numberFmt.format(b.error_count)
                   )}
                 </Td>
-                <Td>{b.total_tokens}</Td>
-              </tr>
+                <Td className="text-right tabular-nums">
+                  {numberFmt.format(b.total_tokens)}
+                </Td>
+              </Tr>
             ))}
-            {buckets.length === 0 ? (
-              <tr>
-                <Td className="text-slate-400">{t("common.empty")}</Td>
-              </tr>
-            ) : null}
           </tbody>
         </Table>
       )}
@@ -80,13 +106,62 @@ export default function Dashboard() {
     queryFn: healthApi.circuitBreakers,
   });
 
+  // Aggregate top-line metrics from the by-model buckets.
+  const modelBuckets = byModel.data?.buckets ?? [];
+  const totalRequests = modelBuckets.reduce((s, b) => s + b.count, 0);
+  const totalErrors = modelBuckets.reduce((s, b) => s + b.error_count, 0);
+  const totalTokens = modelBuckets.reduce((s, b) => s + b.total_tokens, 0);
+  const errorRate =
+    totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0;
+
+  const targets = breakers.data?.targets ?? [];
+  const unhealthy = targets.filter((b) => !b.healthy).length;
+
   return (
     <div className="space-y-6">
-      <PageHeader title={t("dashboard.title")} />
+      <PageHeader
+        title={t("dashboard.title")}
+        description={t("dashboard.costUnavailable")}
+      />
 
-      <p className="text-xs text-slate-400">{t("dashboard.costUnavailable")}</p>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <Metric
+          label={t("dashboard.totalRequests")}
+          value={
+            byModel.isLoading ? "…" : numberFmt.format(totalRequests)
+          }
+          caption={t("dashboard.summaryCaption")}
+        />
+        <Metric
+          label={t("dashboard.errorRate")}
+          value={byModel.isLoading ? "…" : `${errorRate.toFixed(1)}%`}
+          tone={errorRate > 0 ? "danger" : "default"}
+          caption={`${numberFmt.format(totalErrors)} ${t("dashboard.errors")}`}
+        />
+        <Metric
+          label={t("dashboard.totalTokens")}
+          value={byModel.isLoading ? "…" : numberFmt.format(totalTokens)}
+          caption={t("dashboard.summaryCaption")}
+        />
+        <Metric
+          label={t("dashboard.breakerStatus")}
+          value={
+            breakers.isLoading
+              ? "…"
+              : unhealthy === 0
+                ? t("dashboard.healthy")
+                : unhealthy
+          }
+          tone={unhealthy === 0 ? "success" : "danger"}
+          caption={
+            unhealthy === 0
+              ? t("dashboard.breakersOk")
+              : t("dashboard.breakersDegraded", { count: unhealthy })
+          }
+        />
+      </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="grid gap-6 xl:grid-cols-2">
         <StatsTable title={t("dashboard.byModel")} query={byModel} />
         <StatsTable title={t("dashboard.byProvider")} query={byProvider} />
         <StatsTable title={t("dashboard.byApiKey")} query={byApiKey} />
@@ -94,15 +169,19 @@ export default function Dashboard() {
         <Card>
           <CardHeader title={t("dashboard.circuitBreakers")} />
           {breakers.isLoading ? (
-            <Spinner />
+            <TableSkeleton rows={4} />
           ) : breakers.error ? (
             <div className="p-4">
-              <ErrorBox message={(breakers.error as Error).message} />
+              <ErrorBox
+                message={(breakers.error as Error).message}
+                onRetry={() => breakers.refetch()}
+                retryLabel={t("common.retry")}
+              />
             </div>
-          ) : (breakers.data?.targets ?? []).length === 0 ? (
-            <p className="p-4 text-sm text-slate-400">
-              {breakers.data?.note ?? t("dashboard.noBreakers")}
-            </p>
+          ) : targets.length === 0 ? (
+            <EmptyState
+              title={breakers.data?.note ?? t("dashboard.noBreakers")}
+            />
           ) : (
             <Table>
               <thead>
@@ -112,20 +191,25 @@ export default function Dashboard() {
                 </tr>
               </thead>
               <tbody>
-                {(breakers.data?.targets ?? []).map((b) => (
-                  <tr key={b.target}>
+                {targets.map((b) => (
+                  <Tr key={b.target}>
                     <Td className="font-mono text-xs">{b.target}</Td>
                     <Td>
-                      {b.healthy ? (
-                        <Badge tone="green">{t("dashboard.healthy")}</Badge>
-                      ) : (
-                        <Badge tone="red">{t("dashboard.unhealthy")}</Badge>
-                      )}
-                      <span className="ml-2 text-xs text-slate-400">
-                        {b.status}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        {b.healthy ? (
+                          <Badge tone="success">{t("dashboard.healthy")}</Badge>
+                        ) : (
+                          <Badge tone="danger">{t("dashboard.unhealthy")}</Badge>
+                        )}
+                        <span
+                          className="text-xs text-text-subtle"
+                          title={b.status}
+                        >
+                          {b.status}
+                        </span>
+                      </div>
                     </Td>
-                  </tr>
+                  </Tr>
                 ))}
               </tbody>
             </Table>

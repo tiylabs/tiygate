@@ -8,15 +8,22 @@ import {
   Badge,
   Button,
   Card,
+  ConfirmDialog,
+  Dialog,
+  EmptyState,
   ErrorBox,
   Field,
   Input,
-  Modal,
+  PasswordInput,
+  RowActions,
   Select,
-  Spinner,
+  Switch,
   Table,
+  TableSkeleton,
   Td,
   Th,
+  Tr,
+  useToast,
 } from "@/components/ui";
 import { PageHeader, fmtTime, shortId } from "@/components/PageHeader";
 
@@ -48,7 +55,8 @@ function emptyForm(): FormState {
 export default function Providers() {
   const { t } = useTranslation();
   const qc = useQueryClient();
-  const { data, isLoading, error } = useQuery({
+  const toast = useToast();
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["providers"],
     queryFn: providersApi.list,
   });
@@ -57,9 +65,9 @@ export default function Providers() {
   const [form, setForm] = useState<FormState>(emptyForm());
   const [editing, setEditing] = useState<Provider | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Provider | null>(null);
 
-  const invalidate = () =>
-    qc.invalidateQueries({ queryKey: ["providers"] });
+  const invalidate = () => qc.invalidateQueries({ queryKey: ["providers"] });
 
   const saveMutation = useMutation({
     mutationFn: (input: { id?: string; body: ProviderInput }) =>
@@ -68,6 +76,7 @@ export default function Providers() {
         : providersApi.create(input.body),
     onSuccess: () => {
       setModalOpen(false);
+      toast.success(t("providers.saved"));
       void invalidate();
     },
     onError: (e: Error) => setFormError(e.message),
@@ -75,7 +84,15 @@ export default function Providers() {
 
   const deleteMutation = useMutation({
     mutationFn: providersApi.remove,
-    onSuccess: () => void invalidate(),
+    onSuccess: () => {
+      setPendingDelete(null);
+      toast.success(t("providers.deleted"));
+      void invalidate();
+    },
+    onError: (e: Error) => {
+      setPendingDelete(null);
+      toast.error(t("providers.deleteFailed"), e.message);
+    },
   });
 
   function openCreate() {
@@ -122,95 +139,116 @@ export default function Providers() {
       <PageHeader
         title={t("providers.title")}
         action={
-          <Button variant="primary" onClick={openCreate}>
-            <Plus size={16} />
+          <Button variant="primary" icon={<Plus size={16} />} onClick={openCreate}>
             {t("providers.add")}
           </Button>
         }
       />
-      {error ? <ErrorBox message={(error as Error).message} /> : null}
-      <Card>
-        {isLoading ? (
-          <Spinner />
-        ) : (
-          <Table>
-            <thead>
-              <tr>
-                <Th>{t("common.name")}</Th>
-                <Th>{t("providers.vendor")}</Th>
-                <Th>{t("providers.apiBase")}</Th>
-                <Th>{t("providers.authMode")}</Th>
-                <Th>{t("common.status")}</Th>
-                <Th>{t("common.updatedAt")}</Th>
-                <Th className="text-right">{t("common.actions")}</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {(data ?? []).map((p) => (
-                <tr key={p.id}>
-                  <Td>
-                    <div className="font-medium text-slate-800">{p.name}</div>
-                    <div className="text-xs text-slate-400">{shortId(p.id)}</div>
-                  </Td>
-                  <Td>{p.vendor}</Td>
-                  <Td className="max-w-[220px] truncate">{p.api_base}</Td>
-                  <Td>{p.auth_mode}</Td>
-                  <Td>
-                    {p.enabled ? (
-                      <Badge tone="green">{t("common.enabled")}</Badge>
-                    ) : (
-                      <Badge tone="slate">{t("common.disabled")}</Badge>
-                    )}
-                  </Td>
-                  <Td className="text-xs text-slate-500">{fmtTime(p.updated_at)}</Td>
-                  <Td className="text-right">
-                    <div className="flex justify-end gap-1">
-                      <Button variant="ghost" onClick={() => openEdit(p)}>
-                        <Pencil size={14} />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        onClick={() => {
-                          if (
-                            window.confirm(
-                              t("providers.deleteConfirm", { name: p.name }),
-                            )
-                          ) {
-                            deleteMutation.mutate(p.id);
-                          }
-                        }}
-                      >
-                        <Trash2 size={14} className="text-red-500" />
-                      </Button>
-                    </div>
-                  </Td>
-                </tr>
-              ))}
-              {(data ?? []).length === 0 && !isLoading ? (
+      {error ? (
+        <ErrorBox
+          message={(error as Error).message}
+          onRetry={() => refetch()}
+          retryLabel={t("common.retry")}
+        />
+      ) : (
+        <Card>
+          {isLoading ? (
+            <TableSkeleton />
+          ) : (data ?? []).length === 0 ? (
+            <EmptyState
+              title={t("common.emptyTitle")}
+              description={t("providers.empty")}
+              action={
+                <Button
+                  variant="primary"
+                  icon={<Plus size={16} />}
+                  onClick={openCreate}
+                >
+                  {t("providers.add")}
+                </Button>
+              }
+            />
+          ) : (
+            <Table>
+              <thead>
                 <tr>
-                  <Td className="text-slate-400" >
-                    {t("common.empty")}
-                  </Td>
+                  <Th>{t("common.name")}</Th>
+                  <Th>{t("providers.vendor")}</Th>
+                  <Th>{t("providers.apiBase")}</Th>
+                  <Th>{t("providers.authMode")}</Th>
+                  <Th>{t("common.status")}</Th>
+                  <Th>{t("common.updatedAt")}</Th>
+                  <Th className="text-right">{t("common.actions")}</Th>
                 </tr>
-              ) : null}
-            </tbody>
-          </Table>
-        )}
-      </Card>
+              </thead>
+              <tbody>
+                {(data ?? []).map((p) => (
+                  <Tr key={p.id}>
+                    <Td>
+                      <div className="font-medium text-text">{p.name}</div>
+                      <div className="font-mono text-xs text-text-subtle">
+                        {shortId(p.id)}
+                      </div>
+                    </Td>
+                    <Td>{p.vendor}</Td>
+                    <Td className="max-w-[220px] truncate font-mono text-xs" title={p.api_base}>
+                      {p.api_base}
+                    </Td>
+                    <Td>{p.auth_mode}</Td>
+                    <Td>
+                      {p.enabled ? (
+                        <Badge tone="success">{t("common.enabled")}</Badge>
+                      ) : (
+                        <Badge tone="neutral">{t("common.disabled")}</Badge>
+                      )}
+                    </Td>
+                    <Td className="text-xs text-text-muted">
+                      {fmtTime(p.updated_at)}
+                    </Td>
+                    <Td className="text-right">
+                      <div className="flex justify-end">
+                        <RowActions
+                          label={t("common.rowActions")}
+                          items={[
+                            {
+                              key: "edit",
+                              label: t("common.edit"),
+                              icon: <Pencil size={14} />,
+                              onSelect: () => openEdit(p),
+                            },
+                            {
+                              key: "delete",
+                              label: t("common.delete"),
+                              icon: <Trash2 size={14} />,
+                              destructive: true,
+                              onSelect: () => setPendingDelete(p),
+                            },
+                          ]}
+                        />
+                      </div>
+                    </Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          )}
+        </Card>
+      )}
 
-      <Modal
+      <Dialog
         open={modalOpen}
-        onClose={() => setModalOpen(false)}
+        onOpenChange={setModalOpen}
         title={editing ? t("providers.editTitle") : t("providers.addTitle")}
+        closeLabel={t("common.close")}
         footer={
           <>
-            <Button onClick={() => setModalOpen(false)}>
+            <Button variant="secondary" onClick={() => setModalOpen(false)}>
               {t("common.cancel")}
             </Button>
             <Button
               variant="primary"
               onClick={submit}
-              disabled={saveMutation.isPending}
+              loading={saveMutation.isPending}
             >
               {t("common.save")}
             </Button>
@@ -219,7 +257,7 @@ export default function Providers() {
       >
         <div className="space-y-4">
           {formError ? <ErrorBox message={formError} /> : null}
-          <Field label={t("common.name")}>
+          <Field label={t("common.name")} required>
             <Input
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
@@ -241,24 +279,21 @@ export default function Providers() {
           <Field label={t("providers.authMode")}>
             <Select
               value={form.auth_mode}
-              onChange={(e) => setForm({ ...form, auth_mode: e.target.value })}
-            >
-              {AUTH_MODES.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </Select>
+              onValueChange={(v) => setForm({ ...form, auth_mode: v })}
+              ariaLabel={t("providers.authMode")}
+              options={AUTH_MODES.map((m) => ({ value: m, label: m }))}
+            />
           </Field>
           <Field
             label={t("providers.apiKey")}
             hint={editing ? t("providers.apiKeyHint") : t("providers.redacted")}
           >
-            <Input
-              type="password"
+            <PasswordInput
               value={form.api_key}
               onChange={(e) => setForm({ ...form, api_key: e.target.value })}
               placeholder={editing ? "••••••••" : "sk-…"}
+              toggleLabel={t("providers.apiKey")}
+              autoComplete="off"
             />
           </Field>
           <Field label={t("providers.tenantScope")}>
@@ -269,16 +304,29 @@ export default function Providers() {
               }
             />
           </Field>
-          <label className="flex items-center gap-2 text-sm text-slate-600">
-            <input
-              type="checkbox"
-              checked={form.enabled}
-              onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
-            />
-            {t("common.enabled")}
-          </label>
+          <Switch
+            checked={form.enabled}
+            onCheckedChange={(v) => setForm({ ...form, enabled: v })}
+            label={t("common.enabled")}
+          />
         </div>
-      </Modal>
+      </Dialog>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        onOpenChange={(o) => !o && setPendingDelete(null)}
+        title={t("providers.deleteTitle")}
+        description={t("providers.deleteConfirm", {
+          name: pendingDelete?.name ?? "",
+        })}
+        confirmLabel={t("common.delete")}
+        cancelLabel={t("common.cancel")}
+        destructive
+        loading={deleteMutation.isPending}
+        onConfirm={() =>
+          pendingDelete && deleteMutation.mutate(pendingDelete.id)
+        }
+      />
     </div>
   );
 }

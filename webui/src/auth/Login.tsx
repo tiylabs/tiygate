@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import { probeToken, ApiError } from "@/api/client";
 import { useAuth } from "./AuthContext";
-import { Button, Card, ErrorBox, Field, Input } from "@/components/ui";
+import { Button, Card, ErrorBox, Field, PasswordInput, Switch } from "@/components/ui";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 
 export default function Login() {
@@ -38,43 +38,40 @@ export default function Login() {
   }
 
   return (
-    <div className="flex min-h-full items-center justify-center bg-slate-50 px-4">
+    <div className="flex min-h-full items-center justify-center bg-bg px-4">
       <div className="w-full max-w-sm">
         <div className="mb-6 flex items-center justify-between">
-          <h1 className="text-lg font-semibold text-slate-800">
-            {t("app.title")}
-          </h1>
+          <h1 className="text-lg font-semibold text-text">{t("app.title")}</h1>
           <LanguageSwitcher />
         </div>
         <Card className="p-6">
-          <h2 className="text-base font-semibold text-slate-800">
+          <h2 className="text-base font-semibold text-text">
             {t("login.title")}
           </h2>
-          <p className="mt-1 text-sm text-slate-500">{t("login.subtitle")}</p>
+          <p className="mt-1 text-sm text-text-muted">{t("login.subtitle")}</p>
           <form className="mt-5 space-y-4" onSubmit={onSubmit}>
             <Field label={t("login.tokenLabel")}>
-              <Input
-                type="password"
+              <PasswordInput
                 autoFocus
+                autoComplete="off"
                 value={token}
                 onChange={(e) => setToken(e.target.value)}
                 placeholder={t("login.tokenPlaceholder")}
+                toggleLabel={t("login.tokenLabel")}
               />
             </Field>
-            <label className="flex items-center gap-2 text-sm text-slate-600">
-              <input
-                type="checkbox"
-                checked={remember}
-                onChange={(e) => setRemember(e.target.checked)}
-              />
-              {t("login.remember")}
-            </label>
+            <Switch
+              checked={remember}
+              onCheckedChange={setRemember}
+              label={t("login.remember")}
+            />
             {error ? <ErrorBox message={error} /> : null}
             <Button
               type="submit"
               variant="primary"
               className="w-full"
-              disabled={busy || !token.trim()}
+              loading={busy}
+              disabled={!token.trim()}
             >
               {busy ? t("login.verifying") : t("login.submit")}
             </Button>

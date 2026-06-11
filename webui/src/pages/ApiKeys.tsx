@@ -5,17 +5,23 @@ import { Plus, SlidersHorizontal, Ban, Trash2, Copy, Check } from "lucide-react"
 import { apiKeysApi } from "@/api/resources";
 import type { ApiKey, CreateApiKeyResponse, QuotaSpec } from "@/api/types";
 import {
+  Alert,
   Badge,
   Button,
   Card,
+  ConfirmDialog,
+  Dialog,
+  EmptyState,
   ErrorBox,
   Field,
   Input,
-  Modal,
-  Spinner,
+  RowActions,
   Table,
+  TableSkeleton,
   Td,
   Th,
+  Tr,
+  useToast,
 } from "@/components/ui";
 import { PageHeader, fmtTime, shortId } from "@/components/PageHeader";
 
@@ -38,7 +44,8 @@ function quotaSummary(q: QuotaSpec): string {
 export default function ApiKeys() {
   const { t } = useTranslation();
   const qc = useQueryClient();
-  const { data, isLoading, error } = useQuery({
+  const toast = useToast();
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["api-keys"],
     queryFn: apiKeysApi.list,
   });
@@ -58,6 +65,7 @@ export default function ApiKeys() {
       setCreateOpen(false);
       setNewName("");
       setSecret(res);
+      toast.success(t("apiKeys.created"));
       void invalidate();
     },
     onError: (e: Error) => setCreateError(e.message),
@@ -85,18 +93,38 @@ export default function ApiKeys() {
     },
     onSuccess: () => {
       setQuotaKey(null);
+      toast.success(t("common.saved"));
       void invalidate();
     },
     onError: (e: Error) => setQuotaError(e.message),
   });
 
+  const [pendingDisable, setPendingDisable] = useState<ApiKey | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<ApiKey | null>(null);
+
   const disableMutation = useMutation({
     mutationFn: apiKeysApi.disable,
-    onSuccess: () => void invalidate(),
+    onSuccess: () => {
+      setPendingDisable(null);
+      toast.success(t("apiKeys.disabled"));
+      void invalidate();
+    },
+    onError: (e: Error) => {
+      setPendingDisable(null);
+      toast.error(t("apiKeys.actionFailed"), e.message);
+    },
   });
   const deleteMutation = useMutation({
     mutationFn: apiKeysApi.remove,
-    onSuccess: () => void invalidate(),
+    onSuccess: () => {
+      setPendingDelete(null);
+      toast.success(t("apiKeys.deleted"));
+      void invalidate();
+    },
+    onError: (e: Error) => {
+      setPendingDelete(null);
+      toast.error(t("apiKeys.actionFailed"), e.message);
+    },
   });
 
   function openQuota(k: ApiKey) {
@@ -112,9 +140,14 @@ export default function ApiKeys() {
 
   async function copySecret() {
     if (!secret) return;
-    await navigator.clipboard.writeText(secret.secret);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    try {
+      await navigator.clipboard.writeText(secret.secret);
+      setCopied(true);
+      toast.success(t("apiKeys.secretCopied"));
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      toast.error(t("common.copyFailed"));
+    }
   }
 
   return (
@@ -124,113 +157,138 @@ export default function ApiKeys() {
         action={
           <Button
             variant="primary"
+            icon={<Plus size={16} />}
             onClick={() => {
               setNewName("");
               setCreateError(null);
               setCreateOpen(true);
             }}
           >
-            <Plus size={16} />
             {t("apiKeys.add")}
           </Button>
         }
       />
-      {error ? <ErrorBox message={(error as Error).message} /> : null}
-      <Card>
-        {isLoading ? (
-          <Spinner />
-        ) : (
-          <Table>
-            <thead>
-              <tr>
-                <Th>{t("common.name")}</Th>
-                <Th>{t("apiKeys.keyHash")}</Th>
-                <Th>{t("apiKeys.quota")}</Th>
-                <Th>{t("common.status")}</Th>
-                <Th>{t("common.createdAt")}</Th>
-                <Th className="text-right">{t("common.actions")}</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {(data ?? []).map((k) => (
-                <tr key={k.id}>
-                  <Td>
-                    <div className="font-medium text-slate-800">{k.name}</div>
-                    <div className="text-xs text-slate-400">{shortId(k.id)}</div>
-                  </Td>
-                  <Td className="font-mono text-xs">{shortId(k.key_hash, 16)}</Td>
-                  <Td className="text-xs">{quotaSummary(k.quota)}</Td>
-                  <Td>
-                    {k.status === "active" ? (
-                      <Badge tone="green">{k.status}</Badge>
-                    ) : (
-                      <Badge tone="slate">{k.status}</Badge>
-                    )}
-                  </Td>
-                  <Td className="text-xs text-slate-500">
-                    {fmtTime(k.created_at)}
-                  </Td>
-                  <Td className="text-right">
-                    <div className="flex justify-end gap-1">
-                      <Button variant="ghost" onClick={() => openQuota(k)}>
-                        <SlidersHorizontal size={14} />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        disabled={k.status !== "active"}
-                        onClick={() => {
-                          if (
-                            window.confirm(
-                              t("apiKeys.disableConfirm", { name: k.name }),
-                            )
-                          ) {
-                            disableMutation.mutate(k.id);
-                          }
-                        }}
-                      >
-                        <Ban size={14} className="text-amber-600" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        onClick={() => {
-                          if (
-                            window.confirm(
-                              t("apiKeys.deleteConfirm", { name: k.name }),
-                            )
-                          ) {
-                            deleteMutation.mutate(k.id);
-                          }
-                        }}
-                      >
-                        <Trash2 size={14} className="text-red-500" />
-                      </Button>
-                    </div>
-                  </Td>
-                </tr>
-              ))}
-              {(data ?? []).length === 0 && !isLoading ? (
+      {error ? (
+        <ErrorBox
+          message={(error as Error).message}
+          onRetry={() => refetch()}
+          retryLabel={t("common.retry")}
+        />
+      ) : (
+        <Card>
+          {isLoading ? (
+            <TableSkeleton />
+          ) : (data ?? []).length === 0 ? (
+            <EmptyState
+              title={t("common.emptyTitle")}
+              description={t("apiKeys.empty")}
+              action={
+                <Button
+                  variant="primary"
+                  icon={<Plus size={16} />}
+                  onClick={() => {
+                    setNewName("");
+                    setCreateError(null);
+                    setCreateOpen(true);
+                  }}
+                >
+                  {t("apiKeys.add")}
+                </Button>
+              }
+            />
+          ) : (
+            <Table>
+              <thead>
                 <tr>
-                  <Td className="text-slate-400">{t("common.empty")}</Td>
+                  <Th>{t("common.name")}</Th>
+                  <Th>{t("apiKeys.keyHash")}</Th>
+                  <Th>{t("apiKeys.quota")}</Th>
+                  <Th>{t("common.status")}</Th>
+                  <Th>{t("common.createdAt")}</Th>
+                  <Th className="text-right">{t("common.actions")}</Th>
                 </tr>
-              ) : null}
-            </tbody>
-          </Table>
-        )}
-      </Card>
+              </thead>
+              <tbody>
+                {(data ?? []).map((k) => (
+                  <Tr key={k.id}>
+                    <Td>
+                      <div className="font-medium text-text">{k.name}</div>
+                      <div className="font-mono text-xs text-text-subtle">
+                        {shortId(k.id)}
+                      </div>
+                    </Td>
+                    <Td className="font-mono text-xs">
+                      {shortId(k.key_hash, 16)}
+                    </Td>
+                    <Td className="text-xs tabular-nums">
+                      {quotaSummary(k.quota)}
+                    </Td>
+                    <Td>
+                      {k.status === "active" ? (
+                        <Badge tone="success" title={k.status}>
+                          {k.status}
+                        </Badge>
+                      ) : (
+                        <Badge tone="neutral" title={k.status}>
+                          {k.status}
+                        </Badge>
+                      )}
+                    </Td>
+                    <Td className="text-xs text-text-muted">
+                      {fmtTime(k.created_at)}
+                    </Td>
+                    <Td className="text-right">
+                      <div className="flex justify-end">
+                        <RowActions
+                          label={t("common.rowActions")}
+                          items={[
+                            {
+                              key: "quota",
+                              label: t("apiKeys.editQuota"),
+                              icon: <SlidersHorizontal size={14} />,
+                              onSelect: () => openQuota(k),
+                            },
+                            {
+                              key: "disable",
+                              label: t("apiKeys.disable"),
+                              icon: <Ban size={14} />,
+                              disabled: k.status !== "active",
+                              onSelect: () => setPendingDisable(k),
+                            },
+                            {
+                              key: "delete",
+                              label: t("common.delete"),
+                              icon: <Trash2 size={14} />,
+                              destructive: true,
+                              onSelect: () => setPendingDelete(k),
+                            },
+                          ]}
+                        />
+                      </div>
+                    </Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          )}
+        </Card>
+      )}
 
-      {/* create modal */}
-      <Modal
+      {/* create dialog */}
+      <Dialog
         open={createOpen}
-        onClose={() => setCreateOpen(false)}
+        onOpenChange={setCreateOpen}
         title={t("apiKeys.createTitle")}
+        closeLabel={t("common.close")}
         footer={
           <>
-            <Button onClick={() => setCreateOpen(false)}>
+            <Button variant="secondary" onClick={() => setCreateOpen(false)}>
               {t("common.cancel")}
             </Button>
             <Button
               variant="primary"
-              disabled={!newName.trim() || createMutation.isPending}
+              disabled={!newName.trim()}
+              loading={createMutation.isPending}
               onClick={() => createMutation.mutate()}
             >
               {t("common.create")}
@@ -240,7 +298,7 @@ export default function ApiKeys() {
       >
         <div className="space-y-4">
           {createError ? <ErrorBox message={createError} /> : null}
-          <Field label={t("common.name")}>
+          <Field label={t("common.name")} required>
             <Input
               autoFocus
               value={newName}
@@ -248,13 +306,14 @@ export default function ApiKeys() {
             />
           </Field>
         </div>
-      </Modal>
+      </Dialog>
 
-      {/* one-time secret modal */}
-      <Modal
+      {/* one-time secret dialog */}
+      <Dialog
         open={secret !== null}
-        onClose={() => setSecret(null)}
+        onOpenChange={(o) => !o && setSecret(null)}
         title={t("apiKeys.secretTitle")}
+        closeLabel={t("common.close")}
         footer={
           <Button variant="primary" onClick={() => setSecret(null)}>
             {t("common.close")}
@@ -262,34 +321,32 @@ export default function ApiKeys() {
         }
       >
         <div className="space-y-3">
-          <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            {t("apiKeys.secretWarning")}
-          </div>
+          <Alert tone="warning">{t("apiKeys.secretWarning")}</Alert>
           <div className="flex items-center gap-2">
-            <code className="flex-1 break-all rounded-md bg-slate-100 px-3 py-2 font-mono text-sm">
+            <code className="flex-1 break-all rounded-md bg-surface-muted px-3 py-2 font-mono text-sm text-text">
               {secret?.secret}
             </code>
-            <Button onClick={copySecret}>
-              {copied ? <Check size={14} /> : <Copy size={14} />}
+            <Button variant="accent" icon={copied ? <Check size={14} /> : <Copy size={14} />} onClick={copySecret}>
               {copied ? t("common.copied") : t("common.copy")}
             </Button>
           </div>
         </div>
-      </Modal>
+      </Dialog>
 
-      {/* quota edit modal */}
-      <Modal
+      {/* quota edit dialog */}
+      <Dialog
         open={quotaKey !== null}
-        onClose={() => setQuotaKey(null)}
+        onOpenChange={(o) => !o && setQuotaKey(null)}
         title={t("apiKeys.quotaTitle", { name: quotaKey?.name ?? "" })}
+        closeLabel={t("common.close")}
         footer={
           <>
-            <Button onClick={() => setQuotaKey(null)}>
+            <Button variant="secondary" onClick={() => setQuotaKey(null)}>
               {t("common.cancel")}
             </Button>
             <Button
               variant="primary"
-              disabled={quotaMutation.isPending}
+              loading={quotaMutation.isPending}
               onClick={() => quotaMutation.mutate()}
             >
               {t("common.save")}
@@ -308,7 +365,7 @@ export default function ApiKeys() {
                 ? Math.min(100, Math.round((usage / limit) * 100))
                 : null;
             return (
-              <div key={f.key} className="space-y-1">
+              <div key={f.key} className="space-y-1.5">
                 <Field label={t(f.label)} hint={t("apiKeys.unlimited")}>
                   <Input
                     type="number"
@@ -320,15 +377,15 @@ export default function ApiKeys() {
                 </Field>
                 {usage != null ? (
                   <div className="space-y-1">
-                    <div className="text-xs text-slate-500">
+                    <div className="text-xs text-text-muted tabular-nums">
                       {t("apiKeys.usage")}: {usage}
                       {limit ? ` / ${limit}` : ""}
                     </div>
                     {pct != null ? (
-                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-200">
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-muted">
                         <div
                           className={
-                            pct >= 100 ? "h-full bg-red-500" : "h-full bg-slate-700"
+                            pct >= 100 ? "h-full bg-danger" : "h-full bg-primary"
                           }
                           style={{ width: `${pct}%` }}
                         />
@@ -341,12 +398,44 @@ export default function ApiKeys() {
           })}
           {detailQuery.data &&
           Object.keys(detailQuery.data.usage ?? {}).length === 0 ? (
-            <p className="text-xs text-slate-400">
+            <p className="text-xs text-text-subtle">
               {t("apiKeys.usageUnavailable")}
             </p>
           ) : null}
         </div>
-      </Modal>
+      </Dialog>
+
+      <ConfirmDialog
+        open={pendingDisable !== null}
+        onOpenChange={(o) => !o && setPendingDisable(null)}
+        title={t("apiKeys.disableTitle")}
+        description={t("apiKeys.disableConfirm", {
+          name: pendingDisable?.name ?? "",
+        })}
+        confirmLabel={t("apiKeys.disable")}
+        cancelLabel={t("common.cancel")}
+        destructive
+        loading={disableMutation.isPending}
+        onConfirm={() =>
+          pendingDisable && disableMutation.mutate(pendingDisable.id)
+        }
+      />
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        onOpenChange={(o) => !o && setPendingDelete(null)}
+        title={t("apiKeys.deleteTitle")}
+        description={t("apiKeys.deleteConfirm", {
+          name: pendingDelete?.name ?? "",
+        })}
+        confirmLabel={t("common.delete")}
+        cancelLabel={t("common.cancel")}
+        destructive
+        loading={deleteMutation.isPending}
+        onConfirm={() =>
+          pendingDelete && deleteMutation.mutate(pendingDelete.id)
+        }
+      />
     </div>
   );
 }
