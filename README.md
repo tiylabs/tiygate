@@ -121,8 +121,51 @@ Send `SIGTERM` (or K8s `preStop`) and the gateway:
 1. Flips `/readyz` to `503` so the load balancer removes it from the pool
 2. Refuses new requests with `503 + Retry-After`
 3. Lets in-flight requests (including long SSE streams) finish naturally
-4. On `drain_timeout` (default 30s, must be ≥ single-request `deadline`), sends a **protocol-native error frame** to any still-open streams and runs `UsageAccumulator` to prevent billing drift
+4. On `drain_timeout` (default 30s, must be ≥ single-request `deadline`), sends a **protocol-native error frame** to any still-open streams and runs `UsageAccumulator` to prevent billing drift. The streaming path is implemented in `crates/server/src/ingress.rs::drive_upstream_stream` — it also adds a 120s idle timer (configurable via `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`), an opt-in total wall-clock budget (`TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS`, default disabled), and a 30s SSE keepalive (`SseKeepaliveStream`) so middleboxes do not silently drop long-quiet streams
 5. Flushes the telemetry channel, releases resources, exits
+
+### Environment variables
+
+All TiyGate knobs are read from environment variables. Unknown keys are ignored. The gateway also loads `.env` from the working directory at startup (when the `dotenv` feature is on).
+
+#### Server core
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TIYGATE_LISTEN_ADDR` | `0.0.0.0:3000` | Listen address for the HTTP server. |
+| `TIYGATE_MODE` | `all` | Deployment mode. `all` (data + control in one process), `proxy` (data plane only), `admin` (control plane only). |
+| `TIYGATE_MAX_BODY_BYTES` | `10485760` (10 MiB) | Per-request body size limit for plain text / JSON. |
+| `TIYGATE_MAX_INFLIGHT` | `1024` | Maximum concurrent in-flight requests. Beyond this, additional requests queue and are eventually rejected with `503 + Retry-After`. |
+| `TIYGATE_ROUTING_STRATEGY` | `weighted` | Routing strategy across targets. `weighted` (default §3.4), `priority`, `cooldown`, `latency`. |
+
+#### Streaming lifecycle (see `crates/server/src/ingress.rs::drive_upstream_stream`)
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` | `120` | Idle window for upstream streaming responses. If no chunk arrives for this long, the stream is closed with a protocol-native end frame. |
+| `TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS` | `0` (disabled) | Wall-clock budget for upstream streaming responses. When it elapses, the stream is closed with a protocol-native error frame. Set to `0` to opt out. |
+
+#### Providers — auto-routing on first boot
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENAI_API_KEY` | If set, auto-registers routes for `gpt-4o`, `gpt-4o-mini`, and `gpt-3.5-turbo` pointing at `https://api.openai.com/v1`. |
+| `ANTHROPIC_API_KEY` | If set, auto-registers a route for `claude-sonnet-4-20250514` pointing at `https://api.anthropic.com/v1`. |
+| `OPENAI_COMPATIBLE_BASE_URL` | Base URL of a generic OpenAI-compatible provider (Ollama, vLLM, DeepSeek, Moonshot, etc.). Required for the openai-compatible provider to register. |
+| `OPENAI_COMPATIBLE_API_KEY` | API key for the generic provider above. Defaults to `not-needed` when omitted (suitable for local / unauthenticated endpoints). |
+
+#### Security
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TIYGATE_ADMIN_TOKEN` | unset | Bearer token required by the Admin API. When unset, Admin API requests are rejected. |
+| `TIYGATE_MASTER_KEY` | unset | Master key used to AES-GCM-encrypt provider keys/tokens at rest. **Planned for the DB-backed phase; the in-memory config store does not yet read it.** Treat unset as "not encrypted" today. |
+
+#### Observability
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `RUST_LOG` | `info` | `tracing` / `tracing-subscriber` filter. Examples: `info`, `tiygate=debug`, `tiygate_server::ingress=trace`. |
 
 ### Configuration
 

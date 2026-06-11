@@ -62,6 +62,17 @@ pub struct ServerConfig {
     pub acquire_timeout_secs: u64,
     /// Drain timeout in seconds.
     pub drain_timeout_secs: u64,
+    /// Idle timeout for upstream streaming responses, in seconds.
+    /// The streaming handler emits a keepalive if no chunk arrives
+    /// for this long and then closes the stream with a protocol-native
+    /// end frame once the configured idle window has fully elapsed
+    /// without activity. Default: 120s.
+    pub upstream_stream_idle_timeout_secs: u64,
+    /// Total wall-clock timeout for upstream streaming responses, in
+    /// seconds. When the budget elapses the streaming handler closes
+    /// the stream with a protocol-native error frame. Set to 0 to
+    /// disable the total budget entirely. Default: 0 (disabled).
+    pub upstream_stream_total_timeout_secs: u64,
     /// Routing strategy (default `Weighted`, per §3.4).
     pub routing_strategy: RoutingStrategyName,
 }
@@ -78,6 +89,11 @@ impl Default for ServerConfig {
             max_queue_depth: 256,
             acquire_timeout_secs: 5,
             drain_timeout_secs: 30,
+            // 120s idle gives a reasonable safety net against proxies
+            // and slow upstreams; 0 disables the total budget so the
+            // operator opts in to a wall-clock cap explicitly.
+            upstream_stream_idle_timeout_secs: 120,
+            upstream_stream_total_timeout_secs: 0,
             routing_strategy: RoutingStrategyName::Weighted,
         }
     }
@@ -115,6 +131,16 @@ impl ServerConfig {
                 "latency" => RoutingStrategyName::Latency,
                 _ => RoutingStrategyName::Weighted,
             };
+        }
+        if let Ok(v) = std::env::var("TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse() {
+                cfg.upstream_stream_idle_timeout_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse() {
+                cfg.upstream_stream_total_timeout_secs = n;
+            }
         }
 
         cfg

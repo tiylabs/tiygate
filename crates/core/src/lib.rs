@@ -23,7 +23,7 @@ mod tests;
 // Re-export key types
 pub use ir::{
     Content, FinishReason, GenerationParams, IrRequest, IrResponse, Message, RawEnvelope,
-    ResponseFormat, Role, StreamPart, Tool, Usage, UsageAccumulator,
+    ResponseFormat, Role, StreamPart, Tool, TruncationReason, Usage, UsageAccumulator,
 };
 pub use pipeline::{
     ExecutionHook, HookDecision, ObserveHook, PipelineContext, PipelineStage, PreRequestHook,

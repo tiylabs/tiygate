@@ -121,8 +121,51 @@ curl -sS http://localhost:8080/v1/chat/completions \
 1. 将 `/readyz` 翻转为 `503`,让负载均衡摘除该副本
 2. 对**新请求**返回 `503 + Retry-After`
 3. **放行存量请求**(含长 SSE 流式)自然结束
-4. 超过 `drain_timeout`(默认 30s,应 ≥ 单请求 `deadline`)时,对仍未结束的流发送**协议原生 error 帧**,并跑 `UsageAccumulator` 兜底计费,防止账单漂移
+4. 超过 `drain_timeout`(默认 30s,应 ≥ 单请求 `deadline`)时,对仍未结束的流发送**协议原生 error 帧**,并跑 `UsageAccumulator` 兜底计费,防止账单漂移。流式路径实现在 `crates/server/src/ingress.rs::drive_upstream_stream` —— 它同时叠加 120s idle 计时(可通过 `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` 调节)、可选用 total 总时长预算(`TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS`,默认关闭)以及 30s 周期 SSE keepalive(`SseKeepaliveStream`),防止中间代理对长时间静默的流做隐式断连
 5. flush 日志 channel、归还资源、退出
+
+### 环境变量
+
+TiyGate 全部可调参数均通过环境变量读取,未识别的键会被忽略。网关启动时还会从工作目录加载 `.env`(在 `dotenv` feature 开启时)。
+
+#### Server 核心
+
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `TIYGATE_LISTEN_ADDR` | `0.0.0.0:3000` | HTTP server 监听地址。 |
+| `TIYGATE_MODE` | `all` | 部署模式。`all`(数据面+控制面同进程)、`proxy`(纯数据面)、`admin`(纯控制面)。 |
+| `TIYGATE_MAX_BODY_BYTES` | `10485760`(10 MiB) | 普通文本 / JSON 请求体大小上限。 |
+| `TIYGATE_MAX_INFLIGHT` | `1024` | 最大并发在途请求数。超过后新请求排队,排满后被 `503 + Retry-After` 拒绝。 |
+| `TIYGATE_ROUTING_STRATEGY` | `weighted` | 跨 target 的路由策略。`weighted`(默认,§3.4)、`priority`、`cooldown`、`latency`。 |
+
+#### 流式生命周期(实现见 `crates/server/src/ingress.rs::drive_upstream_stream`)
+
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` | `120` | 上游流式响应的 idle 窗口。若该时长内无 chunk 到达,以协议原生 end 帧关闭流。 |
+| `TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS` | `0`(关闭) | 上游流式响应的总时长预算。到期后以协议原生 error 帧关闭流。设为 `0` 表示不启用。 |
+
+#### Provider 启动自动注册路由
+
+| 变量 | 用途 |
+| --- | --- |
+| `OPENAI_API_KEY` | 若设置,自动注册 `gpt-4o` / `gpt-4o-mini` / `gpt-3.5-turbo` 路由,指向 `https://api.openai.com/v1`。 |
+| `ANTHROPIC_API_KEY` | 若设置,自动注册 `claude-sonnet-4-20250514` 路由,指向 `https://api.anthropic.com/v1`。 |
+| `OPENAI_COMPATIBLE_BASE_URL` | 通用 OpenAI 兼容 provider(Ollama、vLLM、DeepSeek、Moonshot 等)的 base URL。该 provider 注册的必要条件。 |
+| `OPENAI_COMPATIBLE_API_KEY` | 上述通用 provider 的 API key。未设置时默认 `not-needed`(适用于本地 / 无鉴权端点)。 |
+
+#### 安全
+
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `TIYGATE_ADMIN_TOKEN` | 未设置 | Admin API 要求的 bearer 鉴权 token。未设置时 Admin API 请求会被拒绝。 |
+| `TIYGATE_MASTER_KEY` | 未设置 | 用于 AES-GCM 静态加密 provider key / token 的主密钥。**计划在 DB 持久化阶段引入,当前内存 ConfigStore 暂未读取**——目前未设置等同于"不加密"。 |
+
+#### 可观测性
+
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `RUST_LOG` | `info` | `tracing` / `tracing-subscriber` 过滤器。示例:`info`、`tiygate=debug`、`tiygate_server::ingress=trace`。 |
 
 ### 配置
 

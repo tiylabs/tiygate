@@ -78,6 +78,17 @@ tracing-subscriber = { workspace = true, optional = true }
 dotenvy = { workspace = true, optional = true }
 anyhow.workspace = true
 
+# SSE parsing support — reserved for upcoming SSE decoder work in the
+# ingress pipeline. Wired through here so the version is locked to the
+# workspace-wide pin.
+eventsource-stream.workspace = true
+
+# `async-stream` and `pin-project` back the SseKeepaliveStream and the
+# drive_upstream_stream bridge in ingress.rs. Both are workspace-pinned
+# but need an explicit re-export here so this crate can use them.
+async-stream.workspace = true
+pin-project.workspace = true
+
 [dev-dependencies]
 wiremock.workspace = true
 

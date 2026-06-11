@@ -266,6 +266,25 @@ pub struct RawEnvelope {
 // Re-export ProtocolEndpoint for IR use
 use crate::protocol::ProtocolEndpoint;
 
+/// Why a streaming response was terminated before the upstream
+/// naturally completed. Recorded on `UsageAccumulator::truncated`
+/// so that disconnect-billing can distinguish "client cancelled"
+/// from "gateway hit a timeout" without losing the partial usage
+/// that was already accumulated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncationReason {
+    /// The idle timer fired (no chunk received within the configured
+    /// idle window). The accumulator's partial state is still billable.
+    Idle,
+    /// The total wall-clock timer fired (stream exceeded the configured
+    /// total budget). Partial state is still billable.
+    Total,
+    /// The upstream connection returned an error mid-stream.
+    /// Partial state is still billable for the bytes already received.
+    UpstreamError,
+}
+
 /// Accumulates usage from streaming responses for billing when the
 /// client disconnects mid-stream. Estimates token counts from
 /// character counts as a fallback.
@@ -277,6 +296,13 @@ pub struct UsageAccumulator {
     pub control_chars: usize,
     /// Whether the stream completed normally.
     pub completed: bool,
+    /// If the stream was terminated by the gateway (idle / total /
+    /// upstream error) instead of by a natural end-of-stream, this
+    /// records the reason. `None` until either `mark_completed()` or
+    /// `mark_truncated()` is called. Mutually exclusive with
+    /// `completed == true` in the sense that the gateway never sets
+    /// both flags — the last call wins.
+    pub truncated: Option<TruncationReason>,
 }
 
 impl UsageAccumulator {
@@ -298,6 +324,15 @@ impl UsageAccumulator {
     /// Mark the stream as completed normally.
     pub fn mark_completed(&mut self) {
         self.completed = true;
+        self.truncated = None;
+    }
+
+    /// Mark the stream as truncated by a gateway-side event. The
+    /// `completed` flag is forced to `false` so that downstream
+    /// observers can distinguish "ended early" from "ended cleanly".
+    pub fn mark_truncated(&mut self, reason: TruncationReason) {
+        self.completed = false;
+        self.truncated = Some(reason);
     }
 
     /// Estimate usage from accumulated characters.

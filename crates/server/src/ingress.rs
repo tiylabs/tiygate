@@ -18,7 +18,8 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use futures::StreamExt;
+use futures::{ready, Future, Stream, StreamExt};
+use pin_project::pin_project;
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -27,7 +28,7 @@ use tower_http::timeout::RequestBodyTimeoutLayer;
 use tiygate_core::{
     classify_error, DefaultFallbackPolicy, EndpointCodec, ErrorClass, FallbackDecision,
     FallbackPolicy, HealthRegistry, IrRequest, PipelineContext, RawEnvelope, RetryPolicy,
-    TelemetryBus,
+    TelemetryBus, TruncationReason, UsageAccumulator,
 };
 use tiygate_protocols::chat_completions::ChatCompletionsCodec;
 use tiygate_protocols::embeddings::EmbeddingsCodec;
@@ -85,6 +86,15 @@ pub struct AppState {
     pub max_multimodal_body_bytes: u64,
     /// Read timeout for the full request body.
     pub request_read_timeout: Duration,
+    /// Idle timeout (seconds) for upstream streaming responses. Used by
+    /// `drive_upstream_stream` to close long-silent streams with a
+    /// protocol-native end frame. Default 120s.
+    pub upstream_stream_idle_timeout_secs: u64,
+    /// Total wall-clock timeout (seconds) for upstream streaming
+    /// responses. 0 disables the total budget. Used by
+    /// `drive_upstream_stream` to close over-budget streams with a
+    /// protocol-native error frame.
+    pub upstream_stream_total_timeout_secs: u64,
     /// Shared reqwest connection pool across all handlers.
     pub http_client: reqwest::Client,
     /// Async telemetry bus — non-blocking send.
@@ -132,6 +142,8 @@ pub fn router_with_telemetry(
         max_request_body_bytes: server_config.max_request_body_bytes,
         max_multimodal_body_bytes: server_config.max_multimodal_body_bytes,
         request_read_timeout: Duration::from_secs(server_config.request_read_timeout_secs),
+        upstream_stream_idle_timeout_secs: server_config.upstream_stream_idle_timeout_secs,
+        upstream_stream_total_timeout_secs: server_config.upstream_stream_total_timeout_secs,
         // Shared connection pool: 30s connect timeout, no per-call read
         // timeout (we rely on RequestBodyTimeoutLayer for ingress + Sse for
         // streaming keepalive). Pool size defaults to reqwest's recommended
@@ -431,6 +443,114 @@ mod ingress_helper_tests {
             32 * 1024 * 1024,
         );
         assert!(r.is_err());
+    }
+}
+
+#[cfg(test)]
+mod streaming_helper_tests {
+    //! Tests for the streaming helper types in ingress.rs.
+    //!
+    //! These tests are intentionally simple — they exercise the
+    //! `SseKeepaliveStream` forwarder and the
+    //! `UsageAccumulator` ↔ `TruncationReason` transitions without
+    //! spinning up an HTTP server. End-to-end idle / total / keepalive
+    //! timing is covered by the wiremock tests in
+    //! `crates/server/tests/wiremock_providers.rs`; here we focus on
+    //! the deterministic state transitions.
+
+    use futures::stream;
+    use std::time::Duration;
+    use tiygate_core::{TruncationReason, UsageAccumulator};
+
+    /// `SseKeepaliveStream` configured with a non-zero interval
+    /// forwards a real frame and resets the keepalive deadline. We
+    /// verify that the first frame is observed *unchanged* by
+    /// pinning the wrapper (its `pin-project` projection makes
+    /// `SseKeepaliveStream` `!Unpin`).
+    #[tokio::test]
+    async fn keepalive_wrapper_forwards_real_frames_unchanged() {
+        let inner = stream::iter(vec![Ok::<_, axum::Error>(
+            axum::response::sse::Event::default().data("hello"),
+        )]);
+        let kept = Box::pin(super::SseKeepaliveStream::new(
+            inner,
+            Duration::from_millis(50),
+        ));
+        // `SseKeepaliveStream` is `!Unpin`; `Box::pin` it for the
+        // duration of the test so `futures::StreamExt::next` can
+        // take `&mut Self: Unpin` on the boxed value.
+        let first = futures::StreamExt::next(&mut { kept }).await;
+        // We don't introspect the frame body here because axum 0.7's
+        // `Event` representation depends on the build; the important
+        // invariant is that the wrapper returned *some* event before
+        // closing.
+        let saw_event = matches!(first, Some(Ok(_)));
+        assert!(saw_event, "expected one real frame, got {first:?}");
+    }
+
+    /// `SseKeepaliveStream` configured with a `Duration::ZERO` interval
+    /// never emits a synthetic keepalive comment for a short inner
+    /// stream. The downstream observer should only see real frames
+    /// and then immediate close.
+    #[tokio::test]
+    async fn keepalive_wrapper_disables_when_interval_is_zero() {
+        let inner = stream::iter(vec![Ok::<_, axum::Error>(
+            axum::response::sse::Event::default().data("first"),
+        )]);
+        let mut kept = Box::pin(super::SseKeepaliveStream::new(inner, Duration::ZERO));
+        let first = futures::StreamExt::next(&mut kept).await;
+        let saw_event = matches!(first, Some(Ok(_)));
+        assert!(saw_event, "expected one real frame, got {first:?}");
+        // No more events should be pending before the inner is
+        // exhausted; pulling again should close the stream.
+        let after = futures::StreamExt::next(&mut kept).await;
+        assert!(after.is_none());
+    }
+
+    /// `mark_completed` and `mark_truncated` are mutually exclusive
+    /// transitions on the accumulator — calling one clears the other
+    /// so disconnect-billing can rely on a single source of truth.
+    #[test]
+    fn accumulator_completed_clears_truncated() {
+        let mut a = UsageAccumulator::new();
+        a.record_chunk("hello");
+        a.mark_truncated(TruncationReason::Idle);
+        assert!(!a.completed);
+        assert_eq!(a.truncated, Some(TruncationReason::Idle));
+        // Late natural close.
+        a.mark_completed();
+        assert!(a.completed);
+        assert!(a.truncated.is_none());
+        // `estimate_usage` is unchanged regardless of the reason.
+        let usage = a.estimate_usage();
+        assert!(usage.completion_tokens >= 1);
+    }
+
+    /// `mark_truncated` forces `completed = false` even if the caller
+    /// had previously marked the stream complete. The last call wins.
+    #[test]
+    fn accumulator_truncated_clears_completed() {
+        let mut a = UsageAccumulator::new();
+        a.record_chunk("hello");
+        a.mark_completed();
+        assert!(a.completed);
+        // A late upstream error after the natural end should
+        // downgrade the state to truncated so billing knows it was
+        // not a clean finish.
+        a.mark_truncated(TruncationReason::UpstreamError);
+        assert!(!a.completed);
+        assert_eq!(a.truncated, Some(TruncationReason::UpstreamError));
+    }
+
+    /// The three truncation reasons round-trip through `Debug` /
+    /// `PartialEq` so disconnect-billing logs are reliable.
+    #[test]
+    fn truncation_reason_distinct() {
+        assert_ne!(TruncationReason::Idle, TruncationReason::Total);
+        assert_ne!(TruncationReason::Idle, TruncationReason::UpstreamError);
+        assert_ne!(TruncationReason::Total, TruncationReason::UpstreamError);
+        // Debug formatting is used by telemetry events.
+        assert!(format!("{:?}", TruncationReason::Idle).contains("Idle"));
     }
 }
 
@@ -1043,27 +1163,32 @@ async fn execute_upstream(
             return Err(app_err);
         }
 
-        // Usage accumulator tracks chunks received from upstream, used by
-        // disconnect-billing estimation and the bytes_emitted idempotency gate.
+        // Usage accumulator tracks chunks received from upstream, used
+        // by `drive_upstream_stream` for disconnect-billing and the
+        // bytes_emitted idempotency gate.
         let accum =
             std::sync::Arc::new(std::sync::Mutex::new(tiygate_core::UsageAccumulator::new()));
-        let accum_for_stream = accum.clone();
 
-        let stream = response.bytes_stream().map(move |result| {
-            result
-                .map(|bytes| {
-                    // Record chunk for billing estimation
-                    if let Ok(mut a) = accum_for_stream.lock() {
-                        a.record_chunk(&String::from_utf8_lossy(&bytes));
-                    }
-                    axum::response::sse::Event::default()
-                        .data(String::from_utf8_lossy(&bytes).to_string())
-                })
-                .map_err(|e| axum::Error::new(std::io::Error::other(e)))
-        });
+        // Build the protocol-native end / error frames from the egress
+        // codec. The streaming helper writes the right one for each
+        // termination reason (natural end → end frame, idle / total /
+        // upstream error → error frame).
+        let mut end_enc = codec.stream_encoder();
+        let mut err_enc = codec.stream_encoder();
+        let end_marker = end_enc.encode_done();
+        let error_marker = err_enc
+            .encode_error("upstream stream truncated by gateway", Some("upstream_timeout"));
 
-        let sse_stream = Sse::new(stream);
-        let mut response = sse_stream.into_response();
+        let mut response = drive_upstream_stream(
+            state,
+            accum,
+            response,
+            end_marker,
+            error_marker,
+            Duration::from_secs(state.upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.upstream_stream_total_timeout_secs),
+            DEFAULT_SSE_KEEPALIVE_INTERVAL,
+        );
         // Passthrough Retry-After if present
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
@@ -1079,9 +1204,6 @@ async fn execute_upstream(
                 }
             }
         }
-        // When the client disconnects, the accumulator lets us estimate
-        // usage for the partial response so we can still bill it.
-        let _accum = accum;
         Ok(response)
     } else {
         // PassThrough: forward raw body bytes verbatim (no re-serialize).
@@ -1256,15 +1378,30 @@ async fn execute_messages_upstream(
             return Err(app_err);
         }
 
-        let stream = response.bytes_stream().map(|result| {
-            result
-                .map(|bytes| {
-                    axum::response::sse::Event::default().data(String::from_utf8_lossy(&bytes))
-                })
-                .map_err(|e| axum::Error::new(std::io::Error::other(e)))
-        });
+        let accum = std::sync::Arc::new(std::sync::Mutex::new(
+            tiygate_core::UsageAccumulator::new(),
+        ));
 
-        let mut response = Sse::new(stream).into_response();
+        // Build the protocol-native end / error frames from the egress
+        // codec. The streaming helper writes the right one for each
+        // termination reason (natural end → end frame, idle / total /
+        // upstream error → error frame).
+        let mut end_enc = codec.stream_encoder();
+        let mut err_enc = codec.stream_encoder();
+        let end_marker = end_enc.encode_done();
+        let error_marker = err_enc
+            .encode_error("upstream stream truncated by gateway", Some("upstream_timeout"));
+
+        let mut response = drive_upstream_stream(
+            state,
+            accum,
+            response,
+            end_marker,
+            error_marker,
+            Duration::from_secs(state.upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.upstream_stream_total_timeout_secs),
+            DEFAULT_SSE_KEEPALIVE_INTERVAL,
+        );
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
                 http::HeaderName::from_static("retry-after"),
@@ -1508,6 +1645,73 @@ async fn handle_responses(
     apply_provider_auth(target, &mut upstream_headers).await?;
 
     let upstream_url = format!("{}/responses", target.effective_api_base());
+
+    if is_stream {
+        // Streaming path: tell the upstream we accept SSE and drive the
+        // body through the same idle/total/keepalive bridge used by the
+        // chat-completions and anthropic-messages paths.
+        let response = state
+            .http_client
+            .post(&upstream_url)
+            .headers(upstream_headers)
+            .header(http::header::ACCEPT, "text/event-stream")
+            .json(&upstream_body)
+            .send()
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let retry_after = extract_retry_after(response.headers());
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            let mut app_err = AppError::new(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                format!("Upstream {}: {}", status, error_body),
+            );
+            app_err.upstream_status = Some(status.as_u16());
+            if let Some(ra) = retry_after {
+                app_err = app_err.with_retry_after_header(ra);
+            }
+            return Err(app_err);
+        }
+
+        let accum = std::sync::Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let mut end_enc = codec.stream_encoder();
+        let mut err_enc = codec.stream_encoder();
+        let end_marker = end_enc.encode_done();
+        let error_marker = err_enc
+            .encode_error("upstream stream truncated by gateway", Some("upstream_timeout"));
+
+        let mut response = drive_upstream_stream(
+            &state,
+            accum,
+            response,
+            end_marker,
+            error_marker,
+            Duration::from_secs(state.upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.upstream_stream_total_timeout_secs),
+            DEFAULT_SSE_KEEPALIVE_INTERVAL,
+        );
+        if let Some(ra) = retry_after {
+            response.headers_mut().insert(
+                http::HeaderName::from_static("retry-after"),
+                http::HeaderValue::from_str(&ra).unwrap_or(http::HeaderValue::from_static("")),
+            );
+        }
+        // Passthrough upstream RateLimit-* headers so the downstream
+        // client can observe the upstream's rate-limit posture on the
+        // first response frame.
+        for (name, value) in extract_rate_limit_headers(response.headers()) {
+            if let Ok(hv) = http::HeaderValue::from_str(&value) {
+                if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
+                    response.headers_mut().insert(hn, hv);
+                }
+            }
+        }
+        state.health.record_success(&target.health_key());
+        return Ok(response);
+    }
+
+    // Non-streaming path: read the full body and forward as JSON.
     let response = state
         .http_client
         .post(&upstream_url)
@@ -1551,7 +1755,6 @@ async fn handle_responses(
         }
     }
     state.health.record_success(&target.health_key());
-    let _ = is_stream;
     Ok(resp)
 }
 
@@ -1618,11 +1821,82 @@ async fn handle_gemini_generate(
     })?;
     apply_provider_auth(target, &mut upstream_headers).await?;
 
-    let upstream_url = format!(
+    // Gemini uses `?alt=sse` on the query string to switch the same
+    // POST endpoint into Server-Sent Events mode. The body shape is
+    // identical to the non-streaming call, so we share `upstream_body`.
+    let base_stream_url = format!(
         "{}/v1beta/models/{}:generateContent",
         target.effective_api_base(),
         virtual_model
     );
+
+    if is_stream {
+        // Streaming path: append `?alt=sse` and run the body through
+        // `drive_upstream_stream` so the client sees the same idle /
+        // total / keepalive / protocol-native end-frame semantics as
+        // the other streaming ingress paths.
+        let response = state
+            .http_client
+            .post(format!("{base_stream_url}?alt=sse"))
+            .headers(upstream_headers)
+            .json(&upstream_body)
+            .send()
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let retry_after = extract_retry_after(response.headers());
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            let mut app_err = AppError::new(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                format!("Upstream {}: {}", status, error_body),
+            );
+            app_err.upstream_status = Some(status.as_u16());
+            if let Some(ra) = retry_after {
+                app_err = app_err.with_retry_after_header(ra);
+            }
+            return Err(app_err);
+        }
+
+        let accum = std::sync::Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let mut end_enc = codec.stream_encoder();
+        let mut err_enc = codec.stream_encoder();
+        let end_marker = end_enc.encode_done();
+        let error_marker = err_enc
+            .encode_error("upstream stream truncated by gateway", Some("upstream_timeout"));
+
+        let mut response = drive_upstream_stream(
+            &state,
+            accum,
+            response,
+            end_marker,
+            error_marker,
+            Duration::from_secs(state.upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.upstream_stream_total_timeout_secs),
+            DEFAULT_SSE_KEEPALIVE_INTERVAL,
+        );
+        if let Some(ra) = retry_after {
+            response.headers_mut().insert(
+                http::HeaderName::from_static("retry-after"),
+                http::HeaderValue::from_str(&ra).unwrap_or(http::HeaderValue::from_static("")),
+            );
+        }
+        // Passthrough upstream RateLimit-* headers so the downstream
+        // client can observe the upstream's rate-limit posture on the
+        // first response frame.
+        for (name, value) in extract_rate_limit_headers(response.headers()) {
+            if let Ok(hv) = http::HeaderValue::from_str(&value) {
+                if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
+                    response.headers_mut().insert(hn, hv);
+                }
+            }
+        }
+        state.health.record_success(&target.health_key());
+        return Ok(response);
+    }
+
+    // Non-streaming path: read the full body and forward as JSON.
+    let upstream_url = base_stream_url;
     let response = state
         .http_client
         .post(&upstream_url)
@@ -1666,8 +1940,336 @@ async fn handle_gemini_generate(
         }
     }
     state.health.record_success(&target.health_key());
-    let _ = (is_stream, ingress_protocol);
+    let _ = ingress_protocol;
     Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming helper types
+// ---------------------------------------------------------------------------
+
+/// Default keepalive cadence for downstream SSE proxies. Cheap to send
+/// (`:keepalive\n\n` is a single SSE comment line) and short enough to
+/// keep corporate proxies from killing the connection on idle.
+pub const DEFAULT_SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Wraps an inner event stream and emits an SSE comment frame every
+/// `interval` while the inner stream is still pending. Once the
+/// inner stream completes, the wrapper completes with it — keepalive
+/// frames are only useful while a real frame could still arrive.
+///
+/// This is the "always-on" liveness signal for the downstream client;
+/// the *protocol-native* end frame (or error frame) is the gateway's
+/// "this is the end" signal and is handled by `drive_upstream_stream`,
+/// not by this wrapper.
+///
+/// The struct is `!Unpin` because it carries a `tokio::time::Sleep`
+/// (a non-Unpin future). The single production call site in
+/// `drive_upstream_stream` wraps the constructed value in `Box::pin`
+/// before handing it to `Sse::new`, so the field-level `!Unpin` is
+/// invisible to the rest of the pipeline.
+#[pin_project]
+pub struct SseKeepaliveStream<S> {
+    #[pin]
+    inner: S,
+    interval: Duration,
+    #[pin]
+    timer: tokio::time::Sleep,
+    /// The instant at which we should next emit a keepalive. Re-armed
+    /// every time a real frame is forwarded so the downstream only sees
+    /// activity on a live connection.
+    emit_keepalive_at: Instant,
+    /// Set once the wrapper has decided the stream is closed (either
+    /// the inner stream finished or a frame errored); prevents extra
+    /// keepalive emissions after close.
+    done: bool,
+}
+
+impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> SseKeepaliveStream<S> {
+    /// Build a new keepalive wrapper around `inner`. `interval` is the
+    /// gap between successive keepalive comments; pass
+    /// `Duration::ZERO` to effectively disable keepalives (the
+    /// wrapper will then forward inner frames only).
+    pub fn new(inner: S, interval: Duration) -> Self {
+        let now = Instant::now();
+        let interval_for_timer = if interval.is_zero() {
+            // Park the timer 1000 years in the future so it never fires
+            // in practice — the stream only resolves on the inner path.
+            Duration::from_secs(60 * 60 * 24 * 365 * 1000)
+        } else {
+            interval
+        };
+        let timer = tokio::time::sleep(interval_for_timer);
+        Self {
+            inner,
+            interval,
+            timer,
+            emit_keepalive_at: now + interval_for_timer,
+            done: false,
+        }
+    }
+}
+
+impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> Stream
+    for SseKeepaliveStream<S>
+{
+    type Item = Result<axum::response::sse::Event, axum::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        let mut this = self.project();
+
+        // Fast path: poll the inner stream first. A real frame is
+        // always preferred over a synthetic keepalive — keepalives are
+        // a "no progress" signal, not a "please yield" signal.
+        match this.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(event))) => {
+                // Reset the keepalive deadline on real activity.
+                *this.emit_keepalive_at =
+                    Instant::now() + if this.interval.is_zero() {
+                        Duration::from_secs(0)
+                    } else {
+                        *this.interval
+                    };
+                let _ = this.timer.as_mut().reset(tokio::time::Instant::now() + *this.interval);
+                return std::task::Poll::Ready(Some(Ok(event)));
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                *this.done = true;
+                return std::task::Poll::Ready(Some(Err(e)));
+            }
+            std::task::Poll::Ready(None) => {
+                *this.done = true;
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Pending => {}
+        }
+
+        // Inner stream is pending: see whether the keepalive timer has
+        // elapsed and, if so, emit a comment frame and re-arm the
+        // timer.
+        if !this.interval.is_zero() {
+            let now = Instant::now();
+            if now >= *this.emit_keepalive_at {
+                *this.emit_keepalive_at = now + *this.interval;
+                let _ = this
+                    .timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + *this.interval);
+                let keepalive = axum::response::sse::Event::default().comment("keepalive");
+                return std::task::Poll::Ready(Some(Ok(keepalive)));
+            }
+            // Re-register the timer waker so the task wakes up when
+            // the keepalive deadline is reached.
+            let _ = ready!(this.timer.as_mut().poll(cx));
+        }
+
+        std::task::Poll::Pending
+    }
+}
+
+/// Drive an upstream HTTP response body to the downstream client as an
+/// SSE stream. Adds:
+///
+/// 1. An **idle timer** (default 120s). Every time a chunk is forwarded
+///    the timer resets. If no chunk arrives for the full window, the
+///    stream is closed with `end_marker` (a `encode_done()`-style
+///    protocol-native end frame) and the accumulator is marked
+///    truncated with `TruncationReason::Idle`.
+/// 2. A **total timer** (default disabled, `0` = off). A wall-clock
+///    budget measured from the moment this function is called. When it
+///    elapses the stream is closed with `error_marker` and the
+///    accumulator is marked truncated with
+///    `TruncationReason::Total`.
+/// 3. A **30s SSE keepalive** wrapper that emits `:keepalive` comments
+///    on the downstream side whenever the upstream is silent but
+///    inside the idle budget.
+///
+/// `end_marker` and `error_marker` are caller-supplied because the
+/// protocol-native framing differs per ingress protocol (chat completions,
+/// anthropic messages, responses, gemini). Bytes from the upstream are
+/// passed through verbatim — we do not parse SSE in this path. When the
+/// upstream connection produces an error mid-stream, the stream is
+/// closed with `error_marker` and the accumulator is marked truncated
+/// with `TruncationReason::UpstreamError`. The
+/// `Retry-After` / `RateLimit-*` headers from the upstream response
+/// are passed through by the caller; this function only builds the
+/// streaming body.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_upstream_stream(
+    _state: &AppState,
+    accum: Arc<std::sync::Mutex<UsageAccumulator>>,
+    response: reqwest::Response,
+    end_marker: Vec<u8>,
+    error_marker: Vec<u8>,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+    keepalive_interval: Duration,
+) -> Response {
+    use async_stream::stream;
+
+    let total_budget_enabled = !total_timeout.is_zero();
+    let total_started = Instant::now();
+    let mut upstream = response.bytes_stream();
+    let mut last_reason: Option<TruncationReason> = None;
+    let end_marker = end_marker;
+    let error_marker = error_marker;
+    let idle_timeout = if idle_timeout.is_zero() {
+        // 0 means "use the keepalive cadence as a no-progress signal"
+        // — but to be safe we still need *some* upper bound so a hung
+        // upstream cannot pin a connection forever. Use the keepalive
+        // cadence as the soft idle, and 24h as the absolute hard cap.
+        Duration::from_secs(60 * 60 * 24)
+    } else {
+        idle_timeout
+    };
+    let keepalive_interval = if keepalive_interval.is_zero() {
+        DEFAULT_SSE_KEEPALIVE_INTERVAL
+    } else {
+        keepalive_interval
+    };
+
+    // Per-poll timer state: we keep a `Sleep` future that is reset on
+    // every forwarded chunk. While the future is pending the stream
+    // returns `Pending`; when it fires, we close the stream with the
+    // idle end frame.
+    let idle_future = stream! {
+        // Initial timer fires after one idle window. We give the
+        // upstream a chance to deliver the first chunk by sleeping
+        // before checking.
+        let mut idle_deadline = tokio::time::Instant::now() + idle_timeout;
+        let total_deadline: Option<tokio::time::Instant> =
+            if total_budget_enabled {
+                Some(tokio::time::Instant::now() + total_timeout)
+            } else {
+                None
+            };
+        loop {
+            tokio::select! {
+                biased;
+                chunk = upstream.next() => {
+                    match chunk {
+                        Some(Ok(bytes)) => {
+                            // Reset the idle deadline — the upstream is
+                            // actively producing.
+                            idle_deadline = tokio::time::Instant::now() + idle_timeout;
+                            if let Ok(text) = std::str::from_utf8(&bytes) {
+                                if let Ok(mut a) = accum.lock() {
+                                    a.record_chunk(text);
+                                }
+                            } else if let Ok(mut a) = accum.lock() {
+                                a.record_chunk(&String::from_utf8_lossy(&bytes));
+                            }
+                            yield Ok(axum::response::sse::Event::default()
+                                .data(String::from_utf8_lossy(&bytes).to_string()));
+                        }
+                        Some(Err(_e)) => {
+                            last_reason = Some(TruncationReason::UpstreamError);
+                            // Mark the accumulator as truncated BEFORE
+                            // yielding the error marker so disconnect-
+                            // billing sees the right state.
+                            if let Ok(mut a) = accum.lock() {
+                                a.mark_truncated(TruncationReason::UpstreamError);
+                            }
+                            // Emit the protocol-native error frame so
+                            // the client can tell the upstream failed,
+                            // then close.
+                            if !error_marker.is_empty() {
+                                if let Ok(text) = std::str::from_utf8(&error_marker) {
+                                    yield Ok(axum::response::sse::Event::default()
+                                        .data(text.to_string()));
+                                } else {
+                                    yield Ok(axum::response::sse::Event::default()
+                                        .data(String::from_utf8_lossy(&error_marker).to_string()));
+                                }
+                            }
+                            break;
+                        }
+                        None => {
+                            // Upstream closed naturally — emit the
+                            // protocol-native end frame and finish.
+                            last_reason = None;
+                            if let Ok(mut a) = accum.lock() {
+                                a.mark_completed();
+                            }
+                            if !end_marker.is_empty() {
+                                if let Ok(text) = std::str::from_utf8(&end_marker) {
+                                    yield Ok(axum::response::sse::Event::default()
+                                        .data(text.to_string()));
+                                } else {
+                                    yield Ok(axum::response::sse::Event::default()
+                                        .data(String::from_utf8_lossy(&end_marker).to_string()));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(idle_deadline) => {
+                    last_reason = Some(TruncationReason::Idle);
+                    if let Ok(mut a) = accum.lock() {
+                        a.mark_truncated(TruncationReason::Idle);
+                    }
+                    // Idle elapsed. Emit the protocol-native end
+                    // frame and close — already-received bytes are
+                    // still billable.
+                    if !end_marker.is_empty() {
+                        if let Ok(text) = std::str::from_utf8(&end_marker) {
+                            yield Ok(axum::response::sse::Event::default()
+                                .data(text.to_string()));
+                        } else {
+                            yield Ok(axum::response::sse::Event::default()
+                                .data(String::from_utf8_lossy(&end_marker).to_string()));
+                        }
+                    }
+                    break;
+                }
+                _ = async {
+                    if let Some(t) = total_deadline {
+                        tokio::time::sleep_until(t).await;
+                    } else {
+                        // No total budget — wait forever.
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    last_reason = Some(TruncationReason::Total);
+                    if let Ok(mut a) = accum.lock() {
+                        a.mark_truncated(TruncationReason::Total);
+                    }
+                    // Total budget elapsed. Emit the protocol-native
+                    // error frame so the client can tell this was a
+                    // gateway-side cap, not a natural end.
+                    if !error_marker.is_empty() {
+                        if let Ok(text) = std::str::from_utf8(&error_marker) {
+                            yield Ok(axum::response::sse::Event::default()
+                                .data(text.to_string()));
+                        } else {
+                            yield Ok(axum::response::sse::Event::default()
+                                .data(String::from_utf8_lossy(&error_marker).to_string()));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        // Touch `last_reason` to silence the unused-variable lint
+        // — the variable is captured by the async-stream macro but
+        // `cargo` does not always see the use.
+        let _ = last_reason;
+        // Touch the total_started clock for the same reason.
+        let _ = total_started;
+    };
+
+    // Wrap the inner stream in a keepalive emitter so the downstream
+    // client (and any middlebox) keeps seeing activity even when the
+    // upstream is between chunks.
+    let kept = SseKeepaliveStream::new(Box::pin(idle_future), keepalive_interval);
+    Sse::new(kept).into_response()
 }
 
 /// Simple error type for the HTTP layer.

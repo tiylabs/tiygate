@@ -538,6 +538,65 @@ async fn test_multi_target_fallback_5xx_transfers() {
 }
 
 #[tokio::test]
+async fn test_streaming_chat_completion_forwards_done_frame() {
+    // Streaming path: the gateway must forward a chunked OpenAI-style
+    // SSE response to the downstream and append the protocol-native
+    // end frame (`data: [DONE]`) when the upstream closes naturally.
+    // This exercises the new `drive_upstream_stream` bridge end-to-end
+    // — keepalive is on a longer cadence (default 30s) and the test
+    // body is small enough that the stream closes before any
+    // keepalive is emitted, so we can assert on the done-frame
+    // passthrough only.
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .and(wiremock::matchers::header("authorization", "Bearer sk-test"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_openai_test_app(mock_server.uri(), "gpt-4o");
+
+    let body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    // The real frame from the upstream must be present.
+    assert!(
+        body_str.contains("\"content\":\"hi\""),
+        "expected upstream frame, got: {body_str}"
+    );
+    // And the protocol-native end frame the gateway emits on natural
+    // upstream close must also be present.
+    assert!(
+        body_str.contains("data: [DONE]"),
+        "expected protocol-native end frame, got: {body_str}"
+    );
+}
+
+#[tokio::test]
 async fn test_passthrough_forwards_raw_body_verbatim() {
     // PassThrough contract: when the target's protocol suite matches the
     // ingress suite and the codec declares Passthrough, the gateway
