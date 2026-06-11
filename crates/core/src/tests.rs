@@ -450,7 +450,8 @@ mod tests {
         // Combined test: max_total_attempts=2 + 1 retry (RetryPolicy)
         // Total possible attempts: 2 (TryNext) + 1 retry = 3
         // Verify policy rejects when attempt >= max_total_attempts
-        let policy = DefaultFallbackPolicy::new(2, Duration::from_secs(60), RetryPolicy::with_defaults());
+        let policy =
+            DefaultFallbackPolicy::new(2, Duration::from_secs(60), RetryPolicy::with_defaults());
         let target = RoutingTarget {
             provider_id: "test".to_string(),
             model_id: "m".to_string(),

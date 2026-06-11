@@ -16,9 +16,12 @@ pub mod ir;
 pub mod pipeline;
 pub mod protocol;
 pub mod provider;
+pub mod quota;
+pub mod redaction;
 pub mod routing;
 pub mod telemetry;
 mod tests;
+pub mod tracing_ctx;
 
 // Re-export key types
 pub use ir::{
@@ -41,4 +44,6 @@ pub use routing::{
     FallbackDecision, FallbackPolicy, HealthRegistry, LatencyStrategy, PriorityStrategy,
     RetryPolicy, RoutingTable, RoutingTarget, RoutingTargetHealth, Strategy, WeightedStrategy,
 };
-pub use telemetry::{EventSink, PipelineEvent, RequestEvent, TelemetryBus};
+pub use telemetry::{
+    EventSink, MicroUsd, PipelineEvent, PriceProvider, RequestEvent, TelemetryBus, TokenKind,
+};

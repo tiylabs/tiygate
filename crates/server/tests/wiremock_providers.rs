@@ -49,7 +49,7 @@ fn build_test_app_with_config(
         }],
     );
 
-    let config_store = ConfigStore { routing_table };
+    let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
     ingress::router(config_store, health, &server_config)
 }
@@ -76,7 +76,7 @@ fn build_anthropic_test_app(upstream_url: String, model: &str) -> axum::Router {
         }],
     );
 
-    let config_store = ConfigStore { routing_table };
+    let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
     let server_config = ServerConfig::default();
     ingress::router(config_store, health, &server_config)
@@ -108,7 +108,7 @@ fn build_openai_compatible_test_app(
         }],
     );
 
-    let config_store = ConfigStore { routing_table };
+    let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
     let server_config = ServerConfig::default();
     ingress::router(config_store, health, &server_config)
@@ -512,7 +512,7 @@ async fn test_multi_target_fallback_5xx_transfers() {
             },
         ],
     );
-    let config_store = ConfigStore { routing_table };
+    let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
     let app = ingress::router(config_store, health, &ServerConfig::default());
 
@@ -551,13 +551,14 @@ async fn test_streaming_chat_completion_forwards_done_frame() {
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/chat/completions"))
-        .and(wiremock::matchers::header("authorization", "Bearer sk-test"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer sk-test",
+        ))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-                ),
+                .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
         )
         .mount(&mock_server)
         .await;

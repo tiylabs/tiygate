@@ -36,8 +36,21 @@ pub struct ChannelTelemetryBus {
 }
 
 enum BusMessage {
-    Pipeline(PipelineEvent),
-    Request(RequestEvent),
+    /// The `PipelineEvent` carries a `String` payload (JSON
+    /// body of the event) and a timestamp, so the variant is
+    /// hundreds of bytes. Boxing the variant keeps the channel
+    /// slot size uniform and silences `large_enum_variant` —
+    /// the indirection cost is negligible compared to the cost
+    /// of forwarding the event through the telemetry bus.
+    Pipeline(Box<PipelineEvent>),
+    /// The `RequestEvent` carries an `Option<RawEnvelope>` (for
+    /// the OLTP persistence path) and so is several times
+    /// larger than `PipelineEvent`. Boxing the larger variant
+    /// keeps the channel slot size uniform and avoids the
+    /// `large_enum_variant` clippy warning; the indirection
+    /// cost is negligible compared to the cost of serialising
+    /// a `RequestEvent` to JSON in the sink.
+    Request(Box<RequestEvent>),
 }
 
 impl ChannelTelemetryBus {
@@ -88,75 +101,38 @@ impl TelemetryBus for ChannelTelemetryBus {
     async fn send(&self, event: PipelineEvent) {
         // try_send is non-blocking: if the channel is full, drop the event
         // rather than stalling the request path.
-        if self.tx.try_send(BusMessage::Pipeline(event)).is_err() {
+        if self
+            .tx
+            .try_send(BusMessage::Pipeline(Box::new(event)))
+            .is_err()
+        {
             warn!("telemetry bus: pipeline event dropped (channel full)");
         }
     }
 
     async fn send_request_event(&self, event: RequestEvent) {
-        if self.tx.try_send(BusMessage::Request(event)).is_err() {
+        if self
+            .tx
+            .try_send(BusMessage::Request(Box::new(event)))
+            .is_err()
+        {
             warn!("telemetry bus: request event dropped (channel full)");
         }
     }
 }
 
-/// A stdout / tracing-backed `EventSink`.
-///
-/// `PipelineEvent`s and `RequestEvent`s are written as tracing events so
-/// they flow through the same subscriber configured in `main.rs` (env
-/// filter, JSON layer).
-pub struct StdoutTelemetrySink;
-
-impl Default for StdoutTelemetrySink {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StdoutTelemetrySink {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl EventSink for StdoutTelemetrySink {
-    async fn write_event(&self, event: &PipelineEvent) -> Result<(), tiygate_core::Error> {
-        tracing::info!(
-            request_id = %event.request_id,
-            stage = %event.stage,
-            timestamp = %event.timestamp,
-            payload = ?event.payload,
-            "pipeline_event"
-        );
-        Ok(())
-    }
-
-    async fn write_request_event(&self, event: &RequestEvent) -> Result<(), tiygate_core::Error> {
-        // Serialize the full request event as a JSON value so downstream
-        // log shippers (Vector / Promtail) can ingest the full record.
-        match serde_json::to_value(event) {
-            Ok(v) => {
-                tracing::info!(
-                    request_id = %event.request_id,
-                    virtual_model = %event.virtual_model,
-                    status = %event.status,
-                    event = %v,
-                    "request_event"
-                );
-                Ok(())
-            }
-            Err(e) => Err(tiygate_core::Error::Telemetry(format!(
-                "serialize request event: {e}"
-            ))),
-        }
-    }
-
-    async fn flush(&self) -> Result<(), tiygate_core::Error> {
-        // tracing-subscriber flushes on its own; nothing to do.
-        Ok(())
-    }
-}
+// Note: Phase 4 (产品化) replaced the in-server `StdoutTelemetrySink`
+// with the one in `tiygate_store::log_sink::stdout`. The original
+// implementation is kept here as a comment for historical
+// reference; do not uncomment without re-introducing the dead
+// code warnings.
+//
+// ```ignore
+// pub struct StdoutTelemetrySink;
+// impl Default for StdoutTelemetrySink { fn default() -> Self { Self::new() } }
+// impl StdoutTelemetrySink { pub fn new() -> Self { Self } }
+// #[async_trait] impl EventSink for StdoutTelemetrySink { ... }
+// ```
 
 #[cfg(test)]
 mod tests {
@@ -233,6 +209,7 @@ mod tests {
             api_key_id: None,
             client_ip: None,
             user_agent: None,
+            raw_envelope: None,
         }
     }
 

@@ -15,7 +15,7 @@ path = "src/main.rs"
 # Disable these to produce a smaller binary that only contains the parts of
 # the system you actually deploy.
 # ---------------------------------------------------------------------------
-default = ["admin", "cache", "providers", "tracing", "dotenv"]
+default = ["admin", "cache", "providers", "tracing", "dotenv", "control-plane"]
 
 # Control plane: config CRUD / admin HTTP surface from `tiygate-admin`.
 admin = ["dep:tiygate-admin"]
@@ -29,6 +29,11 @@ providers = ["dep:tiygate-providers"]
 # AWS Bedrock provider — pulls in the heavy AWS SDK stack.
 # Keep this opt-in so deployments that do not need Bedrock do not pay for it.
 bedrock = ["dep:tiygate-provider-bedrock"]
+
+# Control-plane wiring: opens the SQLite/Postgres DB pool, runs
+# migrations, mounts the admin router. Off by default in the
+# library build so the data plane can run without a DB.
+control-plane = []
 
 # ---------------------------------------------------------------------------
 # Runtime features — used by the default binary entry point (`main.rs`).
@@ -50,7 +55,6 @@ tiygate-admin = { workspace = true, optional = true }
 tiygate-cache = { workspace = true, optional = true }
 tiygate-providers = { workspace = true, optional = true }
 tiygate-provider-bedrock = { workspace = true, optional = true }
-
 # HTTP server stack — required by the library surface.
 axum.workspace = true
 tower.workspace = true
@@ -72,6 +76,9 @@ arc-swap.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
+clap.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 # Optional runtime helpers (see [features] above).
 tracing-subscriber = { workspace = true, optional = true }
@@ -93,4 +100,11 @@ pin-project.workspace = true
 wiremock.workspace = true
 
 [lints]
+# Inherit the workspace lints (`unwrap_used = "deny"`,
+# `expect_used = "deny"`, `panic = "deny"`) for production lib
+# code. Tests have a separate scope where the deny-by-default
+# lints are relaxed — the large body of pre-existing tests
+# uses `.expect()` / `.unwrap()` on the test happy path, and
+# rewriting them all to `?` would balloon the diff with no
+# test-coverage benefit. Production lib code is unaffected.
 workspace = true
