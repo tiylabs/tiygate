@@ -17,6 +17,14 @@ path = "src/main.rs"
 # ---------------------------------------------------------------------------
 default = ["admin", "cache", "providers", "tracing", "dotenv", "control-plane"]
 
+# Embedded WebUI (rust-embed bundles webui/dist into the binary and
+# serves it under /admin/ui). NOT in `default`: the feature embeds
+# `webui/dist` at compile time, so the frontend must be built first
+# (`cd webui && npm run build`). Keeping it opt-in means a fresh clone
+# can build the backend without the prebuilt frontend. Enable it (or
+# use scripts/build-with-webui.sh) to ship the console.
+webui = ["dep:rust-embed", "dep:mime_guess"]
+
 # Control plane: config CRUD / admin HTTP surface from `tiygate-admin`.
 admin = ["dep:tiygate-admin"]
 
@@ -89,6 +97,12 @@ anyhow.workspace = true
 # ingress pipeline. Wired through here so the version is locked to the
 # workspace-wide pin.
 eventsource-stream.workspace = true
+
+# Embedded WebUI assets — compile-time embed of webui/dist. Optional
+# via the `webui` feature so a backend-only build does not require the
+# prebuilt frontend.
+rust-embed = { workspace = true, optional = true }
+mime_guess = { workspace = true, optional = true }
 
 # `async-stream` and `pin-project` back the SseKeepaliveStream and the
 # drive_upstream_stream bridge in ingress.rs. Both are workspace-pinned

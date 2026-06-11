@@ -125,6 +125,10 @@ hdrhistogram = "7"
 # SSE parsing
 eventsource-stream = "0.2"
 
+# Embedded WebUI assets (compile-time embed of webui/dist)
+rust-embed = "8"
+mime_guess = "2"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

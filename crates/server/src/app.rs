@@ -158,6 +158,11 @@ impl App {
 
     pub fn router(&self) -> Router {
         let db_store = self.control_plane.as_ref().map(|cp| cp.store.clone());
+        // `router` is reassigned when the admin and/or webui routers
+        // are merged in. In the rare build combo where neither the
+        // `admin` nor `webui` feature is enabled, those reassignments
+        // are compiled out, so silence the spurious unused_mut.
+        #[allow(unused_mut)]
         let mut router = crate::ingress::router_with_telemetry_full(
             self.config.clone(),
             self.health.clone(),
@@ -177,17 +182,39 @@ impl App {
             // admin routes; in `all` we mount both.
             match self.server_config.mode {
                 crate::config::DeployMode::All | crate::config::DeployMode::Admin => {
-                    let admin_state = tiygate_admin::AdminState::new(
-                        cp.store.clone(),
-                        cp.pool.clone(),
-                        Some(self.health.clone()),
-                    );
-                    let admin = tiygate_admin::build_router(admin_state);
-                    router = router.merge(admin);
+                    #[cfg(feature = "admin")]
+                    {
+                        let admin_state = tiygate_admin::AdminState::new(
+                            cp.store.clone(),
+                            cp.pool.clone(),
+                            Some(self.health.clone()),
+                        )
+                        .with_quota(self.quota.clone());
+                        let admin = tiygate_admin::build_router(admin_state);
+                        router = router.merge(admin);
+                    }
+                    #[cfg(not(feature = "admin"))]
+                    {
+                        let _ = cp;
+                        info!("admin feature disabled: admin router not mounted");
+                    }
                 }
                 crate::config::DeployMode::Proxy => {
                     info!("proxy mode: admin router not mounted");
                 }
+            }
+
+            // Mount the embedded WebUI SPA under `/admin/ui` in the
+            // same modes that expose the admin API. The routes own
+            // their own SPA fallback scoped to `/admin/ui`, so they
+            // never intercept data-plane (`/v1/*`) or admin API
+            // (`/admin/v1/*`) routes.
+            #[cfg(feature = "webui")]
+            if matches!(
+                self.server_config.mode,
+                crate::config::DeployMode::All | crate::config::DeployMode::Admin
+            ) {
+                router = crate::webui::mount(router);
             }
         }
         // The embedding cache is reachable from ingress via the

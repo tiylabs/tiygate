@@ -249,7 +249,7 @@ pub fn spawn_epoch_poll(
                 tracing::warn!(error = %e, "epoch poll: refresh failed");
                 continue;
             }
-            tracing::info!(epoch = current, "epoch poll: applied new config snapshot");
+            tracing::debug!(epoch = current, "epoch poll: applied new config snapshot");
             last_seen = Some(current);
         }
     });

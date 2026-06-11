@@ -26,6 +26,8 @@ mod ingress;
 mod ingress_phase4;
 mod telemetry;
 mod trace;
+#[cfg(feature = "webui")]
+mod webui;
 
 // Ensure provider-bedrock is linked for Executor discovery (only when the
 // `bedrock` feature is enabled, otherwise the crate is not even compiled in).
