@@ -52,6 +52,7 @@ tiygate/
 │   ├── cache/              # Embedding 缓存(仅确定性;LLM chat/completion 不做)
 │   ├── admin/              # Admin REST API + OAuth 交互
 │   └── server/             # Ingress、数据面/控制面组装、部署模式
+├── webui/                  # 内嵌管理控制台(React + TS + Vite,挂载于 /admin/ui)
 ├── docs/                   # 架构设计 + 协议能力矩阵
 └── scripts/                # 运维脚本
 ```
@@ -111,6 +112,12 @@ curl -sS http://localhost:8080/v1/chat/completions \
 
 - `GET /healthz` —— liveness,即使在 draining 期间也返回 200(避免被强杀)
 - `GET /readyz` —— readiness,进入 draining 后返回 503(让 LB 摘流量)
+
+### 管理控制台(WebUI)
+
+在 `all` / `admin` 模式下,二进制会在 **`/admin/ui`** 提供内嵌的 React 控制台(如 `http://localhost:8080/admin/ui`)。它覆盖完整控制面 —— 供应商、路由、API 密钥(一次性 secret + 配额编辑与实时用量)、OAuth 授权码流程 —— 以及分析:按模型 / 供应商 / API 密钥的统计、熔断器状态、请求日志下钻与回放、审计记录,支持中英文双语。
+
+鉴权复用单一的 `TIYGATE_ADMIN_TOKEN`:在登录页粘贴(经 Admin API 校验后存于浏览器)。UI 通过 `rust-embed`(opt-in 的 `webui` feature)编译进二进制,因此前端必须先于 Rust crate 构建 —— 运行 `scripts/build-with-webui.sh`,或先 `cd webui && npm install && npm run build` 再 `cargo build -p tiygate-server --features webui`。开发细节见 `webui/README.md`。
 
 ## 运维
 
@@ -216,8 +223,9 @@ CI 基线严格:不允许 `#[allow(...)]` 绕过、库代码中不允许 `unwrap
 | `bedrock` | `tiygate-provider-bedrock`(AWS SDK) | 路由到 AWS Bedrock |
 | `tracing` | `tracing-subscriber` + JSON formatter | 默认 `tiygate` 二进制 |
 | `dotenv` | `dotenvy` —— 启动时自动加载 `.env` | 本地开发 |
+| `webui` | `rust-embed` —— 内嵌 `webui/dist`,在 `/admin/ui` 提供管理控制台 | 带 UI 的 `admin` / `all` 部署模式 |
 
-**默认值**:`admin`、`cache`、`providers`、`tracing`、`dotenv` —— 覆盖常见场景。**`bedrock` 是 opt-in**(它会拉整个 AWS SDK),需要 Bedrock 路由时再显式开启。
+**默认值**:`admin`、`cache`、`providers`、`tracing`、`dotenv` —— 覆盖常见场景。**`bedrock` 是 opt-in**(它会拉整个 AWS SDK),需要 Bedrock 路由时再显式开启。**`webui` 同样是 opt-in**:它在编译期读取 `webui/dist`,因此**必须先构建前端**(`cd webui && npm install && npm run build`)再以 `--features webui` 编译,或直接运行 `scripts/build-with-webui.sh`(按顺序完成两步)。
 
 ```bash
 # 默认编译(Bedrock 之外的全功能)

@@ -52,6 +52,7 @@ tiygate/
 │   ├── cache/              # Embedding cache (deterministic, LLM chat/completion are NOT cached)
 │   ├── admin/              # Admin REST API + OAuth flows
 │   └── server/             # Ingress, data/control plane assembly, deployment modes
+├── webui/                  # Embedded admin console (React + TS + Vite, served at /admin/ui)
 ├── docs/                   # Architecture design + protocol capability matrix
 └── scripts/                # Operational scripts
 ```
@@ -111,6 +112,12 @@ Health probes are wired by default:
 
 - `GET /healthz` — liveness, returns 200 even while draining (so you don't get killed mid-roll)
 - `GET /readyz` — readiness, returns 503 once the pod enters draining (so the load balancer stops sending traffic)
+
+### Admin console (WebUI)
+
+In `all` / `admin` modes the binary serves an embedded React console at **`/admin/ui`** (e.g. `http://localhost:8080/admin/ui`). It covers the full control plane — providers, routes, API keys (with one-time secret + quota editing and live usage), the OAuth authorization-code flow — plus analytics: per-model / provider / API-key stats, circuit-breaker status, request-log drill-down with replay, and the audit trail. It is bilingual (English / 简体中文).
+
+Authentication reuses the single `TIYGATE_ADMIN_TOKEN`: paste it on the login screen (validated against the Admin API, stored in the browser). The UI is compiled into the binary via `rust-embed` (the opt-in `webui` feature), so the frontend must be built before the Rust crate — run `scripts/build-with-webui.sh`, or `cd webui && npm install && npm run build` followed by `cargo build -p tiygate-server --features webui`. See `webui/README.md` for development details.
 
 ## Operations
 
@@ -216,8 +223,9 @@ The `tiygate` binary is feature-gated. Pick the smallest set that matches your d
 | `bedrock` | `tiygate-provider-bedrock` (AWS SDK) | Routes that target AWS Bedrock |
 | `tracing` | `tracing-subscriber` with JSON formatter | The default `tiygate` binary |
 | `dotenv` | `dotenvy` — auto-load `.env` at startup | Local development |
+| `webui` | `rust-embed` — embeds `webui/dist` and serves the admin console at `/admin/ui` | `admin` / `all` deploy mode with a UI |
 
-**Defaults:** `admin`, `cache`, `providers`, `tracing`, `dotenv` — the common case. **`bedrock` is opt-in** (it pulls the heavy AWS SDK) — add it explicitly if you need AWS Bedrock routes.
+**Defaults:** `admin`, `cache`, `providers`, `tracing`, `dotenv` — the common case. **`bedrock` is opt-in** (it pulls the heavy AWS SDK) — add it explicitly if you need AWS Bedrock routes. **`webui` is also opt-in**: it embeds `webui/dist` at compile time, so **build the frontend first** (`cd webui && npm install && npm run build`) and then build with `--features webui`, or just run `scripts/build-with-webui.sh` which does both in order.
 
 ```bash
 # Default build (everything except Bedrock — that's now opt-in)
