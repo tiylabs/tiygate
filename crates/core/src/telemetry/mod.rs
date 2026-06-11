@@ -77,7 +77,7 @@ pub enum EventPayload {
 }
 
 /// The complete request log event (aggregated after request completion).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestEvent {
     pub request_id: String,
     pub timestamp: DateTime<Utc>,
@@ -104,6 +104,15 @@ pub struct RequestEvent {
     pub api_key_id: Option<String>,
     pub client_ip: Option<String>,
     pub user_agent: Option<String>,
+    /// The redacted, truncated `RawEnvelope` captured at the
+    /// ingress. Persisted to the OLTP log table so an operator can
+    /// replay a failed request via the envelope and inspect the
+    /// exact headers / body the caller sent. Per §8 acceptance
+    /// #3 / #8 ("RawEnvelope 默认脱敏存储"), the `Redactor` is
+    /// already applied at build time so the value here is safe to
+    /// store as-is.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_envelope: Option<crate::RawEnvelope>,
 }
 
 /// Latency breakdown for a request.
@@ -132,4 +141,33 @@ pub trait EventSink: Send + Sync {
     async fn write_request_event(&self, event: &RequestEvent) -> Result<(), crate::Error>;
     /// Flush any buffered events.
     async fn flush(&self) -> Result<(), crate::Error>;
+}
+
+/// Token kind for pricing queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    /// Prompt / input tokens.
+    Input,
+    /// Completion / output tokens.
+    Output,
+    /// Cached input tokens (prompt caching, Anthropic-style).
+    CacheRead,
+    /// Cache write tokens.
+    CacheWrite,
+}
+
+/// Cost in micro-USD (1/1_000_000 of a cent).
+pub type MicroUsd = u64;
+
+/// Pluggable pricing data source for translating token usage into cost.
+///
+/// This trait is **reserved** for a future reliable pricing source. No
+/// implementation is wired in Phase 4 because no trustworthy, complete
+/// pricing API exists today (see §3.3 of the architecture). All `cost`
+/// fields on events remain `None` until a `PriceProvider` is configured.
+pub trait PriceProvider: Send + Sync {
+    /// Return the unit price in micro-USD for a given model and token kind,
+    /// or `None` when the price is unknown.
+    fn unit_price(&self, model: &str, kind: TokenKind) -> Option<MicroUsd>;
 }

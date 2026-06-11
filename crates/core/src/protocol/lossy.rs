@@ -155,10 +155,7 @@ pub fn check_lossy_conversion(
             if let Content::Media { source, .. } = content {
                 if let Some(dim) = media_source_dimension(source, egress, egress_caps) {
                     let hint = format!("media part with kind {:?}", media_kind(source));
-                    return Err((
-                        dim,
-                        lossy_error(dim, egress, &hint),
-                    ));
+                    return Err((dim, lossy_error(dim, egress, &hint)));
                 }
             }
         }
@@ -189,7 +186,11 @@ pub fn check_lossy_conversion(
     if has_reasoning && !egress_caps.extended_reasoning {
         return Err((
             LossyDimension::ExtendedReasoning,
-            lossy_error(LossyDimension::ExtendedReasoning, egress, "reasoning content"),
+            lossy_error(
+                LossyDimension::ExtendedReasoning,
+                egress,
+                "reasoning content",
+            ),
         ));
     }
 

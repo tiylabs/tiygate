@@ -21,10 +21,11 @@ pub enum DeployMode {
 /// changes. LatencyStrategy needs a `HealthRegistry` handle, which the
 /// `strategy_arg` config string captures statically — the corresponding
 /// strategy is constructed inside the handler where the registry is available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingStrategyName {
     /// Weighted random shuffle (default per §3.4).
+    #[default]
     Weighted,
     /// Sort by weight desc — useful for tiered providers.
     Priority,
@@ -32,12 +33,6 @@ pub enum RoutingStrategyName {
     Cooldown,
     /// Prefer healthy + lowest EWMA latency.
     Latency,
-}
-
-impl Default for RoutingStrategyName {
-    fn default() -> Self {
-        Self::Weighted
-    }
 }
 
 /// Server configuration.
@@ -75,6 +70,16 @@ pub struct ServerConfig {
     pub upstream_stream_total_timeout_secs: u64,
     /// Routing strategy (default `Weighted`, per §3.4).
     pub routing_strategy: RoutingStrategyName,
+    /// Database URL for the control plane. When unset, the server
+    /// runs in legacy in-memory mode (no admin router, no log
+    /// retention, no quota counters).
+    pub database_url: Option<String>,
+    /// Max bytes for the raw envelope body before truncation
+    /// (default 256 KiB). Per design doc §4.1.
+    pub raw_envelope_max_bytes: u64,
+    /// Whether to capture inline media (base64) inside raw envelopes
+    /// (default `false` — store metadata only, per §4.1).
+    pub raw_envelope_capture_media: bool,
 }
 
 impl Default for ServerConfig {
@@ -95,6 +100,9 @@ impl Default for ServerConfig {
             upstream_stream_idle_timeout_secs: 120,
             upstream_stream_total_timeout_secs: 0,
             routing_strategy: RoutingStrategyName::Weighted,
+            database_url: None,
+            raw_envelope_max_bytes: 256 * 1024, // 256 KiB
+            raw_envelope_capture_media: false,
         }
     }
 }
@@ -141,6 +149,21 @@ impl ServerConfig {
             if let Ok(n) = v.parse() {
                 cfg.upstream_stream_total_timeout_secs = n;
             }
+        }
+        if let Ok(v) = std::env::var("TIYGATE_DATABASE_URL") {
+            let trimmed = v.trim().to_string();
+            if !trimmed.is_empty() {
+                cfg.database_url = Some(trimmed);
+            }
+        }
+        if let Ok(v) = std::env::var("TIYGATE_RAW_ENVELOPE_MAX_BYTES") {
+            if let Ok(n) = v.parse() {
+                cfg.raw_envelope_max_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TIYGATE_RAW_ENVELOPE_CAPTURE_MEDIA") {
+            cfg.raw_envelope_capture_media =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
         }
 
         cfg

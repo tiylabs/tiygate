@@ -444,9 +444,8 @@ impl EndpointCodec for ChatCompletionsCodec {
 
             // Avoid emitting a duplicate empty assistant message when the only
             // contribution was a ToolResult (already pushed as its own message).
-            let has_real_content = !text_parts.is_empty()
-                || !reasoning_text.is_empty()
-                || !tool_calls_json.is_empty();
+            let has_real_content =
+                !text_parts.is_empty() || !reasoning_text.is_empty() || !tool_calls_json.is_empty();
             if has_real_content || msg.content.is_empty() {
                 messages.push(msg_json);
             }

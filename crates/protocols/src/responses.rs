@@ -290,9 +290,12 @@ impl EndpointCodec for ResponsesCodec {
                             Content::Text { text } => {
                                 text_parts.push(json!({"type": "input_text", "text": text}));
                             }
-                            Content::Media { source, mime_type, .. } => match source {
+                            Content::Media {
+                                source, mime_type, ..
+                            } => match source {
                                 tiygate_core::ir::MediaSource::Url { url } => {
-                                    text_parts.push(json!({"type": "input_image", "image_url": url}));
+                                    text_parts
+                                        .push(json!({"type": "input_image", "image_url": url}));
                                 }
                                 tiygate_core::ir::MediaSource::Inline { data } => {
                                     text_parts.push(json!({
@@ -358,7 +361,10 @@ impl EndpointCodec for ResponsesCodec {
                     if !text_parts.is_empty() {
                         let mut item = json!({"role": role_str});
                         if text_parts.len() == 1
-                            && text_parts[0].get("type").map(|v| v == "input_text").unwrap_or(false)
+                            && text_parts[0]
+                                .get("type")
+                                .map(|v| v == "input_text")
+                                .unwrap_or(false)
                         {
                             item["content"] = text_parts[0]["text"].clone();
                         } else {

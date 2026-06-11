@@ -65,13 +65,21 @@ hkdf = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Test serialisation — see crates/admin/tests/integration.rs and
+# crates/store/src/config_store.rs for the env-var races it works
+# around.
+serial_test = "3"
+
 # Config
 figment = { version = "0.10", features = ["env", "toml"] }
 serde_yaml = "0.9"
 dotenvy = "0.15"
 
 # Caching
-moka = { version = "0.12", features = ["sync"] }
+moka = { version = "0.12", features = ["sync", "future"] }
 
 # OAuth
 oauth2 = "4"

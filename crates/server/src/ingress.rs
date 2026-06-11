@@ -18,13 +18,13 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use futures::{ready, Future, Stream, StreamExt};
+use futures::{Future, Stream, StreamExt};
 use pin_project::pin_project;
 use serde_json::Value;
 use tokio::sync::Semaphore;
-use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::RequestBodyTimeoutLayer;
 
+use tiygate_core::tracing_ctx::TraceContext;
 use tiygate_core::{
     classify_error, DefaultFallbackPolicy, EndpointCodec, ErrorClass, FallbackDecision,
     FallbackPolicy, HealthRegistry, IrRequest, PipelineContext, RawEnvelope, RetryPolicy,
@@ -44,7 +44,6 @@ fn build_strategy(
     name: crate::config::RoutingStrategyName,
     health: Arc<HealthRegistry>,
 ) -> (Box<dyn tiygate_core::routing::Strategy>, &'static str) {
-    use tiygate_core::routing::Strategy;
     match name {
         crate::config::RoutingStrategyName::Weighted => (
             Box::new(tiygate_core::routing::WeightedStrategy),
@@ -72,6 +71,14 @@ use tiygate_store::config::ConfigStore;
 #[allow(dead_code)]
 pub struct AppState {
     pub config: ConfigStore,
+    /// Optional handle to the DB-backed config store. When `Some`,
+    /// the data plane can perform per-caller `api_keys` lookups
+    /// (used by `resolve_api_key` in `ingress_phase4`). When `None`
+    /// (legacy in-memory path, no control plane) the api key
+    /// resolution is a no-op and all requests are treated as
+    /// anonymous. Production code wires this in via
+    /// `router_with_telemetry` from `app.rs`.
+    pub db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
     pub health: Arc<HealthRegistry>,
     pub concurrency_semaphore: Arc<Semaphore>,
     /// Max inflight requests before queueing.
@@ -101,11 +108,29 @@ pub struct AppState {
     pub telemetry: Arc<dyn TelemetryBus>,
     /// Routing strategy selector (default `Weighted`, per §3.4).
     pub routing_strategy: crate::config::RoutingStrategyName,
+    /// Quota counter; `None` in the legacy in-memory path. The
+    /// ingress hot path consults this *before* forwarding upstream
+    /// and returns `429 + Retry-After` on deny.
+    pub quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
+    /// Embedding cache; `None` when the `cache` feature is off.
+    /// Only `/v1/embeddings` consults this; chat handlers ignore
+    /// it (per §4.7).
+    pub embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
+    /// Raw envelope body cap in bytes; bodies larger than this are
+    /// truncated and `truncated=true` is set on the `RawEnvelope`.
+    pub raw_envelope_max_bytes: u64,
+    /// Whether to capture inline base64 media in raw envelopes
+    /// (default false — store metadata only, per §4.1).
+    pub raw_envelope_capture_media: bool,
+    /// Per-request `Redactor` instance. Configurable so future
+    /// env-var-driven extensions remain test-friendly.
+    pub redactor: Arc<tiygate_core::redaction::Redactor>,
 }
 
 use crate::config::ServerConfig;
 
 /// Build the ingress router.
+#[allow(dead_code)]
 pub fn router(
     config: ConfigStore,
     health: Arc<HealthRegistry>,
@@ -114,26 +139,59 @@ pub fn router(
     // Build a no-op telemetry bus for tests / direct router() calls. The
     // App::new() path wires up a real stdout-backed bus via the App struct.
     let telemetry: Arc<dyn TelemetryBus> = Arc::new(crate::telemetry::ChannelTelemetryBus::spawn(
-        Arc::new(crate::telemetry::StdoutTelemetrySink::new()),
+        Arc::new(tiygate_store::log_sink::stdout::StdoutSink::new()),
         64,
     ));
-    router_with_telemetry(config, health, server_config, telemetry)
+    router_with_telemetry(config, health, server_config, telemetry, None, None)
 }
 
 /// Build the ingress router with an explicit telemetry bus.
 ///
 /// Production code should use this entry point so that bus instances are
 /// not duplicated or orphaned.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn router_with_telemetry(
     config: ConfigStore,
     health: Arc<HealthRegistry>,
     server_config: &ServerConfig,
     telemetry: Arc<dyn TelemetryBus>,
+    quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
+    embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
+) -> Router {
+    // The legacy call path (tests, `router()` shim) does not have
+    // a DB store — the data plane can still serve traffic, but
+    // `resolve_api_key` will treat every request as anonymous.
+    router_with_telemetry_full(
+        config,
+        health,
+        server_config,
+        telemetry,
+        quota,
+        embedding_cache,
+        None,
+    )
+}
+
+/// Build the ingress router with the full set of production
+/// dependencies — including the optional `DbConfigStore` used by
+/// `resolve_api_key` to look up `api_keys` rows. This is the
+/// entry point called from `app.rs`; the simpler
+/// `router_with_telemetry` shim is kept for tests.
+#[allow(clippy::too_many_arguments)]
+pub fn router_with_telemetry_full(
+    config: ConfigStore,
+    health: Arc<HealthRegistry>,
+    server_config: &ServerConfig,
+    telemetry: Arc<dyn TelemetryBus>,
+    quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
+    embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
+    db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
 ) -> Router {
     let semaphore = Arc::new(Semaphore::new(server_config.max_inflight_requests));
-
     let state = AppState {
         config,
+        db_store,
         health,
         concurrency_semaphore: semaphore,
         max_inflight: server_config.max_inflight_requests,
@@ -156,6 +214,11 @@ pub fn router_with_telemetry(
             .unwrap_or_else(|_| reqwest::Client::new()),
         telemetry,
         routing_strategy: server_config.routing_strategy,
+        quota,
+        embedding_cache,
+        raw_envelope_max_bytes: server_config.raw_envelope_max_bytes,
+        raw_envelope_capture_media: server_config.raw_envelope_capture_media,
+        redactor: Arc::new(tiygate_core::redaction::Redactor::with_defaults()),
     };
 
     Router::new()
@@ -254,6 +317,7 @@ pub async fn apply_provider_auth(
 /// Look up the registered provider and invoke its `prepare_body`
 /// hook (used for OAuth subscription providers that need to inject
 /// tokens into the body instead of (or in addition to) headers).
+#[allow(dead_code)]
 pub async fn apply_provider_body_hook(
     target: &tiygate_core::RoutingTarget,
     body: &mut serde_json::Value,
@@ -306,6 +370,7 @@ pub fn enforce_body_limit(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod ingress_helper_tests {
     //! Pure-function tests for header extraction. Mirrors the private helpers
     //! in this file so we can validate behavior without spinning up a server.
@@ -447,6 +512,7 @@ mod ingress_helper_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod streaming_helper_tests {
     //! Tests for the streaming helper types in ingress.rs.
     //!
@@ -625,42 +691,91 @@ async fn handle_chat_completions(
         .unwrap_or(0);
     enforce_body_limit(&state, content_type, body_size)?;
 
-    // Build raw envelope
-    let raw_env = RawEnvelope {
-        method: "POST".to_string(),
-        path: "/v1/chat/completions".to_string(),
-        headers: headers
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect(),
-        body: Some(serde_json::to_string(&body).unwrap_or_default()),
-        truncated: false,
-        original_body_size: 0,
-        timestamp: chrono::Utc::now(),
-    };
+    // Wall-clock anchor for the Phase 4 `RequestEvent`. We measure
+    // the *whole* request handler duration (including fallback
+    // retries) so the latency column reflects what the client
+    // actually experienced.
+    let started = Instant::now();
+    let request_id = uuid::Uuid::now_v7().to_string();
+
+    let trace_ctx = crate::ingress_phase4::extract_trace(&headers);
+    let raw_env = crate::ingress_phase4::build_redacted_envelope(
+        &state,
+        "POST",
+        "/v1/chat/completions",
+        &body,
+        &headers,
+    );
+
+    // Build the RequestScope *after* the body-limit check passes so
+    // that an oversized payload surfaces as the appropriate 413
+    // (no terminal RequestEvent needed for the data-plane
+    // pre-pipeline checks; the existing app-level logger captures
+    // it). We do install the scope for the downstream pipeline
+    // (decode → quota → route → execute) so every code path emits.
+    let mut scope = crate::ingress_phase4::RequestScope::new(
+        &state,
+        request_id.clone(),
+        "unknown",
+        ingress_protocol.clone(),
+        trace_ctx.clone(),
+        started,
+    );
+    // Persist the redacted envelope on the terminal RequestEvent
+    // for audit / replay (§8 #3 / #8). `Redactor` is already
+    // applied at envelope build time, so the value is safe to
+    // store as-is in the OLTP `request_logs.raw_envelope_json`
+    // column.
+    scope.set_envelope(raw_env.clone());
+
+    // Phase 4 §4.6: api key resolution + quota enforcement. The
+    // resolved `api_key` is bound to the scope so the terminal
+    // RequestEvent attributes the row to the right caller.
+    let api_key = crate::ingress_phase4::resolve_api_key(&state, &headers).await;
+    scope.set_api_key_id(api_key.key_id.clone());
+    match crate::ingress_phase4::check_quota(&state, &api_key.key_id, &api_key.spec, 1).await {
+        crate::ingress_phase4::QuotaOutcome::Allow => {}
+        crate::ingress_phase4::QuotaOutcome::Deny { retry_after, .. } => {
+            let app_err =
+                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_retry_after(retry_after.as_secs().max(1));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("quota_exceeded", Some(http_status));
+            return Err(app_err);
+        }
+    }
 
     // Decode request
-    let ir_request = codec
-        .decode_request(body, &raw_env)
-        .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {}", e)))?;
+    let ir_request = match codec.decode_request(body, &raw_env) {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("decode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
     let virtual_model = ir_request.model.clone();
     let is_stream = ir_request.stream;
+    // Re-key the scope now that we know the actual model.
+    scope.set_virtual_model(virtual_model.clone());
 
     // Resolve route
-    let targets = state
-        .config
-        .routing_table
-        .resolve(&virtual_model)
-        .ok_or_else(|| {
-            AppError::new(
+    let targets = match state.config.routing_table.resolve(&virtual_model) {
+        Some(t) => t,
+        None => {
+            let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
-                format!("No route found for model: {}", virtual_model),
-            )
-        })?;
+                format!("No route found for model: {virtual_model}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("route_not_found", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
     // Create pipeline context
-    let request_id = uuid::Uuid::now_v7().to_string();
     let _ctx = PipelineContext::new(
         request_id.clone(),
         ir_request.clone(),
@@ -670,7 +785,7 @@ async fn handle_chat_completions(
     // PassThrough detection: when the target's protocol suite matches
     // the ingress suite and the codec declares Passthrough, forward
     // the original body verbatim (no IR round-trip).
-    let (pass_through_candidate, raw_passthrough_body) =
+    let (_pass_through_candidate, raw_passthrough_body) =
         compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
 
     // Fallback policy and retry policy
@@ -709,10 +824,13 @@ async fn handle_chat_completions(
 
     while target_index < targets.len() && attempt < max_attempts {
         if Instant::now() > deadline {
-            return Err(AppError::new(
+            let app_err = AppError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "request deadline exceeded".to_string(),
-            ));
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("deadline_exceeded", Some(http_status));
+            return Err(app_err);
         }
 
         let target = &targets[target_index];
@@ -769,6 +887,11 @@ async fn handle_chat_completions(
             })
             .await;
 
+        // Bind the resolved target on the scope so the terminal
+        // RequestEvent attributes the row to the right upstream.
+        scope.set_egress(target.api_protocol.clone());
+        scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
+
         match execute_upstream(
             &state,
             &codec,
@@ -777,12 +900,12 @@ async fn handle_chat_completions(
             target,
             is_stream,
             raw_passthrough_body.as_deref(),
+            &trace_ctx,
         )
         .await
         {
             Ok(_response) => {
-                let hop_elapsed_ms = (Utc::now() - hop_started).num_milliseconds().max(0)
-                    as u64;
+                let hop_elapsed_ms = (Utc::now() - hop_started).num_milliseconds().max(0) as u64;
                 // Record success in health registry + EWMA latency for
                 // the LatencyStrategy to use on subsequent requests.
                 state.health.record_success(&health_key);
@@ -801,11 +924,12 @@ async fn handle_chat_completions(
                         },
                     })
                     .await;
+                // Phase 4 §4.2: terminal `RequestEvent` via the scope.
+                scope.emit_ok(Some(_response.status().as_u16()));
                 return Ok(_response);
             }
             Err(app_err) => {
-                let hop_elapsed_ms = (Utc::now() - hop_started).num_milliseconds().max(0)
-                    as u64;
+                let hop_elapsed_ms = (Utc::now() - hop_started).num_milliseconds().max(0) as u64;
                 // Record failure + the latency it took (for EWMA).
                 state.health.record_failure(&health_key);
                 state.health.record_latency_ms(&health_key, hop_elapsed_ms);
@@ -873,9 +997,7 @@ async fn handle_chat_completions(
                             last_error = Some(app_err);
                             target_index += 1;
                             while let Some(next) = ordered_targets.get(target_index) {
-                                if skip_label.is_some()
-                                    && next.account_label == skip_label
-                                {
+                                if skip_label.is_some() && next.account_label == skip_label {
                                     target_index += 1;
                                 } else {
                                     break;
@@ -892,6 +1014,13 @@ async fn handle_chat_completions(
                         continue;
                     }
                     FallbackDecision::Fail => {
+                        // The fallback policy says this is terminal.
+                        // Surface the error_class so the dashboard
+                        // can distinguish auth / rate-limit / timeout
+                        // / routing failures.
+                        let http_status = app_err.http_status().as_u16();
+                        let error_class = format!("{:?}", classification.class);
+                        scope.emit_error(&error_class, Some(http_status));
                         return Err(app_err);
                     }
                 }
@@ -900,12 +1029,20 @@ async fn handle_chat_completions(
     }
 
     // No more targets or attempts exhausted
-    Err(last_error.unwrap_or_else(|| {
+    let final_err = last_error.unwrap_or_else(|| {
         AppError::new(
             StatusCode::BAD_GATEWAY,
             "all upstream targets exhausted".to_string(),
         )
-    }))
+    });
+    // Phase 4 §4.2: surface a terminal `RequestEvent` so the OltpSink
+    // gets a row even when the request never made it to an upstream
+    // success. The classification of the failure (auth / rate-limit /
+    // timeout / routing) was already emitted as `HopFailure` events
+    // inside the loop; here we record the *terminal* state.
+    let http_status = final_err.http_status().as_u16();
+    scope.emit_error("upstream_exhausted", Some(http_status));
+    Err(final_err)
 }
 
 /// Handle POST /v1/messages (Anthropic protocol).
@@ -920,35 +1057,81 @@ async fn handle_messages(
     let codec = MessagesCodec::new();
     let ingress_protocol = codec.id().clone();
 
-    let raw_env = RawEnvelope {
-        method: "POST".to_string(),
-        path: "/v1/messages".to_string(),
-        headers: headers
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect(),
-        body: Some(serde_json::to_string(&body).unwrap_or_default()),
-        truncated: false,
-        original_body_size: 0,
-        timestamp: chrono::Utc::now(),
+    // Wall-clock anchor for the Phase 4 `RequestEvent`.
+    let started = Instant::now();
+    let request_id = uuid::Uuid::now_v7().to_string();
+
+    let trace_ctx = crate::ingress_phase4::extract_trace(&headers);
+    let raw_env = crate::ingress_phase4::build_redacted_envelope(
+        &state,
+        "POST",
+        "/v1/messages",
+        &body,
+        &headers,
+    );
+
+    // Build the RequestScope so every early-return path emits a
+    // terminal `RequestEvent`. See `handle_chat_completions` for
+    // the full rationale.
+    let mut scope = crate::ingress_phase4::RequestScope::new(
+        &state,
+        request_id,
+        "unknown",
+        ingress_protocol.clone(),
+        trace_ctx.clone(),
+        started,
+    );
+    // Persist the redacted envelope on the terminal RequestEvent
+    // for audit / replay (§8 #3 / #8). `Redactor` is already
+    // applied at envelope build time, so the value is safe to
+    // store as-is in the OLTP `request_logs.raw_envelope_json`
+    // column.
+    scope.set_envelope(raw_env.clone());
+
+    // Phase 4 §4.6: api key resolution + quota enforcement (parity
+    // with the chat-completions path). The resolved `api_key` is
+    // bound to the scope so the terminal `RequestEvent` attributes
+    // the row to the right caller.
+    let api_key = crate::ingress_phase4::resolve_api_key(&state, &headers).await;
+    scope.set_api_key_id(api_key.key_id.clone());
+    match crate::ingress_phase4::check_quota(&state, &api_key.key_id, &api_key.spec, 1).await {
+        crate::ingress_phase4::QuotaOutcome::Allow => {}
+        crate::ingress_phase4::QuotaOutcome::Deny { retry_after, .. } => {
+            let app_err =
+                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_retry_after(retry_after.as_secs().max(1));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("quota_exceeded", Some(http_status));
+            return Err(app_err);
+        }
+    }
+
+    let ir_request = match codec.decode_request(body, &raw_env) {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("decode_error", Some(http_status));
+            return Err(app_err);
+        }
     };
-    let ir_request = codec
-        .decode_request(body, &raw_env)
-        .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {}", e)))?;
     let virtual_model = ir_request.model.clone();
     let is_stream = ir_request.stream;
+    scope.set_virtual_model(virtual_model.clone());
 
     // Resolve route
-    let targets = state
-        .config
-        .routing_table
-        .resolve(&virtual_model)
-        .ok_or_else(|| {
-            AppError::new(
+    let targets = match state.config.routing_table.resolve(&virtual_model) {
+        Some(t) => t,
+        None => {
+            let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
-                format!("No route found for model: {}", virtual_model),
-            )
-        })?;
+                format!("No route found for model: {virtual_model}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("route_not_found", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
     // PassThrough: forward raw body bytes verbatim when the target's
     // protocol suite matches the ingress suite.
@@ -972,10 +1155,13 @@ async fn handle_messages(
 
     while target_index < ordered_targets.len() && attempt < max_attempts {
         if Instant::now() > deadline {
-            return Err(AppError::new(
+            let app_err = AppError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "request deadline exceeded".to_string(),
-            ));
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("deadline_exceeded", Some(http_status));
+            return Err(app_err);
         }
 
         let target = ordered_targets[target_index];
@@ -992,9 +1178,26 @@ async fn handle_messages(
 
         attempt += 1;
 
-        match execute_messages_upstream(&state, &codec, &ir_request, target, is_stream, raw_passthrough_body.as_deref()).await {
+        // Bind the resolved target on the scope so the terminal
+        // RequestEvent attributes the row to the right upstream.
+        scope.set_egress(target.api_protocol.clone());
+        scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
+
+        match execute_messages_upstream(
+            &state,
+            &codec,
+            &ir_request,
+            target,
+            is_stream,
+            raw_passthrough_body.as_deref(),
+            &trace_ctx,
+        )
+        .await
+        {
             Ok(response) => {
                 state.health.record_success(&health_key);
+                // Phase 4 §4.2: terminal `RequestEvent` via the scope.
+                scope.emit_ok(Some(response.status().as_u16()));
                 return Ok(response);
             }
             Err(app_err) => {
@@ -1022,22 +1225,30 @@ async fn handle_messages(
                         last_error = Some(app_err);
                         continue;
                     }
-                    FallbackDecision::Fail => return Err(app_err),
+                    FallbackDecision::Fail => {
+                        let http_status = app_err.http_status().as_u16();
+                        let error_class = format!("{:?}", classification.class);
+                        scope.emit_error(&error_class, Some(http_status));
+                        return Err(app_err);
+                    }
                 }
             }
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
+    let final_err = last_error.unwrap_or_else(|| {
         AppError::new(
             StatusCode::BAD_GATEWAY,
             "all upstream targets exhausted".to_string(),
         )
-    }))
+    });
+    let http_status = final_err.http_status().as_u16();
+    scope.emit_error("upstream_exhausted", Some(http_status));
+    Err(final_err)
 }
 
 /// Execute an upstream OpenAI-compatible request.
-
+#[allow(clippy::too_many_arguments)]
 async fn execute_upstream(
     state: &AppState,
     codec: &ChatCompletionsCodec,
@@ -1046,6 +1257,7 @@ async fn execute_upstream(
     target: &tiygate_core::RoutingTarget,
     is_stream: bool,
     raw_passthrough_body: Option<&str>,
+    trace: &TraceContext,
 ) -> Result<Response, AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
@@ -1091,7 +1303,7 @@ async fn execute_upstream(
         // the offending dimension so the caller can fix the request.
         let ingress_caps = codec.capabilities();
         let egress_caps = egress_codec.capabilities();
-        if (ingress_caps.lossy_default_reject || egress_caps.lossy_default_reject) {
+        if ingress_caps.lossy_default_reject || egress_caps.lossy_default_reject {
             if let Err((dim, err)) = tiygate_core::protocol::lossy::check_lossy_conversion(
                 ir_request,
                 &egress_protocol,
@@ -1099,7 +1311,10 @@ async fn execute_upstream(
             ) {
                 return Err(AppError::new(
                     StatusCode::BAD_REQUEST,
-                    format!("Lossy conversion rejected: {err} (dimension: {})", dim.label()),
+                    format!(
+                        "Lossy conversion rejected: {err} (dimension: {})",
+                        dim.label()
+                    ),
                 ));
             }
         }
@@ -1124,10 +1339,15 @@ async fn execute_upstream(
     if is_stream {
         // PassThrough: forward raw body bytes verbatim (no re-serialize).
         // Non-PassThrough: re-serialize via reqwest::Client::json().
-        let mut stream_req = client
-            .post(&upstream_url)
-            .headers(upstream_headers)
-            .timeout(state.request_read_timeout);
+        // `inject_trace` stamps `traceparent` on the builder so the
+        // upstream service sees the same trace id as the downstream.
+        let mut stream_req = crate::ingress_phase4::inject_trace(
+            client
+                .post(&upstream_url)
+                .headers(upstream_headers)
+                .timeout(state.request_read_timeout),
+            trace,
+        );
         if is_pass_through {
             if let Some(raw) = raw_passthrough_body {
                 stream_req = stream_req
@@ -1176,8 +1396,10 @@ async fn execute_upstream(
         let mut end_enc = codec.stream_encoder();
         let mut err_enc = codec.stream_encoder();
         let end_marker = end_enc.encode_done();
-        let error_marker = err_enc
-            .encode_error("upstream stream truncated by gateway", Some("upstream_timeout"));
+        let error_marker = err_enc.encode_error(
+            "upstream stream truncated by gateway",
+            Some("upstream_timeout"),
+        );
 
         let mut response = drive_upstream_stream(
             state,
@@ -1208,10 +1430,15 @@ async fn execute_upstream(
     } else {
         // PassThrough: forward raw body bytes verbatim (no re-serialize).
         // Non-PassThrough: re-serialize via reqwest::Client::json().
-        let mut nonstream_req = client
-            .post(&upstream_url)
-            .headers(upstream_headers)
-            .timeout(state.request_read_timeout);
+        // `inject_trace` stamps `traceparent` on the builder so the
+        // upstream service sees the same trace id as the downstream.
+        let mut nonstream_req = crate::ingress_phase4::inject_trace(
+            client
+                .post(&upstream_url)
+                .headers(upstream_headers)
+                .timeout(state.request_read_timeout),
+            trace,
+        );
         if is_pass_through {
             if let Some(raw) = raw_passthrough_body {
                 nonstream_req = nonstream_req
@@ -1306,6 +1533,7 @@ async fn execute_messages_upstream(
     target: &tiygate_core::RoutingTarget,
     is_stream: bool,
     raw_passthrough_body: Option<&str>,
+    trace: &TraceContext,
 ) -> Result<Response, AppError> {
     let is_pass_through = raw_passthrough_body.is_some();
     // PassThrough: forward raw body bytes verbatim. Non-PassThrough:
@@ -1340,10 +1568,13 @@ async fn execute_messages_upstream(
     let upstream_url = format!("{}/messages", target.effective_api_base());
 
     if is_stream {
-        let mut stream_req = client
-            .post(&upstream_url)
-            .headers(upstream_headers)
-            .timeout(state.request_read_timeout);
+        let mut stream_req = crate::ingress_phase4::inject_trace(
+            client
+                .post(&upstream_url)
+                .headers(upstream_headers)
+                .timeout(state.request_read_timeout),
+            trace,
+        );
         if is_pass_through {
             if let Some(raw) = raw_passthrough_body {
                 stream_req = stream_req
@@ -1355,12 +1586,9 @@ async fn execute_messages_upstream(
         } else {
             stream_req = stream_req.json(&upstream_body);
         }
-        let response = stream_req
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
-            })?;
+        let response = stream_req.send().await.map_err(|e| {
+            AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
+        })?;
 
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
@@ -1378,9 +1606,8 @@ async fn execute_messages_upstream(
             return Err(app_err);
         }
 
-        let accum = std::sync::Arc::new(std::sync::Mutex::new(
-            tiygate_core::UsageAccumulator::new(),
-        ));
+        let accum =
+            std::sync::Arc::new(std::sync::Mutex::new(tiygate_core::UsageAccumulator::new()));
 
         // Build the protocol-native end / error frames from the egress
         // codec. The streaming helper writes the right one for each
@@ -1389,8 +1616,10 @@ async fn execute_messages_upstream(
         let mut end_enc = codec.stream_encoder();
         let mut err_enc = codec.stream_encoder();
         let end_marker = end_enc.encode_done();
-        let error_marker = err_enc
-            .encode_error("upstream stream truncated by gateway", Some("upstream_timeout"));
+        let error_marker = err_enc.encode_error(
+            "upstream stream truncated by gateway",
+            Some("upstream_timeout"),
+        );
 
         let mut response = drive_upstream_stream(
             state,
@@ -1410,15 +1639,14 @@ async fn execute_messages_upstream(
         }
         Ok(response)
     } else {
-        let response = client
-            .post(&upstream_url)
-            .headers(upstream_headers)
-            .json(&upstream_body)
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
-            })?;
+        let response = crate::ingress_phase4::inject_trace(
+            client.post(&upstream_url).headers(upstream_headers),
+            trace,
+        )
+        .json(&upstream_body)
+        .send()
+        .await
+        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)))?;
 
         let retry_after = extract_retry_after(response.headers());
         let rate_limit_headers_vec: Vec<(&'static str, String)> =
@@ -1498,7 +1726,17 @@ fn get_egress_codec(protocol: &tiygate_core::ProtocolEndpoint) -> Option<Box<dyn
     }
 }
 
-/// Handle POST /v1/embeddings (passthrough to upstream).
+/// Handle POST /v1/embeddings.
+///
+/// Phase 4 wiring (§4.7 + §4.1 + §4.8):
+/// 1. Build a *redacted, truncated* `RawEnvelope` for the audit log.
+/// 2. Extract (or mint) the W3C trace context.
+/// 3. Check the embedding cache; on hit, serve the cached value
+///    and emit a `RequestEvent` with `cache_hit = hit`.
+/// 4. On miss, build the upstream request, inject the
+///    `traceparent` header, call the upstream, store the response,
+///    and emit a `RequestEvent` with `cache_hit = miss` and
+///    `latency_ms` populated.
 async fn handle_embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1507,63 +1745,209 @@ async fn handle_embeddings(
     let _permit = acquire_permit(&state).await?;
 
     let codec = EmbeddingsCodec::new();
-    let raw_env = RawEnvelope {
-        method: "POST".to_string(),
-        path: "/v1/embeddings".to_string(),
-        headers: headers
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect(),
-        body: Some(serde_json::to_string(&body).unwrap_or_default()),
-        truncated: false,
-        original_body_size: 0,
-        timestamp: chrono::Utc::now(),
+    let ingress_protocol = codec.id().clone();
+    let raw_env = crate::ingress_phase4::build_redacted_envelope(
+        &state,
+        "POST",
+        "/v1/embeddings",
+        &body,
+        &headers,
+    );
+    let _raw_traceparent = headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let trace_ctx = crate::ingress_phase4::extract_trace(&headers);
+
+    // Wall-clock anchor + scope so every return path emits a
+    // terminal `RequestEvent` (parity with the other 4 handlers).
+    // The `started` clock is also used for the `latency_ms` column
+    // on the miss / hit events below.
+    let started = Instant::now();
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let mut scope = crate::ingress_phase4::RequestScope::new(
+        &state,
+        request_id,
+        "unknown",
+        ingress_protocol.clone(),
+        trace_ctx.clone(),
+        started,
+    );
+    // Persist the redacted envelope on the terminal RequestEvent
+    // for audit / replay (§8 #3 / #8).
+    scope.set_envelope(raw_env.clone());
+
+    // Phase 4 §4.6: api key resolution + quota enforcement, parity
+    // with the chat/messages/responses/gemini handlers. Embedding
+    // requests count against the same `requests_per_minute` /
+    // `requests_per_day` bucket as chat completions.
+    let api_key = crate::ingress_phase4::resolve_api_key(&state, &headers).await;
+    scope.set_api_key_id(api_key.key_id.clone());
+    match crate::ingress_phase4::check_quota(&state, &api_key.key_id, &api_key.spec, 1).await {
+        crate::ingress_phase4::QuotaOutcome::Allow => {}
+        crate::ingress_phase4::QuotaOutcome::Deny { retry_after, .. } => {
+            let app_err =
+                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_retry_after(retry_after.as_secs().max(1));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("quota_exceeded", Some(http_status));
+            return Err(app_err);
+        }
+    }
+
+    // Build the cache key from the body. We don't need to fully
+    // decode the request to know the cache key — the model and
+    // input are at the top level of the OpenAI embeddings schema.
+    let model_for_cache = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+    let input_for_cache = body.get("input").map(|v| v.to_string()).unwrap_or_default();
+    scope.set_virtual_model(model_for_cache.clone());
+    let cache_key = tiygate_cache::embedding_cache::EmbeddingCacheKey::new(
+        model_for_cache.clone(),
+        input_for_cache,
+    );
+
+    // Cache lookup.
+    if let Some(cached) = crate::ingress_phase4::embedding_cache_lookup(&state, &cache_key).await {
+        // Emit a hit event through the scope (which now also
+        // knows the cache_hit column) so the OltpSink persists
+        // a row with `cache_hit = hit`. We pass the hit status
+        // to the scope via a custom helper because `emit_ok` only
+        // takes an http_status; the cache_hit column is filled
+        // in by the underlying `emit_request_event` call.
+        let latency_ms = tiygate_core::telemetry::LatencyBreakdown {
+            total_ms: started.elapsed().as_millis() as u64,
+            upstream_ms: 0,
+            queue_ms: 0,
+        };
+        crate::ingress_phase4::emit_request_event(
+            &state,
+            scope.request_id(),
+            &model_for_cache,
+            None,
+            None,
+            codec.id(),
+            None,
+            "ok",
+            None,
+            None,
+            Some(200),
+            false,
+            Some("hit"),
+            latency_ms,
+            None,
+            None,
+            Some(&api_key.key_id),
+            &trace_ctx,
+            Some(&raw_env),
+        );
+        scope.disarm();
+        return Ok(Json((*cached).clone()).into_response());
+    }
+
+    let ir_request = match codec.decode_request(body, &raw_env) {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("decode_error", Some(http_status));
+            return Err(app_err);
+        }
     };
 
-    let ir_request = codec
-        .decode_request(body, &raw_env)
-        .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {}", e)))?;
-
     let virtual_model = ir_request.model.clone();
-    let targets = state
-        .config
-        .routing_table
-        .resolve(&virtual_model)
-        .ok_or_else(|| {
-            AppError::new(
+    scope.set_virtual_model(virtual_model.clone());
+    let targets = match state.config.routing_table.resolve(&virtual_model) {
+        Some(t) => t,
+        None => {
+            let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
-                format!("No route found for model: {}", virtual_model),
-            )
-        })?;
+                format!("No route found for model: {virtual_model}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("route_not_found", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
-    let target = &targets[0];
-    let (upstream_body, mut upstream_headers) = codec.encode_request(&ir_request).map_err(|e| {
-        AppError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Encode error: {}", e),
-        )
-    })?;
+    let target = match targets.first() {
+        Some(t) => t,
+        None => {
+            let app_err =
+                AppError::new(StatusCode::BAD_GATEWAY, "no targets configured".to_string());
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("no_targets", Some(http_status));
+            return Err(app_err);
+        }
+    };
+    scope.set_egress(target.api_protocol.clone());
+    scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
 
-    apply_provider_auth(target, &mut upstream_headers).await?;
+    let (upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
+        Ok(b) => b,
+        Err(e) => {
+            let app_err = AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Encode error: {e}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("encode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
+
+    if let Err(e) = apply_provider_auth(target, &mut upstream_headers).await {
+        let http_status = e.http_status().as_u16();
+        scope.emit_error("auth_error", Some(http_status));
+        return Err(e);
+    }
     let client = &state.http_client;
     let upstream_url = format!("{}/embeddings", target.effective_api_base());
 
-    let response = client
-        .post(&upstream_url)
+    // Build the upstream request manually so we can inject the
+    // `traceparent` header before sending. `inject_trace` stamps the
+    // header on the builder so it survives the JSON body merge below.
+    let builder = crate::ingress_phase4::inject_trace(client.post(&upstream_url), &trace_ctx);
+    let req = match builder
         .headers(upstream_headers)
         .json(&upstream_body)
-        .send()
-        .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)))?;
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream build: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("upstream_send_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
+    let response = match client.execute(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("upstream_send_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
     let status = response.status();
-    let response_body: Value = response
-        .json()
-        .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+    let response_body: Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("upstream_parse_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
     if !status.is_success() {
-        return Err(AppError::new(
+        let app_err = AppError::new(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             format!(
                 "Upstream error: {}",
@@ -1571,11 +1955,50 @@ async fn handle_embeddings(
                     .as_str()
                     .unwrap_or("Unknown error")
             ),
-        ));
+        );
+        let http_status = app_err.http_status().as_u16();
+        scope.emit_error("upstream_error", Some(http_status));
+        return Err(app_err);
     }
 
-    // Record health success
     state.health.record_success(&target.health_key());
+
+    // Phase 4 §4.7: store the upstream response for the next call.
+    crate::ingress_phase4::embedding_cache_store(&state, &cache_key, response_body.clone()).await;
+
+    // Phase 4 §4.2: emit a `RequestEvent` with `cache_hit = miss`
+    // so the OltpSink persists the row and the dashboard can
+    // aggregate. We use the explicit `emit_request_event` form
+    // here (instead of `scope.emit_ok`) because the cache-hit
+    // column is a *miss* on this path; the scope is disarmed so
+    // Drop is a no-op.
+    let latency_ms = tiygate_core::telemetry::LatencyBreakdown {
+        total_ms: started.elapsed().as_millis() as u64,
+        upstream_ms: started.elapsed().as_millis() as u64,
+        queue_ms: 0,
+    };
+    crate::ingress_phase4::emit_request_event(
+        &state,
+        scope.request_id(),
+        &virtual_model,
+        Some(target.provider_id.as_str()),
+        Some(target.model_id.as_str()),
+        codec.id(),
+        Some(&target.api_protocol),
+        "ok",
+        None,
+        None,
+        Some(status.as_u16()),
+        false,
+        Some("miss"),
+        latency_ms,
+        None,
+        None,
+        Some(&api_key.key_id),
+        &trace_ctx,
+        Some(&raw_env),
+    );
+    scope.disarm();
 
     Ok(Json(response_body).into_response())
 }
@@ -1584,7 +2007,10 @@ async fn handle_embeddings(
 ///
 /// Mirrors `handle_chat_completions` but uses `ResponsesCodec`. The
 /// egress pipeline is the same: per-route body limit, route resolve,
-/// fallback / retry, RateLimit-* passthrough.
+/// fallback / retry, RateLimit-* passthrough. A `RequestScope` drop
+/// guard ensures the terminal `RequestEvent` is emitted on every
+/// return path (success, upstream error, decode / route / encode
+/// failure).
 async fn handle_responses(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1601,48 +2027,108 @@ async fn handle_responses(
         .unwrap_or(0);
     enforce_body_limit(&state, content_type, body_size)?;
 
-    let raw_env = RawEnvelope {
-        method: "POST".to_string(),
-        path: "/v1/responses".to_string(),
-        headers: headers
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect(),
-        body: Some(serde_json::to_string(&body).unwrap_or_default()),
-        truncated: false,
-        original_body_size: 0,
-        timestamp: chrono::Utc::now(),
-    };
+    let trace_ctx = crate::ingress_phase4::extract_trace(&headers);
+    let raw_env = crate::ingress_phase4::build_redacted_envelope(
+        &state,
+        "POST",
+        "/v1/responses",
+        &body,
+        &headers,
+    );
 
-    let ir_request = codec
-        .decode_request(body, &raw_env)
-        .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {}", e)))?;
+    let started = Instant::now();
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let virtual_model_hint = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut scope = crate::ingress_phase4::RequestScope::new(
+        &state,
+        request_id,
+        virtual_model_hint,
+        ingress_protocol.clone(),
+        trace_ctx.clone(),
+        started,
+    );
+    // Persist the redacted envelope on the terminal RequestEvent
+    // for audit / replay (§8 #3 / #8).
+    scope.set_envelope(raw_env.clone());
+    // Bind the api key id so the terminal RequestEvent attributes the
+    // row to the right caller (used by the per-key quota dashboard).
+    let api_key = crate::ingress_phase4::resolve_api_key(&state, &headers).await;
+    scope.set_api_key_id(api_key.key_id.clone());
+    // Phase 4 §4.6: quota enforcement on the request hot path.
+    // Parity with the chat-completions / anthropic-messages paths.
+    match crate::ingress_phase4::check_quota(&state, &api_key.key_id, &api_key.spec, 1).await {
+        crate::ingress_phase4::QuotaOutcome::Allow => {}
+        crate::ingress_phase4::QuotaOutcome::Deny { retry_after, .. } => {
+            let app_err =
+                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_retry_after(retry_after.as_secs().max(1));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("quota_exceeded", Some(http_status));
+            return Err(app_err);
+        }
+    }
+
+    let ir_request = match codec.decode_request(body, &raw_env) {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("decode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
     let virtual_model = ir_request.model.clone();
     let is_stream = ir_request.stream;
 
-    let targets = state
-        .config
-        .routing_table
-        .resolve(&virtual_model)
-        .ok_or_else(|| {
-            AppError::new(
+    let targets = match state.config.routing_table.resolve(&virtual_model) {
+        Some(t) => t,
+        None => {
+            let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
-                format!("No route found for model: {}", virtual_model),
-            )
-        })?;
+                format!("No route found for model: {virtual_model}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("route_not_found", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
-    let target = targets.first().ok_or_else(|| {
-        AppError::new(StatusCode::BAD_GATEWAY, "no targets configured".to_string())
-    })?;
+    let target = match targets.first() {
+        Some(t) => t,
+        None => {
+            let app_err =
+                AppError::new(StatusCode::BAD_GATEWAY, "no targets configured".to_string());
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("no_targets", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
-    let (upstream_body, mut upstream_headers) = codec.encode_request(&ir_request).map_err(|e| {
-        AppError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Encode error: {}", e),
-        )
-    })?;
-    apply_provider_auth(target, &mut upstream_headers).await?;
+    scope.set_egress(target.api_protocol.clone());
+    scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
+
+    let (upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
+        Ok(b) => b,
+        Err(e) => {
+            let app_err = AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Encode error: {e}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("encode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
+    if let Err(e) = apply_provider_auth(target, &mut upstream_headers).await {
+        let http_status = e.http_status().as_u16();
+        scope.emit_error("auth_error", Some(http_status));
+        return Err(e);
+    }
 
     let upstream_url = format!("{}/responses", target.effective_api_base());
 
@@ -1650,15 +2136,27 @@ async fn handle_responses(
         // Streaming path: tell the upstream we accept SSE and drive the
         // body through the same idle/total/keepalive bridge used by the
         // chat-completions and anthropic-messages paths.
-        let response = state
-            .http_client
-            .post(&upstream_url)
-            .headers(upstream_headers)
-            .header(http::header::ACCEPT, "text/event-stream")
-            .json(&upstream_body)
-            .send()
-            .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let response = match crate::ingress_phase4::inject_trace(
+            state
+                .http_client
+                .post(&upstream_url)
+                .headers(upstream_headers)
+                .header(http::header::ACCEPT, "text/event-stream"),
+            &trace_ctx,
+        )
+        .json(&upstream_body)
+        .send()
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let app_err =
+                    AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"));
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("upstream_send_error", Some(http_status));
+                return Err(app_err);
+            }
+        };
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
         if !status.is_success() {
@@ -1671,6 +2169,8 @@ async fn handle_responses(
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("upstream_error", Some(http_status));
             return Err(app_err);
         }
 
@@ -1678,8 +2178,10 @@ async fn handle_responses(
         let mut end_enc = codec.stream_encoder();
         let mut err_enc = codec.stream_encoder();
         let end_marker = end_enc.encode_done();
-        let error_marker = err_enc
-            .encode_error("upstream stream truncated by gateway", Some("upstream_timeout"));
+        let error_marker = err_enc.encode_error(
+            "upstream stream truncated by gateway",
+            Some("upstream_timeout"),
+        );
 
         let mut response = drive_upstream_stream(
             &state,
@@ -1708,26 +2210,43 @@ async fn handle_responses(
             }
         }
         state.health.record_success(&target.health_key());
+        scope.emit_ok(Some(response.status().as_u16()));
         return Ok(response);
     }
 
     // Non-streaming path: read the full body and forward as JSON.
-    let response = state
-        .http_client
-        .post(&upstream_url)
-        .headers(upstream_headers)
-        .json(&upstream_body)
-        .send()
-        .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+    let response = match crate::ingress_phase4::inject_trace(
+        state
+            .http_client
+            .post(&upstream_url)
+            .headers(upstream_headers),
+        &trace_ctx,
+    )
+    .json(&upstream_body)
+    .send()
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("upstream_send_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
     let status = response.status();
     let retry_after = extract_retry_after(response.headers());
     let rate_limit_headers_vec: Vec<(&'static str, String)> =
         extract_rate_limit_headers(response.headers());
-    let response_body: Value = response
-        .json()
-        .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {e}")))?;
+    let response_body: Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("upstream_parse_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
     if !status.is_success() {
         let mut app_err = AppError::new(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -1738,6 +2257,8 @@ async fn handle_responses(
             app_err = app_err.with_retry_after_header(ra);
         }
         app_err.rate_limit_headers = rate_limit_headers_vec;
+        let http_status = app_err.http_status().as_u16();
+        scope.emit_error("upstream_error", Some(http_status));
         return Err(app_err);
     }
     let mut resp = Json(response_body).into_response();
@@ -1755,12 +2276,17 @@ async fn handle_responses(
         }
     }
     state.health.record_success(&target.health_key());
+    let http_status = resp.status().as_u16();
+    scope.emit_ok(Some(http_status));
     Ok(resp)
 }
 
 /// Handle POST /v1beta/models/:model/generateContent — Google Gemini.
 ///
-/// Mirrors `handle_chat_completions` but uses `GeminiCodec`.
+/// Mirrors `handle_chat_completions` but uses `GeminiCodec`. A
+/// `RequestScope` drop guard ensures the terminal `RequestEvent` is
+/// emitted on every return path (success, upstream error, decode /
+/// route / encode failure).
 async fn handle_gemini_generate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1778,48 +2304,103 @@ async fn handle_gemini_generate(
         .unwrap_or(0);
     enforce_body_limit(&state, content_type, body_size)?;
 
-    let raw_env = RawEnvelope {
-        method: "POST".to_string(),
-        path: format!("/v1beta/models/{model}/generateContent"),
-        headers: headers
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect(),
-        body: Some(serde_json::to_string(&body).unwrap_or_default()),
-        truncated: false,
-        original_body_size: 0,
-        timestamp: chrono::Utc::now(),
-    };
+    let trace_ctx = crate::ingress_phase4::extract_trace(&headers);
+    let raw_env = crate::ingress_phase4::build_redacted_envelope(
+        &state,
+        "POST",
+        &format!("/v1beta/models/{model}/generateContent"),
+        &body,
+        &headers,
+    );
 
-    let ir_request = codec
-        .decode_request(body, &raw_env)
-        .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {}", e)))?;
+    let started = Instant::now();
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let mut scope = crate::ingress_phase4::RequestScope::new(
+        &state,
+        request_id,
+        model.clone(),
+        ingress_protocol.clone(),
+        trace_ctx.clone(),
+        started,
+    );
+    // Persist the redacted envelope on the terminal RequestEvent
+    // for audit / replay (§8 #3 / #8).
+    scope.set_envelope(raw_env.clone());
+    // Bind the api key id so the terminal RequestEvent attributes the
+    // row to the right caller (used by the per-key quota dashboard).
+    let api_key = crate::ingress_phase4::resolve_api_key(&state, &headers).await;
+    scope.set_api_key_id(api_key.key_id.clone());
+    // Phase 4 §4.6: quota enforcement on the request hot path.
+    // Parity with the chat-completions / anthropic-messages paths.
+    match crate::ingress_phase4::check_quota(&state, &api_key.key_id, &api_key.spec, 1).await {
+        crate::ingress_phase4::QuotaOutcome::Allow => {}
+        crate::ingress_phase4::QuotaOutcome::Deny { retry_after, .. } => {
+            let app_err =
+                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_retry_after(retry_after.as_secs().max(1));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("quota_exceeded", Some(http_status));
+            return Err(app_err);
+        }
+    }
+
+    let ir_request = match codec.decode_request(body, &raw_env) {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("decode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
     let virtual_model = model;
     let is_stream = ir_request.stream;
 
-    let targets = state
-        .config
-        .routing_table
-        .resolve(&virtual_model)
-        .ok_or_else(|| {
-            AppError::new(
+    let targets = match state.config.routing_table.resolve(&virtual_model) {
+        Some(t) => t,
+        None => {
+            let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
-                format!("No route found for model: {}", virtual_model),
-            )
-        })?;
+                format!("No route found for model: {virtual_model}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("route_not_found", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
-    let target = targets.first().ok_or_else(|| {
-        AppError::new(StatusCode::BAD_GATEWAY, "no targets configured".to_string())
-    })?;
+    let target = match targets.first() {
+        Some(t) => t,
+        None => {
+            let app_err =
+                AppError::new(StatusCode::BAD_GATEWAY, "no targets configured".to_string());
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("no_targets", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
-    let (upstream_body, mut upstream_headers) = codec.encode_request(&ir_request).map_err(|e| {
-        AppError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Encode error: {}", e),
-        )
-    })?;
-    apply_provider_auth(target, &mut upstream_headers).await?;
+    scope.set_egress(target.api_protocol.clone());
+    scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
+
+    let (upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
+        Ok(b) => b,
+        Err(e) => {
+            let app_err = AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Encode error: {e}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("encode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
+    if let Err(e) = apply_provider_auth(target, &mut upstream_headers).await {
+        let http_status = e.http_status().as_u16();
+        scope.emit_error("auth_error", Some(http_status));
+        return Err(e);
+    }
 
     // Gemini uses `?alt=sse` on the query string to switch the same
     // POST endpoint into Server-Sent Events mode. The body shape is
@@ -1835,14 +2416,26 @@ async fn handle_gemini_generate(
         // `drive_upstream_stream` so the client sees the same idle /
         // total / keepalive / protocol-native end-frame semantics as
         // the other streaming ingress paths.
-        let response = state
-            .http_client
-            .post(format!("{base_stream_url}?alt=sse"))
-            .headers(upstream_headers)
-            .json(&upstream_body)
-            .send()
-            .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let response = match crate::ingress_phase4::inject_trace(
+            state
+                .http_client
+                .post(format!("{base_stream_url}?alt=sse"))
+                .headers(upstream_headers),
+            &trace_ctx,
+        )
+        .json(&upstream_body)
+        .send()
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let app_err =
+                    AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"));
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("upstream_send_error", Some(http_status));
+                return Err(app_err);
+            }
+        };
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
         if !status.is_success() {
@@ -1855,6 +2448,8 @@ async fn handle_gemini_generate(
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("upstream_error", Some(http_status));
             return Err(app_err);
         }
 
@@ -1862,8 +2457,10 @@ async fn handle_gemini_generate(
         let mut end_enc = codec.stream_encoder();
         let mut err_enc = codec.stream_encoder();
         let end_marker = end_enc.encode_done();
-        let error_marker = err_enc
-            .encode_error("upstream stream truncated by gateway", Some("upstream_timeout"));
+        let error_marker = err_enc.encode_error(
+            "upstream stream truncated by gateway",
+            Some("upstream_timeout"),
+        );
 
         let mut response = drive_upstream_stream(
             &state,
@@ -1892,27 +2489,44 @@ async fn handle_gemini_generate(
             }
         }
         state.health.record_success(&target.health_key());
+        scope.emit_ok(Some(response.status().as_u16()));
         return Ok(response);
     }
 
     // Non-streaming path: read the full body and forward as JSON.
     let upstream_url = base_stream_url;
-    let response = state
-        .http_client
-        .post(&upstream_url)
-        .headers(upstream_headers)
-        .json(&upstream_body)
-        .send()
-        .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+    let response = match crate::ingress_phase4::inject_trace(
+        state
+            .http_client
+            .post(&upstream_url)
+            .headers(upstream_headers),
+        &trace_ctx,
+    )
+    .json(&upstream_body)
+    .send()
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("upstream_send_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
     let status = response.status();
     let retry_after = extract_retry_after(response.headers());
     let rate_limit_headers_vec: Vec<(&'static str, String)> =
         extract_rate_limit_headers(response.headers());
-    let response_body: Value = response
-        .json()
-        .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {e}")))?;
+    let response_body: Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("upstream_parse_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
     if !status.is_success() {
         let mut app_err = AppError::new(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -1923,6 +2537,8 @@ async fn handle_gemini_generate(
             app_err = app_err.with_retry_after_header(ra);
         }
         app_err.rate_limit_headers = rate_limit_headers_vec;
+        let http_status = app_err.http_status().as_u16();
+        scope.emit_error("upstream_error", Some(http_status));
         return Err(app_err);
     }
     let mut resp = Json(response_body).into_response();
@@ -1941,6 +2557,8 @@ async fn handle_gemini_generate(
     }
     state.health.record_success(&target.health_key());
     let _ = ingress_protocol;
+    let http_status = resp.status().as_u16();
+    scope.emit_ok(Some(http_status));
     Ok(resp)
 }
 
@@ -2030,13 +2648,15 @@ impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> Stream
         match this.inner.as_mut().poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(event))) => {
                 // Reset the keepalive deadline on real activity.
-                *this.emit_keepalive_at =
-                    Instant::now() + if this.interval.is_zero() {
+                *this.emit_keepalive_at = Instant::now()
+                    + if this.interval.is_zero() {
                         Duration::from_secs(0)
                     } else {
                         *this.interval
                     };
-                let _ = this.timer.as_mut().reset(tokio::time::Instant::now() + *this.interval);
+                this.timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + *this.interval);
                 return std::task::Poll::Ready(Some(Ok(event)));
             }
             std::task::Poll::Ready(Some(Err(e))) => {
@@ -2057,8 +2677,7 @@ impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> Stream
             let now = Instant::now();
             if now >= *this.emit_keepalive_at {
                 *this.emit_keepalive_at = now + *this.interval;
-                let _ = this
-                    .timer
+                this.timer
                     .as_mut()
                     .reset(tokio::time::Instant::now() + *this.interval);
                 let keepalive = axum::response::sse::Event::default().comment("keepalive");
@@ -2066,7 +2685,7 @@ impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> Stream
             }
             // Re-register the timer waker so the task wakes up when
             // the keepalive deadline is reached.
-            let _ = ready!(this.timer.as_mut().poll(cx));
+            let _ = this.timer.as_mut().poll(cx);
         }
 
         std::task::Poll::Pending
@@ -2100,7 +2719,18 @@ impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> Stream
 /// `Retry-After` / `RateLimit-*` headers from the upstream response
 /// are passed through by the caller; this function only builds the
 /// streaming body.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::let_underscore_must_use,
+    // `last_reason` is captured by the async-stream macro but
+    // the captured value is only used via the trailing
+    // `let _ = last_reason;` touch at the end of the stream
+    // block; rustc's NLL does not see through the macro
+    // expansion. The variable is documented intent — the
+    // truncation reason is held in scope for future
+    // `TelemetryBus` reports.
+    unused_assignments
+)]
 pub fn drive_upstream_stream(
     _state: &AppState,
     accum: Arc<std::sync::Mutex<UsageAccumulator>>,
@@ -2117,8 +2747,6 @@ pub fn drive_upstream_stream(
     let total_started = Instant::now();
     let mut upstream = response.bytes_stream();
     let mut last_reason: Option<TruncationReason> = None;
-    let end_marker = end_marker;
-    let error_marker = error_marker;
     let idle_timeout = if idle_timeout.is_zero() {
         // 0 means "use the keepalive cadence as a no-progress signal"
         // — but to be safe we still need *some* upper bound so a hung
@@ -2138,6 +2766,7 @@ pub fn drive_upstream_stream(
     // every forwarded chunk. While the future is pending the stream
     // returns `Pending`; when it fires, we close the stream with the
     // idle end frame.
+    #[allow(clippy::let_underscore_must_use)]
     let idle_future = stream! {
         // Initial timer fires after one idle window. We give the
         // upstream a chance to deliver the first chunk by sleeping
@@ -2166,7 +2795,7 @@ pub fn drive_upstream_stream(
                                 a.record_chunk(&String::from_utf8_lossy(&bytes));
                             }
                             yield Ok(axum::response::sse::Event::default()
-                                .data(String::from_utf8_lossy(&bytes).to_string()));
+                                .data(String::from_utf8_lossy(&bytes)));
                         }
                         Some(Err(_e)) => {
                             last_reason = Some(TruncationReason::UpstreamError);
@@ -2182,10 +2811,10 @@ pub fn drive_upstream_stream(
                             if !error_marker.is_empty() {
                                 if let Ok(text) = std::str::from_utf8(&error_marker) {
                                     yield Ok(axum::response::sse::Event::default()
-                                        .data(text.to_string()));
+                                        .data(text));
                                 } else {
                                     yield Ok(axum::response::sse::Event::default()
-                                        .data(String::from_utf8_lossy(&error_marker).to_string()));
+                                        .data(String::from_utf8_lossy(&error_marker)));
                                 }
                             }
                             break;
@@ -2200,10 +2829,10 @@ pub fn drive_upstream_stream(
                             if !end_marker.is_empty() {
                                 if let Ok(text) = std::str::from_utf8(&end_marker) {
                                     yield Ok(axum::response::sse::Event::default()
-                                        .data(text.to_string()));
+                                        .data(text));
                                 } else {
                                     yield Ok(axum::response::sse::Event::default()
-                                        .data(String::from_utf8_lossy(&end_marker).to_string()));
+                                        .data(String::from_utf8_lossy(&end_marker)));
                                 }
                             }
                             break;
@@ -2221,10 +2850,10 @@ pub fn drive_upstream_stream(
                     if !end_marker.is_empty() {
                         if let Ok(text) = std::str::from_utf8(&end_marker) {
                             yield Ok(axum::response::sse::Event::default()
-                                .data(text.to_string()));
+                                .data(text));
                         } else {
                             yield Ok(axum::response::sse::Event::default()
-                                .data(String::from_utf8_lossy(&end_marker).to_string()));
+                                .data(String::from_utf8_lossy(&end_marker)));
                         }
                     }
                     break;
@@ -2247,10 +2876,10 @@ pub fn drive_upstream_stream(
                     if !error_marker.is_empty() {
                         if let Ok(text) = std::str::from_utf8(&error_marker) {
                             yield Ok(axum::response::sse::Event::default()
-                                .data(text.to_string()));
+                                .data(text));
                         } else {
                             yield Ok(axum::response::sse::Event::default()
-                                .data(String::from_utf8_lossy(&error_marker).to_string()));
+                                .data(String::from_utf8_lossy(&error_marker)));
                         }
                     }
                     break;
@@ -2306,6 +2935,13 @@ impl AppError {
     fn with_retry_after_header(mut self, value: String) -> Self {
         self.retry_after_header = Some(value);
         self
+    }
+
+    /// Public accessor for the HTTP status code. Used by the Phase
+    /// 4 telemetry helpers to record the terminal `RequestEvent`'s
+    /// `http_status` column on the failure path.
+    pub fn http_status(&self) -> StatusCode {
+        self.status
     }
 }
 

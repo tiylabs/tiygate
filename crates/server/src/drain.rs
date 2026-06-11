@@ -76,6 +76,7 @@ impl DrainState {
     }
 
     /// Programmatic entry point used by tests and the SIGTERM listener.
+    #[allow(dead_code)]
     pub fn is_drain_signalled(&self) -> bool {
         // `Notify` has no built-in `is_signalled`, so we use a small
         // sentinel: in production we never need this — it is exposed
@@ -87,6 +88,7 @@ impl DrainState {
     }
 
     /// Configured drain timeout.
+    #[allow(dead_code)]
     pub fn drain_timeout(&self) -> Duration {
         self.inner.drain_timeout
     }

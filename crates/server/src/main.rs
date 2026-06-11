@@ -10,83 +10,133 @@
 //! pod, and `axum::serve(...).with_graceful_shutdown(...)` lets in-flight
 //! requests finish. Once the drain task completes (or the configurable
 //! `drain_timeout` elapses) the process exits.
+//!
+//! ## Subcommands (§8 stage 4)
+//!
+//! The binary now accepts `run` (default) / `migrate` / `migrate-status`
+//! clap subcommands. `migrate` runs the schema migrations against the
+//! configured database and exits; `migrate-status` reports the applied
+//! versions. `run` is the legacy path.
 
 mod app;
+mod cli;
 mod config;
 mod drain;
 mod ingress;
+mod ingress_phase4;
 mod telemetry;
+mod trace;
 
 // Ensure provider-bedrock is linked for Executor discovery (only when the
 // `bedrock` feature is enabled, otherwise the crate is not even compiled in).
 #[cfg(feature = "bedrock")]
 use tiygate_provider_bedrock as _;
 
+use std::process::ExitCode;
 use std::time::Duration;
 
 #[cfg(feature = "tracing")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-#[tokio::main]
-async fn main() {
-    // Initialize tracing (no-op when the `tracing` feature is disabled).
+fn init_tracing() {
     #[cfg(feature = "tracing")]
     {
-        use tracing_subscriber::layer::SubscriberExt as _;
-        use tracing_subscriber::util::SubscriberInitExt as _;
         tracing_subscriber::registry()
             .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     }
+}
+
+fn load_dotenv() {
+    #[cfg(feature = "dotenv")]
+    let _ = dotenvy::dotenv();
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    init_tracing();
+    load_dotenv();
 
     tracing::info!("TiyGate AI Gateway v{}", env!("CARGO_PKG_VERSION"));
 
-    // Load .env if present (no-op when the `dotenv` feature is disabled).
-    #[cfg(feature = "dotenv")]
-    let _ = dotenvy::dotenv();
-
-    // Run the rest of startup, mapping any error to the appropriate
-    // return type for the enabled feature set.
-    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = run().await;
-
-    if let Err(e) = result {
-        tracing::error!(error = %e, "server exited with error");
-        #[cfg(feature = "anyhow")]
-        {
-            // Re-raise so the process exits with a non-zero status when
-            // `anyhow` is in scope. We swallow the error otherwise because
-            // we cannot construct an `anyhow::Error` without the dep.
-        }
-        std::process::exit(1);
+    let args = cli::Args::parse_or_exit();
+    let command = args
+        .command
+        .unwrap_or(cli::Command::Run(cli::RunArgs::default()));
+    match command {
+        cli::Command::Run(run_args) => match run(run_args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!(error = %e, "server exited with error");
+                ExitCode::FAILURE
+            }
+        },
+        cli::Command::Migrate => match run_migrate().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!(error = %e, "migrate failed");
+                ExitCode::FAILURE
+            }
+        },
+        cli::Command::MigrateStatus => match run_migrate_status().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!(error = %e, "migrate status failed");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Build the application
-    let app = app::App::new().await?;
+async fn run_migrate() -> anyhow::Result<()> {
+    let cfg = config::ServerConfig::from_env();
+    let database_url = cfg
+        .database_url
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("TIYGATE_DATABASE_URL is required for `migrate`"))?;
+    let pool = tiygate_store::db::open_pool(&database_url).await?;
+    tiygate_store::db::run_migrations(pool.sqlite()).await?;
+    println!("migrations applied to {database_url}");
+    Ok(())
+}
 
-    // Build the server config
+async fn run_migrate_status() -> anyhow::Result<()> {
+    let cfg = config::ServerConfig::from_env();
+    let database_url = cfg
+        .database_url
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("TIYGATE_DATABASE_URL is required for `migrate status`"))?;
+    let pool = tiygate_store::db::open_pool(&database_url).await?;
+    let rows = tiygate_store::db::list_applied(pool.sqlite()).await?;
+    if rows.is_empty() {
+        println!("(no migrations applied yet)");
+    } else {
+        let header = format!("{:<10}  {:<22}  {}", "sequence", "version", "applied_at");
+        println!("{header}");
+        for (seq, version, applied_at) in rows {
+            println!("{:<10}  {:<22}  {}", seq, version, applied_at);
+        }
+    }
+    Ok(())
+}
+
+async fn run(_args: cli::RunArgs) -> anyhow::Result<()> {
+    let app = app::App::new().await?;
     let server_config = config::ServerConfig::from_env();
     tracing::info!(
-        "Starting in {:?} mode on {}",
+        "Starting in {:?} mode on {} (control_plane={})",
         server_config.mode,
-        server_config.listen_addr
+        server_config.listen_addr,
+        app.control_plane().is_some(),
     );
 
-    // Start the HTTP server
     let listener = tokio::net::TcpListener::bind(&server_config.listen_addr).await?;
     tracing::info!("Listening on {}", server_config.listen_addr);
 
-    // Shared draining flag — `/readyz` polls this; the graceful-shutdown
-    // future also waits on it so the two are synchronised.
     let drain_state = drain::DrainState::new(Duration::from_secs(server_config.drain_timeout_secs));
     let drain_signal = drain_state.clone();
-
-    // Spawn a task that listens for SIGTERM/SIGINT and flips the state.
     drain::spawn_signal_listener(drain_signal.clone());
-    // Also forward the per-instance signal into the process-global flag
-    // used by `/readyz`.
     let drain_signal_for_global = drain_signal.clone();
     tokio::spawn(async move {
         drain_signal_for_global.wait_for_signal().await;
@@ -96,23 +146,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app_router = app.router();
     let drain_for_server = drain_state.clone();
     let server = axum::serve(listener, app_router).with_graceful_shutdown(async move {
-        // Wait until the drain state is signalled.
         drain_for_server.wait_for_signal().await;
         tracing::info!("graceful shutdown: in-flight requests will be allowed to finish");
     });
 
-    // Bind a /readyz handler that returns 503 once draining starts.
-    // (The router inside `app.router()` already wires up `/readyz`; we
-    // additionally broadcast the drain signal to background tasks here.)
-
     if let Err(e) = server.await {
         tracing::error!(error = %e, "server exited with error");
-        return Err(Box::new(e));
+        return Err(e.into());
     }
 
-    // After graceful_shutdown completes, run the bounded drain:
-    // - wait up to drain_timeout for telemetry channel to flush
-    // - exit
     tracing::info!(
         "waiting for drain to complete (timeout = {}s)",
         server_config.drain_timeout_secs

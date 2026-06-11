@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 tiygate-core.workspace = true
 serde.workspace = true
@@ -20,6 +23,14 @@ zeroize.workspace = true
 subtle.workspace = true
 rand.workspace = true
 async-trait.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64 = "0.22"
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serial_test.workspace = true
 
 [lints]
 workspace = true

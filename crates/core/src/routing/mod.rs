@@ -239,14 +239,22 @@ impl HealthRegistry {
         self.latencies.write().clear();
     }
 
+    /// Return all target keys currently tracked in the registry.
+    /// Used by the admin API to expose circuit-breaker status (§4.4).
+    pub fn list_targets(&self) -> Vec<String> {
+        self.states.read().keys().cloned().collect()
+    }
+
     /// Record a successful request latency observation (in milliseconds).
     /// Uses EWMA with α=0.3 (recent observations weighted more heavily).
     pub fn record_latency_ms(&self, target_key: &str, latency_ms: u64) {
         let mut latencies = self.latencies.write();
-        let entry = latencies.entry(target_key.to_string()).or_insert(LatencyEwma {
-            ewma: 0.0,
-            samples: 0,
-        });
+        let entry = latencies
+            .entry(target_key.to_string())
+            .or_insert(LatencyEwma {
+                ewma: 0.0,
+                samples: 0,
+            });
         if entry.samples == 0 {
             entry.ewma = latency_ms as f64;
         } else {
@@ -258,10 +266,7 @@ impl HealthRegistry {
     /// Get the current EWMA latency in milliseconds for a target.
     /// Returns None if no samples have been recorded yet.
     pub fn ewma_latency_ms(&self, target_key: &str) -> Option<u64> {
-        self.latencies
-            .read()
-            .get(target_key)
-            .map(|l| l.ewma as u64)
+        self.latencies.read().get(target_key).map(|l| l.ewma as u64)
     }
 
     /// Number of latency samples recorded for the target.
