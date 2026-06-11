@@ -554,3 +554,75 @@ async fn oauth_callback_rejects_unknown_state() {
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn api_key_quota_patch_and_single_get() {
+    // Create a key, then PATCH its quota and confirm the GET reflects
+    // the new quota while the status stays `active` (i.e. PATCH does
+    // not collide with the PUT disable verb).
+    let (router, _store, _pool) = boot_no_auth().await;
+
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/api-keys",
+            json!({ "name": "agent-q", "quota": { "requests_per_minute": 10 } }),
+        ))
+        .await
+        .expect("create");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // PATCH the quota.
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/admin/v1/api-keys/{id}"),
+            json!({ "quota": { "requests_per_minute": 99, "tokens_per_day": 5000 } }),
+        ))
+        .await
+        .expect("patch");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let patched: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(patched["quota"]["requests_per_minute"], json!(99));
+    assert_eq!(patched["quota"]["tokens_per_day"], json!(5000));
+    assert_eq!(patched["status"], json!("active"));
+
+    // Single-key GET returns the updated quota plus a `usage` map
+    // (empty when no live quota counter is wired into the state).
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/admin/v1/api-keys/{id}"))
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("get");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(got["id"], json!(id));
+    assert_eq!(got["quota"]["requests_per_minute"], json!(99));
+    assert!(got["usage"].is_object());
+
+    // GET on an unknown id is a 404.
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/v1/api-keys/does-not-exist")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("get-missing");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

@@ -12,7 +12,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,10 @@ pub fn router() -> Router<AdminState> {
         )
         .route(
             "/admin/v1/api-keys/:id",
-            delete(delete_api_key).put(disable_api_key),
+            get(get_api_key)
+                .delete(delete_api_key)
+                .put(disable_api_key)
+                .patch(update_api_key_quota),
         )
         .route("/admin/v1/stats/by-model", get(stats_by_model))
         .route("/admin/v1/stats/by-provider", get(stats_by_provider))
@@ -477,6 +480,85 @@ async fn disable_api_key(
     )
     .await;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Single-key GET. Returns the key's metadata plus, when a live
+/// quota counter is wired in, its real-time usage per bucket
+/// (`requests_per_minute`, `requests_per_day`, ...). When no quota
+/// backend is available the `usage` map is empty.
+#[derive(Debug, Serialize)]
+struct ApiKeyDetailView {
+    #[serde(flatten)]
+    key: ApiKeyView,
+    usage: serde_json::Value,
+}
+
+async fn get_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, AdminError> {
+    let key = state
+        .store
+        .get_api_key(&id)
+        .await?
+        .ok_or_else(|| AdminError::NotFound(format!("api key {id}")))?;
+    let usage = match &state.quota {
+        Some(counter) => match counter.current_usage(&key.id).await {
+            Ok(map) => {
+                let mut obj = serde_json::Map::new();
+                for (kind, used) in map {
+                    obj.insert(quota_kind_key(kind).to_string(), json!(used));
+                }
+                serde_json::Value::Object(obj)
+            }
+            Err(_) => json!({}),
+        },
+        None => json!({}),
+    };
+    let view = ApiKeyDetailView {
+        key: ApiKeyView::from(key),
+        usage,
+    };
+    Ok(Json(view).into_response())
+}
+
+/// Maps a [`tiygate_core::quota::QuotaKind`] to the JSON field name
+/// used by [`tiygate_core::quota::QuotaSpec`], so the usage map keys
+/// line up with the quota spec keys the UI edits.
+fn quota_kind_key(kind: tiygate_core::quota::QuotaKind) -> &'static str {
+    use tiygate_core::quota::QuotaKind;
+    match kind {
+        QuotaKind::RequestsPerMinute => "requests_per_minute",
+        QuotaKind::RequestsPerDay => "requests_per_day",
+        QuotaKind::TokensPerMinute => "tokens_per_minute",
+        QuotaKind::TokensPerDay => "tokens_per_day",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateQuotaRequest {
+    quota: serde_json::Value,
+}
+
+/// PATCH /admin/v1/api-keys/:id — update the quota JSON only. This
+/// is deliberately separate from the PUT verb (which disables the
+/// key) so the two operations never collide.
+async fn update_api_key_quota(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateQuotaRequest>,
+) -> Result<Response, AdminError> {
+    let key = state.store.update_api_key_quota(&id, req.quota).await?;
+    let _ = tiygate_store::audit::record(
+        state.pool.as_ref(),
+        "admin",
+        "update_quota",
+        "api_key",
+        &key.id,
+        &json!({"quota": key.quota_json}),
+    )
+    .await;
+    Ok(Json(ApiKeyView::from(key)).into_response())
 }
 
 // ---- stats ----

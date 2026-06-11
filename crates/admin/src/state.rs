@@ -17,6 +17,11 @@ pub struct AdminState {
     /// the admin API can report per-target circuit-breaker
     /// status (§4.4 / §8 acceptance).
     pub health: Option<Arc<tiygate_core::routing::HealthRegistry>>,
+    /// Optional reference to the live quota counter so the admin
+    /// API can report real-time per-key usage (§4.6). When the
+    /// control plane runs without a quota backend wired in this is
+    /// `None` and the single-key GET handler omits live usage.
+    pub quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
     /// In-memory store of OAuth 2.0 authorization-code flow
     /// state. The `start` handler mints a `state` nonce, the
     /// `callback` handler validates the incoming `state` query
@@ -58,7 +63,18 @@ impl AdminState {
             store,
             pool,
             health,
+            quota: None,
             oauth_pending: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach a live quota counter so the single-key GET handler can
+    /// surface real-time usage. Returns `self` for chaining.
+    pub fn with_quota(
+        mut self,
+        quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
+    ) -> Self {
+        self.quota = quota;
+        self
     }
 }

@@ -706,6 +706,31 @@ impl DbConfigStore {
         row.map(row_to_api_key).transpose()
     }
 
+    /// Update the quota JSON of an API key in place. Unlike
+    /// [`Self::disable_api_key`] this does not touch the `status`
+    /// column, so the PATCH quota endpoint and the PUT disable
+    /// endpoint stay semantically distinct.
+    pub async fn update_api_key_quota(
+        &self,
+        id: &str,
+        quota: serde_json::Value,
+    ) -> Result<ApiKey, StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let quota_str = serde_json::to_string(&quota)?;
+        let res = sqlx::query("UPDATE api_keys SET quota_json = ?1, updated_at = ?2 WHERE id = ?3")
+            .bind(&quota_str)
+            .bind(&now)
+            .bind(id)
+            .execute(self.pool.sqlite())
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("api key {id}")));
+        }
+        self.get_api_key(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("api key {id}")))
+    }
+
     pub async fn disable_api_key(&self, id: &str) -> Result<(), StoreError> {
         let now = chrono::Utc::now().to_rfc3339();
         let res =

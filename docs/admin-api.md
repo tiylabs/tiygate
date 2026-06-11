@@ -96,7 +96,9 @@ Route body:
 | --- | --- | --- |
 | `GET` | `/admin/v1/api-keys` | List keys (cleartext never returned) |
 | `POST` | `/admin/v1/api-keys` | Create a key (returns the cleartext *once*) |
+| `GET` | `/admin/v1/api-keys/:id` | Fetch one key + real-time usage (`usage` map) |
 | `PUT` | `/admin/v1/api-keys/:id` | Disable a key (status → `disabled`) |
+| `PATCH` | `/admin/v1/api-keys/:id` | Update the key's quota JSON only |
 | `DELETE` | `/admin/v1/api-keys/:id` | Delete a key |
 
 `POST` request body:
@@ -108,6 +110,30 @@ Route body:
   "quota": { "requests_per_minute": 60 },
   "tenant_id": null
 }
+```
+
+`GET /admin/v1/api-keys/:id` returns the `ApiKeyView` fields plus a
+flattened `usage` object. When a live quota counter is wired into the
+control plane the `usage` map carries the current consumption per
+bucket (`requests_per_minute`, `requests_per_day`, `tokens_per_minute`,
+`tokens_per_day`); otherwise it is `{}`:
+
+```json
+{
+  "id": "0190...",
+  "name": "agent-1",
+  "key_hash": "…",
+  "quota": { "requests_per_minute": 60 },
+  "status": "active",
+  "usage": { "requests_per_minute": 12 }
+}
+```
+
+`PATCH /admin/v1/api-keys/:id` replaces only `quota_json` (it never
+touches `status`, so it is independent of the `PUT` disable verb):
+
+```json
+{ "quota": { "requests_per_minute": 100, "tokens_per_day": 1000000 } }
 ```
 
 The `secret` is shown **once** in the response and is never

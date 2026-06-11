@@ -25,11 +25,15 @@ default shape is `{}` (unlimited). Operators set it through the
 admin API:
 
 ```bash
-curl -X PUT http://localhost:3000/admin/v1/api-keys/<id> \
+curl -X PATCH http://localhost:3000/admin/v1/api-keys/<id> \
   -H "Authorization: Bearer $TIYGATE_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{ "quota": { "requests_per_minute": 60, "tokens_per_day": 1000000 } }'
 ```
+
+> `PATCH` updates *only* the quota JSON. The `PUT` verb on the same
+> path **disables** the key (sets `status = disabled`) and takes no
+> body, so the two operations never collide.
 
 ## Backends
 
