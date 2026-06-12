@@ -25,7 +25,6 @@ disable).
 | `resolved_provider` | TEXT | Provider id used by the gateway |
 | `resolved_model` | TEXT | Model name sent to the upstream |
 | `account_label` | TEXT | Multi-account routing label, if any |
-| `tenant_id` | TEXT | Reserved (§3.9), always NULL in Phase 4 |
 | `trace_id` | TEXT | W3C trace id, when present |
 | `span_id` | TEXT | W3C span id, when present |
 | `traceparent` | TEXT | The full `traceparent` header value |

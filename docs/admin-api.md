@@ -53,7 +53,6 @@ Provider body:
   "auth_mode": "api_key",   // api_key | oauth | iam | none
   "oauth_meta": "...",      // optional JSON string
   "metadata": { "...": "..." },
-  "tenant_scope": null,     // reserved (§3.9)
   "enabled": true
 }
 ```
@@ -107,8 +106,7 @@ Route body:
 {
   "name": "agent-1",
   "secret": "tg-...",      // optional; auto-generated when absent
-  "quota": { "requests_per_minute": 60 },
-  "tenant_id": null
+  "quota": { "requests_per_minute": 60 }
 }
 ```
 

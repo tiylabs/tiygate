@@ -56,7 +56,7 @@ TiyGate 的阶段一至四已完成实施。阶段四交付了完整的控制面
 ### 5.2 Provider 管理
 
 - **R-PROV-1 列表**：`GET /admin/v1/providers`，支持 `?enabled=true|false` 过滤。表格列出 id、name、vendor、api_base、auth_mode、enabled、updated_at。
-- **R-PROV-2 创建 / 编辑**：表单字段对应 `ProviderRequest`：`id`（创建可留空，后端用 UUIDv7 生成）、`name`、`vendor`、`api_base`、`api_key`、`auth_mode`（`api_key` / `oauth` / `iam` / `none`）、`oauth_meta`（JSON 字符串）、`metadata`（JSON 对象）、`enabled`。`tenant_scope` 为预留字段，UI 可隐藏或只读。
+- **R-PROV-2 创建 / 编辑**：表单字段对应 `ProviderRequest`：`id`（创建可留空，后端用 UUIDv7 生成）、`name`、`vendor`、`api_base`、`api_key`、`auth_mode`（`api_key` / `oauth` / `iam` / `none`）、`oauth_meta`（JSON 字符串）、`metadata`（JSON 对象）、`enabled`。
 - **R-PROV-3 密钥脱敏**：`GET` 响应中 `encrypted_api_key` / `encrypted_oauth_meta` 是 `[encrypted:…]` 形态的脱敏标记，**永不回传明文**。编辑时密钥输入框应为「留空表示不修改」语义，不回显原值。
 - **R-PROV-4 删除**：`DELETE /admin/v1/providers/:id`，二次确认。
 - **R-PROV-5 OAuth 引导**（仅 `auth_mode=oauth` 的 provider）：见 5.5。
@@ -64,14 +64,14 @@ TiyGate 的阶段一至四已完成实施。阶段四交付了完整的控制面
 ### 5.3 Route 管理
 
 - **R-ROUTE-1 列表**：`GET /admin/v1/routes`，展示 `virtual_model`、targets 数量、enabled。
-- **R-ROUTE-2 创建 / 编辑**：表单对应 `RouteRequest`：`virtual_model`、`targets[]`（每项含 `provider_id`、`model_id`、`weight`、`account_label`）、`enabled`、`tenant_scope`（预留，可隐藏）。`provider_id` 应从 Provider 列表中下拉选择以减少输入错误。
+- **R-ROUTE-2 创建 / 编辑**：表单对应 `RouteRequest`：`virtual_model`、`targets[]`（每项含 `provider_id`、`model_id`、`weight`、`account_label`）、`enabled`。`provider_id` 应从 Provider 列表中下拉选择以减少输入错误。
 - **R-ROUTE-3 权重提示**：当路由策略为 `weighted` 时，UI 可展示各 target 的相对权重占比（仅前端可视化，不改变后端语义）。
 - **R-ROUTE-4 删除**：`DELETE /admin/v1/routes/:id`，二次确认。
 
 ### 5.4 API Key 管理
 
-- **R-KEY-1 列表**：`GET /admin/v1/api-keys`，展示 id、name、`key_hash`、status、quota、tenant_id、created_at。**明文 secret 永不返回**。
-- **R-KEY-2 创建**：`POST /admin/v1/api-keys`，字段 `name`、`secret`（可留空由后端生成 `tg-<hex>`）、`quota`、`tenant_id`（预留）。**创建响应中的明文 `secret` 仅返回一次**，UI 必须用醒目的一次性弹窗展示并提供「复制」，关闭后不可再获取。
+- **R-KEY-1 列表**：`GET /admin/v1/api-keys`，展示 id、name、`key_hash`、status、quota、created_at。**明文 secret 永不返回**。
+- **R-KEY-2 创建**：`POST /admin/v1/api-keys`，字段 `name`、`secret`（可留空由后端生成 `tg-<hex>`）、`quota`。**创建响应中的明文 `secret` 仅返回一次**，UI 必须用醒目的一次性弹窗展示并提供「复制」，关闭后不可再获取。
 - **R-KEY-3 配额编辑**：通过新增的**配额更新端点**（后端补充，见 §7）提交 `quota` 对象，字段为 `requests_per_minute`、`requests_per_day`、`tokens_per_minute`、`tokens_per_day`（均可选，空对象表示无限制，见 `docs/quota.md`）。配额表单支持四个限额的独立设置与「无限制」清空。
   - **实时用量**：通过新增的单 key `GET /admin/v1/api-keys/:id` 读取 `QuotaCounter::current_usage` 暴露的当前用量，展示「已用 / 限额」进度。该端点为本期后端协同项（见 §7 第 6 条）。
 - **R-KEY-4 禁用 / 删除**：禁用走 `PUT /admin/v1/api-keys/:id`（置 `disabled`），删除走 `DELETE /admin/v1/api-keys/:id`，删除即失效，需二次确认。注意禁用与配额更新需用不同端点（禁用沿用现有 `PUT`，配额更新走 §7 新增端点）。
@@ -122,7 +122,6 @@ TiyGate 的阶段一至四已完成实施。阶段四交付了完整的控制面
 ## 8. 范围外（首版不做）
 
 - 复杂 RBAC、多用户账号体系、密码登录（与设计文档一致）。
-- 多租户隔离 UI（`tenant_id`/`tenant_scope` 为预留字段，初期留空）。
 - 成本 / 计费展示的真实数据（未接 `PriceProvider` 前 `cost` 恒为空）。
 - 独立部署 / CORS 模式（本期采用同源嵌入）。
 - 实时流式日志推送、WebSocket 实时监控。
