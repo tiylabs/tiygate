@@ -13,6 +13,7 @@ import {
   LogOut,
   Menu,
   X,
+  Waypoints,
   type LucideIcon,
 } from "lucide-react";
 import { useAuth } from "@/auth/AuthContext";
@@ -37,11 +38,14 @@ const navItems: Array<{
 
 function navLinkClass({ isActive }: { isActive: boolean }): string {
   return cn(
-    "flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors duration-[var(--duration-fast)]",
+    "group relative flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium",
+    "transition-colors duration-[var(--duration-fast)]",
     "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+    "before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-0.5 before:rounded-full",
+    "before:transition-opacity before:duration-[var(--duration-fast)] before:bg-primary",
     isActive
-      ? "border-l-2 border-primary bg-primary-soft text-primary"
-      : "border-l-2 border-transparent text-text-muted hover:bg-surface-muted hover:text-text",
+      ? "bg-primary-soft text-primary before:opacity-100"
+      : "text-text-muted before:opacity-0 hover:bg-surface-muted hover:text-text",
   );
 }
 
@@ -51,10 +55,15 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex h-14 shrink-0 items-center border-b border-border px-4">
-        <span className="text-sm font-semibold text-text">{t("app.title")}</span>
+      <div className="flex h-14 shrink-0 items-center gap-2.5 border-b border-border px-4">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary-soft text-primary">
+          <Waypoints size={16} aria-hidden />
+        </span>
+        <span className="truncate text-sm font-semibold tracking-[-0.01em] text-text">
+          {t("app.title")}
+        </span>
       </div>
-      <nav className="flex-1 space-y-1 overflow-y-auto p-2">
+      <nav className="flex-1 space-y-0.5 overflow-y-auto p-2">
         {navItems.map((item) => {
           const Icon = item.icon;
           return (
@@ -65,8 +74,12 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
               onClick={onNavigate}
               className={navLinkClass}
             >
-              <Icon size={16} aria-hidden />
-              {t(item.key)}
+              <Icon
+                size={16}
+                aria-hidden
+                className="shrink-0 opacity-80 transition-opacity duration-[var(--duration-fast)] group-hover:opacity-100"
+              />
+              <span className="truncate">{t(item.key)}</span>
             </NavLink>
           );
         })}
