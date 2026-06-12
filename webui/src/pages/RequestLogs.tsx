@@ -431,40 +431,55 @@ export default function RequestLogs() {
                         }
                         truncatedNote={t("requests.truncatedNote")}
                         copyAllLabel={t("requests.copySuccess")}
+                        streamNote={
+                          replayQuery.data?.is_stream
+                            ? t("requests.streamNote")
+                            : undefined
+                        }
+                        sseParsed={
+                          replayQuery.data?.is_stream &&
+                          replayQuery.data?.client_sse_parsed_json
+                            ? {
+                                label: t("requests.sseParsed"),
+                                value: replayQuery.data.client_sse_parsed_json,
+                                infoTooltip: t("requests.streamNote"),
+                              }
+                            : undefined
+                        }
                       />
                     ),
                   },
                   {
                     label: t("requests.sectionUpstreamResponse"),
                     content: (
-                      <>
-                        <MessageBlock
-                          mode="response"
-                          status={replayQuery.data?.upstream_status ?? null}
-                          headersJson={
-                            replayQuery.data?.upstream_resp_headers_json
-                          }
-                          body={replayQuery.data?.upstream_resp_body}
-                          bodyTruncated={
-                            replayQuery.data?.upstream_resp_body_truncated
-                          }
-                          truncatedNote={t("requests.truncatedNote")}
-                          copyAllLabel={t("requests.copySuccess")}
-                          streamNote={
-                            replayQuery.data?.is_stream
-                              ? t("requests.streamNote")
-                              : undefined
-                          }
-                        />
-                        {replayQuery.data?.is_stream &&
-                        replayQuery.data?.sse_parsed_json ? (
-                          <SseParsedBlock
-                            label={t("requests.sseParsed")}
-                            value={replayQuery.data?.sse_parsed_json}
-                            infoTooltip={t("requests.streamNote")}
-                          />
-                        ) : null}
-                      </>
+                      <MessageBlock
+                        mode="response"
+                        status={replayQuery.data?.upstream_status ?? null}
+                        headersJson={
+                          replayQuery.data?.upstream_resp_headers_json
+                        }
+                        body={replayQuery.data?.upstream_resp_body}
+                        bodyTruncated={
+                          replayQuery.data?.upstream_resp_body_truncated
+                        }
+                        truncatedNote={t("requests.truncatedNote")}
+                        copyAllLabel={t("requests.copySuccess")}
+                        streamNote={
+                          replayQuery.data?.is_stream
+                            ? t("requests.streamNote")
+                            : undefined
+                        }
+                        sseParsed={
+                          replayQuery.data?.is_stream &&
+                          replayQuery.data?.sse_parsed_json
+                            ? {
+                                label: t("requests.sseParsed"),
+                                value: replayQuery.data.sse_parsed_json,
+                                infoTooltip: t("requests.streamNote"),
+                              }
+                            : undefined
+                        }
+                      />
                     ),
                   },
                 ]}
@@ -812,6 +827,7 @@ function MessageBlock({
   infoTooltip,
   copyAllLabel,
   streamNote,
+  sseParsed,
 }: {
   mode: "request" | "response";
   method?: string;
@@ -824,6 +840,11 @@ function MessageBlock({
   infoTooltip?: string;
   copyAllLabel: string;
   streamNote?: string;
+  sseParsed?: {
+    label: string;
+    value: string;
+    infoTooltip?: string;
+  };
 }) {
   const { t } = useTranslation();
   const headers = parseHeaders(headersJson);
@@ -856,13 +877,24 @@ function MessageBlock({
         }
         copyAllLabel={copyAllLabel}
       />
+      {mode === "response" && sseParsed?.value ? (
+        <SseParsedBlock
+          label={sseParsed.label}
+          value={sseParsed.value}
+          infoTooltip={sseParsed.infoTooltip}
+        />
+      ) : null}
       {body ? (
-        <div>
-          <div className="mb-1 flex items-center gap-1 text-xs font-medium text-text-muted">
+        <details className="group">
+          <summary className="flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-text-muted select-none [&::-webkit-details-marker]:hidden">
+            <ChevronRight
+              size={12}
+              className="shrink-0 transition-transform group-open:rotate-90"
+            />
             <span>
               {mode === "request"
                 ? t("requests.sectionRequestBody")
-                : t("requests.sectionResponseBody")}
+                : t("requests.sectionResponseBodyRaw")}
             </span>
             {bodyTruncated ? (
               <span className="text-text-subtle">{truncatedNote}</span>
@@ -879,11 +911,11 @@ function MessageBlock({
               </Tooltip>
             ) : null}
             <CopyButton value={prettyJson(body)} ariaLabel={copyAllLabel} />
-          </div>
-          <pre className="max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
+          </summary>
+          <pre className="mt-1 max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
             {prettyJson(body)}
           </pre>
-        </div>
+        </details>
       ) : null}
       {infoTooltip && !streamNote ? null : null}
     </div>

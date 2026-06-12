@@ -255,7 +255,7 @@ const zh: Translation = {
     upstreamRespBody: "供应商响应体",
     clientRespHeaders: "返回客户端响应头",
     clientRespBody: "返回客户端响应体",
-    sseParsed: "解析后的 SSE 结果",
+    sseParsed: "响应体（SSE 解析后）",
     sseRaw: "原始 SSE 流",
     truncatedNote: "（已截断）",
     streamNote: "流式响应（SSE）。解析结果已合并各数据块。",
@@ -266,6 +266,7 @@ const zh: Translation = {
     sectionResponseHeaders: "响应头",
     sectionRequestBody: "请求体",
     sectionResponseBody: "响应体",
+    sectionResponseBodyRaw: "响应体（原始）",
     sectionEnvelope: "请求信封",
   },
   audit: {

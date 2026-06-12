@@ -178,6 +178,7 @@ export interface RequestReplay {
   client_resp_body_truncated?: boolean;
   is_stream?: boolean;
   sse_parsed_json?: string | null;
+  client_sse_parsed_json?: string | null;
 }
 
 export interface CircuitBreaker {

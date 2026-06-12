@@ -137,8 +137,9 @@ impl EventSink for OltpSink {
                 egress_headers_json, egress_body, egress_body_truncated, \
                 upstream_status, upstream_resp_headers_json, upstream_resp_body, \
                 upstream_resp_body_truncated, client_resp_headers_json, client_resp_body, \
-                client_resp_body_truncated, is_stream, sse_parsed_json, captured_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                client_resp_body_truncated, is_stream, sse_parsed_json, \
+                client_sse_parsed_json, captured_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )
         .bind(&row.request_id)
         .bind(&row.egress_method)
@@ -155,6 +156,7 @@ impl EventSink for OltpSink {
         .bind(row.client_resp_body_truncated as i32)
         .bind(row.is_stream as i32)
         .bind(&row.sse_parsed_json)
+        .bind(&row.client_sse_parsed_json)
         .bind(&row.captured_at)
         .execute(self.pool.sqlite())
         .await;
@@ -208,6 +210,7 @@ struct RequestPayloadsRow {
     client_resp_body_truncated: bool,
     is_stream: bool,
     sse_parsed_json: Option<String>,
+    client_sse_parsed_json: Option<String>,
     captured_at: String,
 }
 
@@ -244,6 +247,20 @@ impl OltpSink {
             None
         };
 
+        // Same best-effort merge for the Gateway -> Client (g->c)
+        // response direction. For same-protocol streaming the client
+        // body is byte-identical to the upstream SSE; once cross-
+        // protocol re-encoding lands the two will diverge, so we parse
+        // and store the client side independently.
+        let client_sse_parsed_json = if capture.is_stream {
+            capture
+                .client_resp_body
+                .as_deref()
+                .and_then(parse_sse_to_json)
+        } else {
+            None
+        };
+
         RequestPayloadsRow {
             request_id: capture.request_id.clone(),
             egress_method: capture.egress_method.clone(),
@@ -260,6 +277,7 @@ impl OltpSink {
             client_resp_body_truncated,
             is_stream: capture.is_stream,
             sse_parsed_json,
+            client_sse_parsed_json,
             captured_at: chrono::Utc::now().to_rfc3339(),
         }
     }
@@ -1209,6 +1227,7 @@ pub struct RequestReplay {
     pub client_resp_body_truncated: bool,
     pub is_stream: bool,
     pub sse_parsed_json: Option<String>,
+    pub client_sse_parsed_json: Option<String>,
 }
 
 /// Fetch the raw envelope (redacted) for a given request id.
@@ -1233,7 +1252,8 @@ pub async fn get_request_replay(
                 p.client_resp_body AS client_resp_body, \
                 p.client_resp_body_truncated AS client_resp_body_truncated, \
                 p.is_stream AS is_stream, \
-                p.sse_parsed_json AS sse_parsed_json \
+                p.sse_parsed_json AS sse_parsed_json, \
+                p.client_sse_parsed_json AS client_sse_parsed_json \
          FROM request_logs l \
          LEFT JOIN request_payloads p ON p.request_id = l.request_id \
          WHERE l.request_id = ?1",
@@ -1269,6 +1289,7 @@ pub async fn get_request_replay(
                 != 0,
             is_stream: r.get::<Option<i32>, _>("is_stream").unwrap_or(0) != 0,
             sse_parsed_json: r.get("sse_parsed_json"),
+            client_sse_parsed_json: r.get("client_sse_parsed_json"),
         }))
     } else {
         Ok(None)

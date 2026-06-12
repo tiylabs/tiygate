@@ -258,7 +258,7 @@ const en = {
     upstreamRespBody: "Upstream response body",
     clientRespHeaders: "Client response headers",
     clientRespBody: "Client response body",
-    sseParsed: "Parsed SSE result",
+    sseParsed: "Response body (SSE Parsed)",
     sseRaw: "Raw SSE stream",
     truncatedNote: "(truncated)",
     streamNote: "Streaming response (SSE). The parsed result merges the streamed chunks.",
@@ -269,6 +269,7 @@ const en = {
     sectionResponseHeaders: "Response headers",
     sectionRequestBody: "Request body",
     sectionResponseBody: "Response body",
+    sectionResponseBodyRaw: "Response body (RAW)",
     sectionEnvelope: "Request envelope",
   },
   audit: {
