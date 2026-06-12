@@ -8,6 +8,13 @@ export interface SelectOption {
   label: ReactNode;
 }
 
+/**
+ * Radix Select forbids empty-string item values (it reserves "" to clear the
+ * selection). We map "" to/from this sentinel internally so callers can keep
+ * using "" to represent an unselected option.
+ */
+const EMPTY_VALUE = "__empty__";
+
 interface SelectProps {
   value: string;
   onValueChange: (value: string) => void;
@@ -30,7 +37,11 @@ export function Select({
   className,
 }: SelectProps) {
   return (
-    <RSelect.Root value={value} onValueChange={onValueChange} disabled={disabled}>
+    <RSelect.Root
+      value={value === "" ? EMPTY_VALUE : value}
+      onValueChange={(v) => onValueChange(v === EMPTY_VALUE ? "" : v)}
+      disabled={disabled}
+    >
       <RSelect.Trigger
         aria-label={ariaLabel}
         className={cn(
@@ -55,7 +66,7 @@ export function Select({
             {options.map((opt) => (
               <RSelect.Item
                 key={opt.value}
-                value={opt.value}
+                value={opt.value === "" ? EMPTY_VALUE : opt.value}
                 className="flex cursor-pointer items-center justify-between gap-2 rounded-sm px-2.5 py-1.5 text-sm text-text outline-none data-[highlighted]:bg-surface-muted data-[state=checked]:font-medium"
               >
                 <RSelect.ItemText>{opt.label}</RSelect.ItemText>
