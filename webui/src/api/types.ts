@@ -97,6 +97,9 @@ export interface StatBucket {
   error_count: number;
   prompt_tokens: number;
   completion_tokens: number;
+  reasoning_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
   total_tokens: number;
 }
 
@@ -138,6 +141,9 @@ export interface RequestLogEntry {
   ttfb_ms?: number | null;
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  cache_read_tokens?: number | null;
+  cache_write_tokens?: number | null;
   total_tokens?: number | null;
   cost?: number | null;
   api_key_id?: string | null;

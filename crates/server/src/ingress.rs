@@ -125,6 +125,10 @@ pub struct AppState {
     /// Per-request `Redactor` instance. Configurable so future
     /// env-var-driven extensions remain test-friendly.
     pub redactor: Arc<tiygate_core::redaction::Redactor>,
+    /// Bidirectional header forwarding policy (denylist-based). Decides
+    /// which client request headers reach the provider and which
+    /// upstream response headers reach the client.
+    pub header_policy: Arc<tiygate_core::HeaderForwardPolicy>,
 }
 
 impl AppState {
@@ -237,6 +241,11 @@ pub fn router_with_telemetry_full(
         raw_envelope_max_bytes: server_config.raw_envelope_max_bytes,
         raw_envelope_capture_media: server_config.raw_envelope_capture_media,
         redactor: Arc::new(tiygate_core::redaction::Redactor::with_defaults()),
+        header_policy: Arc::new(
+            tiygate_core::HeaderForwardPolicy::with_defaults()
+                .with_request_deny_extra(server_config.forward_request_header_deny_extra.iter())
+                .with_response_deny_extra(server_config.forward_response_header_deny_extra.iter()),
+        ),
     };
 
     Router::new()
@@ -920,6 +929,7 @@ async fn handle_chat_completions(
             raw_passthrough_body.as_deref(),
             &trace_ctx,
             &request_id,
+            &headers,
         )
         .await
         {
@@ -1211,6 +1221,7 @@ async fn handle_messages(
             raw_passthrough_body.as_deref(),
             &trace_ctx,
             &request_id,
+            &headers,
         )
         .await
         {
@@ -1294,6 +1305,74 @@ fn reqwest_headers_to_vec(headers: &reqwest::header::HeaderMap) -> Vec<(String, 
         .collect()
 }
 
+/// Merge client request headers into the upstream header map per the
+/// denylist forwarding policy (C→G→P). Called *after* the codec / auth
+/// have populated `upstream_headers` and *before* `apply_provider_auth`
+/// runs, so a forwarded client header never overwrites a header the
+/// gateway already set (codec content-type, etc.) and auth injection
+/// always wins last. Headers blocked by the policy (credentials,
+/// hop-by-hop, gateway-controlled, trace) are skipped.
+fn merge_client_headers(
+    client: &http::HeaderMap,
+    upstream: &mut http::HeaderMap,
+    policy: &tiygate_core::HeaderForwardPolicy,
+) {
+    for (name, value) in client.iter() {
+        let name_str = name.as_str();
+        if !policy.should_forward_request(name_str) {
+            continue;
+        }
+        // Do not clobber a header the codec already set for the
+        // upstream request (e.g. content-type).
+        if upstream.contains_key(name) {
+            continue;
+        }
+        upstream.insert(name.clone(), value.clone());
+    }
+}
+
+/// Forward upstream response headers to the client response per the
+/// denylist forwarding policy (P→G→C). The upstream headers are passed
+/// as the already-snapshotted `Vec<(name, value)>` (captured before the
+/// reqwest response body/object is consumed). Headers blocked by the
+/// policy (hop-by-hop, length/encoding, framework-controlled) are
+/// skipped; everything else is inserted onto the client response.
+fn forward_upstream_resp_headers(
+    resp: &mut Response,
+    upstream_headers: &[(String, String)],
+    policy: &tiygate_core::HeaderForwardPolicy,
+) {
+    for (name, value) in upstream_headers {
+        if !policy.should_forward_response(name) {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            resp.headers_mut().insert(hn, hv);
+        }
+    }
+}
+
+/// Filter a snapshotted upstream response header list down to the set
+/// that is actually forwarded to the client, for the request-log
+/// `client_resp_headers` capture on the streaming path.
+fn forwarded_resp_headers_for_capture(
+    upstream_headers: &[(String, String)],
+    policy: &tiygate_core::HeaderForwardPolicy,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = upstream_headers
+        .iter()
+        .filter(|(name, _)| policy.should_forward_response(name))
+        .cloned()
+        .collect();
+    // The Sse response sets content-type itself; reflect that in the
+    // recorded client_resp_headers so the log matches the wire.
+    out.push(("content-type".to_string(), "text/event-stream".to_string()));
+    out
+}
+
 /// Overwrite the `model` field of an upstream request body with the
 /// routing target's real upstream model id.
 ///
@@ -1341,6 +1420,7 @@ async fn execute_upstream(
     raw_passthrough_body: Option<&str>,
     trace: &TraceContext,
     request_id: &str,
+    client_headers: &http::HeaderMap,
 ) -> Result<Response, AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
@@ -1423,6 +1503,10 @@ async fn execute_upstream(
     // back to a static `Bearer {api_key}` if no provider is registered
     // for `target.provider_id` (e.g., test fixtures or built-in
     // OpenAI-compatible endpoints that don't need OAuth).
+    //
+    // First merge forwardable client request headers (denylist policy),
+    // then apply auth so gateway-injected credentials always win.
+    merge_client_headers(client_headers, &mut upstream_headers, &state.header_policy);
     apply_provider_auth(target, &mut upstream_headers).await?;
 
     // Capture the egress request (headers + body) for the request-log
@@ -1530,6 +1614,11 @@ async fn execute_upstream(
             Some("upstream_timeout"),
         );
 
+        let forwarded_resp_headers = forwarded_resp_headers_for_capture(
+            &upstream_resp_headers_capture,
+            &state.header_policy,
+        );
+        let upstream_resp_headers_for_forward = upstream_resp_headers_capture.clone();
         let mut response = drive_upstream_stream(
             state,
             accum,
@@ -1546,8 +1635,15 @@ async fn execute_upstream(
                 egress_body: egress_body_capture,
                 upstream_status: Some(upstream_status_capture),
                 upstream_resp_headers: upstream_resp_headers_capture,
+                client_resp_headers: forwarded_resp_headers,
                 max_bytes: state.raw_envelope_max_bytes as usize,
             }),
+        );
+        // Forward upstream response headers to the client (denylist).
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_for_forward,
+            &state.header_policy,
         );
         // Passthrough Retry-After if present
         if let Some(ra) = retry_after {
@@ -1672,6 +1768,12 @@ async fn execute_upstream(
 
         let client_resp_body_capture = serde_json::to_string(&response_json).ok();
         let mut response = Json(response_json).into_response();
+        // Forward upstream response headers to the client (denylist).
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_capture,
+            &state.header_policy,
+        );
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
                 http::HeaderName::from_static("retry-after"),
@@ -1717,6 +1819,7 @@ async fn execute_messages_upstream(
     raw_passthrough_body: Option<&str>,
     trace: &TraceContext,
     request_id: &str,
+    client_headers: &http::HeaderMap,
 ) -> Result<Response, AppError> {
     let is_pass_through = raw_passthrough_body.is_some();
     // PassThrough: forward raw body bytes verbatim. Non-PassThrough:
@@ -1752,6 +1855,10 @@ async fn execute_messages_upstream(
     // `anthropic-version` header is added by the MessagesCodec's
     // `encode_request` (see protocol/messages.rs), so it survives
     // here.
+    //
+    // Merge forwardable client request headers first, then auth so
+    // gateway-injected credentials always win.
+    merge_client_headers(client_headers, &mut upstream_headers, &state.header_policy);
     apply_provider_auth(target, &mut upstream_headers).await?;
 
     // Capture egress request (headers + body) for the detail view.
@@ -1837,6 +1944,11 @@ async fn execute_messages_upstream(
             Some("upstream_timeout"),
         );
 
+        let forwarded_resp_headers = forwarded_resp_headers_for_capture(
+            &upstream_resp_headers_capture,
+            &state.header_policy,
+        );
+        let upstream_resp_headers_for_forward = upstream_resp_headers_capture.clone();
         let mut response = drive_upstream_stream(
             state,
             accum,
@@ -1853,8 +1965,15 @@ async fn execute_messages_upstream(
                 egress_body: egress_body_capture,
                 upstream_status: Some(upstream_status_capture),
                 upstream_resp_headers: upstream_resp_headers_capture,
+                client_resp_headers: forwarded_resp_headers,
                 max_bytes: state.raw_envelope_max_bytes as usize,
             }),
+        );
+        // Forward upstream response headers to the client (denylist).
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_for_forward,
+            &state.header_policy,
         );
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
@@ -1933,6 +2052,12 @@ async fn execute_messages_upstream(
         let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
         let client_resp_body_capture = upstream_resp_body_capture.clone();
         let mut response = Json(response_body).into_response();
+        // Forward upstream response headers to the client (denylist).
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_capture,
+            &state.header_policy,
+        );
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
                 http::HeaderName::from_static("retry-after"),
@@ -2175,6 +2300,7 @@ async fn handle_embeddings(
     // target's real upstream model id.
     override_model_in_body(&mut upstream_body, &target.model_id);
 
+    merge_client_headers(&headers, &mut upstream_headers, &state.header_policy);
     if let Err(e) = apply_provider_auth(target, &mut upstream_headers).await {
         let http_status = e.http_status().as_u16();
         scope.emit_error("auth_error", Some(http_status));
@@ -2261,6 +2387,14 @@ async fn handle_embeddings(
     // Capture the full successful embeddings exchange for the detail
     // view (client body == upstream body, no re-encoding here).
     let body_str_capture = serde_json::to_string(&response_body).ok();
+    // Build the client response and forward upstream response headers
+    // (denylist) so the recorded client_resp_headers match the wire.
+    let mut response = Json(response_body.clone()).into_response();
+    forward_upstream_resp_headers(
+        &mut response,
+        &upstream_resp_headers_capture,
+        &state.header_policy,
+    );
     spawn_capture(
         &state,
         tiygate_core::ExchangeCapture {
@@ -2270,17 +2404,14 @@ async fn handle_embeddings(
             upstream_status: Some(upstream_status_capture),
             upstream_resp_headers: upstream_resp_headers_capture,
             upstream_resp_body: body_str_capture.clone(),
-            client_resp_headers: vec![(
-                "content-type".to_string(),
-                "application/json".to_string(),
-            )],
+            client_resp_headers: header_map_to_vec(response.headers()),
             client_resp_body: body_str_capture,
             is_stream: false,
         },
     );
 
     // Phase 4 §4.7: store the upstream response for the next call.
-    crate::ingress_phase4::embedding_cache_store(&state, &cache_key, response_body.clone()).await;
+    crate::ingress_phase4::embedding_cache_store(&state, &cache_key, response_body).await;
 
     // Phase 4 §4.2: emit a `RequestEvent` with `cache_hit = miss`
     // so the OltpSink persists the row and the dashboard can
@@ -2316,7 +2447,7 @@ async fn handle_embeddings(
     );
     scope.disarm();
 
-    Ok(Json(response_body).into_response())
+    Ok(response)
 }
 
 /// Handle POST /v1/responses — OpenAI Responses API.
@@ -2444,6 +2575,7 @@ async fn handle_responses(
     // Replace the (possibly virtual) model name with the routing
     // target's real upstream model id.
     override_model_in_body(&mut upstream_body, &target.model_id);
+    merge_client_headers(&headers, &mut upstream_headers, &state.header_policy);
     if let Err(e) = apply_provider_auth(target, &mut upstream_headers).await {
         let http_status = e.http_status().as_u16();
         scope.emit_error("auth_error", Some(http_status));
@@ -2548,9 +2680,19 @@ async fn handle_responses(
                 egress_headers: egress_headers_capture.clone(),
                 egress_body: egress_body_capture.clone(),
                 upstream_status: Some(upstream_status_capture),
-                upstream_resp_headers: upstream_resp_headers_capture,
+                upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                client_resp_headers: forwarded_resp_headers_for_capture(
+                    &upstream_resp_headers_capture,
+                    &state.header_policy,
+                ),
                 max_bytes: state.raw_envelope_max_bytes as usize,
             }),
+        );
+        // Forward upstream response headers to the client (denylist).
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_capture,
+            &state.header_policy,
         );
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
@@ -2645,6 +2787,8 @@ async fn handle_responses(
     }
     let body_str_capture = serde_json::to_string(&response_body).ok();
     let mut resp = Json(response_body).into_response();
+    // Forward upstream response headers to the client (denylist).
+    forward_upstream_resp_headers(&mut resp, &upstream_resp_headers_capture, &state.header_policy);
     if let Some(ra) = retry_after {
         resp.headers_mut().insert(
             http::HeaderName::from_static("retry-after"),
@@ -2797,6 +2941,7 @@ async fn handle_gemini_generate(
     // Replace the (possibly virtual) model name with the routing
     // target's real upstream model id.
     override_model_in_body(&mut upstream_body, &target.model_id);
+    merge_client_headers(&headers, &mut upstream_headers, &state.header_policy);
     if let Err(e) = apply_provider_auth(target, &mut upstream_headers).await {
         let http_status = e.http_status().as_u16();
         scope.emit_error("auth_error", Some(http_status));
@@ -2908,9 +3053,19 @@ async fn handle_gemini_generate(
                 egress_headers: egress_headers_capture.clone(),
                 egress_body: egress_body_capture.clone(),
                 upstream_status: Some(upstream_status_capture),
-                upstream_resp_headers: upstream_resp_headers_capture,
+                upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                client_resp_headers: forwarded_resp_headers_for_capture(
+                    &upstream_resp_headers_capture,
+                    &state.header_policy,
+                ),
                 max_bytes: state.raw_envelope_max_bytes as usize,
             }),
+        );
+        // Forward upstream response headers to the client (denylist).
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_capture,
+            &state.header_policy,
         );
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
@@ -3006,6 +3161,8 @@ async fn handle_gemini_generate(
     }
     let body_str_capture = serde_json::to_string(&response_body).ok();
     let mut resp = Json(response_body).into_response();
+    // Forward upstream response headers to the client (denylist).
+    forward_upstream_resp_headers(&mut resp, &upstream_resp_headers_capture, &state.header_policy);
     if let Some(ra) = retry_after {
         resp.headers_mut().insert(
             http::HeaderName::from_static("retry-after"),
@@ -3210,6 +3367,10 @@ pub struct StreamCapture {
     pub egress_body: Option<String>,
     pub upstream_status: Option<u16>,
     pub upstream_resp_headers: Vec<(String, String)>,
+    /// Headers actually forwarded to the client on the SSE response
+    /// (denylist-filtered upstream headers + content-type), recorded as
+    /// the `client_resp_headers` in the detail view.
+    pub client_resp_headers: Vec<(String, String)>,
     /// Byte cap for the accumulated response body; once exceeded the
     /// buffer stops growing (best-effort; truncation is flagged by the
     /// sink when the body hits the persistence cap).
@@ -3426,10 +3587,7 @@ pub fn drive_upstream_stream(
                     upstream_status: cap.upstream_status,
                     upstream_resp_headers: cap.upstream_resp_headers,
                     upstream_resp_body: body.clone(),
-                    client_resp_headers: vec![(
-                        "content-type".to_string(),
-                        "text/event-stream".to_string(),
-                    )],
+                    client_resp_headers: cap.client_resp_headers,
                     client_resp_body: body,
                     is_stream: true,
                 })

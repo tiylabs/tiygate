@@ -85,6 +85,8 @@ function StatsTable({
               <Th>{t("dashboard.bucket")}</Th>
               <Th className="text-right">{t("dashboard.requests")}</Th>
               <Th className="text-right">{t("dashboard.errors")}</Th>
+              <Th className="text-right">{t("dashboard.promptTokens")}</Th>
+              <Th className="text-right">{t("dashboard.completionTokens")}</Th>
               <Th className="text-right">{t("dashboard.tokens")}</Th>
             </tr>
           </thead>
@@ -108,6 +110,12 @@ function StatsTable({
                   ) : (
                     numberFmt.format(b.error_count)
                   )}
+                </Td>
+                <Td className="text-right tabular-nums">
+                  {numberFmt.format(b.prompt_tokens)}
+                </Td>
+                <Td className="text-right tabular-nums">
+                  {numberFmt.format(b.completion_tokens)}
                 </Td>
                 <Td className="text-right tabular-nums">
                   {numberFmt.format(b.total_tokens)}
@@ -229,7 +237,7 @@ export default function Dashboard() {
         />
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-2">
+      <div className="grid gap-6 2xl:grid-cols-2">
         <StatsTable title={t("dashboard.byModel")} query={byModel} />
         <StatsTable
           title={t("dashboard.byProvider")}

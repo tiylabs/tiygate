@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use sqlx::Row;
 use tracing::warn;
 
+use tiygate_core::ir::Usage;
 use tiygate_core::redaction::Redactor;
 use tiygate_core::{EventSink, ExchangeCapture, PipelineEvent, RequestEvent};
 
@@ -160,6 +161,24 @@ impl EventSink for OltpSink {
                 "oltp payload insert: {e}"
             )));
         }
+
+        // Write real upstream token usage back onto the request_logs
+        // row. The request hot path always emits `tokens: None` (the
+        // streaming path only estimates from chars and never feeds it
+        // back), so this background capture is the single point where
+        // accurate usage — covering every protocol, stream and
+        // non-stream — is recovered and persisted. A missing row
+        // (capture racing ahead of the RequestEvent insert) is a
+        // silent no-op.
+        if let Some(usage) = extract_usage_from_capture(capture) {
+            if let Err(e) = self.update_request_tokens(&capture.request_id, &usage).await {
+                warn!(
+                    error = %e,
+                    request_id = %capture.request_id,
+                    "oltp sink: token write-back failed"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -236,6 +255,34 @@ impl OltpSink {
             sse_parsed_json,
             captured_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    /// Update only the six token columns on an existing `request_logs`
+    /// row, keyed by `request_id`. Runs on the telemetry background
+    /// task after a capture is persisted. When the row does not exist
+    /// yet (capture arrived before the `RequestEvent` insert) the
+    /// UPDATE affects zero rows and returns `Ok` — a benign no-op.
+    async fn update_request_tokens(
+        &self,
+        request_id: &str,
+        usage: &Usage,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE request_logs SET \
+                prompt_tokens = ?1, completion_tokens = ?2, reasoning_tokens = ?3, \
+                cache_read_tokens = ?4, cache_write_tokens = ?5, total_tokens = ?6 \
+             WHERE request_id = ?7",
+        )
+        .bind(usage.prompt_tokens as i64)
+        .bind(usage.completion_tokens as i64)
+        .bind(usage.reasoning_tokens.map(|n| n as i64))
+        .bind(usage.cache_read_tokens.map(|n| n as i64))
+        .bind(usage.cache_write_tokens.map(|n| n as i64))
+        .bind(usage.total_tokens as i64)
+        .bind(request_id)
+        .execute(self.pool.sqlite())
+        .await?;
+        Ok(())
     }
 
     /// Redact a JSON body string (best-effort) and apply byte-cap
@@ -402,6 +449,258 @@ pub fn parse_sse_to_json(raw: &str) -> Option<String> {
     serde_json::to_string_pretty(&merged).ok()
 }
 
+/// Returns true when a usage struct carries no meaningful token data
+/// (all fields zero/None). We never write such results back so that a
+/// missing/garbage upstream body doesn't clobber a previously-written
+/// row with zeros.
+fn usage_is_empty(u: &Usage) -> bool {
+    u.prompt_tokens == 0
+        && u.completion_tokens == 0
+        && u.total_tokens == 0
+        && u.reasoning_tokens.unwrap_or(0) == 0
+        && u.cache_read_tokens.unwrap_or(0) == 0
+        && u.cache_write_tokens.unwrap_or(0) == 0
+}
+
+/// Extract a structured [`Usage`] from a non-streaming upstream JSON
+/// response body. Mirrors the protocol-specific field mappings in the
+/// `protocols` crate (chat_completions / responses / messages /
+/// gemini) without taking a dependency on it — we sniff the protocol
+/// from the response shape. Returns `None` when no usage block is
+/// found.
+fn extract_usage_from_json(body: &serde_json::Value) -> Option<Usage> {
+    // Gemini uses `usageMetadata`, all others use `usage`.
+    if let Some(u) = body.get("usageMetadata") {
+        return Some(Usage {
+            prompt_tokens: u["promptTokenCount"].as_u64().unwrap_or(0),
+            completion_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0),
+            total_tokens: u["totalTokenCount"].as_u64().unwrap_or(0),
+            reasoning_tokens: u["thoughtsTokenCount"].as_u64(),
+            cache_read_tokens: u["cachedContentTokenCount"].as_u64(),
+            cache_write_tokens: None,
+        });
+    }
+
+    let u = body.get("usage")?;
+    if u.is_null() {
+        return None;
+    }
+
+    // OpenAI Responses API: input_tokens / output_tokens.
+    if u.get("input_tokens").is_some() || u.get("output_tokens").is_some() {
+        // Anthropic Messages also uses input_tokens/output_tokens but
+        // additionally carries cache_creation/cache_read_input_tokens
+        // and has no total_tokens — disambiguate on those fields.
+        let is_anthropic = u.get("cache_creation_input_tokens").is_some()
+            || u.get("cache_read_input_tokens").is_some()
+            || u.get("total_tokens").is_none();
+        if is_anthropic {
+            let input = u["input_tokens"].as_u64().unwrap_or(0);
+            let output = u["output_tokens"].as_u64().unwrap_or(0);
+            let cache_creation = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            // Anthropic has no total_tokens; derive it identically to
+            // protocols/messages.rs: input + cache_creation + cache_read + output.
+            let total = u["total_tokens"]
+                .as_u64()
+                .unwrap_or(input + cache_creation + cache_read + output);
+            return Some(Usage {
+                prompt_tokens: input,
+                completion_tokens: output,
+                total_tokens: total,
+                reasoning_tokens: u["output_tokens_details"]["thinking_tokens"].as_u64(),
+                cache_read_tokens: u
+                    .get("cache_read_input_tokens")
+                    .is_some()
+                    .then_some(cache_read),
+                cache_write_tokens: u
+                    .get("cache_creation_input_tokens")
+                    .is_some()
+                    .then_some(cache_creation),
+            });
+        }
+        // OpenAI Responses API.
+        return Some(Usage {
+            prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0),
+            completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+            total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+            reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
+            cache_read_tokens: u["input_tokens_details"]["cached_tokens"].as_u64(),
+            cache_write_tokens: None,
+        });
+    }
+
+    // OpenAI chat.completions / embeddings: prompt_tokens / completion_tokens.
+    Some(Usage {
+        prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+        completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+        total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+        reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"].as_u64(),
+        cache_read_tokens: u["prompt_tokens_details"]["cached_tokens"].as_u64(),
+        cache_write_tokens: None,
+    })
+}
+
+/// Extract a structured [`Usage`] from a raw SSE stream body. Walks
+/// every `data:` JSON frame and accumulates per-protocol usage:
+///   * OpenAI chat.completion.chunk — last frame's `usage`.
+///   * OpenAI Responses — `response.completed` frame's `response.usage`.
+///   * Anthropic — `message_start.message.usage` (input/cache) merged
+///     with `message_delta.usage` (output).
+///   * Gemini — last frame's `usageMetadata`.
+fn extract_usage_from_sse(raw: &str) -> Option<Usage> {
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = rest.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+            frames.push(v);
+        }
+    }
+    if frames.is_empty() {
+        return None;
+    }
+
+    // Anthropic accumulates across two frame types; track separately.
+    let mut anthropic_input: Option<u64> = None;
+    let mut anthropic_output: u64 = 0;
+    let mut anthropic_cache_read: Option<u64> = None;
+    let mut anthropic_cache_creation: Option<u64> = None;
+    let mut anthropic_reasoning: Option<u64> = None;
+    let mut saw_anthropic = false;
+
+    // Last-seen usage for OpenAI chat / Responses / Gemini.
+    let mut last_json_usage: Option<Usage> = None;
+
+    for ev in &frames {
+        // Gemini frames carry usageMetadata.
+        if ev.get("usageMetadata").is_some() {
+            if let Some(u) = extract_usage_from_json(ev) {
+                last_json_usage = Some(u);
+            }
+            continue;
+        }
+        // OpenAI chat.completion.chunk usage (sent on the final frame
+        // when stream_options.include_usage is set).
+        if ev.get("object").and_then(|o| o.as_str()) == Some("chat.completion.chunk") {
+            if let Some(u) = ev.get("usage") {
+                if !u.is_null() {
+                    last_json_usage = Some(Usage {
+                        prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+                        completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                        total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+                        reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"]
+                            .as_u64(),
+                        cache_read_tokens: u["prompt_tokens_details"]["cached_tokens"].as_u64(),
+                        cache_write_tokens: None,
+                    });
+                }
+            }
+            continue;
+        }
+        // Frames discriminated by `type`: Anthropic + Responses.
+        match ev.get("type").and_then(|t| t.as_str()) {
+            Some("response.completed") => {
+                if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
+                    if !u.is_null() {
+                        last_json_usage = Some(Usage {
+                            prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0),
+                            completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+                            total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+                            reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"]
+                                .as_u64(),
+                            cache_read_tokens: u["input_tokens_details"]["cached_tokens"].as_u64(),
+                            cache_write_tokens: None,
+                        });
+                    }
+                }
+            }
+            Some("message_start") => {
+                if let Some(u) = ev["message"]["usage"].as_object() {
+                    saw_anthropic = true;
+                    anthropic_input =
+                        Some(u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0));
+                    if let Some(o) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+                        anthropic_output = o;
+                    }
+                    if let Some(cc) = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()) {
+                        anthropic_cache_creation = Some(cc);
+                    }
+                    if let Some(cr) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+                        anthropic_cache_read = Some(cr);
+                    }
+                    if let Some(rt) = u
+                        .get("output_tokens_details")
+                        .and_then(|d| d.get("thinking_tokens"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        anthropic_reasoning = Some(rt);
+                    }
+                }
+            }
+            Some("message_delta") => {
+                if let Some(u) = ev["usage"].as_object() {
+                    saw_anthropic = true;
+                    if let Some(o) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+                        anthropic_output = o;
+                    }
+                    if let Some(rt) = u
+                        .get("output_tokens_details")
+                        .and_then(|d| d.get("thinking_tokens"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        anthropic_reasoning = Some(rt);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if saw_anthropic {
+        let input = anthropic_input.unwrap_or(0);
+        let cache_creation = anthropic_cache_creation.unwrap_or(0);
+        let cache_read = anthropic_cache_read.unwrap_or(0);
+        let total = input + cache_creation + cache_read + anthropic_output;
+        return Some(Usage {
+            prompt_tokens: input,
+            completion_tokens: anthropic_output,
+            total_tokens: total,
+            reasoning_tokens: anthropic_reasoning,
+            cache_read_tokens: anthropic_cache_read,
+            cache_write_tokens: anthropic_cache_creation,
+        });
+    }
+
+    last_json_usage
+}
+
+/// Extract real upstream usage from an `ExchangeCapture`. For
+/// streaming exchanges the upstream body is raw SSE; for non-stream
+/// it is the full JSON response. Returns `None` when no meaningful
+/// usage can be recovered (so callers can skip the write-back).
+fn extract_usage_from_capture(capture: &ExchangeCapture) -> Option<Usage> {
+    let body = capture.upstream_resp_body.as_deref()?;
+    let usage = if capture.is_stream {
+        extract_usage_from_sse(body)
+    } else {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| extract_usage_from_json(&v))
+    }?;
+    if usage_is_empty(&usage) {
+        None
+    } else {
+        Some(usage)
+    }
+}
+
 #[derive(Debug, Default)]
 struct RequestEventRow {
     request_id: String,
@@ -496,6 +795,9 @@ pub struct StatsBucket {
     pub error_count: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub total_tokens: u64,
 }
 
@@ -512,6 +814,9 @@ pub async fn aggregate_by_model(
                 SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS e, \
                 COALESCE(SUM(prompt_tokens), 0) AS pt, \
                 COALESCE(SUM(completion_tokens), 0) AS ct, \
+                COALESCE(SUM(reasoning_tokens), 0) AS rt, \
+                COALESCE(SUM(cache_read_tokens), 0) AS crt, \
+                COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
                 COALESCE(SUM(total_tokens), 0) AS tt \
          FROM request_logs \
          WHERE ts >= ?1 AND ts < ?2 \
@@ -530,6 +835,9 @@ pub async fn aggregate_by_model(
             error_count: r.get::<i64, _>("e") as u64,
             prompt_tokens: r.get::<i64, _>("pt") as u64,
             completion_tokens: r.get::<i64, _>("ct") as u64,
+            reasoning_tokens: r.get::<i64, _>("rt") as u64,
+            cache_read_tokens: r.get::<i64, _>("crt") as u64,
+            cache_write_tokens: r.get::<i64, _>("cwt") as u64,
             total_tokens: r.get::<i64, _>("tt") as u64,
         });
     }
@@ -547,6 +855,9 @@ pub async fn aggregate_by_provider(
                 SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS e, \
                 COALESCE(SUM(prompt_tokens), 0) AS pt, \
                 COALESCE(SUM(completion_tokens), 0) AS ct, \
+                COALESCE(SUM(reasoning_tokens), 0) AS rt, \
+                COALESCE(SUM(cache_read_tokens), 0) AS crt, \
+                COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
                 COALESCE(SUM(total_tokens), 0) AS tt \
          FROM request_logs \
          WHERE ts >= ?1 AND ts < ?2 \
@@ -565,6 +876,9 @@ pub async fn aggregate_by_provider(
             error_count: r.get::<i64, _>("e") as u64,
             prompt_tokens: r.get::<i64, _>("pt") as u64,
             completion_tokens: r.get::<i64, _>("ct") as u64,
+            reasoning_tokens: r.get::<i64, _>("rt") as u64,
+            cache_read_tokens: r.get::<i64, _>("crt") as u64,
+            cache_write_tokens: r.get::<i64, _>("cwt") as u64,
             total_tokens: r.get::<i64, _>("tt") as u64,
         });
     }
@@ -582,6 +896,9 @@ pub async fn aggregate_by_api_key(
                 SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS e, \
                 COALESCE(SUM(prompt_tokens), 0) AS pt, \
                 COALESCE(SUM(completion_tokens), 0) AS ct, \
+                COALESCE(SUM(reasoning_tokens), 0) AS rt, \
+                COALESCE(SUM(cache_read_tokens), 0) AS crt, \
+                COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
                 COALESCE(SUM(total_tokens), 0) AS tt \
          FROM request_logs \
          WHERE ts >= ?1 AND ts < ?2 \
@@ -600,6 +917,9 @@ pub async fn aggregate_by_api_key(
             error_count: r.get::<i64, _>("e") as u64,
             prompt_tokens: r.get::<i64, _>("pt") as u64,
             completion_tokens: r.get::<i64, _>("ct") as u64,
+            reasoning_tokens: r.get::<i64, _>("rt") as u64,
+            cache_read_tokens: r.get::<i64, _>("crt") as u64,
+            cache_write_tokens: r.get::<i64, _>("cwt") as u64,
             total_tokens: r.get::<i64, _>("tt") as u64,
         });
     }
@@ -1203,5 +1523,254 @@ mod tests {
         assert!(parse_sse_to_json("not an sse stream").is_none());
         assert!(parse_sse_to_json("").is_none());
         assert!(parse_sse_to_json("data: [DONE]\n").is_none());
+    }
+
+    #[test]
+    fn extract_usage_json_openai_chat() {
+        let body = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 22,
+                "total_tokens": 33,
+                "prompt_tokens_details": {"cached_tokens": 4},
+                "completion_tokens_details": {"reasoning_tokens": 7}
+            }
+        });
+        let u = extract_usage_from_json(&body).expect("usage");
+        assert_eq!(u.prompt_tokens, 11);
+        assert_eq!(u.completion_tokens, 22);
+        assert_eq!(u.total_tokens, 33);
+        assert_eq!(u.cache_read_tokens, Some(4));
+        assert_eq!(u.reasoning_tokens, Some(7));
+        assert_eq!(u.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn extract_usage_json_responses() {
+        let body = serde_json::json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150,
+                "input_tokens_details": {"cached_tokens": 20},
+                "output_tokens_details": {"reasoning_tokens": 30}
+            }
+        });
+        let u = extract_usage_from_json(&body).expect("usage");
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 150);
+        assert_eq!(u.cache_read_tokens, Some(20));
+        assert_eq!(u.reasoning_tokens, Some(30));
+    }
+
+    #[test]
+    fn extract_usage_json_anthropic_derives_total() {
+        let body = serde_json::json!({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 3,
+                "cache_read_input_tokens": 2
+            }
+        });
+        let u = extract_usage_from_json(&body).expect("usage");
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 5);
+        // total = input + cache_creation + cache_read + output = 10+3+2+5
+        assert_eq!(u.total_tokens, 20);
+        assert_eq!(u.cache_read_tokens, Some(2));
+        assert_eq!(u.cache_write_tokens, Some(3));
+    }
+
+    #[test]
+    fn extract_usage_json_gemini() {
+        let body = serde_json::json!({
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "candidatesTokenCount": 12,
+                "totalTokenCount": 20,
+                "thoughtsTokenCount": 4,
+                "cachedContentTokenCount": 2
+            }
+        });
+        let u = extract_usage_from_json(&body).expect("usage");
+        assert_eq!(u.prompt_tokens, 8);
+        assert_eq!(u.completion_tokens, 12);
+        assert_eq!(u.total_tokens, 20);
+        assert_eq!(u.reasoning_tokens, Some(4));
+        assert_eq!(u.cache_read_tokens, Some(2));
+    }
+
+    #[test]
+    fn extract_usage_sse_openai_chat() {
+        let raw = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\
+                   data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\
+                   data: [DONE]\n";
+        let u = extract_usage_from_sse(raw).expect("usage");
+        assert_eq!(u.prompt_tokens, 5);
+        assert_eq!(u.completion_tokens, 3);
+        assert_eq!(u.total_tokens, 8);
+    }
+
+    #[test]
+    fn extract_usage_sse_anthropic_merges_frames() {
+        let raw = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}\n\
+                   data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"x\"}}\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n";
+        let u = extract_usage_from_sse(raw).expect("usage");
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 7);
+        assert_eq!(u.cache_read_tokens, Some(2));
+        assert_eq!(u.cache_write_tokens, Some(1));
+        // total = 10 + 1 + 2 + 7
+        assert_eq!(u.total_tokens, 20);
+    }
+
+    #[test]
+    fn extract_usage_sse_responses() {
+        let raw = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":40,\"output_tokens\":10,\"total_tokens\":50}}}\n";
+        let u = extract_usage_from_sse(raw).expect("usage");
+        assert_eq!(u.prompt_tokens, 40);
+        assert_eq!(u.completion_tokens, 10);
+        assert_eq!(u.total_tokens, 50);
+    }
+
+    #[test]
+    fn extract_usage_sse_gemini() {
+        let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"a\"}]}}]}\n\
+                   data: {\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2,\"totalTokenCount\":5}}\n";
+        let u = extract_usage_from_sse(raw).expect("usage");
+        assert_eq!(u.prompt_tokens, 3);
+        assert_eq!(u.completion_tokens, 2);
+        assert_eq!(u.total_tokens, 5);
+    }
+
+    /// A request event that carries NO token data, mirroring the
+    /// production hot path (RequestEvent.tokens is always None).
+    fn dummy_request_event_no_tokens() -> RequestEvent {
+        let mut ev = dummy_request_event();
+        ev.tokens = None;
+        ev
+    }
+
+    #[tokio::test]
+    async fn write_capture_backfills_tokens_non_stream() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(pool.sqlite()).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        // Hot path writes the row with no token data.
+        sink.write_request_event(&dummy_request_event_no_tokens())
+            .await
+            .expect("write event");
+
+        let capture = ExchangeCapture {
+            request_id: "req-1".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: Some(
+                "{\"id\":\"chatcmpl-1\",\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":25,\"total_tokens\":40,\"prompt_tokens_details\":{\"cached_tokens\":5}}}"
+                    .to_string(),
+            ),
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: false,
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        let row =
+            sqlx::query("SELECT prompt_tokens, completion_tokens, total_tokens, cache_read_tokens FROM request_logs WHERE request_id = ?1")
+                .bind("req-1")
+                .fetch_one(pool.sqlite())
+                .await
+                .expect("query");
+        assert_eq!(row.get::<Option<i64>, _>("prompt_tokens"), Some(15));
+        assert_eq!(row.get::<Option<i64>, _>("completion_tokens"), Some(25));
+        assert_eq!(row.get::<Option<i64>, _>("total_tokens"), Some(40));
+        assert_eq!(row.get::<Option<i64>, _>("cache_read_tokens"), Some(5));
+
+        // Aggregates should now report the backfilled tokens.
+        let now = Utc::now().to_rfc3339();
+        let earlier = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let by_model = aggregate_by_model(&pool, &earlier, &now)
+            .await
+            .expect("agg");
+        assert_eq!(by_model[0].prompt_tokens, 15);
+        assert_eq!(by_model[0].completion_tokens, 25);
+        assert_eq!(by_model[0].total_tokens, 40);
+        assert_eq!(by_model[0].cache_read_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn write_capture_backfills_tokens_streaming() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(pool.sqlite()).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        sink.write_request_event(&dummy_request_event_no_tokens())
+            .await
+            .expect("write event");
+
+        let sse = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\
+                   data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":6,\"total_tokens\":15}}\n\
+                   data: [DONE]\n";
+        let capture = ExchangeCapture {
+            request_id: "req-1".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: Some(sse.to_string()),
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: true,
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        let row =
+            sqlx::query("SELECT prompt_tokens, completion_tokens, total_tokens FROM request_logs WHERE request_id = ?1")
+                .bind("req-1")
+                .fetch_one(pool.sqlite())
+                .await
+                .expect("query");
+        assert_eq!(row.get::<Option<i64>, _>("prompt_tokens"), Some(9));
+        assert_eq!(row.get::<Option<i64>, _>("completion_tokens"), Some(6));
+        assert_eq!(row.get::<Option<i64>, _>("total_tokens"), Some(15));
+    }
+
+    #[tokio::test]
+    async fn write_capture_missing_row_is_noop() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(pool.sqlite()).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        // No request_logs row exists yet (capture racing ahead).
+        let capture = ExchangeCapture {
+            request_id: "ghost".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: Some(
+                "{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}"
+                    .to_string(),
+            ),
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: false,
+        };
+        // Should succeed (UPDATE affects zero rows; payload row still inserts).
+        sink.write_capture(&capture).await.expect("write capture");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE request_id = ?1")
+                .bind("ghost")
+                .fetch_one(pool.sqlite())
+                .await
+                .expect("count");
+        assert_eq!(count, 0);
     }
 }

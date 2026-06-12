@@ -312,6 +312,38 @@ export default function RequestLogs() {
             />
           </div>
 
+          <div>
+            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-text-subtle">
+              {t("requests.sectionTokens")}
+            </p>
+            <div className="grid grid-cols-3 gap-3">
+              <Detail
+                label={t("requests.tokenPrompt")}
+                value={fmtToken(detail?.prompt_tokens)}
+              />
+              <Detail
+                label={t("requests.tokenCompletion")}
+                value={fmtToken(detail?.completion_tokens)}
+              />
+              <Detail
+                label={t("requests.tokenReasoning")}
+                value={fmtToken(detail?.reasoning_tokens)}
+              />
+              <Detail
+                label={t("requests.tokenCacheRead")}
+                value={fmtToken(detail?.cache_read_tokens)}
+              />
+              <Detail
+                label={t("requests.tokenCacheWrite")}
+                value={fmtToken(detail?.cache_write_tokens)}
+              />
+              <Detail
+                label={t("requests.tokenTotal")}
+                value={fmtToken(detail?.total_tokens)}
+              />
+            </div>
+          </div>
+
           {replayQuery.isLoading ? (
             <Spinner />
           ) : replayQuery.error ? (
@@ -430,6 +462,10 @@ export default function RequestLogs() {
       </Drawer>
     </div>
   );
+}
+
+function fmtToken(value?: number | null): string {
+  return value === null || value === undefined ? "—" : value.toLocaleString();
 }
 
 function Detail({ label, value }: { label: string; value?: string | null }) {

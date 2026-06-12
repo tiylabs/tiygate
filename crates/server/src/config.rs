@@ -80,6 +80,14 @@ pub struct ServerConfig {
     /// Whether to capture inline media (base64) inside raw envelopes
     /// (default `false` — store metadata only, per §4.1).
     pub raw_envelope_capture_media: bool,
+    /// Extra header names appended to the request-direction (client →
+    /// provider) forwarding denylist, on top of the hardcoded
+    /// defaults. Lowercase, set via `TIYGATE_FORWARD_REQUEST_HEADER_DENY`.
+    pub forward_request_header_deny_extra: Vec<String>,
+    /// Extra header names appended to the response-direction (provider
+    /// → client) forwarding denylist, on top of the hardcoded
+    /// defaults. Lowercase, set via `TIYGATE_FORWARD_RESPONSE_HEADER_DENY`.
+    pub forward_response_header_deny_extra: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -103,6 +111,8 @@ impl Default for ServerConfig {
             database_url: None,
             raw_envelope_max_bytes: 256 * 1024, // 256 KiB
             raw_envelope_capture_media: false,
+            forward_request_header_deny_extra: Vec::new(),
+            forward_response_header_deny_extra: Vec::new(),
         }
     }
 }
@@ -165,7 +175,22 @@ impl ServerConfig {
             cfg.raw_envelope_capture_media =
                 matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
         }
+        if let Ok(v) = std::env::var("TIYGATE_FORWARD_REQUEST_HEADER_DENY") {
+            cfg.forward_request_header_deny_extra = parse_header_list(&v);
+        }
+        if let Ok(v) = std::env::var("TIYGATE_FORWARD_RESPONSE_HEADER_DENY") {
+            cfg.forward_response_header_deny_extra = parse_header_list(&v);
+        }
 
         cfg
     }
+}
+
+/// Parse a comma-separated header-name list into a normalized
+/// (trimmed, lowercased, non-empty) `Vec<String>`.
+fn parse_header_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
 }

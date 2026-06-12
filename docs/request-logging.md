@@ -73,3 +73,56 @@ g→p/p→g/g→c 三段在落库前由 `OltpSink::capture_to_row()`
 所有 5 个协议执行函数（chat completions、anthropic messages、embeddings、
 responses、gemini）的 stream 与 non-stream 分支共 9 个发送点，统一通过
 `finalize_egress()` + `client.execute()` 捕获 egress header，保证规范一致。
+
+## Header 透传策略（双向 denylist）
+
+网关默认**转发** header，只挡黑名单（denylist 模式），策略实现于
+`crates/core/src/header_forward.rs` 的 `HeaderForwardPolicy`，与脱敏
+`Redactor` 解耦：转发策略决定 header 是否真正上/下线，脱敏决定 header
+值在日志里是否被掩码。
+
+### 请求方向（C→G→P）
+
+`merge_client_headers()`（`crates/server/src/ingress.rs`）在
+`upstream_headers` 初始化之后、`apply_provider_auth()` 之前，把客户端请求
+header 按 `should_forward_request` 合并进上游请求；已被 codec 设置的 header
+不被覆盖，auth 注入始终最后胜出。默认**不转发**的请求 header：
+
+- 凭证类（客户端对网关的凭证，绝不能泄露给 Provider，且网关注入自己的）：
+  `authorization`、`proxy-authorization`、`x-api-key`、`anthropic-version`、
+  `cookie`
+- 网关重算/自控类：`host`、`content-length`、`content-type`、
+  `content-encoding`、`accept-encoding`、`expect`
+- 逐跳 header（RFC 7230 §6.1）：`connection`、`keep-alive`、
+  `proxy-connection`、`te`、`trailer`、`transfer-encoding`、`upgrade`
+- trace（网关重新注入）：`traceparent`、`tracestate`
+
+其余 header（如 `x-debug-id`、`x-correlation-id`）默认转发给 Provider，并如实
+出现在 g→p 段记录中。
+
+### 响应方向（P→G→C）
+
+`forward_upstream_resp_headers()` 把供应商响应 header 按
+`should_forward_response` 转发到客户端响应（stream 与 non-stream 均覆盖）。
+默认**不转发**的响应 header：
+
+- 逐跳 header：`connection`、`keep-alive`、`proxy-connection`、`te`、
+  `trailer`、`transfer-encoding`、`upgrade`
+- 长度/编码（网关重新序列化或 reqwest 解压后失配）：`content-length`、
+  `content-encoding`
+- 框架自设：`content-type`（由 `Json`/`Sse` 决定）、`date`
+
+`retry-after` 与 `x-ratelimit-*` 不在黑名单，正常转发给客户端。其余供应商
+header（如 `x-request-id`、`x-llm-served-by`）默认转发，并如实出现在 g→c 段
+记录中。
+
+### 可配置追加
+
+在硬编码默认黑名单之上，可通过环境变量追加额外要拦截的 header（逗号分隔，
+大小写不敏感）：
+
+- `TIYGATE_FORWARD_REQUEST_HEADER_DENY` —— 追加请求方向黑名单
+- `TIYGATE_FORWARD_RESPONSE_HEADER_DENY` —— 追加响应方向黑名单
+
+例如 `TIYGATE_FORWARD_REQUEST_HEADER_DENY=x-stainless-lang,x-internal` 会在
+默认基础上额外屏蔽这两个客户端 header。
