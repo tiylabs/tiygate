@@ -1,7 +1,7 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useState, type MouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2, X } from "lucide-react";
+import { Check, Copy, Pencil, Plus, Trash2, X } from "lucide-react";
 import { providersApi, routesApi } from "@/api/resources";
 import type { Route, RouteInput, RouteTarget } from "@/api/types";
 import {
@@ -22,6 +22,7 @@ import {
   TableSkeleton,
   Td,
   Th,
+  Tooltip,
   Tr,
   useToast,
 } from "@/components/ui";
@@ -97,6 +98,28 @@ export default function RoutesPage() {
       setPendingDelete(null);
       toast.error(t("routes.deleteFailed"), e.message);
     },
+  });
+
+  const copyMutation = useMutation({
+    mutationFn: (r: Route) => {
+      const suffix = Math.random().toString(36).slice(2, 7);
+      const body: RouteInput = {
+        virtual_model: `${r.virtual_model}-${suffix}`,
+        targets: r.targets.map((tg) => ({
+          provider_id: tg.provider_id,
+          model_id: tg.model_id,
+          weight: tg.weight ?? undefined,
+          priority: tg.priority ?? undefined,
+        })),
+        enabled: false,
+      };
+      return routesApi.create(body);
+    },
+    onSuccess: () => {
+      toast.success(t("routes.copied"));
+      void invalidate();
+    },
+    onError: (e: Error) => toast.error(t("routes.copyFailed"), e.message),
   });
 
   function openCreate() {
@@ -222,11 +245,16 @@ export default function RoutesPage() {
                 {(data ?? []).map((r) => (
                   <Tr key={r.id}>
                     <Td className="align-middle">
-                      <div
-                        className="truncate font-medium text-text"
-                        title={r.virtual_model}
-                      >
-                        {r.virtual_model}
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className="truncate font-medium text-text"
+                          title={r.virtual_model}
+                        >
+                          {r.virtual_model}
+                        </span>
+                        <Tooltip content={t("routes.copyVirtualModel")} side="top">
+                          <CopyValueButton value={r.virtual_model} />
+                        </Tooltip>
                       </div>
                       <div
                         className="break-all font-mono text-xs text-text-subtle"
@@ -276,6 +304,12 @@ export default function RoutesPage() {
                               label: t("common.edit"),
                               icon: <Pencil size={14} />,
                               onSelect: () => openEdit(r),
+                            },
+                            {
+                              key: "copy",
+                              label: t("common.copy"),
+                              icon: <Copy size={14} />,
+                              onSelect: () => copyMutation.mutate(r),
                             },
                             {
                               key: "delete",
@@ -351,7 +385,7 @@ export default function RoutesPage() {
             {form.targets.map((tg, idx) => (
               <div
                 key={idx}
-                className="grid grid-cols-1 gap-2 rounded-md border border-border p-3 sm:grid-cols-[1fr_1fr_70px_70px_auto] sm:items-end"
+                className="grid grid-cols-1 gap-2 rounded-md border border-border p-3 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_56px_56px_auto] sm:items-end"
               >
                 <div className="space-y-1">
                   <Label>{t("routes.provider")}</Label>
@@ -441,5 +475,33 @@ export default function RoutesPage() {
         }
       />
     </div>
+  );
+}
+
+function CopyValueButton({ value }: { value: string }) {
+  const { t } = useTranslation();
+  const toast = useToast();
+  const [done, setDone] = useState(false);
+  async function handle(e: MouseEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success(t("routes.virtualModelCopied"));
+    } catch {
+      toast.error(t("routes.virtualModelCopyFailed"));
+    }
+    setDone(true);
+    window.setTimeout(() => setDone(false), 1200);
+  }
+  return (
+    <button
+      type="button"
+      onClick={handle}
+      aria-label={t("routes.copyVirtualModel")}
+      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+    >
+      {done ? <Check size={12} /> : <Copy size={12} />}
+    </button>
   );
 }

@@ -37,6 +37,27 @@ impl ProtocolSuite {
             Self::GoogleGemini => "google-gemini",
         }
     }
+
+    /// The canonical `(name, version)` pair for this suite's primary endpoint.
+    ///
+    /// Used when building a default [`ProtocolEndpoint`] for a suite without
+    /// hard-coding the OpenAI Chat Completions identity everywhere. Keeping
+    /// this aligned with the registered codecs avoids producing mismatched
+    /// identities such as `anthropic-messages/chat-completions/v1`.
+    pub fn default_endpoint_id(self) -> (&'static str, &'static str) {
+        match self {
+            Self::OpenAiCompatible => ("chat-completions", "v1"),
+            Self::OpenAiResponses => ("responses", "v1"),
+            Self::AnthropicMessages => ("messages", "2023-06-01"),
+            Self::GoogleGemini => ("generateContent", "v1beta"),
+        }
+    }
+
+    /// Build the canonical default [`ProtocolEndpoint`] for this suite.
+    pub fn default_endpoint(self) -> ProtocolEndpoint {
+        let (name, version) = self.default_endpoint_id();
+        ProtocolEndpoint::new(self, name, version)
+    }
 }
 
 /// Three-segment protocol identity: `{suite}/{name}/{version}`.

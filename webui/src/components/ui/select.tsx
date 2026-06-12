@@ -50,14 +50,18 @@ export function Select({
         aria-label={ariaLabel}
         title={triggerTitle}
         className={cn(
-          "inline-flex w-full items-center justify-between gap-2 rounded-sm border border-border-strong bg-surface px-3 py-1.5 text-sm text-text transition-colors duration-[var(--duration-fast)]",
+          "inline-flex w-full items-center justify-between gap-2 overflow-hidden rounded-sm border border-border-strong bg-surface px-3 py-1.5 text-sm text-text transition-colors duration-[var(--duration-fast)]",
           "focus-visible:outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-ring",
           "disabled:cursor-not-allowed disabled:opacity-50 data-[placeholder]:text-text-subtle",
+          // Radix Select.Value strips its own className to preserve
+          // positioning, so style the inner text node via a child selector
+          // to enable single-line truncation with ellipsis.
+          "[&>span]:min-w-0 [&>span]:flex-1 [&>span]:truncate [&>span]:text-left",
           className,
         )}
       >
         <RSelect.Value placeholder={placeholder} />
-        <RSelect.Icon>
+        <RSelect.Icon className="shrink-0">
           <ChevronDown size={16} className="text-text-subtle" />
         </RSelect.Icon>
       </RSelect.Trigger>

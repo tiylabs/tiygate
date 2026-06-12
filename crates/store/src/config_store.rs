@@ -238,11 +238,7 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
                 model_id: t.model_id.clone(),
                 api_base,
                 api_key,
-                api_protocol: ProtocolEndpoint::new(
-                    vendor_to_suite(&provider.vendor),
-                    "chat-completions",
-                    "v1",
-                ),
+                api_protocol: vendor_to_suite(&provider.vendor).default_endpoint(),
                 account_label: t.account_label.clone(),
                 api_key_override: t.api_key_override.clone(),
                 api_base_override: t.api_base_override.clone(),
