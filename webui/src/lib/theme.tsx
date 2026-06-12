@@ -8,9 +8,43 @@ import {
   type PropsWithChildren,
 } from "react";
 
-export type Theme = "light" | "dark";
+export type ThemeMode = "light" | "dark";
+
+export type Theme =
+  | "light"
+  | "light-warm"
+  | "light-slate"
+  | "dark"
+  | "dark-dim"
+  | "dark-oled";
+
+export interface ThemeMeta {
+  id: Theme;
+  mode: ThemeMode;
+  labelKey: string;
+}
+
+export const THEMES: ThemeMeta[] = [
+  { id: "light", mode: "light", labelKey: "app.themeLightDefault" },
+  { id: "light-warm", mode: "light", labelKey: "app.themeLightWarm" },
+  { id: "light-slate", mode: "light", labelKey: "app.themeLightSlate" },
+  { id: "dark", mode: "dark", labelKey: "app.themeDarkDefault" },
+  { id: "dark-dim", mode: "dark", labelKey: "app.themeDarkDim" },
+  { id: "dark-oled", mode: "dark", labelKey: "app.themeDarkOled" },
+];
+
+const DEFAULT_LIGHT: Theme = "light";
+const DEFAULT_DARK: Theme = "dark";
 
 const STORAGE_KEY = "tiygate.theme";
+
+function isValidTheme(value: string | null): value is Theme {
+  return THEMES.some((t) => t.id === value);
+}
+
+function modeOf(theme: Theme): ThemeMode {
+  return THEMES.find((t) => t.id === theme)?.mode ?? "light";
+}
 
 interface ThemeState {
   theme: Theme;
@@ -22,11 +56,11 @@ const ThemeContext = createContext<ThemeState | null>(null);
 
 function readInitialTheme(): Theme {
   const saved = window.localStorage.getItem(STORAGE_KEY);
-  if (saved === "light" || saved === "dark") return saved;
+  if (isValidTheme(saved)) return saved;
   const prefersDark = window.matchMedia(
     "(prefers-color-scheme: dark)",
   ).matches;
-  return prefersDark ? "dark" : "light";
+  return prefersDark ? DEFAULT_DARK : DEFAULT_LIGHT;
 }
 
 function applyTheme(theme: Theme): void {
@@ -41,13 +75,14 @@ export function ThemeProvider({ children }: PropsWithChildren) {
   }, [theme]);
 
   const setTheme = useCallback((next: Theme) => {
+    if (!isValidTheme(next)) return;
     window.localStorage.setItem(STORAGE_KEY, next);
     setThemeState(next);
   }, []);
 
   const toggleTheme = useCallback(() => {
     setThemeState((prev) => {
-      const next = prev === "dark" ? "light" : "dark";
+      const next = modeOf(prev) === "dark" ? DEFAULT_LIGHT : DEFAULT_DARK;
       window.localStorage.setItem(STORAGE_KEY, next);
       return next;
     });

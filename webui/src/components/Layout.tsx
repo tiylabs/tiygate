@@ -13,13 +13,11 @@ import {
   LogOut,
   Menu,
   X,
-  Moon,
-  Sun,
   type LucideIcon,
 } from "lucide-react";
 import { useAuth } from "@/auth/AuthContext";
-import { useTheme } from "@/lib/theme";
 import { LanguageSwitcher } from "./LanguageSwitcher";
+import { ThemeSwitcher } from "./ThemeSwitcher";
 import { cn } from "@/lib/cn";
 
 const navItems: Array<{
@@ -50,7 +48,6 @@ function navLinkClass({ isActive }: { isActive: boolean }): string {
 function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   const { t } = useTranslation();
   const { logout } = useAuth();
-  const { theme, toggleTheme } = useTheme();
 
   return (
     <div className="flex h-full flex-col">
@@ -77,14 +74,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
       <div className="space-y-2 border-t border-border p-3">
         <div className="flex items-center justify-between">
           <LanguageSwitcher />
-          <button
-            type="button"
-            onClick={toggleTheme}
-            aria-label={t(theme === "dark" ? "app.themeLight" : "app.themeDark")}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
-          </button>
+          <ThemeSwitcher />
         </div>
         <button
           type="button"

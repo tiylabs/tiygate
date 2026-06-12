@@ -4,7 +4,8 @@
 /* Semantic design tokens — v0.2 "Quiet Precision"                     */
 /* (docs/webui-design-system.md §3, §5, §6, §12)                       */
 /* ------------------------------------------------------------------ */
-:root {
+:root,
+[data-theme="light"] {
   color-scheme: light;
   /* neutrals (Ink) */
   --bg: #f7f8fa;
@@ -96,6 +97,134 @@
   --info: #4fbbf0;
   --info-soft: #0e2433;
   --overlay: rgb(0 0 0 / 0.6);
+}
+
+/* Light · Warm — paper-warm neutrals with amber-leaning accent */
+[data-theme="light-warm"] {
+  color-scheme: light;
+  --bg: #faf7f2;
+  --surface: #fffdf9;
+  --surface-muted: #f3ede2;
+  --border: #e7ddcd;
+  --border-strong: #d6c8b2;
+  --text: #2a2118;
+  --text-muted: #5a4d3c;
+  --text-subtle: #7a6c58;
+  --primary: #b4530e;
+  --primary-strong: #8f4109;
+  --primary-soft: #f6e6d4;
+  --primary-faint: #fbf3e9;
+  --on-primary: #ffffff;
+  --accent: #1d6f4f;
+  --accent-strong: #155539;
+  --on-accent: #ffffff;
+  --success: #2f7d3f;
+  --success-soft: #e8f3e3;
+  --warning: #9a5a08;
+  --warning-soft: #f8ecd6;
+  --danger: #c0331f;
+  --danger-strong: #9e2718;
+  --danger-soft: #f8e4de;
+  --on-danger: #ffffff;
+  --info: #1f6f9e;
+  --info-soft: #e3f0f6;
+  --overlay: rgb(42 33 24 / 0.5);
+}
+
+/* Light · Slate — cool blue-grey neutrals with indigo accent */
+[data-theme="light-slate"] {
+  color-scheme: light;
+  --bg: #eef1f5;
+  --surface: #ffffff;
+  --surface-muted: #e6eaf0;
+  --border: #d5dbe4;
+  --border-strong: #bcc5d2;
+  --text: #1a2230;
+  --text-muted: #455062;
+  --text-subtle: #647082;
+  --primary: #475569;
+  --primary-strong: #334155;
+  --primary-soft: #dde3ec;
+  --primary-faint: #eef1f6;
+  --on-primary: #ffffff;
+  --accent: #7c3aed;
+  --accent-strong: #6427c4;
+  --on-accent: #ffffff;
+  --success: #15803d;
+  --success-soft: #e3f3e8;
+  --warning: #a15c07;
+  --warning-soft: #f7eed9;
+  --danger: #c81e1e;
+  --danger-strong: #a31616;
+  --danger-soft: #f9e3e3;
+  --on-danger: #ffffff;
+  --info: #0369a1;
+  --info-soft: #e0f0f9;
+  --overlay: rgb(26 34 48 / 0.5);
+}
+
+/* Dark · Dim — softer slate-grey dark (less contrast than default) */
+[data-theme="dark-dim"] {
+  color-scheme: dark;
+  --bg: #1a1d24;
+  --surface: #21252e;
+  --surface-muted: #2a2f3a;
+  --border: #353b47;
+  --border-strong: #454c5a;
+  --text: #e6e9ef;
+  --text-muted: #aab2c0;
+  --text-subtle: #828b9a;
+  --primary: #f0915a;
+  --primary-strong: #f5ad82;
+  --primary-soft: #45301f;
+  --primary-faint: #2f2014;
+  --on-primary: #14171d;
+  --accent: #f1965a;
+  --accent-strong: #f7b181;
+  --on-accent: #14171d;
+  --success: #54cc8a;
+  --success-soft: #1c3325;
+  --warning: #f2bb66;
+  --warning-soft: #352b18;
+  --danger: #f48279;
+  --danger-strong: #f9a39b;
+  --danger-soft: #3a211e;
+  --on-danger: #14171d;
+  --info: #5ec3f2;
+  --info-soft: #182d3a;
+  --overlay: rgb(0 0 0 / 0.55);
+}
+
+/* Dark · OLED — true-black background for OLED displays */
+[data-theme="dark-oled"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --surface: #0a0a0c;
+  --surface-muted: #131316;
+  --border: #222226;
+  --border-strong: #323237;
+  --text: #f2f3f5;
+  --text-muted: #a8acb5;
+  --text-subtle: #787c85;
+  --primary: #94a3b8;
+  --primary-strong: #b4c0d0;
+  --primary-soft: #2a3340;
+  --primary-faint: #1a212b;
+  --on-primary: #000000;
+  --accent: #f3934a;
+  --accent-strong: #f8af76;
+  --on-accent: #000000;
+  --success: #49c982;
+  --success-soft: #0c2417;
+  --warning: #f2b557;
+  --warning-soft: #2a210e;
+  --danger: #f37b72;
+  --danger-strong: #f99c94;
+  --danger-soft: #2c1411;
+  --on-danger: #000000;
+  --info: #54bdf2;
+  --info-soft: #0a2230;
+  --overlay: rgb(0 0 0 / 0.7);
 }
 
 /* Map semantic tokens to Tailwind v4 utilities (bg-surface, text-muted, …) */
