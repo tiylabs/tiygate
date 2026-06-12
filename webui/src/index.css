@@ -516,11 +516,11 @@ body {
 @keyframes content-in {
   from {
     opacity: 0;
-    transform: translate(-50%, calc(-50% + 8px)) scale(0.96);
+    transform: translateY(8px) scale(0.96);
   }
   to {
     opacity: 1;
-    transform: translate(-50%, -50%) scale(1);
+    transform: translateY(0) scale(1);
   }
 }
 
