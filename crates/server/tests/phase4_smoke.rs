@@ -333,7 +333,7 @@ async fn db_config_store_lookup_round_trips_quota_spec() {
 
     let quota = serde_json::json!({ "requests_per_minute": 7 });
     let (key, secret) = store
-        .create_api_key("test-key", "sk-test-secret", quota.clone(), None)
+        .create_api_key("test-key", "sk-test-secret", quota.clone())
         .await
         .expect("create");
 

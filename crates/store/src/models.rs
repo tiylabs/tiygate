@@ -51,7 +51,6 @@ pub struct Provider {
     /// Encrypted OAuth metadata JSON, or empty.
     pub encrypted_oauth_meta: String,
     pub metadata_json: serde_json::Value,
-    pub tenant_scope: Option<String>,
     pub enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -86,7 +85,6 @@ pub struct Route {
     pub virtual_model: String,
     pub targets: Vec<RouteTarget>,
     pub enabled: bool,
-    pub tenant_scope: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -126,7 +124,6 @@ pub struct ApiKey {
     pub key_hash: String,
     pub quota_json: serde_json::Value,
     pub status: ApiKeyStatus,
-    pub tenant_id: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }

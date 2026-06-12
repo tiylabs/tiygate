@@ -13,7 +13,6 @@ CREATE TABLE IF NOT EXISTS request_logs (
     resolved_provider TEXT,
     resolved_model TEXT,
     account_label TEXT,
-    tenant_id TEXT,
     trace_id TEXT,
     span_id TEXT,
     traceparent TEXT,

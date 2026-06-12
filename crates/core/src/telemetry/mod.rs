@@ -85,7 +85,6 @@ pub struct RequestEvent {
     pub resolved_provider: Option<String>,
     pub resolved_model: Option<String>,
     pub account_label: Option<String>,
-    pub tenant_id: Option<String>,
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
     pub traceparent: Option<String>,

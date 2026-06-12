@@ -401,7 +401,7 @@ impl DbConfigStore {
     pub async fn get_provider(&self, id: &str) -> Result<Option<Provider>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, name, vendor, api_base, encrypted_api_key, auth_mode, \
-                    encrypted_oauth_meta, metadata_json, tenant_scope, enabled, \
+                    encrypted_oauth_meta, metadata_json, enabled, \
                     created_at, updated_at FROM providers WHERE id = ?1",
         )
         .bind(id)
@@ -421,7 +421,6 @@ impl DbConfigStore {
         auth_mode: AuthMode,
         oauth_meta_plain: Option<&str>,
         metadata_json: serde_json::Value,
-        tenant_scope: Option<&str>,
         enabled: bool,
     ) -> Result<Provider, StoreError> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -459,13 +458,13 @@ impl DbConfigStore {
 
         sqlx::query(
             "INSERT INTO providers (id, name, vendor, api_base, encrypted_api_key, auth_mode, \
-             encrypted_oauth_meta, metadata_json, tenant_scope, enabled, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(id) DO UPDATE SET \
                 name=excluded.name, vendor=excluded.vendor, api_base=excluded.api_base, \
                 encrypted_api_key=excluded.encrypted_api_key, auth_mode=excluded.auth_mode, \
                 encrypted_oauth_meta=excluded.encrypted_oauth_meta, metadata_json=excluded.metadata_json, \
-                tenant_scope=excluded.tenant_scope, enabled=excluded.enabled, updated_at=excluded.updated_at",
+                enabled=excluded.enabled, updated_at=excluded.updated_at",
         )
         .bind(id)
         .bind(name)
@@ -475,7 +474,6 @@ impl DbConfigStore {
         .bind(auth_mode.as_str())
         .bind(&encrypted_oauth_meta)
         .bind(&metadata_str)
-        .bind(tenant_scope)
         .bind(enabled_int)
         .bind(&created_at)
         .bind(&now)
@@ -548,7 +546,7 @@ impl DbConfigStore {
     async fn load_providers(&self) -> Result<Vec<Provider>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, name, vendor, api_base, encrypted_api_key, auth_mode, \
-                    encrypted_oauth_meta, metadata_json, tenant_scope, enabled, \
+                    encrypted_oauth_meta, metadata_json, enabled, \
                     created_at, updated_at FROM providers",
         )
         .fetch_all(self.pool.sqlite())
@@ -564,7 +562,7 @@ impl DbConfigStore {
 
     pub async fn get_route(&self, id: &str) -> Result<Option<Route>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, enabled, tenant_scope, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, enabled, created_at, updated_at \
              FROM routes WHERE id = ?1",
         )
         .bind(id)
@@ -579,7 +577,6 @@ impl DbConfigStore {
         virtual_model: &str,
         targets: &[RouteTarget],
         enabled: bool,
-        tenant_scope: Option<&str>,
     ) -> Result<Route, StoreError> {
         if targets.is_empty() {
             return Err(StoreError::Invalid(
@@ -596,17 +593,16 @@ impl DbConfigStore {
         let enabled_int: i32 = if enabled { 1 } else { 0 };
 
         sqlx::query(
-            "INSERT INTO routes (id, virtual_model, targets_json, enabled, tenant_scope, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+            "INSERT INTO routes (id, virtual_model, targets_json, enabled, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(id) DO UPDATE SET \
                 virtual_model=excluded.virtual_model, targets_json=excluded.targets_json, \
-                enabled=excluded.enabled, tenant_scope=excluded.tenant_scope, updated_at=excluded.updated_at",
+                enabled=excluded.enabled, updated_at=excluded.updated_at",
         )
         .bind(id)
         .bind(virtual_model)
         .bind(&targets_json)
         .bind(enabled_int)
-        .bind(tenant_scope)
         .bind(&created_at)
         .bind(&now)
         .execute(self.pool.sqlite())
@@ -632,7 +628,7 @@ impl DbConfigStore {
 
     async fn load_routes(&self) -> Result<Vec<Route>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, enabled, tenant_scope, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, enabled, created_at, updated_at \
              FROM routes",
         )
         .fetch_all(self.pool.sqlite())
@@ -644,7 +640,7 @@ impl DbConfigStore {
 
     pub async fn list_api_keys(&self) -> Result<Vec<ApiKey>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, name, key_hash, quota_json, status, tenant_id, created_at, updated_at \
+            "SELECT id, name, key_hash, quota_json, status, created_at, updated_at \
              FROM api_keys",
         )
         .fetch_all(self.pool.sqlite())
@@ -657,21 +653,19 @@ impl DbConfigStore {
         name: &str,
         secret_plain: &str,
         quota: serde_json::Value,
-        tenant_id: Option<&str>,
     ) -> Result<(ApiKey, String), StoreError> {
         let id = Uuid::now_v7().to_string();
         let key_hash = hash_api_key(secret_plain);
         let now = chrono::Utc::now().to_rfc3339();
         let quota_str = serde_json::to_string(&quota)?;
         sqlx::query(
-            "INSERT INTO api_keys (id, name, key_hash, quota_json, status, tenant_id, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7)",
+            "INSERT INTO api_keys (id, name, key_hash, quota_json, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6)",
         )
         .bind(&id)
         .bind(name)
         .bind(&key_hash)
         .bind(&quota_str)
-        .bind(tenant_id)
         .bind(&now)
         .bind(&now)
         .execute(self.pool.sqlite())
@@ -685,7 +679,7 @@ impl DbConfigStore {
 
     pub async fn get_api_key(&self, id: &str) -> Result<Option<ApiKey>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, name, key_hash, quota_json, status, tenant_id, created_at, updated_at \
+            "SELECT id, name, key_hash, quota_json, status, created_at, updated_at \
              FROM api_keys WHERE id = ?1",
         )
         .bind(id)
@@ -697,7 +691,7 @@ impl DbConfigStore {
     pub async fn find_api_key_by_secret(&self, secret: &str) -> Result<Option<ApiKey>, StoreError> {
         let key_hash = hash_api_key(secret);
         let row = sqlx::query(
-            "SELECT id, name, key_hash, quota_json, status, tenant_id, created_at, updated_at \
+            "SELECT id, name, key_hash, quota_json, status, created_at, updated_at \
              FROM api_keys WHERE key_hash = ?1",
         )
         .bind(&key_hash)
@@ -811,7 +805,6 @@ fn row_to_provider(row: sqlx::sqlite::SqliteRow) -> Result<Provider, StoreError>
         serde_json::from_str(&metadata_str)?
     };
     let enabled_int: i32 = row.get("enabled");
-    let tenant_scope: Option<String> = row.get("tenant_scope");
     Ok(Provider {
         id: row.get("id"),
         name: row.get("name"),
@@ -821,11 +814,6 @@ fn row_to_provider(row: sqlx::sqlite::SqliteRow) -> Result<Provider, StoreError>
         auth_mode,
         encrypted_oauth_meta: row.get("encrypted_oauth_meta"),
         metadata_json,
-        tenant_scope: if tenant_scope.as_deref().map(str::is_empty).unwrap_or(true) {
-            None
-        } else {
-            tenant_scope
-        },
         enabled: enabled_int != 0,
         created_at: parse_dt(row.get("created_at"))?,
         updated_at: parse_dt(row.get("updated_at"))?,
@@ -837,17 +825,11 @@ fn row_to_route(row: sqlx::sqlite::SqliteRow) -> Result<Route, StoreError> {
     let targets_str: String = row.get("targets_json");
     let targets: Vec<RouteTarget> = serde_json::from_str(&targets_str)?;
     let enabled_int: i32 = row.get("enabled");
-    let tenant_scope: Option<String> = row.get("tenant_scope");
     Ok(Route {
         id: row.get("id"),
         virtual_model: row.get("virtual_model"),
         targets,
         enabled: enabled_int != 0,
-        tenant_scope: if tenant_scope.as_deref().map(str::is_empty).unwrap_or(true) {
-            None
-        } else {
-            tenant_scope
-        },
         created_at: parse_dt(row.get("created_at"))?,
         updated_at: parse_dt(row.get("updated_at"))?,
     })
@@ -863,18 +845,12 @@ fn row_to_api_key(row: sqlx::sqlite::SqliteRow) -> Result<ApiKey, StoreError> {
     } else {
         serde_json::from_str(&quota_str)?
     };
-    let tenant_id: Option<String> = row.get("tenant_id");
     Ok(ApiKey {
         id: row.get("id"),
         name: row.get("name"),
         key_hash: row.get("key_hash"),
         quota_json,
         status,
-        tenant_id: if tenant_id.as_deref().map(str::is_empty).unwrap_or(true) {
-            None
-        } else {
-            tenant_id
-        },
         created_at: parse_dt(row.get("created_at"))?,
         updated_at: parse_dt(row.get("updated_at"))?,
     })

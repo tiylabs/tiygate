@@ -205,7 +205,6 @@ async fn acceptance_1_with_master_key_decrypts_into_routing_table() {
             AuthMode::ApiKey,
             None,
             serde_json::json!({}),
-            None,
             true,
         )
         .await
@@ -264,7 +263,6 @@ async fn acceptance_3_stats_aggregate_uses_oltp_log_table() {
         resolved_provider: Some("openai".to_string()),
         resolved_model: Some(model.to_string()),
         account_label: None,
-        tenant_id: None,
         trace_id: None,
         span_id: None,
         traceparent: None,
@@ -323,7 +321,6 @@ async fn acceptance_3_stats_by_provider_endpoint() {
         resolved_provider: Some("openai".to_string()),
         resolved_model: Some("gpt-4o".to_string()),
         account_label: None,
-        tenant_id: None,
         trace_id: None,
         span_id: None,
         traceparent: None,

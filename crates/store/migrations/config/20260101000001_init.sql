@@ -19,8 +19,6 @@ CREATE TABLE IF NOT EXISTS providers (
     encrypted_oauth_meta TEXT NOT NULL DEFAULT '',
     -- Free-form metadata (json-as-text, e.g. organisation, project).
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    -- Reserved for §3.9 tenant scoping. Always NULL in Phase 4.
-    tenant_scope TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -33,7 +31,6 @@ CREATE TABLE IF NOT EXISTS routes (
     -- JSON array of {provider_id, model_id, weight, account_label, ...}.
     targets_json TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
-    tenant_scope TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -54,7 +51,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
     quota_json TEXT NOT NULL DEFAULT '{}',
     -- 'active' | 'disabled' (Phase 4: 创建-启用-删除 三态; 删除即失效).
     status TEXT NOT NULL DEFAULT 'active',
-    tenant_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

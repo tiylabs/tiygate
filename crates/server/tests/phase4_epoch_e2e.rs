@@ -60,7 +60,6 @@ async fn data_plane_sees_admin_writes_via_epoch_poll() {
             AuthMode::ApiKey,
             None,
             serde_json::json!({}),
-            None,
             true,
         )
         .await
@@ -78,7 +77,6 @@ async fn data_plane_sees_admin_writes_via_epoch_poll() {
                 api_base_override: None,
             }],
             true,
-            None,
         )
         .await
         .expect("upsert route");

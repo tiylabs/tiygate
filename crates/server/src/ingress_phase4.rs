@@ -706,7 +706,6 @@ pub fn emit_request_event(
         resolved_provider: resolved_provider.map(str::to_string),
         resolved_model: resolved_model.map(str::to_string),
         account_label: None,
-        tenant_id: None,
         trace_id: Some(trace.trace_id.clone()),
         span_id: Some(trace.parent_span_id.clone()),
         traceparent: Some(trace.to_traceparent()),

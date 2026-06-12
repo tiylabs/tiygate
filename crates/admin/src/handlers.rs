@@ -80,7 +80,6 @@ struct ProviderRequest {
     auth_mode: Option<String>,
     oauth_meta: Option<String>,
     metadata: Option<serde_json::Value>,
-    tenant_scope: Option<String>,
     enabled: Option<bool>,
 }
 
@@ -94,7 +93,6 @@ struct ProviderView {
     encrypted_api_key: String,
     encrypted_oauth_meta: String,
     metadata: serde_json::Value,
-    tenant_scope: Option<String>,
     enabled: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -115,7 +113,6 @@ impl From<Provider> for ProviderView {
                 &p.encrypted_oauth_meta,
             ),
             metadata: p.metadata_json,
-            tenant_scope: p.tenant_scope,
             enabled: p.enabled,
             created_at: p.created_at,
             updated_at: p.updated_at,
@@ -174,7 +171,6 @@ async fn create_provider(
             auth_mode,
             req.oauth_meta.as_deref(),
             req.metadata.unwrap_or_else(|| serde_json::json!({})),
-            req.tenant_scope.as_deref(),
             req.enabled.unwrap_or(true),
         )
         .await?;
@@ -211,7 +207,6 @@ async fn update_provider(
             auth_mode,
             req.oauth_meta.as_deref(),
             req.metadata.unwrap_or_else(|| serde_json::json!({})),
-            req.tenant_scope.as_deref(),
             req.enabled.unwrap_or(true),
         )
         .await?;
@@ -243,7 +238,6 @@ struct RouteRequest {
     virtual_model: String,
     targets: Vec<RouteTarget>,
     enabled: Option<bool>,
-    tenant_scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -252,7 +246,6 @@ struct RouteView {
     virtual_model: String,
     targets: Vec<RouteTarget>,
     enabled: bool,
-    tenant_scope: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -264,7 +257,6 @@ impl From<Route> for RouteView {
             virtual_model: r.virtual_model,
             targets: r.targets,
             enabled: r.enabled,
-            tenant_scope: r.tenant_scope,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -301,7 +293,6 @@ async fn create_route(
             &req.virtual_model,
             &req.targets,
             req.enabled.unwrap_or(true),
-            req.tenant_scope.as_deref(),
         )
         .await?;
     let _ = tiygate_store::audit::record(
@@ -328,7 +319,6 @@ async fn update_route(
             &req.virtual_model,
             &req.targets,
             req.enabled.unwrap_or(true),
-            req.tenant_scope.as_deref(),
         )
         .await?;
     Ok(Json(RouteView::from(r)).into_response())
@@ -360,7 +350,6 @@ struct CreateApiKeyRequest {
     secret: Option<String>,
     /// Optional quota (forwarded to the column as JSON).
     quota: Option<serde_json::Value>,
-    tenant_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -380,7 +369,6 @@ struct ApiKeyView {
     key_hash: String,
     quota: serde_json::Value,
     status: String,
-    tenant_id: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -393,7 +381,6 @@ impl From<tiygate_store::models::ApiKey> for ApiKeyView {
             key_hash: k.key_hash,
             quota: k.quota_json,
             status: k.status.as_str().to_string(),
-            tenant_id: k.tenant_id,
             created_at: k.created_at,
             updated_at: k.updated_at,
         }
@@ -425,7 +412,6 @@ async fn create_api_key(
             &req.name,
             &secret,
             req.quota.unwrap_or_else(|| serde_json::json!({})),
-            req.tenant_id.as_deref(),
         )
         .await?;
     let _ = tiygate_store::audit::record(

@@ -52,14 +52,14 @@ impl EventSink for OltpSink {
         let res = sqlx::query(
             "INSERT OR REPLACE INTO request_logs (\
                 request_id, ts, virtual_model, resolved_provider, resolved_model, account_label, \
-                tenant_id, trace_id, span_id, traceparent, ingress_protocol, egress_protocol, \
+                trace_id, span_id, traceparent, ingress_protocol, egress_protocol, \
                 lossy, cache_hit, status, error_class, http_status, error_source, \
                 total_latency_ms, upstream_latency_ms, queue_latency_ms, ttfb_ms, \
                 prompt_tokens, completion_tokens, reasoning_tokens, cache_read_tokens, \
                 cache_write_tokens, total_tokens, cost, api_key_id, client_ip, user_agent, \
                 raw_envelope_json, redacted_headers_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-                     ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
         )
         .bind(&row.request_id)
         .bind(&row.ts)
@@ -67,7 +67,6 @@ impl EventSink for OltpSink {
         .bind(&row.resolved_provider)
         .bind(&row.resolved_model)
         .bind(&row.account_label)
-        .bind(&row.tenant_id)
         .bind(&row.trace_id)
         .bind(&row.span_id)
         .bind(&row.traceparent)
@@ -117,7 +116,6 @@ struct RequestEventRow {
     resolved_provider: Option<String>,
     resolved_model: Option<String>,
     account_label: Option<String>,
-    tenant_id: Option<String>,
     trace_id: Option<String>,
     span_id: Option<String>,
     traceparent: Option<String>,
@@ -156,7 +154,6 @@ fn request_event_to_row(event: &RequestEvent) -> RequestEventRow {
         resolved_provider: event.resolved_provider.clone(),
         resolved_model: event.resolved_model.clone(),
         account_label: event.account_label.clone(),
-        tenant_id: event.tenant_id.clone(),
         trace_id: event.trace_id.clone(),
         span_id: event.span_id.clone(),
         traceparent: event.traceparent.clone(),
@@ -328,7 +325,6 @@ pub struct RequestLogEntry {
     pub resolved_provider: Option<String>,
     pub resolved_model: Option<String>,
     pub account_label: Option<String>,
-    pub tenant_id: Option<String>,
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
     pub traceparent: Option<String>,
@@ -364,7 +360,6 @@ fn row_to_entry(row: &sqlx::sqlite::SqliteRow) -> RequestLogEntry {
         resolved_provider: row.get("resolved_provider"),
         resolved_model: row.get("resolved_model"),
         account_label: row.get("account_label"),
-        tenant_id: row.get("tenant_id"),
         trace_id: row.get("trace_id"),
         span_id: row.get("span_id"),
         traceparent: row.get("traceparent"),
@@ -521,7 +516,7 @@ pub async fn list_requests(
     // Data query
     let data_sql = format!(
         "SELECT request_id, ts, virtual_model, resolved_provider, resolved_model, \
-                account_label, tenant_id, trace_id, span_id, traceparent, \
+                account_label, trace_id, span_id, traceparent, \
                 ingress_protocol, egress_protocol, lossy, cache_hit, \
                 status, error_class, http_status, error_source, \
                 total_latency_ms, upstream_latency_ms, queue_latency_ms, ttfb_ms, \
@@ -613,7 +608,6 @@ mod tests {
             resolved_provider: Some("openai".to_string()),
             resolved_model: Some("gpt-4o".to_string()),
             account_label: None,
-            tenant_id: None,
             trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()),
             span_id: Some("00f067aa0ba902b7".to_string()),
             traceparent: Some(

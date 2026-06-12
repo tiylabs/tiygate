@@ -190,7 +190,6 @@ mod tests {
             resolved_provider: Some("openai".to_string()),
             resolved_model: Some("gpt-4o".to_string()),
             account_label: None,
-            tenant_id: None,
             trace_id: None,
             span_id: None,
             traceparent: None,
