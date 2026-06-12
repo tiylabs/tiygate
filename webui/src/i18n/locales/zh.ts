@@ -7,6 +7,8 @@ const zh: Translation = {
     language: "语言",
     menu: "菜单",
     closeMenu: "关闭菜单",
+    collapseSidebar: "收起侧边栏",
+    expandSidebar: "展开侧边栏",
     theme: "主题",
     themeMenu: "切换主题",
     themeGroupLight: "浅色",

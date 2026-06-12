@@ -5,6 +5,8 @@ const en = {
     language: "Language",
     menu: "Menu",
     closeMenu: "Close menu",
+    collapseSidebar: "Collapse sidebar",
+    expandSidebar: "Expand sidebar",
     theme: "Theme",
     themeMenu: "Switch theme",
     themeGroupLight: "Light",
