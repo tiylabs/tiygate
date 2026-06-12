@@ -10,7 +10,6 @@ export interface Provider {
   encrypted_api_key: string;
   encrypted_oauth_meta: string;
   metadata: Record<string, unknown>;
-  tenant_scope: string | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -25,7 +24,6 @@ export interface ProviderInput {
   auth_mode?: string;
   oauth_meta?: string;
   metadata?: Record<string, unknown>;
-  tenant_scope?: string | null;
   enabled?: boolean;
 }
 
@@ -41,7 +39,6 @@ export interface Route {
   virtual_model: string;
   targets: RouteTarget[];
   enabled: boolean;
-  tenant_scope: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -51,7 +48,6 @@ export interface RouteInput {
   virtual_model: string;
   targets: RouteTarget[];
   enabled?: boolean;
-  tenant_scope?: string | null;
 }
 
 export interface QuotaSpec {
@@ -67,7 +63,6 @@ export interface ApiKey {
   key_hash: string;
   quota: QuotaSpec;
   status: string;
-  tenant_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -117,7 +112,6 @@ export interface RequestLogEntry {
   resolved_provider?: string | null;
   resolved_model?: string | null;
   account_label?: string | null;
-  tenant_id?: string | null;
   trace_id?: string | null;
   ingress_protocol?: string;
   egress_protocol?: string | null;

@@ -36,7 +36,6 @@ interface FormState {
   api_base: string;
   api_key: string;
   auth_mode: string;
-  tenant_scope: string;
   enabled: boolean;
 }
 
@@ -47,7 +46,6 @@ function emptyForm(): FormState {
     api_base: "",
     api_key: "",
     auth_mode: "api_key",
-    tenant_scope: "",
     enabled: true,
   };
 }
@@ -111,7 +109,6 @@ export default function Providers() {
       api_base: p.api_base,
       api_key: "",
       auth_mode: p.auth_mode,
-      tenant_scope: p.tenant_scope ?? "",
       enabled: p.enabled,
     });
     setFormError(null);
@@ -125,7 +122,6 @@ export default function Providers() {
       vendor: form.vendor,
       api_base: form.api_base,
       auth_mode: form.auth_mode,
-      tenant_scope: form.tenant_scope || null,
       enabled: form.enabled,
     };
     // Only send api_key when the operator typed one — blank keeps the
@@ -294,14 +290,6 @@ export default function Providers() {
               placeholder={editing ? "••••••••" : "sk-…"}
               toggleLabel={t("providers.apiKey")}
               autoComplete="off"
-            />
-          </Field>
-          <Field label={t("providers.tenantScope")}>
-            <Input
-              value={form.tenant_scope}
-              onChange={(e) =>
-                setForm({ ...form, tenant_scope: e.target.value })
-              }
             />
           </Field>
           <Switch

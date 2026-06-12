@@ -30,6 +30,7 @@ const en = {
   login: {
     title: "Sign in",
     subtitle: "Paste your admin token to continue.",
+    brandTagline: "Unified gateway for LLM providers.",
     tokenLabel: "Admin token",
     tokenPlaceholder: "TIYGATE_ADMIN_TOKEN",
     remember: "Remember on this device",
@@ -113,7 +114,6 @@ const en = {
     redacted: "Secret is stored encrypted and never returned.",
     deleteConfirm: "Delete provider {{name}}? This cannot be undone.",
     deleteTitle: "Delete provider",
-    tenantScope: "Tenant scope",
     saved: "Provider saved.",
     deleted: "Provider deleted.",
     deleteFailed: "Failed to delete provider.",
@@ -145,7 +145,6 @@ const en = {
     add: "Create key",
     keyHash: "Key hash",
     quota: "Quota",
-    tenant: "Tenant",
     editQuota: "Edit quota",
     quotaTitle: "Quota for {{name}}",
     rpm: "Requests / minute",

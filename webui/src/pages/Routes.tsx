@@ -32,7 +32,6 @@ interface FormState {
   virtual_model: string;
   targets: RouteTarget[];
   enabled: boolean;
-  tenant_scope: string;
 }
 
 function emptyForm(): FormState {
@@ -40,7 +39,6 @@ function emptyForm(): FormState {
     virtual_model: "",
     targets: [{ provider_id: "", model: "" }],
     enabled: true,
-    tenant_scope: "",
   };
 }
 
@@ -108,7 +106,6 @@ export default function RoutesPage() {
         ? r.targets.map((tg) => ({ ...tg }))
         : [{ provider_id: "", model: "" }],
       enabled: r.enabled,
-      tenant_scope: r.tenant_scope ?? "",
     });
     setFormError(null);
     setModalOpen(true);
@@ -139,7 +136,6 @@ export default function RoutesPage() {
       virtual_model: form.virtual_model,
       targets,
       enabled: form.enabled,
-      tenant_scope: form.tenant_scope || null,
     };
     saveMutation.mutate({ id: editing?.id, body });
   }
@@ -373,14 +369,6 @@ export default function RoutesPage() {
             ))}
           </div>
 
-          <Field label={t("providers.tenantScope")}>
-            <Input
-              value={form.tenant_scope}
-              onChange={(e) =>
-                setForm({ ...form, tenant_scope: e.target.value })
-              }
-            />
-          </Field>
           <Switch
             checked={form.enabled}
             onCheckedChange={(v) => setForm({ ...form, enabled: v })}

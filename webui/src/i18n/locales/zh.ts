@@ -32,6 +32,7 @@ const zh: Translation = {
   login: {
     title: "登录",
     subtitle: "粘贴管理员 token 以继续。",
+    brandTagline: "统一的 LLM 供应商网关。",
     tokenLabel: "管理员 Token",
     tokenPlaceholder: "TIYGATE_ADMIN_TOKEN",
     remember: "在此设备上记住",
@@ -114,7 +115,6 @@ const zh: Translation = {
     redacted: "密钥加密存储，永不返回明文。",
     deleteConfirm: "删除供应商 {{name}}？此操作不可撤销。",
     deleteTitle: "删除供应商",
-    tenantScope: "租户范围",
     saved: "供应商已保存。",
     deleted: "供应商已删除。",
     deleteFailed: "删除供应商失败。",
@@ -146,7 +146,6 @@ const zh: Translation = {
     add: "创建密钥",
     keyHash: "密钥哈希",
     quota: "配额",
-    tenant: "租户",
     editQuota: "编辑配额",
     quotaTitle: "{{name}} 的配额",
     rpm: "请求 / 分钟",

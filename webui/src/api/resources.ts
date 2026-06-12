@@ -49,7 +49,6 @@ export const apiKeysApi = {
     name: string;
     secret?: string;
     quota?: QuotaSpec;
-    tenant_id?: string | null;
   }) => apiRequest<CreateApiKeyResponse>("/api-keys", { method: "POST", body }),
   updateQuota: (id: string, quota: QuotaSpec) =>
     apiRequest<ApiKey>(`/api-keys/${id}`, { method: "PATCH", body: { quota } }),
