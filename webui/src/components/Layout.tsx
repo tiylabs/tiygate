@@ -13,7 +13,6 @@ import {
   LogOut,
   Menu,
   X,
-  Waypoints,
   PanelLeftClose,
   PanelLeftOpen,
   type LucideIcon,
@@ -80,10 +79,13 @@ function SidebarContent({
               onClick={onToggleCollapse}
               className="group/logo inline-flex h-8 w-8 items-center justify-center rounded-md text-primary transition-colors hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <Waypoints
-                size={16}
+              <img
+                src="./icon.svg"
+                alt=""
+                width={20}
+                height={20}
                 aria-hidden
-                className="group-hover/logo:hidden"
+                className="h-5 w-5 group-hover/logo:hidden"
               />
               <PanelLeftOpen
                 size={16}
@@ -94,8 +96,15 @@ function SidebarContent({
           )
         ) : (
           <>
-            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary-soft text-primary">
-              <Waypoints size={16} aria-hidden />
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-md bg-primary-soft text-primary">
+              <img
+                src="./icon.svg"
+                alt=""
+                width={28}
+                height={28}
+                aria-hidden
+                className="h-7 w-7"
+              />
             </span>
             <span className="truncate text-sm font-semibold tracking-[-0.01em] text-text">
               {t("app.title")}
