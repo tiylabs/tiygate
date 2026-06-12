@@ -33,6 +33,11 @@ import {
 } from "@/components/ui";
 import { PageHeader } from "@/components/PageHeader";
 import { cn } from "@/lib/cn";
+import openaiBrand from "@/assets/brand/openai.svg?raw";
+import anthropicBrand from "@/assets/brand/anthropic.svg?raw";
+import geminiBrand from "@/assets/brand/googlegemini.svg?raw";
+import pythonLang from "@/assets/lang/python.svg?raw";
+import typescriptLang from "@/assets/lang/typescript.svg?raw";
 
 type ProtocolId = "openai" | "anthropic" | "responses" | "embeddings" | "gemini";
 type LanguageId = "python" | "typescript" | "curl";
@@ -46,6 +51,11 @@ interface ProtocolSpec {
   pathTemplate: string;
   descriptionKey: string;
   icon: LucideIcon;
+  /** Inline SVG markup. SVGs use `fill="currentColor"` so they pick up the
+   *  surrounding `text-*` color, which is `text-primary` (light blue in light
+   *  themes, soft blue in dark themes). */
+  brand: string;
+  brandLabel: string;
   auth: "bearer" | "x-api-key";
 }
 
@@ -54,6 +64,10 @@ interface LanguageSpec {
   label: string;
   icon: LucideIcon;
   fileName: string;
+  /** Inline SVG markup for the language badge. `null` keeps the Lucide icon
+   *  (used for the generic cURL entry which has no brand mark). */
+  brand: string | null;
+  brandLabel: string | null;
 }
 
 const PROTOCOLS: ProtocolSpec[] = [
@@ -65,6 +79,8 @@ const PROTOCOLS: ProtocolSpec[] = [
     pathTemplate: "/v1/chat/completions",
     descriptionKey: "integration.protocolOpenaiDesc",
     icon: Radio,
+    brand: openaiBrand,
+    brandLabel: "OpenAI",
     auth: "bearer",
   },
   {
@@ -75,6 +91,8 @@ const PROTOCOLS: ProtocolSpec[] = [
     pathTemplate: "/v1/responses",
     descriptionKey: "integration.protocolResponsesDesc",
     icon: Webhook,
+    brand: openaiBrand,
+    brandLabel: "OpenAI",
     auth: "bearer",
   },
   {
@@ -85,6 +103,8 @@ const PROTOCOLS: ProtocolSpec[] = [
     pathTemplate: "/v1/messages",
     descriptionKey: "integration.protocolAnthropicDesc",
     icon: BookOpen,
+    brand: anthropicBrand,
+    brandLabel: "Anthropic",
     auth: "x-api-key",
   },
   {
@@ -95,6 +115,8 @@ const PROTOCOLS: ProtocolSpec[] = [
     pathTemplate: "/v1beta/models/{model}:generateContent",
     descriptionKey: "integration.protocolGeminiDesc",
     icon: Server,
+    brand: geminiBrand,
+    brandLabel: "Google Gemini",
     auth: "bearer",
   },
   {
@@ -105,14 +127,37 @@ const PROTOCOLS: ProtocolSpec[] = [
     pathTemplate: "/v1/embeddings",
     descriptionKey: "integration.protocolEmbeddingsDesc",
     icon: Code2,
+    brand: openaiBrand,
+    brandLabel: "OpenAI",
     auth: "bearer",
   },
 ];
 
 const LANGUAGES: LanguageSpec[] = [
-  { id: "python", label: "Python", icon: TerminalSquare, fileName: "sample.py" },
-  { id: "typescript", label: "TypeScript", icon: Code2, fileName: "sample.ts" },
-  { id: "curl", label: "cURL", icon: TerminalSquare, fileName: "sample.sh" },
+  {
+    id: "python",
+    label: "Python",
+    icon: TerminalSquare,
+    fileName: "sample.py",
+    brand: pythonLang,
+    brandLabel: "Python",
+  },
+  {
+    id: "typescript",
+    label: "TypeScript",
+    icon: Code2,
+    fileName: "sample.ts",
+    brand: typescriptLang,
+    brandLabel: "TypeScript",
+  },
+  {
+    id: "curl",
+    label: "cURL",
+    icon: TerminalSquare,
+    fileName: "sample.sh",
+    brand: null,
+    brandLabel: null,
+  },
 ];
 
 const DEFAULT_API_BASE = "http://localhost:3000";
@@ -441,6 +486,37 @@ function buildSample(
 }
 
 /* -------------------------------------------------------------------------- */
+/* Brand icon (inline SVG, inherits currentColor for dark mode)               */
+/* -------------------------------------------------------------------------- */
+
+/** Renders an inline SVG that picks up the surrounding `text-*` color via
+ *  `fill="currentColor"`. This lets brand icons adapt to dark themes without
+ *  a separate asset per theme. */
+function BrandIcon({
+  markup,
+  label,
+  className,
+}: {
+  markup: string;
+  label: string;
+  className?: string;
+}) {
+  return (
+    <span
+      role="img"
+      aria-label={label}
+      className={cn(
+        "inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center [&_svg]:h-full [&_svg]:w-full",
+        className,
+      )}
+      // The SVG markup is author-controlled and shipped as a local asset, so
+      // it is safe to inject.
+      dangerouslySetInnerHTML={{ __html: markup }}
+    />
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /* Segmented control                                                          */
 /* -------------------------------------------------------------------------- */
 
@@ -693,14 +769,17 @@ export default function IntegrationGuide() {
                 aria-label={t("integration.ingress")}
               >
                 {PROTOCOLS.map((p) => {
-                  const Icon = p.icon;
                   return (
                     <li
                       key={p.id}
                       className="flex flex-wrap items-center gap-3 bg-surface px-3 py-2.5 sm:flex-nowrap"
                     >
                       <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary-soft text-primary">
-                        <Icon size={14} aria-hidden />
+                        <BrandIcon
+                          markup={p.brand}
+                          label={p.brandLabel}
+                          className="h-3.5 w-3.5"
+                        />
                       </span>
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-sm font-medium text-text">
@@ -771,10 +850,10 @@ export default function IntegrationGuide() {
                       value: p.id,
                       label: (
                         <span className="flex min-w-0 items-center gap-2">
-                          <p.icon
-                            size={12}
-                            className="shrink-0 text-text-subtle"
-                            aria-hidden
+                          <BrandIcon
+                            markup={p.brand}
+                            label={p.brandLabel}
+                            className="h-3 w-3"
                           />
                           <span className="truncate">{t(p.labelKey)}</span>
                           <span className="ml-auto truncate font-mono text-[10px] text-text-subtle">
@@ -859,8 +938,19 @@ export default function IntegrationGuide() {
                   onChange={setActiveLanguage}
                   options={LANGUAGES.map((l) => ({
                     value: l.id,
-                    label: l.label,
-                    icon: l.icon,
+                    label: l.brand ? (
+                      <span className="inline-flex items-center gap-1.5">
+                        <BrandIcon
+                          markup={l.brand}
+                          label={l.brandLabel ?? l.label}
+                          className="h-3 w-3"
+                        />
+                        {l.label}
+                      </span>
+                    ) : (
+                      l.label
+                    ),
+                    icon: l.brand ? undefined : l.icon,
                   }))}
                 />
 
