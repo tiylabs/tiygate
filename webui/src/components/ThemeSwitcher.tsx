@@ -5,24 +5,17 @@ import { THEMES, useTheme, type ThemeMode } from "@/lib/theme";
 import { cn } from "@/lib/cn";
 
 const contentClass =
-  "z-40 min-w-[12rem] overflow-hidden rounded-md border border-border bg-surface p-1 shadow-md " +
+  "z-40 rounded-lg border border-border bg-surface p-3 shadow-md " +
   "data-[state=open]:animate-overlay-in";
 
-const itemClass =
-  "flex cursor-pointer items-center justify-between gap-3 rounded-sm px-2.5 py-1.5 text-sm text-text outline-none " +
-  "transition-colors duration-[var(--duration-fast)] focus:bg-surface-muted data-[highlighted]:bg-surface-muted";
-
-const groupLabelClass =
-  "px-2.5 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-[0.04em] text-text-subtle";
+const ROWS: Array<{ mode: ThemeMode; labelKey: string }> = [
+  { mode: "light", labelKey: "app.themeGroupLight" },
+  { mode: "dark", labelKey: "app.themeGroupDark" },
+];
 
 export function ThemeSwitcher() {
   const { t } = useTranslation();
   const { theme, setTheme } = useTheme();
-
-  const groups: Array<{ mode: ThemeMode; labelKey: string }> = [
-    { mode: "light", labelKey: "app.themeGroupLight" },
-    { mode: "dark", labelKey: "app.themeGroupDark" },
-  ];
 
   return (
     <RDropdown.Root>
@@ -43,31 +36,62 @@ export function ThemeSwitcher() {
           sideOffset={6}
           className={contentClass}
         >
-          {groups.map((group, gi) => (
-            <RDropdown.Group key={group.mode}>
-              {gi > 0 ? (
-                <RDropdown.Separator className="my-1 h-px bg-border" />
-              ) : null}
-              <RDropdown.Label className={groupLabelClass}>
-                {t(group.labelKey)}
-              </RDropdown.Label>
-              {THEMES.filter((item) => item.mode === group.mode).map((item) => {
-                const active = item.id === theme;
-                return (
-                  <RDropdown.Item
-                    key={item.id}
-                    onSelect={() => setTheme(item.id)}
-                    className={cn(itemClass, active && "font-medium")}
-                  >
-                    <span>{t(item.labelKey)}</span>
-                    {active ? (
-                      <Check size={14} className="text-primary" aria-hidden />
-                    ) : null}
-                  </RDropdown.Item>
-                );
-              })}
-            </RDropdown.Group>
-          ))}
+          <RDropdown.Label className="px-0.5 pb-2.5 text-[11px] font-medium uppercase tracking-[0.04em] text-text-subtle">
+            {t("app.themeMenu")}
+          </RDropdown.Label>
+          <div className="space-y-2.5">
+            {ROWS.map((row) => (
+              <div key={row.mode} className="flex items-center gap-2.5">
+                <span className="w-9 shrink-0 text-[11px] font-medium text-text-muted">
+                  {t(row.labelKey)}
+                </span>
+                <div className="flex gap-2.5">
+                  {THEMES.filter((item) => item.mode === row.mode).map(
+                    (item) => {
+                      const active = item.id === theme;
+                      const label = t(item.labelKey);
+                      return (
+                        <RDropdown.Item
+                          key={item.id}
+                          onSelect={() => setTheme(item.id)}
+                          aria-label={label}
+                          aria-current={active}
+                          title={label}
+                          className={cn(
+                            "relative h-5 w-8 overflow-hidden rounded p-0 outline-none",
+                            "transition-shadow duration-[var(--duration-fast)]",
+                            "ring-1 ring-inset ring-border",
+                            "data-[highlighted]:ring-border-strong focus-visible:ring-2 focus-visible:ring-ring",
+                            active &&
+                              "ring-2 ring-primary ring-offset-2 ring-offset-surface data-[highlighted]:ring-primary",
+                          )}
+                        >
+                          {/* diagonal split chip: upper-left = theme primary, lower-right = theme background */}
+                          <span
+                            className="block h-full w-full"
+                            style={{
+                              background: `linear-gradient(135deg, ${item.swatchColor} 0 50%, ${item.swatchBg} 50% 100%)`,
+                            }}
+                            aria-hidden
+                          />
+                          {active ? (
+                            <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                              <Check
+                                size={12}
+                                strokeWidth={3}
+                                className="text-on-primary drop-shadow-[0_0_1px_rgba(0,0,0,0.6)]"
+                                aria-hidden
+                              />
+                            </span>
+                          ) : null}
+                        </RDropdown.Item>
+                      );
+                    },
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
         </RDropdown.Content>
       </RDropdown.Portal>
     </RDropdown.Root>

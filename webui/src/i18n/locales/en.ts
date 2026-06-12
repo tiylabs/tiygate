@@ -6,7 +6,7 @@ const en = {
     menu: "Menu",
     closeMenu: "Close menu",
     theme: "Theme",
-    themeMenu: "Choose theme",
+    themeMenu: "Switch theme",
     themeGroupLight: "Light",
     themeGroupDark: "Dark",
     themeLightDefault: "Default",

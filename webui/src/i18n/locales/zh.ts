@@ -8,7 +8,7 @@ const zh: Translation = {
     menu: "菜单",
     closeMenu: "关闭菜单",
     theme: "主题",
-    themeMenu: "选择主题",
+    themeMenu: "切换主题",
     themeGroupLight: "浅色",
     themeGroupDark: "深色",
     themeLightDefault: "默认",

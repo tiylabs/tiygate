@@ -22,15 +22,54 @@ export interface ThemeMeta {
   id: Theme;
   mode: ThemeMode;
   labelKey: string;
+  /** Preview swatch background (theme bg) and dot (theme primary). */
+  swatchBg: string;
+  swatchColor: string;
 }
 
 export const THEMES: ThemeMeta[] = [
-  { id: "light", mode: "light", labelKey: "app.themeLightDefault" },
-  { id: "light-warm", mode: "light", labelKey: "app.themeLightWarm" },
-  { id: "light-slate", mode: "light", labelKey: "app.themeLightSlate" },
-  { id: "dark", mode: "dark", labelKey: "app.themeDarkDefault" },
-  { id: "dark-dim", mode: "dark", labelKey: "app.themeDarkDim" },
-  { id: "dark-oled", mode: "dark", labelKey: "app.themeDarkOled" },
+  {
+    id: "light",
+    mode: "light",
+    labelKey: "app.themeLightDefault",
+    swatchBg: "#f7f8fa",
+    swatchColor: "#2e5be6",
+  },
+  {
+    id: "light-warm",
+    mode: "light",
+    labelKey: "app.themeLightWarm",
+    swatchBg: "#faf7f2",
+    swatchColor: "#b4530e",
+  },
+  {
+    id: "light-slate",
+    mode: "light",
+    labelKey: "app.themeLightSlate",
+    swatchBg: "#eef1f5",
+    swatchColor: "#475569",
+  },
+  {
+    id: "dark",
+    mode: "dark",
+    labelKey: "app.themeDarkDefault",
+    swatchBg: "#0b0d12",
+    swatchColor: "#84a6ff",
+  },
+  {
+    id: "dark-dim",
+    mode: "dark",
+    labelKey: "app.themeDarkDim",
+    swatchBg: "#1a1d24",
+    swatchColor: "#f0915a",
+  },
+  {
+    id: "dark-oled",
+    mode: "dark",
+    labelKey: "app.themeDarkOled",
+    swatchBg: "#000000",
+    swatchColor: "#94a3b8",
+  },
 ];
 
 const DEFAULT_LIGHT: Theme = "light";
