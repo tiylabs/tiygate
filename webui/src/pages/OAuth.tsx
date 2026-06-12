@@ -1,10 +1,9 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { ExternalLink, RefreshCw, Play, Copy } from "lucide-react";
+import { ExternalLink, Info, RefreshCw, Play, Copy } from "lucide-react";
 import { oauthApi, providersApi } from "@/api/resources";
 import {
-  Alert,
   Button,
   Card,
   CardBody,
@@ -14,6 +13,7 @@ import {
   Field,
   Select,
   Spinner,
+  Tooltip,
   useToast,
 } from "@/components/ui";
 import { PageHeader } from "@/components/PageHeader";
@@ -88,8 +88,22 @@ export default function OAuth() {
           <EmptyState title={t("oauth.noProviders")} />
         ) : (
           <CardBody className="space-y-4">
-            <Alert tone="info">{t("oauth.requirements")}</Alert>
-            <Field label={t("oauth.selectProvider")}>
+            <Field
+              label={
+                <span className="inline-flex items-center gap-1.5">
+                  {t("oauth.selectProvider")}
+                  <Tooltip content={t("oauth.requirements")} side="top">
+                    <button
+                      type="button"
+                      aria-label={t("oauth.requirements")}
+                      className="inline-flex h-5 w-5 items-center justify-center rounded text-text-muted transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-primary/40"
+                    >
+                      <Info size={14} />
+                    </button>
+                  </Tooltip>
+                </span>
+              }
+            >
               <Select
                 value={providerId}
                 onValueChange={(v) => {
