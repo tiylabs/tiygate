@@ -9,6 +9,7 @@ import ApiKeys from "@/pages/ApiKeys";
 import OAuth from "@/pages/OAuth";
 import RequestLogs from "@/pages/RequestLogs";
 import Audit from "@/pages/Audit";
+import IntegrationGuide from "@/pages/IntegrationGuide";
 
 export default function App() {
   return (
@@ -28,6 +29,7 @@ export default function App() {
         <Route path="oauth" element={<OAuth />} />
         <Route path="requests" element={<RequestLogs />} />
         <Route path="audit" element={<Audit />} />
+        <Route path="integration" element={<IntegrationGuide />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

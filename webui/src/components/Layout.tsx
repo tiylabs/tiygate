@@ -10,6 +10,7 @@ import {
   ShieldCheck,
   ScrollText,
   ListChecks,
+  BookOpen,
   LogOut,
   Menu,
   X,
@@ -35,6 +36,7 @@ const navItems: Array<{
   { to: "/oauth", key: "nav.oauth", icon: ShieldCheck },
   { to: "/requests", key: "nav.requests", icon: ScrollText },
   { to: "/audit", key: "nav.audit", icon: ListChecks },
+  { to: "/integration", key: "nav.integration", icon: BookOpen },
 ];
 
 function navLinkClass({ isActive }: { isActive: boolean }): string {
