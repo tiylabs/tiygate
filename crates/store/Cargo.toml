@@ -27,6 +27,7 @@ sha2.workspace = true
 hex.workspace = true
 base64 = "0.22"
 parking_lot.workspace = true
+arc-swap.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

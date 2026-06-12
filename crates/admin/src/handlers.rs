@@ -53,6 +53,7 @@ pub fn router() -> Router<AdminState> {
                 .put(disable_api_key)
                 .patch(update_api_key_quota),
         )
+        .route("/admin/v1/provider-catalog", get(list_provider_catalog))
         .route("/admin/v1/stats/by-model", get(stats_by_model))
         .route("/admin/v1/stats/by-provider", get(stats_by_provider))
         .route("/admin/v1/stats/by-api-key", get(stats_by_api_key))
@@ -228,6 +229,60 @@ async fn delete_provider(
     )
     .await;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// ---- provider catalog (server-side registered providers) ----
+
+/// One entry of the server-side provider catalog. Unlike
+/// [`ProviderView`] (which describes a *configured* DB provider row),
+/// this describes a provider that is *registered and compiled into the
+/// binary* via `inventory`. The set therefore reflects the active
+/// feature flags / linked crates at build time.
+#[derive(Debug, Serialize)]
+struct ProviderCatalogEntry {
+    /// Registration id (e.g. "openai"); used as the `vendor` value when
+    /// creating a DB provider.
+    id: String,
+    /// Human-readable name from the provider metadata.
+    display_name: String,
+    /// Default base URL the provider ships with.
+    default_base_url: String,
+    /// Normalized auth mode, aligned with the DB-layer `auth_mode`
+    /// values the UI uses (api_key | oauth | iam).
+    auth_mode: String,
+}
+
+/// Normalize the core [`tiygate_core::provider::AuthMode`] enum into the
+/// DB-layer `auth_mode` string the UI understands. This is intentionally
+/// lossy (5 core variants → 3 UI values); it only drives the create-form
+/// default, which the operator can still override.
+fn map_auth_mode(mode: &tiygate_core::provider::AuthMode) -> &'static str {
+    use tiygate_core::provider::AuthMode;
+    match mode {
+        AuthMode::Bearer | AuthMode::ApiKey { .. } | AuthMode::Custom => "api_key",
+        AuthMode::OAuth2 => "oauth",
+        AuthMode::AwsSigV4 => "iam",
+    }
+}
+
+/// GET /admin/v1/provider-catalog — the read-only catalog of providers
+/// the gateway supports, derived at runtime from the `inventory`
+/// registry. No store access or side effects.
+async fn list_provider_catalog() -> Result<Response, AdminError> {
+    let mut entries: Vec<ProviderCatalogEntry> = tiygate_core::provider::all_providers()
+        .iter()
+        .map(|p| {
+            let m = p.metadata();
+            ProviderCatalogEntry {
+                id: p.id().to_string(),
+                display_name: m.display_name.clone(),
+                default_base_url: m.base_url.clone(),
+                auth_mode: map_auth_mode(&m.auth_mode).to_string(),
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(Json(entries).into_response())
 }
 
 // ---- routes ----

@@ -108,6 +108,8 @@ const en = {
     editTitle: "Edit provider",
     addTitle: "New provider",
     vendor: "Vendor",
+    vendorLoading: "Loading vendors…",
+    vendorLoadError: "Failed to load vendors",
     apiBase: "API base",
     authMode: "Auth mode",
     apiKey: "API key",

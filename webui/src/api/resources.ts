@@ -8,6 +8,7 @@ import type {
   OAuthStartResponse,
   OAuthTokenResponse,
   Provider,
+  ProviderCatalogEntry,
   ProviderInput,
   QuotaSpec,
   RequestListResponse,
@@ -27,6 +28,11 @@ export const providersApi = {
     apiRequest<Provider>(`/providers/${id}`, { method: "PUT", body }),
   remove: (id: string) =>
     apiRequest<void>(`/providers/${id}`, { method: "DELETE", allowEmpty: true }),
+};
+
+// ---- provider catalog (server-side registered providers) ----
+export const providerCatalogApi = {
+  list: () => apiRequest<ProviderCatalogEntry[]>("/provider-catalog"),
 };
 
 // ---- routes ----

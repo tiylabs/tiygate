@@ -199,11 +199,12 @@ export default function Layout() {
   }, [collapsed]);
 
   return (
-    <div className="flex min-h-full bg-bg">
-      {/* Desktop sidebar */}
+    <div className="flex h-full overflow-hidden bg-bg">
+      {/* Desktop sidebar — fixed full-height column that never scrolls
+          with the page; its inner nav scrolls independently. */}
       <aside
         className={cn(
-          "relative hidden shrink-0 border-r border-border bg-surface transition-[width] duration-[var(--duration-fast)] lg:block",
+          "relative hidden h-full min-h-0 shrink-0 border-r border-border bg-surface transition-[width] duration-[var(--duration-fast)] lg:block",
           collapsed ? "w-16" : "w-56",
         )}
       >
@@ -213,7 +214,7 @@ export default function Layout() {
         />
       </aside>
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {/* Mobile top bar */}
         <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface px-4 lg:hidden">
           <RDialog.Root open={drawerOpen} onOpenChange={setDrawerOpen}>

@@ -27,9 +27,20 @@ export interface ProviderInput {
   enabled?: boolean;
 }
 
+/** One entry of the server-side provider catalog
+ *  (`GET /admin/v1/provider-catalog`). Reflects the providers actually
+ *  registered/compiled into the gateway binary, so the set changes with
+ *  feature flags rather than a hardcoded frontend list. */
+export interface ProviderCatalogEntry {
+  id: string;
+  display_name: string;
+  default_base_url: string;
+  auth_mode: string;
+}
+
 export interface RouteTarget {
   provider_id: string;
-  model: string;
+  model_id: string;
   weight?: number | null;
   priority?: number | null;
 }

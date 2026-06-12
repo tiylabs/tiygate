@@ -103,7 +103,7 @@ pub async fn resolve_api_key(state: &AppState, headers: &axum::http::HeaderMap) 
     // deployments.
     let lookup_result = match state.db_store.as_ref() {
         Some(db) => db.find_api_key_by_secret(&secret).await,
-        None => state.config.find_api_key_by_secret(&secret).await,
+        None => state.current_config().find_api_key_by_secret(&secret).await,
     };
     match lookup_result {
         Ok(Some(api_key)) => {

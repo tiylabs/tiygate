@@ -623,3 +623,59 @@ async fn api_key_quota_patch_and_single_get() {
         .expect("get-missing");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ---- provider catalog: server-side registered providers ----
+
+#[tokio::test]
+async fn provider_catalog_lists_registered_providers() {
+    let (router, _store, _pool) = boot_no_auth().await;
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/v1/provider-catalog")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("get-catalog");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+
+    let ids: Vec<&str> = entries
+        .iter()
+        .map(|e| e["id"].as_str().expect("id is a string"))
+        .collect();
+
+    // These providers are always linked into the default build.
+    assert!(ids.contains(&"openai"), "catalog should contain openai: {ids:?}");
+    assert!(
+        ids.contains(&"anthropic"),
+        "catalog should contain anthropic: {ids:?}"
+    );
+    // Bedrock is gated behind the `bedrock` feature and is not linked
+    // by the admin crate, so it must not appear in the default build.
+    assert!(
+        !ids.contains(&"bedrock"),
+        "catalog must not contain bedrock in the default build: {ids:?}"
+    );
+
+    // Entries are sorted by id for a stable UI.
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "catalog must be sorted by id");
+
+    // Each entry exposes the fields the UI relies on.
+    let openai = entries
+        .iter()
+        .find(|e| e["id"] == json!("openai"))
+        .expect("openai entry");
+    assert!(openai["display_name"].is_string());
+    assert!(openai["default_base_url"].is_string());
+    assert!(openai["auth_mode"].is_string());
+}

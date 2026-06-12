@@ -276,13 +276,16 @@ pub struct DbConfigStore {
     pool: DbPool,
     encryption: Option<Arc<KeyEncryption>>,
     /// In-memory copy of the latest snapshot, used by readers that
-    /// want a `ConfigStore` view.
-    inner: RwLock<ConfigStore>,
+    /// want a `ConfigStore` view. Held in an `ArcSwap` so the data
+    /// plane can read the latest snapshot lock-free (a single
+    /// atomic pointer load) and the epoch-poll task can publish a
+    /// new snapshot without blocking readers.
+    inner: arc_swap::ArcSwap<ConfigStore>,
 }
 
 impl DbConfigStore {
     pub fn new(pool: DbPool, encryption: Option<Arc<KeyEncryption>>) -> Self {
-        let inner = RwLock::new(ConfigStore::new());
+        let inner = arc_swap::ArcSwap::from_pointee(ConfigStore::new());
         Self {
             pool,
             encryption,
@@ -306,7 +309,16 @@ impl DbConfigStore {
     /// Returns a clone of the current `ConfigStore` view. The data
     /// plane uses this in `App::new()`.
     pub fn config_store(&self) -> ConfigStore {
-        self.inner.read().clone()
+        (*self.inner.load_full()).clone()
+    }
+
+    /// Returns the latest config snapshot as a shared `Arc`. This is
+    /// a lock-free atomic pointer load — the data plane calls this on
+    /// every request to read the most recent routing table published
+    /// by the epoch-poll task, without cloning the underlying
+    /// `HashMap`.
+    pub fn snapshot(&self) -> Arc<ConfigStore> {
+        self.inner.load_full()
     }
 
     /// Returns the current config epoch (cheap DB read).
@@ -371,7 +383,7 @@ impl DbConfigStore {
                 .collect(),
         };
         let store = ConfigStore::from_snapshot(snapshot);
-        *self.inner.write() = store;
+        self.inner.store(Arc::new(store));
         debug!(epoch, "config snapshot refreshed");
         Ok(())
     }

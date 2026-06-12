@@ -109,6 +109,8 @@ const zh: Translation = {
     editTitle: "编辑供应商",
     addTitle: "新建供应商",
     vendor: "厂商",
+    vendorLoading: "正在加载厂商…",
+    vendorLoadError: "无法获取厂商列表",
     apiBase: "API 地址",
     authMode: "鉴权方式",
     apiKey: "API 密钥",

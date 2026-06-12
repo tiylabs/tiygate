@@ -70,7 +70,7 @@ use tiygate_store::config::ConfigStore;
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct AppState {
-    pub config: ConfigStore,
+    pub config: Arc<ConfigStore>,
     /// Optional handle to the DB-backed config store. When `Some`,
     /// the data plane can perform per-caller `api_keys` lookups
     /// (used by `resolve_api_key` in `ingress_phase4`). When `None`
@@ -125,6 +125,24 @@ pub struct AppState {
     /// Per-request `Redactor` instance. Configurable so future
     /// env-var-driven extensions remain test-friendly.
     pub redactor: Arc<tiygate_core::redaction::Redactor>,
+}
+
+impl AppState {
+    /// Returns the config snapshot the data plane should read for
+    /// this request. When a `DbConfigStore` is wired in (production
+    /// control-plane path), this returns the latest snapshot the
+    /// epoch-poll task has published — so admin CRUD writes become
+    /// visible to live traffic within the poll interval, without
+    /// restarting the process and without the request itself
+    /// triggering any DB read. When no DB store is present (legacy /
+    /// test path), it returns the static snapshot captured at router
+    /// build time.
+    pub fn current_config(&self) -> Arc<ConfigStore> {
+        match &self.db_store {
+            Some(db) => db.snapshot(),
+            None => self.config.clone(),
+        }
+    }
 }
 
 use crate::config::ServerConfig;
@@ -190,7 +208,7 @@ pub fn router_with_telemetry_full(
 ) -> Router {
     let semaphore = Arc::new(Semaphore::new(server_config.max_inflight_requests));
     let state = AppState {
-        config,
+        config: Arc::new(config),
         db_store,
         health,
         concurrency_semaphore: semaphore,
@@ -762,7 +780,7 @@ async fn handle_chat_completions(
     scope.set_virtual_model(virtual_model.clone());
 
     // Resolve route
-    let targets = match state.config.routing_table.resolve(&virtual_model) {
+    let targets = match state.current_config().routing_table.resolve(&virtual_model) {
         Some(t) => t,
         None => {
             let app_err = AppError::new(
@@ -1120,7 +1138,7 @@ async fn handle_messages(
     scope.set_virtual_model(virtual_model.clone());
 
     // Resolve route
-    let targets = match state.config.routing_table.resolve(&virtual_model) {
+    let targets = match state.current_config().routing_table.resolve(&virtual_model) {
         Some(t) => t,
         None => {
             let app_err = AppError::new(
@@ -1861,7 +1879,7 @@ async fn handle_embeddings(
 
     let virtual_model = ir_request.model.clone();
     scope.set_virtual_model(virtual_model.clone());
-    let targets = match state.config.routing_table.resolve(&virtual_model) {
+    let targets = match state.current_config().routing_table.resolve(&virtual_model) {
         Some(t) => t,
         None => {
             let app_err = AppError::new(
@@ -2085,7 +2103,7 @@ async fn handle_responses(
     let virtual_model = ir_request.model.clone();
     let is_stream = ir_request.stream;
 
-    let targets = match state.config.routing_table.resolve(&virtual_model) {
+    let targets = match state.current_config().routing_table.resolve(&virtual_model) {
         Some(t) => t,
         None => {
             let app_err = AppError::new(
@@ -2357,7 +2375,7 @@ async fn handle_gemini_generate(
     let virtual_model = model;
     let is_stream = ir_request.stream;
 
-    let targets = match state.config.routing_table.resolve(&virtual_model) {
+    let targets = match state.current_config().routing_table.resolve(&virtual_model) {
         Some(t) => t,
         None => {
             let app_err = AppError::new(

@@ -1,6 +1,12 @@
+import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
-import { healthApi, statsApi } from "@/api/resources";
+import {
+  apiKeysApi,
+  healthApi,
+  providersApi,
+  statsApi,
+} from "@/api/resources";
 import type { StatBucket, StatsResponse } from "@/api/types";
 import {
   Badge,
@@ -19,9 +25,30 @@ import { PageHeader } from "@/components/PageHeader";
 
 const numberFmt = new Intl.NumberFormat();
 
+/** Two-line cell: primary name on top, faint id below as fallback / context. */
+function BucketCell({ primary, secondary }: { primary: string; secondary?: string }) {
+  if (!secondary || secondary === primary) {
+    return (
+      <span className="font-medium text-text">{primary || "—"}</span>
+    );
+  }
+  return (
+    <div className="flex flex-col leading-tight">
+      <span className="font-medium text-text">{primary}</span>
+      <span
+        className="font-mono text-[11px] text-text-subtle"
+        title={secondary}
+      >
+        {secondary}
+      </span>
+    </div>
+  );
+}
+
 function StatsTable({
   title,
   query,
+  resolveBucket,
 }: {
   title: string;
   query: {
@@ -30,6 +57,9 @@ function StatsTable({
     error: unknown;
     refetch: () => void;
   };
+  /** Map a raw bucket id to a human-friendly name. When omitted the raw
+   *  bucket is shown as-is. */
+  resolveBucket?: (id: string) => string | undefined;
 }) {
   const { t } = useTranslation();
   const buckets: StatBucket[] = query.data?.buckets ?? [];
@@ -61,7 +91,12 @@ function StatsTable({
           <tbody>
             {buckets.map((b) => (
               <Tr key={b.bucket}>
-                <Td className="font-medium text-text">{b.bucket || "—"}</Td>
+                <Td>
+                  <BucketCell
+                    primary={resolveBucket?.(b.bucket) ?? b.bucket}
+                    secondary={b.bucket}
+                  />
+                </Td>
                 <Td className="text-right tabular-nums">
                   {numberFmt.format(b.count)}
                 </Td>
@@ -105,6 +140,39 @@ export default function Dashboard() {
     queryKey: ["circuit-breakers"],
     queryFn: healthApi.circuitBreakers,
   });
+  // Name directories for nicer labels in the stats tables. We keep these
+  // queries on a long stale time so they don't refetch with every stats
+  // refresh; resource names rarely change.
+  const providers = useQuery({
+    queryKey: ["providers"],
+    queryFn: providersApi.list,
+    staleTime: 5 * 60_000,
+  });
+  const apiKeys = useQuery({
+    queryKey: ["api-keys"],
+    queryFn: apiKeysApi.list,
+    staleTime: 5 * 60_000,
+  });
+
+  const providerNameById = useMemo(() => {
+    const m = new Map<string, string>();
+    (providers.data ?? []).forEach((p) => m.set(p.id, p.name));
+    return m;
+  }, [providers.data]);
+  const apiKeyNameById = useMemo(() => {
+    const m = new Map<string, string>();
+    (apiKeys.data ?? []).forEach((k) => m.set(k.id, k.name));
+    return m;
+  }, [apiKeys.data]);
+
+  const resolveProviderBucket = useCallback(
+    (id: string) => providerNameById.get(id),
+    [providerNameById],
+  );
+  const resolveApiKeyBucket = useCallback(
+    (id: string) => apiKeyNameById.get(id),
+    [apiKeyNameById],
+  );
 
   // Aggregate top-line metrics from the by-model buckets.
   const modelBuckets = byModel.data?.buckets ?? [];
@@ -163,8 +231,16 @@ export default function Dashboard() {
 
       <div className="grid gap-6 xl:grid-cols-2">
         <StatsTable title={t("dashboard.byModel")} query={byModel} />
-        <StatsTable title={t("dashboard.byProvider")} query={byProvider} />
-        <StatsTable title={t("dashboard.byApiKey")} query={byApiKey} />
+        <StatsTable
+          title={t("dashboard.byProvider")}
+          query={byProvider}
+          resolveBucket={resolveProviderBucket}
+        />
+        <StatsTable
+          title={t("dashboard.byApiKey")}
+          query={byApiKey}
+          resolveBucket={resolveApiKeyBucket}
+        />
 
         <Card>
           <CardHeader title={t("dashboard.circuitBreakers")} />
@@ -184,25 +260,35 @@ export default function Dashboard() {
             />
           ) : (
             <Table>
+              <colgroup>
+                <col className="w-2/5" />
+                <col />
+              </colgroup>
               <thead>
                 <tr>
                   <Th>{t("dashboard.bucket")}</Th>
-                  <Th>{t("common.status")}</Th>
+                  <Th className="whitespace-nowrap">
+                    {t("common.status")}
+                  </Th>
                 </tr>
               </thead>
               <tbody>
                 {targets.map((b) => (
                   <Tr key={b.target}>
                     <Td className="font-mono text-xs">{b.target}</Td>
-                    <Td>
-                      <div className="flex items-center gap-2">
+                    <Td className="min-w-[12rem]">
+                      <div className="flex flex-wrap items-center gap-2">
                         {b.healthy ? (
-                          <Badge tone="success">{t("dashboard.healthy")}</Badge>
+                          <Badge tone="success">
+                            {t("dashboard.healthy")}
+                          </Badge>
                         ) : (
-                          <Badge tone="danger">{t("dashboard.unhealthy")}</Badge>
+                          <Badge tone="danger">
+                            {t("dashboard.unhealthy")}
+                          </Badge>
                         )}
                         <span
-                          className="text-xs text-text-subtle"
+                          className="break-all text-xs text-text-subtle"
                           title={b.status}
                         >
                           {b.status}

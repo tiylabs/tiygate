@@ -6,7 +6,10 @@
 //! directory has to ship alongside it.
 //!
 //! Routing contract:
-//! * `/admin/ui` and `/admin/ui/` return `index.html`.
+//! * `/admin/ui` permanently redirects to `/admin/ui/` so the
+//!   browser resolves the SPA's relative asset URLs and react-router
+//!   `basename` against the trailing slash.
+//! * `/admin/ui/` returns `index.html`.
 //! * `/admin/ui/<asset>` returns the embedded asset when it exists.
 //! * Any other path under `/admin/ui/` falls back to `index.html` so
 //!   the client-side router (react-router with `basename="/admin/ui"`)
@@ -21,8 +24,8 @@
 
 use axum::{
     extract::Path,
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Redirect, Response},
     routing::get,
     Router,
 };
@@ -35,9 +38,27 @@ struct WebUiAssets;
 /// Merge the `/admin/ui` SPA routes into the given router.
 pub fn mount(router: Router) -> Router {
     router
-        .route("/admin/ui", get(serve_index))
+        .route("/admin/ui", get(redirect_to_slash))
         .route("/admin/ui/", get(serve_index))
         .route("/admin/ui/*path", get(serve_asset))
+}
+
+/// Redirect the bare `/admin/ui` (no trailing slash) to `/admin/ui/`.
+///
+/// The SPA's `index.html` references its assets with relative URLs
+/// (`./assets/…`, `./icon.svg`) and react-router resolves its
+/// `basename` against the trailing slash. Serving `index.html`
+/// directly at `/admin/ui` makes the browser resolve those relative
+/// URLs against `/admin/` (the parent), breaking asset loading and
+/// client-side routing. A permanent redirect that preserves the
+/// query string keeps deep links working. The query is forwarded so
+/// links like `/admin/ui?foo=bar` survive the hop.
+async fn redirect_to_slash(uri: Uri) -> Response {
+    let target = match uri.query() {
+        Some(q) if !q.is_empty() => format!("/admin/ui/?{q}"),
+        _ => "/admin/ui/".to_string(),
+    };
+    Redirect::permanent(&target).into_response()
 }
 
 async fn serve_index() -> Response {

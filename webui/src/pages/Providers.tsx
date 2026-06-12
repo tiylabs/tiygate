@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Pencil, Trash2 } from "lucide-react";
-import { providersApi } from "@/api/resources";
+import { providersApi, providerCatalogApi } from "@/api/resources";
 import type { Provider, ProviderInput } from "@/api/types";
 import {
   Badge,
@@ -26,6 +26,7 @@ import {
   useToast,
 } from "@/components/ui";
 import { PageHeader, fmtTime, shortId } from "@/components/PageHeader";
+import { VendorIcon } from "@/lib/vendors";
 
 const AUTH_MODES = ["api_key", "oauth"];
 
@@ -58,12 +59,55 @@ export default function Providers() {
     queryKey: ["providers"],
     queryFn: providersApi.list,
   });
+  const {
+    data: catalog,
+    isLoading: catalogLoading,
+    isError: catalogError,
+  } = useQuery({
+    queryKey: ["provider-catalog"],
+    queryFn: providerCatalogApi.list,
+  });
 
+  // Map catalog id → display name for the table's vendor column.
+  const catalogLabel = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const e of catalog ?? []) m.set(e.id, e.display_name);
+    return m;
+  }, [catalog]);
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm());
   const [editing, setEditing] = useState<Provider | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Provider | null>(null);
+
+  // Options for the vendor dropdown, sourced from the server catalog. When
+  // editing a provider whose vendor is no longer in the catalog (server
+  // narrowed the set), we inject the current value so its value is never
+  // silently dropped.
+  const vendorOptions = useMemo(() => {
+    const entries = catalog ?? [];
+    const opts = entries.map((e) => ({
+      value: e.id,
+      label: (
+        <span className="flex items-center gap-2">
+          <VendorIcon vendor={e.id} className="h-4 w-4" />
+          <span>{e.display_name}</span>
+        </span>
+      ),
+    }));
+    if (form.vendor && !entries.some((e) => e.id === form.vendor)) {
+      opts.push({
+        value: form.vendor,
+        label: (
+          <span className="flex items-center gap-2">
+            <VendorIcon vendor={form.vendor} className="h-4 w-4" />
+            <span>{form.vendor}</span>
+          </span>
+        ),
+      });
+    }
+    return opts;
+  }, [catalog, form.vendor]);
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["providers"] });
 
@@ -186,7 +230,14 @@ export default function Providers() {
                         {shortId(p.id)}
                       </div>
                     </Td>
-                    <Td>{p.vendor}</Td>
+                    <Td>
+                      <div className="flex items-center gap-2">
+                        <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary-soft text-primary">
+                          <VendorIcon vendor={p.vendor} />
+                        </span>
+                        <span>{catalogLabel.get(p.vendor) ?? p.vendor}</span>
+                      </div>
+                    </Td>
                     <Td className="max-w-[220px] truncate font-mono text-xs" title={p.api_base}>
                       {p.api_base}
                     </Td>
@@ -260,9 +311,34 @@ export default function Providers() {
             />
           </Field>
           <Field label={t("providers.vendor")}>
-            <Input
+            <Select
               value={form.vendor}
-              onChange={(e) => setForm({ ...form, vendor: e.target.value })}
+              onValueChange={(v) => {
+                // On a fresh create, prefill from the selected catalog entry:
+                // api_base only when still empty (don't clobber a typed URL),
+                // auth_mode follows the chosen vendor's declared mode.
+                const entry = catalog?.find((e) => e.id === v);
+                setForm((prev) => ({
+                  ...prev,
+                  vendor: v,
+                  api_base:
+                    !editing && !prev.api_base && entry
+                      ? entry.default_base_url
+                      : prev.api_base,
+                  auth_mode:
+                    !editing && entry ? entry.auth_mode : prev.auth_mode,
+                }));
+              }}
+              ariaLabel={t("providers.vendor")}
+              disabled={catalogLoading || catalogError || vendorOptions.length === 0}
+              placeholder={
+                catalogLoading
+                  ? t("providers.vendorLoading")
+                  : catalogError
+                    ? t("providers.vendorLoadError")
+                    : undefined
+              }
+              options={vendorOptions}
             />
           </Field>
           <Field label={t("providers.apiBase")}>

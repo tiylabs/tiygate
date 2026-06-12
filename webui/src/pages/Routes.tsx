@@ -37,7 +37,7 @@ interface FormState {
 function emptyForm(): FormState {
   return {
     virtual_model: "",
-    targets: [{ provider_id: "", model: "" }],
+    targets: [{ provider_id: "", model_id: "" }],
     enabled: true,
   };
 }
@@ -104,7 +104,7 @@ export default function RoutesPage() {
       virtual_model: r.virtual_model,
       targets: r.targets.length
         ? r.targets.map((tg) => ({ ...tg }))
-        : [{ provider_id: "", model: "" }],
+        : [{ provider_id: "", model_id: "" }],
       enabled: r.enabled,
     });
     setFormError(null);
@@ -121,10 +121,10 @@ export default function RoutesPage() {
   function submit() {
     setFormError(null);
     const targets = form.targets
-      .filter((tg) => tg.provider_id && tg.model)
+      .filter((tg) => tg.provider_id && tg.model_id)
       .map((tg) => ({
         provider_id: tg.provider_id,
-        model: tg.model,
+        model_id: tg.model_id,
         weight: tg.weight ?? undefined,
         priority: tg.priority ?? undefined,
       }));
@@ -208,7 +208,7 @@ export default function RoutesPage() {
                       <div className="flex flex-wrap gap-1">
                         {r.targets.map((tg, i) => (
                           <Badge key={i} tone="primary">
-                            {tg.provider_id} → {tg.model}
+                            {tg.provider_id} → {tg.model_id}
                           </Badge>
                         ))}
                       </div>
@@ -298,7 +298,7 @@ export default function RoutesPage() {
                 onClick={() =>
                   setForm((f) => ({
                     ...f,
-                    targets: [...f.targets, { provider_id: "", model: "" }],
+                    targets: [...f.targets, { provider_id: "", model_id: "" }],
                   }))
                 }
               >
@@ -322,8 +322,8 @@ export default function RoutesPage() {
                 <div className="space-y-1">
                   <Label>{t("routes.model")}</Label>
                   <Input
-                    value={tg.model}
-                    onChange={(e) => updateTarget(idx, { model: e.target.value })}
+                    value={tg.model_id}
+                    onChange={(e) => updateTarget(idx, { model_id: e.target.value })}
                   />
                 </div>
                 <div className="space-y-1">
