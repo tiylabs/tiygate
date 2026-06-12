@@ -596,11 +596,13 @@ pub fn inject_trace(
 /// This is the single source of truth for the gateway → provider
 /// (egress) headers we record: by capturing from the *built* request
 /// rather than the hand-assembled `HeaderMap`, the snapshot includes
-/// every header reqwest adds at finalize time (`content-type`,
-/// `content-length`, the injected `traceparent`, auth, etc.) so the
-/// recorded set matches the bytes on the wire. Redaction + truncation
-/// happen later on the telemetry background task; the returned headers
-/// are still cleartext here.
+/// every application-level header (`content-type`, the injected
+/// `traceparent`, auth, etc.). `host` and `content-length` — which the
+/// underlying hyper client only materializes at the wire layer — are
+/// derived from the request URL and body so the recorded set matches
+/// the bytes on the wire. Redaction + truncation happen later on the
+/// telemetry background task; the returned headers are still cleartext
+/// here.
 ///
 /// Callers send the returned request via
 /// `state.http_client.execute(req)`.
@@ -613,11 +615,34 @@ pub fn finalize_egress(
             format!("build upstream request: {e}"),
         )
     })?;
-    let headers = req
+    let mut headers: Vec<(String, String)> = req
         .headers()
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
+
+    // `host` and `content-length` are added by the underlying hyper
+    // client at the wire layer and never appear in
+    // `reqwest::Request::headers()`. Derive them here so the recorded
+    // egress header set matches what is actually sent upstream.
+    let has_host = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"));
+    let has_content_length = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+    if !has_host {
+        if let Some(host) = req.url().host_str() {
+            let host_value = match req.url().port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            };
+            headers.push(("host".to_string(), host_value));
+        }
+    }
+    if !has_content_length {
+        if let Some(len) = req.body().and_then(|b| b.as_bytes()).map(|b| b.len()) {
+            headers.push(("content-length".to_string(), len.to_string()));
+        }
+    }
     Ok((req, headers))
 }
 
