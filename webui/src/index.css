@@ -1,74 +1,101 @@
 @import "tailwindcss";
 
 /* ------------------------------------------------------------------ */
-/* Semantic design tokens (docs/webui-design-system.md §13)            */
+/* Semantic design tokens — v0.2 "Quiet Precision"                     */
+/* (docs/webui-design-system.md §3, §5, §6, §12)                       */
 /* ------------------------------------------------------------------ */
 :root {
   color-scheme: light;
-  --bg: #f8fafc;
+  /* neutrals (Ink) */
+  --bg: #f7f8fa;
   --surface: #ffffff;
-  --surface-muted: #f1f5f9;
-  --border: #e2e8f0;
-  --text: #0f172a;
-  --text-muted: #475569;
-  --text-subtle: #64748b;
-  --primary: #2563eb;
-  --primary-strong: #1d4ed8;
-  --primary-soft: #dbeafe;
+  --surface-muted: #f1f3f6;
+  --border: #e4e7ec;
+  --border-strong: #d0d5dd;
+  --text: #101828;
+  --text-muted: #475467;
+  --text-subtle: #667085;
+  /* primary & accent */
+  --primary: #2e5be6;
+  --primary-strong: #2348c7;
+  --primary-soft: #e8eefe;
+  --primary-faint: #f4f7fe;
   --on-primary: #ffffff;
-  --accent: #f97316;
-  --accent-strong: #ea580c;
+  --accent: #e56910;
+  --accent-strong: #c45708;
   --on-accent: #ffffff;
+  /* status */
+  --success: #17914f;
+  --success-soft: #e6f6ec;
+  --warning: #b45309;
+  --warning-soft: #fbf1e0;
+  --danger: #d92d20;
+  --danger-strong: #b42318;
+  --danger-soft: #fbeae8;
   --on-danger: #ffffff;
-  --success: #16a34a;
-  --success-soft: #dcfce7;
-  --warning: #d97706;
-  --warning-soft: #fef3c7;
-  --danger: #dc2626;
-  --danger-strong: #b91c1c;
-  --danger-soft: #fee2e2;
-  --info: #0284c7;
-  --info-soft: #e0f2fe;
+  --info: #0e7cb8;
+  --info-soft: #e3f3fc;
+  /* focus */
+  --ring: color-mix(in srgb, var(--primary) 45%, transparent);
 
+  /* radius */
+  --radius-xs: 4px;
   --radius-sm: 6px;
   --radius-md: 8px;
   --radius-lg: 12px;
+  --radius-full: 999px;
 
-  --shadow-sm: 0 1px 2px rgb(15 23 42 / 0.06);
-  --shadow-md: 0 8px 24px rgb(15 23 42 / 0.12);
-  --shadow-lg: 0 20px 48px rgb(15 23 42 / 0.18);
+  /* elevation (docs §5.4) */
+  --shadow-xs: 0 1px 2px rgb(16 24 40 / 0.05);
+  --shadow-md: 0 4px 8px -2px rgb(16 24 40 / 0.1),
+    0 2px 4px -2px rgb(16 24 40 / 0.06);
+  --shadow-lg: 0 20px 24px -4px rgb(16 24 40 / 0.1),
+    0 8px 8px -4px rgb(16 24 40 / 0.04);
+  --overlay: rgb(16 24 40 / 0.5);
 
+  /* motion (docs §6.1) */
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+  --duration-slow: 240ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+
+  /* fonts */
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-    Helvetica, Arial, sans-serif;
-  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    "PingFang SC", "Noto Sans SC", Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
 }
 
 [data-theme="dark"] {
   color-scheme: dark;
-  --bg: #020617;
-  --surface: #0f172a;
-  --surface-muted: #1e293b;
-  --border: #334155;
-  --text: #f8fafc;
-  --text-muted: #cbd5e1;
-  --text-subtle: #94a3b8;
-  --primary: #60a5fa;
-  --primary-strong: #93c5fd;
-  --primary-soft: #1e3a8a;
-  --on-primary: #0b1120;
-  --accent: #fb923c;
-  --accent-strong: #fdba74;
-  --on-accent: #1a1000;
-  --on-danger: #1a0a0a;
-  --success: #4ade80;
-  --success-soft: #14532d;
-  --warning: #fbbf24;
-  --warning-soft: #78350f;
-  --danger: #f87171;
-  --danger-strong: #fca5a5;
-  --danger-soft: #7f1d1d;
-  --info: #38bdf8;
-  --info-soft: #0c4a6e;
+  --bg: #0b0d12;
+  --surface: #12151c;
+  --surface-muted: #1a1e27;
+  --border: #262b36;
+  --border-strong: #343b49;
+  --text: #edeff3;
+  --text-muted: #a4acbb;
+  --text-subtle: #767e8e;
+  --primary: #84a6ff;
+  --primary-strong: #a3bcff;
+  --primary-soft: #1d2a4a;
+  --primary-faint: #161e33;
+  --on-primary: #0b0d12;
+  --accent: #f08c3d;
+  --accent-strong: #f6a86a;
+  --on-accent: #0b0d12;
+  --success: #45c77f;
+  --success-soft: #11291c;
+  --warning: #f0b254;
+  --warning-soft: #2e2410;
+  --danger: #f2756b;
+  --danger-strong: #f8958d;
+  --danger-soft: #321714;
+  --on-danger: #0b0d12;
+  --info: #4fbbf0;
+  --info-soft: #0e2433;
+  --overlay: rgb(0 0 0 / 0.6);
 }
 
 /* Map semantic tokens to Tailwind v4 utilities (bg-surface, text-muted, …) */
@@ -77,12 +104,14 @@
   --color-surface: var(--surface);
   --color-surface-muted: var(--surface-muted);
   --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-text: var(--text);
   --color-text-muted: var(--text-muted);
   --color-text-subtle: var(--text-subtle);
   --color-primary: var(--primary);
   --color-primary-strong: var(--primary-strong);
   --color-primary-soft: var(--primary-soft);
+  --color-primary-faint: var(--primary-faint);
   --color-on-primary: var(--on-primary);
   --color-accent: var(--accent);
   --color-accent-strong: var(--accent-strong);
@@ -97,12 +126,15 @@
   --color-danger-soft: var(--danger-soft);
   --color-info: var(--info);
   --color-info-soft: var(--info-soft);
+  --color-ring: var(--ring);
+  --color-overlay: var(--overlay);
 
+  --radius-xs: var(--radius-xs);
   --radius-sm: var(--radius-sm);
   --radius-md: var(--radius-md);
   --radius-lg: var(--radius-lg);
 
-  --shadow-sm: var(--shadow-sm);
+  --shadow-xs: var(--shadow-xs);
   --shadow-md: var(--shadow-md);
   --shadow-lg: var(--shadow-lg);
 
@@ -123,12 +155,34 @@ body {
   color: var(--text);
 }
 
-/* Tabular figures for data columns / metrics */
+/* Tabular figures for data columns / metrics (docs §4.3) */
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
 
-/* Dialog / toast animations (transform + opacity only) */
+/* Type roles (docs §4.2) */
+.text-title-lg {
+  font-size: 20px;
+  line-height: 28px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.text-display {
+  font-size: 28px;
+  line-height: 36px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.text-label {
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Dialog / drawer / toast animations — transform + opacity only (docs §6) */
 @keyframes overlay-in {
   from {
     opacity: 0;
@@ -141,7 +195,7 @@ body {
 @keyframes content-in {
   from {
     opacity: 0;
-    transform: translate(-50%, -48%) scale(0.96);
+    transform: translate(-50%, calc(-50% + 8px)) scale(0.96);
   }
   to {
     opacity: 1;
@@ -160,9 +214,11 @@ body {
 
 @keyframes drawer-right-in {
   from {
-    transform: translateX(100%);
+    opacity: 0;
+    transform: translateX(16px);
   }
   to {
+    opacity: 1;
     transform: translateX(0);
   }
 }
@@ -179,19 +235,19 @@ body {
 }
 
 .animate-overlay-in {
-  animation: overlay-in 180ms ease-out;
+  animation: overlay-in var(--duration-base) var(--ease-out);
 }
 .animate-content-in {
-  animation: content-in 200ms ease-out;
+  animation: content-in var(--duration-slow) var(--ease-out);
 }
 .animate-drawer-in {
-  animation: drawer-in 200ms ease-out;
+  animation: drawer-in var(--duration-slow) var(--ease-out);
 }
 .animate-drawer-right-in {
-  animation: drawer-right-in 200ms ease-out;
+  animation: drawer-right-in var(--duration-slow) var(--ease-out);
 }
 .animate-toast-in {
-  animation: toast-in 200ms ease-out;
+  animation: toast-in var(--duration-base) var(--ease-out);
 }
 
 @media (prefers-reduced-motion: reduce) {

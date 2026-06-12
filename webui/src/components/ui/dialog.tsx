@@ -43,7 +43,7 @@ export function Dialog({
   return (
     <RDialog.Root open={open} onOpenChange={onOpenChange}>
       <RDialog.Portal>
-        <RDialog.Overlay className="animate-overlay-in fixed inset-0 z-40 bg-slate-900/50 backdrop-blur-[1px]" />
+        <RDialog.Overlay className="animate-overlay-in fixed inset-0 z-40 bg-overlay backdrop-blur-[1px]" />
         <RDialog.Content
           className={cn(
             "animate-content-in fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col rounded-lg border border-border bg-surface shadow-lg focus:outline-none",
@@ -55,7 +55,7 @@ export function Dialog({
               {hideTitle ? (
                 <RDialog.Title className="sr-only">{title}</RDialog.Title>
               ) : (
-                <RDialog.Title className="text-base font-semibold text-text">
+                <RDialog.Title className="text-base font-semibold tracking-[-0.01em] text-text">
                   {title}
                 </RDialog.Title>
               )}
@@ -67,7 +67,7 @@ export function Dialog({
             </div>
             <RDialog.Close
               aria-label={closeLabel}
-              className="-mr-1 rounded-md p-1 text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              className="-mr-1 rounded-md p-1 text-text-subtle transition-colors duration-[var(--duration-fast)] hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <X size={18} />
             </RDialog.Close>
@@ -109,11 +109,11 @@ export function Drawer({
   return (
     <RDialog.Root open={open} onOpenChange={onOpenChange}>
       <RDialog.Portal>
-        <RDialog.Overlay className="animate-overlay-in fixed inset-0 z-40 bg-slate-900/50 backdrop-blur-[1px]" />
+        <RDialog.Overlay className="animate-overlay-in fixed inset-0 z-40 bg-overlay backdrop-blur-[1px]" />
         <RDialog.Content className="data-[state=open]:animate-drawer-right-in fixed right-0 top-0 z-50 flex h-full w-full max-w-xl flex-col border-l border-border bg-surface shadow-lg focus:outline-none">
           <div className="flex items-start justify-between gap-4 border-b border-border px-5 py-4">
             <div className="min-w-0">
-              <RDialog.Title className="truncate text-base font-semibold text-text">
+              <RDialog.Title className="truncate text-base font-semibold tracking-[-0.01em] text-text">
                 {title}
               </RDialog.Title>
               {description ? (
@@ -124,7 +124,7 @@ export function Drawer({
             </div>
             <RDialog.Close
               aria-label={closeLabel}
-              className="-mr-1 rounded-md p-1 text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              className="-mr-1 rounded-md p-1 text-text-subtle transition-colors duration-[var(--duration-fast)] hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <X size={18} />
             </RDialog.Close>

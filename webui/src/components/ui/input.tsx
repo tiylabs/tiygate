@@ -9,10 +9,11 @@ import { Eye, EyeOff } from "lucide-react";
 import { cn } from "@/lib/cn";
 
 const fieldBase =
-  "w-full rounded-md border border-border bg-surface px-3 py-1.5 text-sm " +
-  "text-text placeholder:text-text-subtle transition-colors " +
+  "w-full rounded-sm border border-border-strong bg-surface px-3 py-1.5 text-sm " +
+  "text-text placeholder:text-text-subtle " +
+  "transition-colors duration-[var(--duration-fast)] " +
   "focus-visible:outline-none focus-visible:border-primary " +
-  "focus-visible:ring-2 focus-visible:ring-primary/40 " +
+  "focus-visible:ring-2 focus-visible:ring-ring " +
   "disabled:cursor-not-allowed disabled:opacity-50";
 
 export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(

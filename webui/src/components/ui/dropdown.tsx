@@ -4,12 +4,12 @@ import { MoreHorizontal } from "lucide-react";
 import { cn } from "@/lib/cn";
 
 const contentClass =
-  "z-50 min-w-[10rem] overflow-hidden rounded-md border border-border bg-surface p-1 shadow-md " +
+  "z-40 min-w-[10rem] overflow-hidden rounded-md border border-border bg-surface p-1 shadow-md " +
   "data-[state=open]:animate-overlay-in";
 
 const itemClass =
   "flex cursor-pointer items-center gap-2 rounded-sm px-2.5 py-1.5 text-sm text-text outline-none " +
-  "transition-colors focus:bg-surface-muted data-[highlighted]:bg-surface-muted " +
+  "transition-colors duration-[var(--duration-fast)] focus:bg-surface-muted data-[highlighted]:bg-surface-muted " +
   "data-[disabled]:pointer-events-none data-[disabled]:opacity-50";
 
 export interface DropdownItem {
@@ -37,7 +37,7 @@ export function RowActions({ items, label }: RowActionsProps) {
       <RDropdown.Trigger asChild>
         <button
           aria-label={label}
-          className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-muted transition-colors duration-[var(--duration-fast)] hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <MoreHorizontal size={16} />
         </button>

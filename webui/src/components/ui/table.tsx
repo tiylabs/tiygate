@@ -21,7 +21,7 @@ export function Th({
   return (
     <th
       className={cn(
-        "border-b border-border bg-surface-muted px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wide text-text-muted",
+        "text-label border-b border-border bg-surface-muted px-4 py-2.5 text-left text-text-muted",
         className,
       )}
     >
@@ -51,7 +51,12 @@ export function Tr({
   className,
 }: PropsWithChildren<{ className?: string }>) {
   return (
-    <tr className={cn("transition-colors hover:bg-surface-muted", className)}>
+    <tr
+      className={cn(
+        "transition-colors duration-[var(--duration-fast)] hover:bg-surface-muted",
+        className,
+      )}
+    >
       {children}
     </tr>
   );

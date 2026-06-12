@@ -7,7 +7,7 @@ export function LanguageSwitcher() {
   const current = i18n.language.startsWith("zh") ? "zh" : "en";
   const itemClass = (active: boolean) =>
     cn(
-      "rounded px-1.5 py-0.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
+      "rounded px-1.5 py-0.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
       active ? "font-semibold text-text" : "text-text-subtle hover:text-text",
     );
   return (

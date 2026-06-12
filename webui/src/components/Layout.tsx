@@ -39,8 +39,8 @@ const navItems: Array<{
 
 function navLinkClass({ isActive }: { isActive: boolean }): string {
   return cn(
-    "flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors",
-    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
+    "flex items-center gap-2.5 rounded-md px-3 py-2 text-sm font-medium transition-colors duration-[var(--duration-fast)]",
+    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
     isActive
       ? "border-l-2 border-primary bg-primary-soft text-primary"
       : "border-l-2 border-transparent text-text-muted hover:bg-surface-muted hover:text-text",
@@ -81,14 +81,14 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
             type="button"
             onClick={toggleTheme}
             aria-label={t(theme === "dark" ? "app.themeLight" : "app.themeDark")}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
           </button>
         </div>
         <button
           type="button"
-          className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-danger transition-colors hover:bg-danger-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
+          className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-danger transition-colors hover:bg-danger-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           onClick={logout}
         >
           <LogOut size={16} aria-hidden />
@@ -118,20 +118,20 @@ export default function Layout() {
               <button
                 type="button"
                 aria-label={t("app.menu")}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                className="inline-flex h-9 w-9 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <Menu size={18} />
               </button>
             </RDialog.Trigger>
             <RDialog.Portal>
-              <RDialog.Overlay className="animate-overlay-in fixed inset-0 z-40 bg-slate-900/50 lg:hidden" />
+              <RDialog.Overlay className="animate-overlay-in fixed inset-0 z-40 bg-overlay lg:hidden" />
               <RDialog.Content className="animate-drawer-in fixed inset-y-0 left-0 z-50 w-64 border-r border-border bg-surface focus:outline-none lg:hidden">
                 <RDialog.Title className="sr-only">{t("app.menu")}</RDialog.Title>
                 <RDialog.Close asChild>
                   <button
                     type="button"
                     aria-label={t("app.closeMenu")}
-                    className="absolute right-2 top-3 z-10 inline-flex h-8 w-8 items-center justify-center rounded-md text-text-subtle hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                    className="absolute right-2 top-3 z-10 inline-flex h-8 w-8 items-center justify-center rounded-md text-text-subtle hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     <X size={18} />
                   </button>

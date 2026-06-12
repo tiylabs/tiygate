@@ -12,7 +12,7 @@ export function PageHeader({
   return (
     <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div className="min-w-0">
-        <h1 className="text-xl font-semibold text-text">{title}</h1>
+        <h1 className="text-title-lg text-text">{title}</h1>
         {description ? (
           <p className="mt-1 text-sm text-text-muted">{description}</p>
         ) : null}

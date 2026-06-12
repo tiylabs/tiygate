@@ -18,7 +18,7 @@ export function Tooltip({ content, children, side = "top" }: TooltipProps) {
         <RTooltip.Content
           side={side}
           sideOffset={6}
-          className="z-50 max-w-xs rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-text shadow-md data-[state=delayed-open]:animate-overlay-in"
+          className="z-40 max-w-xs rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-text shadow-md data-[state=delayed-open]:animate-overlay-in"
         >
           {content}
           <RTooltip.Arrow className="fill-[var(--surface)]" />

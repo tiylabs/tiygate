@@ -35,7 +35,7 @@ export function ConfirmDialog({
   return (
     <RDialog.Root open={open} onOpenChange={onOpenChange}>
       <RDialog.Portal>
-        <RDialog.Overlay className="animate-overlay-in fixed inset-0 z-40 bg-slate-900/50 backdrop-blur-[1px]" />
+        <RDialog.Overlay className="animate-overlay-in fixed inset-0 z-40 bg-overlay backdrop-blur-[1px]" />
         <RDialog.Content
           onEscapeKeyDown={destructive ? (e) => e.preventDefault() : undefined}
           className="animate-content-in fixed left-1/2 top-1/2 z-50 w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-surface shadow-lg focus:outline-none"
@@ -47,7 +47,7 @@ export function ConfirmDialog({
               </div>
             ) : null}
             <div className="min-w-0 flex-1">
-              <RDialog.Title className="text-base font-semibold text-text">
+              <RDialog.Title className="text-base font-semibold tracking-[-0.01em] text-text">
                 {title}
               </RDialog.Title>
               <RDialog.Description className="mt-1.5 text-sm text-text-muted">

@@ -8,7 +8,7 @@ export function Card({
   return (
     <div
       className={cn(
-        "rounded-md border border-border bg-surface shadow-sm",
+        "rounded-md border border-border bg-surface shadow-xs",
         className,
       )}
     >
@@ -66,12 +66,8 @@ export function Metric({
         : "text-text";
   return (
     <Card className="p-4">
-      <div className="text-xs font-medium uppercase tracking-wide text-text-subtle">
-        {label}
-      </div>
-      <div className={cn("mt-1 text-2xl font-semibold tabular-nums", valueTone)}>
-        {value}
-      </div>
+      <div className="text-label text-text-subtle">{label}</div>
+      <div className={cn("text-display mt-1", valueTone)}>{value}</div>
       {caption ? (
         <div className="mt-1 text-xs text-text-subtle">{caption}</div>
       ) : null}

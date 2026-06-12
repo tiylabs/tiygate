@@ -34,8 +34,8 @@ export function Select({
       <RSelect.Trigger
         aria-label={ariaLabel}
         className={cn(
-          "inline-flex w-full items-center justify-between gap-2 rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-text transition-colors",
-          "focus-visible:outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary/40",
+          "inline-flex w-full items-center justify-between gap-2 rounded-sm border border-border-strong bg-surface px-3 py-1.5 text-sm text-text transition-colors duration-[var(--duration-fast)]",
+          "focus-visible:outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-ring",
           "disabled:cursor-not-allowed disabled:opacity-50 data-[placeholder]:text-text-subtle",
           className,
         )}
@@ -49,7 +49,7 @@ export function Select({
         <RSelect.Content
           position="popper"
           sideOffset={4}
-          className="z-50 max-h-72 min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-md border border-border bg-surface shadow-md"
+          className="z-40 max-h-72 min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-md border border-border bg-surface shadow-md"
         >
           <RSelect.Viewport className="p-1">
             {options.map((opt) => (

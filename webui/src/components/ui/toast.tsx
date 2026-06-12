@@ -113,14 +113,14 @@ export function ToastProvider({ children }: PropsWithChildren) {
               </div>
               <RToast.Close
                 aria-label="Close"
-                className="-mr-1 rounded p-0.5 text-text-subtle transition-colors hover:bg-surface-muted hover:text-text"
+                className="-mr-1 rounded p-0.5 text-text-subtle transition-colors duration-[var(--duration-fast)] hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <X size={14} />
               </RToast.Close>
             </RToast.Root>
           );
         })}
-        <RToast.Viewport className="fixed bottom-0 right-0 z-[100] m-0 flex w-[calc(100%-2rem)] max-w-sm list-none flex-col gap-2 p-4 outline-none sm:right-4" />
+        <RToast.Viewport className="fixed bottom-0 right-0 z-[60] m-0 flex w-[calc(100%-2rem)] max-w-sm list-none flex-col gap-2 p-4 outline-none sm:right-4" />
       </RToast.Provider>
     </ToastContext.Provider>
   );

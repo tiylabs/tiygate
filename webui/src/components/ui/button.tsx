@@ -23,8 +23,10 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 const base =
   "inline-flex items-center justify-center gap-1.5 rounded-md font-medium " +
-  "transition-colors cursor-pointer select-none " +
-  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary " +
+  "cursor-pointer select-none " +
+  "transition-[background-color,border-color,color,transform] duration-[var(--duration-fast)] " +
+  "active:scale-[0.98] " +
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring " +
   "focus-visible:ring-offset-2 focus-visible:ring-offset-bg " +
   "disabled:cursor-not-allowed disabled:opacity-50 disabled:pointer-events-none";
 
@@ -37,7 +39,7 @@ const variants: Record<ButtonVariant, string> = {
   primary:
     "bg-primary text-on-primary hover:bg-primary-strong active:bg-primary-strong",
   secondary:
-    "bg-surface text-text border border-border hover:bg-surface-muted",
+    "bg-surface text-text border border-border-strong hover:bg-surface-muted",
   ghost: "bg-transparent text-text-muted hover:bg-surface-muted hover:text-text",
   danger: "bg-danger text-on-danger hover:bg-danger-strong",
   accent: "bg-accent text-on-accent hover:bg-accent-strong",
