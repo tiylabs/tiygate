@@ -53,12 +53,18 @@ export function ThemeSwitcher() {
                       return (
                         <RDropdown.Item
                           key={item.id}
-                          onSelect={() => setTheme(item.id)}
+                          onSelect={(event) => {
+                            // Keep the menu open so users can compare themes
+                            // back-to-back. preventDefault stops Radix
+                            // from auto-closing the dropdown on selection.
+                            event.preventDefault();
+                            setTheme(item.id);
+                          }}
                           aria-label={label}
                           aria-current={active}
                           title={label}
                           className={cn(
-                            "relative h-5 w-8 overflow-hidden rounded p-0 outline-none",
+                            "relative h-5 w-8 overflow-visible rounded p-0 outline-none",
                             "transition-shadow duration-[var(--duration-fast)]",
                             "ring-1 ring-inset ring-border",
                             "data-[highlighted]:ring-border-strong focus-visible:ring-2 focus-visible:ring-ring",
@@ -68,20 +74,18 @@ export function ThemeSwitcher() {
                         >
                           {/* diagonal split chip: upper-left = theme primary, lower-right = theme background */}
                           <span
-                            className="block h-full w-full"
+                            className="block h-full w-full overflow-hidden rounded"
                             style={{
                               background: `linear-gradient(135deg, ${item.swatchColor} 0 50%, ${item.swatchBg} 50% 100%)`,
                             }}
                             aria-hidden
                           />
                           {active ? (
-                            <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
-                              <Check
-                                size={12}
-                                strokeWidth={3}
-                                className="text-on-primary drop-shadow-[0_0_1px_rgba(0,0,0,0.6)]"
-                                aria-hidden
-                              />
+                            <span
+                              className="pointer-events-none absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-on-primary shadow ring-1 ring-surface"
+                              aria-hidden
+                            >
+                              <Check size={10} strokeWidth={3} />
                             </span>
                           ) : null}
                         </RDropdown.Item>

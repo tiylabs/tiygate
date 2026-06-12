@@ -14,9 +14,15 @@ export type Theme =
   | "light"
   | "light-warm"
   | "light-slate"
+  | "light-lime"
+  | "light-fuchsia"
+  | "light-mauve"
   | "dark"
   | "dark-dim"
-  | "dark-oled";
+  | "dark-oled"
+  | "dark-lime"
+  | "dark-fuchsia"
+  | "dark-mauve";
 
 export interface ThemeMeta {
   id: Theme;
@@ -31,44 +37,86 @@ export const THEMES: ThemeMeta[] = [
   {
     id: "light",
     mode: "light",
-    labelKey: "app.themeLightDefault",
+    labelKey: "app.themeBlue",
     swatchBg: "#f7f8fa",
     swatchColor: "#2e5be6",
   },
   {
     id: "light-warm",
     mode: "light",
-    labelKey: "app.themeLightWarm",
+    labelKey: "app.themeAmber",
     swatchBg: "#faf7f2",
     swatchColor: "#b4530e",
   },
   {
     id: "light-slate",
     mode: "light",
-    labelKey: "app.themeLightSlate",
+    labelKey: "app.themeSlate",
     swatchBg: "#eef1f5",
     swatchColor: "#475569",
   },
   {
+    id: "light-lime",
+    mode: "light",
+    labelKey: "app.themeLime",
+    swatchBg: "#f6f9f0",
+    swatchColor: "#4d7c0f",
+  },
+  {
+    id: "light-fuchsia",
+    mode: "light",
+    labelKey: "app.themeFuchsia",
+    swatchBg: "#fdf4fb",
+    swatchColor: "#c026d3",
+  },
+  {
+    id: "light-mauve",
+    mode: "light",
+    labelKey: "app.themeMauve",
+    swatchBg: "#f6f3f7",
+    swatchColor: "#8b5c9e",
+  },
+  {
     id: "dark",
     mode: "dark",
-    labelKey: "app.themeDarkDefault",
-    swatchBg: "#0b0d12",
+    labelKey: "app.themeBlue",
+    swatchBg: "#0a0c14",
     swatchColor: "#84a6ff",
   },
   {
     id: "dark-dim",
     mode: "dark",
-    labelKey: "app.themeDarkDim",
-    swatchBg: "#1a1d24",
+    labelKey: "app.themeAmber",
+    swatchBg: "#1b1812",
     swatchColor: "#f0915a",
   },
   {
     id: "dark-oled",
     mode: "dark",
-    labelKey: "app.themeDarkOled",
+    labelKey: "app.themeSlate",
     swatchBg: "#000000",
     swatchColor: "#94a3b8",
+  },
+  {
+    id: "dark-lime",
+    mode: "dark",
+    labelKey: "app.themeLime",
+    swatchBg: "#0c120a",
+    swatchColor: "#a3e635",
+  },
+  {
+    id: "dark-fuchsia",
+    mode: "dark",
+    labelKey: "app.themeFuchsia",
+    swatchBg: "#120a11",
+    swatchColor: "#e879f9",
+  },
+  {
+    id: "dark-mauve",
+    mode: "dark",
+    labelKey: "app.themeMauve",
+    swatchBg: "#14111a",
+    swatchColor: "#c4a7e0",
   },
 ];
 

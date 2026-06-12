@@ -70,11 +70,11 @@
 
 [data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0b0d12;
-  --surface: #12151c;
-  --surface-muted: #1a1e27;
-  --border: #262b36;
-  --border-strong: #343b49;
+  --bg: #0a0c14;
+  --surface: #11141e;
+  --surface-muted: #191d2a;
+  --border: #262c3b;
+  --border-strong: #343c4e;
   --text: #edeff3;
   --text-muted: #a4acbb;
   --text-subtle: #7c8494;
@@ -163,17 +163,17 @@
   --overlay: rgb(26 34 48 / 0.5);
 }
 
-/* Dark · Dim — softer slate-grey dark (less contrast than default) */
+/* Dark · Dim — softer warm-grey dark with amber accent */
 [data-theme="dark-dim"] {
   color-scheme: dark;
-  --bg: #1a1d24;
-  --surface: #21252e;
-  --surface-muted: #2a2f3a;
-  --border: #353b47;
-  --border-strong: #454c5a;
-  --text: #e6e9ef;
-  --text-muted: #aab2c0;
-  --text-subtle: #8b94a3;
+  --bg: #1b1812;
+  --surface: #221e17;
+  --surface-muted: #2c2820;
+  --border: #38322a;
+  --border-strong: #4a4339;
+  --text: #efe9e0;
+  --text-muted: #bbb0a0;
+  --text-subtle: #948a7b;
   --primary: #f0915a;
   --primary-strong: #f5ad82;
   --primary-soft: #45301f;
@@ -225,6 +225,198 @@
   --info: #54bdf2;
   --info-soft: #0a2230;
   --overlay: rgb(0 0 0 / 0.7);
+}
+
+/* Light · Lime — fresh green-tinted neutrals with lime accent */
+[data-theme="light-lime"] {
+  color-scheme: light;
+  --bg: #f6f9f0;
+  --surface: #ffffff;
+  --surface-muted: #eef3e3;
+  --border: #dde6cc;
+  --border-strong: #c7d4ad;
+  --text: #1a2410;
+  --text-muted: #475436;
+  --text-subtle: #65734f;
+  --primary: #4d7c0f;
+  --primary-strong: #3f6212;
+  --primary-soft: #e6f0cf;
+  --primary-faint: #f2f7e3;
+  --on-primary: #ffffff;
+  --accent: #0d9488;
+  --accent-strong: #0b7d73;
+  --on-accent: #ffffff;
+  --success: #15803d;
+  --success-soft: #e3f3e8;
+  --warning: #a15c07;
+  --warning-soft: #f7eed9;
+  --danger: #c81e1e;
+  --danger-strong: #a31616;
+  --danger-soft: #f9e3e3;
+  --on-danger: #ffffff;
+  --info: #0369a1;
+  --info-soft: #e0f0f9;
+  --overlay: rgb(26 36 16 / 0.5);
+}
+
+/* Light · Fuchsia — cool neutrals with vivid fuchsia accent */
+[data-theme="light-fuchsia"] {
+  color-scheme: light;
+  --bg: #fdf4fb;
+  --surface: #ffffff;
+  --surface-muted: #f8e8f5;
+  --border: #f0d4ea;
+  --border-strong: #e3b6da;
+  --text: #2a1226;
+  --text-muted: #573b52;
+  --text-subtle: #75576f;
+  --primary: #c026d3;
+  --primary-strong: #a21caf;
+  --primary-soft: #f7dcf6;
+  --primary-faint: #fcecfb;
+  --on-primary: #ffffff;
+  --accent: #2563eb;
+  --accent-strong: #1d4ed8;
+  --on-accent: #ffffff;
+  --success: #15803d;
+  --success-soft: #e3f3e8;
+  --warning: #a15c07;
+  --warning-soft: #f7eed9;
+  --danger: #c81e1e;
+  --danger-strong: #a31616;
+  --danger-soft: #f9e3e3;
+  --on-danger: #ffffff;
+  --info: #0369a1;
+  --info-soft: #e0f0f9;
+  --overlay: rgb(42 18 38 / 0.5);
+}
+
+/* Light · Mauve — muted mauve-grey neutrals with soft purple accent */
+[data-theme="light-mauve"] {
+  color-scheme: light;
+  --bg: #f6f3f7;
+  --surface: #fffdff;
+  --surface-muted: #ece6ef;
+  --border: #ddd4e2;
+  --border-strong: #c8bbd0;
+  --text: #241e2a;
+  --text-muted: #534b5c;
+  --text-subtle: #6f6678;
+  --primary: #8b5c9e;
+  --primary-strong: #714183;
+  --primary-soft: #ebdef0;
+  --primary-faint: #f4ecf6;
+  --on-primary: #ffffff;
+  --accent: #be185d;
+  --accent-strong: #9d164e;
+  --on-accent: #ffffff;
+  --success: #2f7d3f;
+  --success-soft: #e8f3e3;
+  --warning: #a15c07;
+  --warning-soft: #f7eed9;
+  --danger: #c0331f;
+  --danger-strong: #9e2718;
+  --danger-soft: #f8e4de;
+  --on-danger: #ffffff;
+  --info: #1f6f9e;
+  --info-soft: #e3f0f6;
+  --overlay: rgb(36 30 42 / 0.5);
+}
+
+/* Dark · Lime — deep green-tinted dark with lime accent */
+[data-theme="dark-lime"] {
+  color-scheme: dark;
+  --bg: #0c120a;
+  --surface: #141b10;
+  --surface-muted: #1d2618;
+  --border: #2c3823;
+  --border-strong: #3d4c31;
+  --text: #eaf0e2;
+  --text-muted: #aab59b;
+  --text-subtle: #828d73;
+  --primary: #a3e635;
+  --primary-strong: #bef264;
+  --primary-soft: #2a3a13;
+  --primary-faint: #1c280d;
+  --on-primary: #0c120a;
+  --accent: #2dd4bf;
+  --accent-strong: #5eead4;
+  --on-accent: #0c120a;
+  --success: #4ec97f;
+  --success-soft: #11291c;
+  --warning: #f0b254;
+  --warning-soft: #2e2410;
+  --danger: #f2756b;
+  --danger-strong: #f8958d;
+  --danger-soft: #321714;
+  --on-danger: #0c120a;
+  --info: #4fbbf0;
+  --info-soft: #0e2433;
+  --overlay: rgb(0 0 0 / 0.6);
+}
+
+/* Dark · Fuchsia — deep plum dark with vivid fuchsia accent */
+[data-theme="dark-fuchsia"] {
+  color-scheme: dark;
+  --bg: #120a11;
+  --surface: #1b121a;
+  --surface-muted: #261a25;
+  --border: #382634;
+  --border-strong: #4a3445;
+  --text: #f1e6ef;
+  --text-muted: #b6a3b3;
+  --text-subtle: #8d7a8a;
+  --primary: #e879f9;
+  --primary-strong: #f0abfc;
+  --primary-soft: #3e1c41;
+  --primary-faint: #2a1329;
+  --on-primary: #120a11;
+  --accent: #60a5fa;
+  --accent-strong: #93c5fd;
+  --on-accent: #120a11;
+  --success: #45c77f;
+  --success-soft: #11291c;
+  --warning: #f0b254;
+  --warning-soft: #2e2410;
+  --danger: #f2756b;
+  --danger-strong: #f8958d;
+  --danger-soft: #321714;
+  --on-danger: #120a11;
+  --info: #4fbbf0;
+  --info-soft: #0e2433;
+  --overlay: rgb(0 0 0 / 0.6);
+}
+
+/* Dark · Mauve — muted mauve-grey dark with soft purple accent */
+[data-theme="dark-mauve"] {
+  color-scheme: dark;
+  --bg: #14111a;
+  --surface: #1c1924;
+  --surface-muted: #26222f;
+  --border: #352f40;
+  --border-strong: #463f53;
+  --text: #ebe7f0;
+  --text-muted: #aaa3b8;
+  --text-subtle: #847c94;
+  --primary: #c4a7e0;
+  --primary-strong: #d6c0ec;
+  --primary-soft: #332842;
+  --primary-faint: #221b2e;
+  --on-primary: #14111a;
+  --accent: #f472b6;
+  --accent-strong: #f9a8d4;
+  --on-accent: #14111a;
+  --success: #45c77f;
+  --success-soft: #11291c;
+  --warning: #f0b254;
+  --warning-soft: #2e2410;
+  --danger: #f2756b;
+  --danger-strong: #f8958d;
+  --danger-soft: #321714;
+  --on-danger: #14111a;
+  --info: #4fbbf0;
+  --info-soft: #0e2433;
+  --overlay: rgb(0 0 0 / 0.6);
 }
 
 /* Map semantic tokens to Tailwind v4 utilities (bg-surface, text-muted, …) */
