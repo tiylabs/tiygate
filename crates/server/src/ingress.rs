@@ -12,12 +12,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
+    body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response, Sse},
+    response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
+use bytes::Bytes;
 use futures::{Future, Stream, StreamExt};
 use pin_project::pin_project;
 use serde_json::Value;
@@ -562,9 +564,9 @@ mod streaming_helper_tests {
     /// `SseKeepaliveStream` `!Unpin`).
     #[tokio::test]
     async fn keepalive_wrapper_forwards_real_frames_unchanged() {
-        let inner = stream::iter(vec![Ok::<_, axum::Error>(
-            axum::response::sse::Event::default().data("hello"),
-        )]);
+        let inner = stream::iter(vec![Ok::<_, axum::Error>(bytes::Bytes::from_static(
+            b"data: hello\n\n",
+        ))]);
         let kept = Box::pin(super::SseKeepaliveStream::new(
             inner,
             Duration::from_millis(50),
@@ -573,12 +575,17 @@ mod streaming_helper_tests {
         // duration of the test so `futures::StreamExt::next` can
         // take `&mut Self: Unpin` on the boxed value.
         let first = futures::StreamExt::next(&mut { kept }).await;
-        // We don't introspect the frame body here because axum 0.7's
-        // `Event` representation depends on the build; the important
-        // invariant is that the wrapper returned *some* event before
-        // closing.
-        let saw_event = matches!(first, Some(Ok(_)));
-        assert!(saw_event, "expected one real frame, got {first:?}");
+        // The wrapper must forward the upstream bytes VERBATIM — no
+        // extra `data:` prefixing. This is the regression guard for
+        // the double-`data:` bug.
+        match first {
+            Some(Ok(b)) => assert_eq!(
+                b.as_ref(),
+                b"data: hello\n\n",
+                "frame must be forwarded verbatim"
+            ),
+            other => panic!("expected one real frame, got {other:?}"),
+        }
     }
 
     /// `SseKeepaliveStream` configured with a `Duration::ZERO` interval
@@ -587,9 +594,9 @@ mod streaming_helper_tests {
     /// and then immediate close.
     #[tokio::test]
     async fn keepalive_wrapper_disables_when_interval_is_zero() {
-        let inner = stream::iter(vec![Ok::<_, axum::Error>(
-            axum::response::sse::Event::default().data("first"),
-        )]);
+        let inner = stream::iter(vec![Ok::<_, axum::Error>(bytes::Bytes::from_static(
+            b"data: first\n\n",
+        ))]);
         let mut kept = Box::pin(super::SseKeepaliveStream::new(inner, Duration::ZERO));
         let first = futures::StreamExt::next(&mut kept).await;
         let saw_event = matches!(first, Some(Ok(_)));
@@ -3238,7 +3245,7 @@ pub struct SseKeepaliveStream<S> {
     done: bool,
 }
 
-impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> SseKeepaliveStream<S> {
+impl<S: Stream<Item = Result<Bytes, axum::Error>>> SseKeepaliveStream<S> {
     /// Build a new keepalive wrapper around `inner`. `interval` is the
     /// gap between successive keepalive comments; pass
     /// `Duration::ZERO` to effectively disable keepalives (the
@@ -3263,10 +3270,10 @@ impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> SseKeepa
     }
 }
 
-impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> Stream
+impl<S: Stream<Item = Result<Bytes, axum::Error>>> Stream
     for SseKeepaliveStream<S>
 {
-    type Item = Result<axum::response::sse::Event, axum::Error>;
+    type Item = Result<Bytes, axum::Error>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
@@ -3315,7 +3322,7 @@ impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> Stream
                 this.timer
                     .as_mut()
                     .reset(tokio::time::Instant::now() + *this.interval);
-                let keepalive = axum::response::sse::Event::default().comment("keepalive");
+                let keepalive = Bytes::from_static(b":keepalive\n\n");
                 return std::task::Poll::Ready(Some(Ok(keepalive)));
             }
             // Re-register the timer waker so the task wakes up when
@@ -3411,6 +3418,14 @@ pub fn drive_upstream_stream(
     // stop appending (the sink flags truncation on read-back).
     let mut capture_buf: Vec<u8> = Vec::new();
     let capture_max_bytes = capture.as_ref().map(|c| c.max_bytes).unwrap_or(0);
+    // Rolling tail of the most recently forwarded upstream bytes. Used
+    // on natural close to detect whether the upstream already emitted
+    // its own protocol-native terminal frame (e.g. `data: [DONE]` or
+    // `event: message_stop`), so the gateway does not append a
+    // *duplicate* end frame. Capped to a small window large enough to
+    // hold the biggest terminal frame.
+    let mut tail_buf: Vec<u8> = Vec::new();
+    const TAIL_CAP: usize = 512;
     let idle_timeout = if idle_timeout.is_zero() {
         // 0 means "use the keepalive cadence as a no-progress signal"
         // — but to be safe we still need *some* upper bound so a hung
@@ -3467,8 +3482,19 @@ pub fn drive_upstream_stream(
                                 let take = remaining.min(bytes.len());
                                 capture_buf.extend_from_slice(&bytes[..take]);
                             }
-                            yield Ok(axum::response::sse::Event::default()
-                                .data(String::from_utf8_lossy(&bytes)));
+                            // Maintain a small rolling tail for terminal-
+                            // frame dedup on natural close.
+                            tail_buf.extend_from_slice(&bytes);
+                            if tail_buf.len() > TAIL_CAP {
+                                let cut = tail_buf.len() - TAIL_CAP;
+                                tail_buf.drain(..cut);
+                            }
+                            // Forward upstream bytes VERBATIM. The upstream
+                            // chunk is already a complete SSE frame
+                            // (`data: ...\n\n`); wrapping it in an axum
+                            // `Event` would double-prefix `data:` and
+                            // corrupt the stream. Pass the raw bytes.
+                            yield Ok(bytes);
                         }
                         Some(Err(_e)) => {
                             last_reason = Some(TruncationReason::UpstreamError);
@@ -3480,15 +3506,9 @@ pub fn drive_upstream_stream(
                             }
                             // Emit the protocol-native error frame so
                             // the client can tell the upstream failed,
-                            // then close.
+                            // then close. Bytes are forwarded verbatim.
                             if !error_marker.is_empty() {
-                                if let Ok(text) = std::str::from_utf8(&error_marker) {
-                                    yield Ok(axum::response::sse::Event::default()
-                                        .data(text));
-                                } else {
-                                    yield Ok(axum::response::sse::Event::default()
-                                        .data(String::from_utf8_lossy(&error_marker)));
-                                }
+                                yield Ok(Bytes::from(error_marker.clone()));
                             }
                             break;
                         }
@@ -3499,14 +3519,14 @@ pub fn drive_upstream_stream(
                             if let Ok(mut a) = accum.lock() {
                                 a.mark_completed();
                             }
-                            if !end_marker.is_empty() {
-                                if let Ok(text) = std::str::from_utf8(&end_marker) {
-                                    yield Ok(axum::response::sse::Event::default()
-                                        .data(text));
-                                } else {
-                                    yield Ok(axum::response::sse::Event::default()
-                                        .data(String::from_utf8_lossy(&end_marker)));
-                                }
+                            // Only append our own end frame if the upstream
+                            // did NOT already send an identical terminal
+                            // frame (avoids the duplicate `[DONE]` the old
+                            // code produced). Bytes forwarded verbatim.
+                            if !end_marker.is_empty()
+                                && !tail_ends_with_marker(&tail_buf, &end_marker)
+                            {
+                                yield Ok(Bytes::from(end_marker.clone()));
                             }
                             break;
                         }
@@ -3519,15 +3539,12 @@ pub fn drive_upstream_stream(
                     }
                     // Idle elapsed. Emit the protocol-native end
                     // frame and close — already-received bytes are
-                    // still billable.
-                    if !end_marker.is_empty() {
-                        if let Ok(text) = std::str::from_utf8(&end_marker) {
-                            yield Ok(axum::response::sse::Event::default()
-                                .data(text));
-                        } else {
-                            yield Ok(axum::response::sse::Event::default()
-                                .data(String::from_utf8_lossy(&end_marker)));
-                        }
+                    // still billable. Dedup against an upstream
+                    // terminal frame just like the natural-close path.
+                    if !end_marker.is_empty()
+                        && !tail_ends_with_marker(&tail_buf, &end_marker)
+                    {
+                        yield Ok(Bytes::from(end_marker.clone()));
                     }
                     break;
                 }
@@ -3545,15 +3562,9 @@ pub fn drive_upstream_stream(
                     }
                     // Total budget elapsed. Emit the protocol-native
                     // error frame so the client can tell this was a
-                    // gateway-side cap, not a natural end.
+                    // gateway-side cap, not a natural end. Verbatim bytes.
                     if !error_marker.is_empty() {
-                        if let Ok(text) = std::str::from_utf8(&error_marker) {
-                            yield Ok(axum::response::sse::Event::default()
-                                .data(text));
-                        } else {
-                            yield Ok(axum::response::sse::Event::default()
-                                .data(String::from_utf8_lossy(&error_marker)));
-                        }
+                        yield Ok(Bytes::from(error_marker.clone()));
                     }
                     break;
                 }
@@ -3599,7 +3610,43 @@ pub fn drive_upstream_stream(
     // client (and any middlebox) keeps seeing activity even when the
     // upstream is between chunks.
     let kept = SseKeepaliveStream::new(Box::pin(idle_future), keepalive_interval);
-    Sse::new(kept).into_response()
+    // Build a raw byte-stream body. We deliberately do NOT use axum's
+    // `Sse` responder here: the upstream already delivers fully-formed
+    // SSE frames, and `Sse`/`Event` would re-encode (double `data:`
+    // prefix) the bytes. We forward the bytes verbatim and set the SSE
+    // headers ourselves.
+    let mut response = Body::from_stream(kept).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
+/// Returns true if `tail` (the rolling window of the most recently
+/// forwarded upstream bytes) already ends with the gateway's terminal
+/// `marker`, ignoring trailing ASCII whitespace on both sides. Used to
+/// suppress a duplicate end frame when the upstream already sent its
+/// own protocol-native terminator (`data: [DONE]`, `message_stop`).
+fn tail_ends_with_marker(tail: &[u8], marker: &[u8]) -> bool {
+    let trim_end = |b: &[u8]| -> usize {
+        let mut n = b.len();
+        while n > 0 && b[n - 1].is_ascii_whitespace() {
+            n -= 1;
+        }
+        n
+    };
+    let t = &tail[..trim_end(tail)];
+    let m = &marker[..trim_end(marker)];
+    if m.is_empty() {
+        return false;
+    }
+    t.ends_with(m)
 }
 
 /// Simple error type for the HTTP layer.

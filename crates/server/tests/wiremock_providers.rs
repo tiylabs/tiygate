@@ -718,3 +718,125 @@ async fn test_virtual_model_rewritten_to_upstream_model_id() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_streaming_forwards_sse_bytes_verbatim_no_double_data() {
+    // Regression: the gateway used to re-wrap each upstream SSE frame in
+    // an axum `Event::default().data(...)`, producing a corrupt
+    // double-`data:` prefix (`data: data: {...}`) and a duplicate
+    // terminal frame. The fix forwards upstream bytes verbatim and
+    // dedups the gateway end frame against the upstream's own
+    // terminator. This test asserts the exact wire bytes.
+    let mock_server = wiremock::MockServer::start().await;
+
+    // Faithful OpenAI-style SSE body: two delta frames plus the
+    // upstream's own `data: [DONE]` terminator.
+    let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_openai_test_app(mock_server.uri(), "gpt-4o");
+    let body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+        "SSE response must set content-type: text/event-stream"
+    );
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // The bytes must be forwarded verbatim — identical to what the
+    // upstream sent (gateway adds nothing because the upstream already
+    // terminated with `data: [DONE]`).
+    assert_eq!(
+        body_str, sse_body,
+        "gateway must forward upstream SSE bytes verbatim, got: {body_str:?}"
+    );
+    // Defensive: no double `data:` prefix anywhere.
+    assert!(
+        !body_str.contains("data: data:"),
+        "double data: prefix leaked: {body_str:?}"
+    );
+    // Defensive: exactly one `[DONE]` (no duplicate terminal frame).
+    assert_eq!(
+        body_str.matches("[DONE]").count(),
+        1,
+        "expected exactly one [DONE] frame, got: {body_str:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_appends_done_when_upstream_omits_it() {
+    // When the upstream closes without its own terminal frame, the
+    // gateway must append exactly one protocol-native `data: [DONE]`.
+    let mock_server = wiremock::MockServer::start().await;
+
+    let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_openai_test_app(mock_server.uri(), "gpt-4o");
+    let body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    let expected = format!("{sse_body}data: [DONE]\n\n");
+    assert_eq!(
+        body_str, expected,
+        "gateway must append exactly one [DONE], got: {body_str:?}"
+    );
+    assert!(
+        !body_str.contains("data: data:"),
+        "double data: prefix leaked: {body_str:?}"
+    );
+}
+
