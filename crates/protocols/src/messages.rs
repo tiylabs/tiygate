@@ -305,7 +305,8 @@ impl EndpointCodec for MessagesCodec {
         let mut body = json!({
             "model": ir.model,
             "stream": ir.stream,
-            "max_tokens": ir.params.max_tokens.unwrap_or(1024),
+            // Messages 协议要求 max_tokens 必填；上游未提供时填充默认值 64k
+            "max_tokens": ir.params.max_tokens.unwrap_or(65536),
         });
 
         // System prompt
