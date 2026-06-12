@@ -382,31 +382,32 @@ export default function RequestLogs() {
                   {
                     label: t("requests.sectionClientRequest"),
                     content: (
-                      <>
-                        <PayloadBlock
-                          label={t("requests.redactedHeaders")}
-                          value={replayQuery.data?.redacted_headers_json}
-                        />
-                        <PayloadBlock
-                          label={t("requests.rawEnvelope")}
-                          value={replayQuery.data?.raw_envelope_json}
-                        />
-                      </>
+                      <EnvelopeBlock
+                        envelopeJson={
+                          replayQuery.data?.raw_envelope_json
+                        }
+                        headersFallbackJson={
+                          replayQuery.data?.redacted_headers_json
+                        }
+                        copyAllLabel={t("requests.copySuccess")}
+                      />
                     ),
                   },
                   {
                     label: t("requests.sectionEgressRequest"),
                     content: (
                       <>
-                        <PayloadBlock
-                          label={t("requests.egressHeaders")}
-                          value={replayQuery.data?.egress_headers_json}
-                        />
-                        <PayloadBlock
-                          label={t("requests.egressBody")}
-                          value={replayQuery.data?.egress_body}
-                          truncated={replayQuery.data?.egress_body_truncated}
+                        <MessageBlock
+                          mode="request"
+                          method={replayQuery.data?.egress_method ?? undefined}
+                          path={replayQuery.data?.egress_path ?? undefined}
+                          headersJson={replayQuery.data?.egress_headers_json}
+                          body={replayQuery.data?.egress_body}
+                          bodyTruncated={
+                            replayQuery.data?.egress_body_truncated
+                          }
                           truncatedNote={t("requests.truncatedNote")}
+                          copyAllLabel={t("requests.copySuccess")}
                         />
                       </>
                     ),
@@ -420,55 +421,49 @@ export default function RequestLogs() {
                   {
                     label: t("requests.sectionClientResponse"),
                     content: (
-                      <>
-                        <PayloadBlock
-                          label={t("requests.clientRespHeaders")}
-                          value={replayQuery.data?.client_resp_headers_json}
-                        />
-                        <PayloadBlock
-                          label={t("requests.clientRespBody")}
-                          value={replayQuery.data?.client_resp_body}
-                          truncated={replayQuery.data?.client_resp_body_truncated}
-                          truncatedNote={t("requests.truncatedNote")}
-                        />
-                      </>
+                      <MessageBlock
+                        mode="response"
+                        status={detail?.http_status ?? null}
+                        headersJson={replayQuery.data?.client_resp_headers_json}
+                        body={replayQuery.data?.client_resp_body}
+                        bodyTruncated={
+                          replayQuery.data?.client_resp_body_truncated
+                        }
+                        truncatedNote={t("requests.truncatedNote")}
+                        copyAllLabel={t("requests.copySuccess")}
+                      />
                     ),
                   },
                   {
                     label: t("requests.sectionUpstreamResponse"),
                     content: (
                       <>
-                        <PayloadBlock
-                          label={t("requests.upstreamRespHeaders")}
-                          value={replayQuery.data?.upstream_resp_headers_json}
+                        <MessageBlock
+                          mode="response"
+                          status={replayQuery.data?.upstream_status ?? null}
+                          headersJson={
+                            replayQuery.data?.upstream_resp_headers_json
+                          }
+                          body={replayQuery.data?.upstream_resp_body}
+                          bodyTruncated={
+                            replayQuery.data?.upstream_resp_body_truncated
+                          }
+                          truncatedNote={t("requests.truncatedNote")}
+                          copyAllLabel={t("requests.copySuccess")}
+                          streamNote={
+                            replayQuery.data?.is_stream
+                              ? t("requests.streamNote")
+                              : undefined
+                          }
                         />
                         {replayQuery.data?.is_stream &&
                         replayQuery.data?.sse_parsed_json ? (
-                          <>
-                            <SseParsedBlock
-                              label={t("requests.sseParsed")}
-                              value={replayQuery.data?.sse_parsed_json}
-                              infoTooltip={t("requests.streamNote")}
-                            />
-                            <SseRawBlock
-                              label={t("requests.sseRaw")}
-                              value={replayQuery.data?.upstream_resp_body}
-                              truncated={
-                                replayQuery.data?.upstream_resp_body_truncated
-                              }
-                              truncatedNote={t("requests.truncatedNote")}
-                            />
-                          </>
-                        ) : (
-                          <PayloadBlock
-                            label={t("requests.upstreamRespBody")}
-                            value={replayQuery.data?.upstream_resp_body}
-                            truncated={
-                              replayQuery.data?.upstream_resp_body_truncated
-                            }
-                            truncatedNote={t("requests.truncatedNote")}
+                          <SseParsedBlock
+                            label={t("requests.sseParsed")}
+                            value={replayQuery.data?.sse_parsed_json}
+                            infoTooltip={t("requests.streamNote")}
                           />
-                        )}
+                        ) : null}
                       </>
                     ),
                   },
@@ -694,6 +689,257 @@ function PayloadTabGroup({
   );
 }
 
+/**
+ * Parse a headers payload string into an array of `[key, value]`
+ * pairs. The backend serialises headers as a JSON object (BTreeMap /
+ * HashMap → `{ "Accept": "..", ... }`). Falls back to a tolerant
+ * `[[k, v], ...]` array form when needed, and returns `null` when
+ * the payload is missing or unparseable.
+ */
+function parseHeaders(
+  json?: string | null,
+): [string, string][] | null {
+  if (!json) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return Object.entries(parsed as Record<string, unknown>).map(
+      ([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)] as [string, string],
+    );
+  }
+  if (Array.isArray(parsed)) {
+    const out: [string, string][] = [];
+    for (const item of parsed) {
+      if (
+        Array.isArray(item) &&
+        item.length >= 2 &&
+        typeof item[0] === "string"
+      ) {
+        out.push([item[0], String(item[1])]);
+      }
+    }
+    return out;
+  }
+  return null;
+}
+
+/** Pretty-print a JSON body so it lines up like a real packet body. */
+function prettyJson(value: string): string {
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return value;
+  }
+}
+
+/** Render headers as a K: V table, one row per header (抓包风格). */
+function HeadersBlock({
+  headers,
+  label,
+  emptyHint,
+  copyAllLabel,
+}: {
+  headers: [string, string][] | null;
+  label?: string;
+  emptyHint?: string;
+  copyAllLabel: string;
+}) {
+  const { t } = useTranslation();
+  if (headers === null) {
+    return emptyHint ? (
+      <p className="text-xs text-text-subtle">{emptyHint}</p>
+    ) : null;
+  }
+  const serialized = headers
+    .map(([k, v]) => `${k}: ${v}`)
+    .join("\n");
+  return (
+    <div>
+      {label ? (
+        <div className="mb-1 flex items-center gap-1 text-xs font-medium text-text-muted">
+          <span>{label}</span>
+          <CopyButton value={serialized} ariaLabel={copyAllLabel} />
+        </div>
+      ) : (
+        <div className="mb-1 flex justify-end">
+          <CopyButton value={serialized} ariaLabel={copyAllLabel} />
+        </div>
+      )}
+      <div className="max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
+        {headers.length === 0 ? (
+          <span className="text-text-subtle">—</span>
+        ) : (
+          <table className="w-full border-collapse">
+            <tbody>
+              {headers.map(([k, v], i) => (
+                <tr key={`${k}-${i}`} className="align-top">
+                  <td className="select-none pr-3 text-text-subtle">{k}</td>
+                  <td className="break-all">
+                    <span className="select-none text-text-subtle">: </span>
+                    {v}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Render a single request or response message in a packet-capture
+ * style layout. The first line is a status line:
+ *   - `mode="request"` → `<METHOD> <PATH>` (抓包工具的请求首行)
+ *   - `mode="response"` → `<STATUS>` (抓包工具的响应首行)
+ * Followed by a K: V header table and a body block, both sharing the
+ * same `max-h-64` content area so headers and bodies line up.
+ */
+function MessageBlock({
+  mode,
+  method,
+  path,
+  status,
+  headersJson,
+  body,
+  bodyTruncated,
+  truncatedNote,
+  infoTooltip,
+  copyAllLabel,
+  streamNote,
+}: {
+  mode: "request" | "response";
+  method?: string;
+  path?: string;
+  status?: number | string | null;
+  headersJson?: string | null;
+  body?: string | null;
+  bodyTruncated?: boolean;
+  truncatedNote?: string;
+  infoTooltip?: string;
+  copyAllLabel: string;
+  streamNote?: string;
+}) {
+  const { t } = useTranslation();
+  const headers = parseHeaders(headersJson);
+  const cleanMethod = method?.trim() || undefined;
+  const cleanPath = path?.trim() || undefined;
+  const statusLine =
+    mode === "request"
+      ? cleanMethod || cleanPath
+        ? `${cleanMethod ?? "?"} ${cleanPath ?? ""}`.trim()
+        : ""
+      : status !== undefined && status !== null && status !== ""
+        ? String(status)
+        : "";
+  return (
+    <div className="space-y-2">
+      {statusLine ? (
+        <div className="overflow-hidden truncate rounded-md bg-surface-muted px-3 py-1.5 font-mono text-xs text-text">
+          <span className="select-none text-text-subtle">
+            {mode === "request" ? "→ " : "← "}
+          </span>
+          {statusLine}
+        </div>
+      ) : null}
+      <HeadersBlock
+        headers={headers}
+        label={
+          mode === "request"
+            ? t("requests.sectionRequestHeaders")
+            : t("requests.sectionResponseHeaders")
+        }
+        copyAllLabel={copyAllLabel}
+      />
+      {body ? (
+        <div>
+          <div className="mb-1 flex items-center gap-1 text-xs font-medium text-text-muted">
+            <span>
+              {mode === "request"
+                ? t("requests.sectionRequestBody")
+                : t("requests.sectionResponseBody")}
+            </span>
+            {bodyTruncated ? (
+              <span className="text-text-subtle">{truncatedNote}</span>
+            ) : null}
+            {streamNote ? (
+              <Tooltip content={streamNote}>
+                <button
+                  type="button"
+                  aria-label={streamNote}
+                  className="inline-flex h-4 w-4 items-center justify-center rounded text-text-subtle hover:text-text"
+                >
+                  <Info size={12} />
+                </button>
+              </Tooltip>
+            ) : null}
+            <CopyButton value={prettyJson(body)} ariaLabel={copyAllLabel} />
+          </div>
+          <pre className="max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
+            {prettyJson(body)}
+          </pre>
+        </div>
+      ) : null}
+      {infoTooltip && !streamNote ? null : null}
+    </div>
+  );
+}
+
+/**
+ * Render the `raw_envelope_json` (client → gateway) snapshot as a
+ * packet-capture style block. The envelope is a serialised
+ * `RawEnvelope` containing `{ method, path, headers, body, ... }`.
+ * When the envelope fails to parse we fall back to the redacted
+ * headers object so something useful still renders.
+ */
+function EnvelopeBlock({
+  envelopeJson,
+  headersFallbackJson,
+  copyAllLabel,
+}: {
+  envelopeJson?: string | null;
+  headersFallbackJson?: string | null;
+  copyAllLabel: string;
+}) {
+  const { t } = useTranslation();
+  let method: string | undefined;
+  let path: string | undefined;
+  let headersJson: string | null | undefined = headersFallbackJson;
+  let body: string | null | undefined;
+  let envelopeTruncated = false;
+  if (envelopeJson) {
+    try {
+      const parsed = JSON.parse(envelopeJson) as Record<string, unknown>;
+      if (typeof parsed.method === "string") method = parsed.method;
+      if (typeof parsed.path === "string") path = parsed.path;
+      if (parsed.headers && typeof parsed.headers === "object") {
+        headersJson = JSON.stringify(parsed.headers);
+      }
+      if (typeof parsed.body === "string") body = parsed.body;
+      if (parsed.truncated === true) envelopeTruncated = true;
+    } catch {
+      // leave defaults
+    }
+  }
+  return (
+    <MessageBlock
+      mode="request"
+      method={method}
+      path={path}
+      headersJson={headersJson}
+      body={body}
+      bodyTruncated={envelopeTruncated}
+      truncatedNote={t("requests.truncatedNote")}
+      copyAllLabel={copyAllLabel}
+    />
+  );
+}
+
 function PayloadBlock({
   label,
   value,
@@ -759,6 +1005,10 @@ function SseRawBlock({
   truncated?: boolean;
   truncatedNote?: string;
 }) {
+  // Retained for callers that want a collapsible raw SSE preview.
+  // The main detail view now renders the upstream body through
+  // `MessageBlock`; this is no longer wired up there but the
+  // component is kept exported locally for future use.
   if (!value) return null;
   return (
     <details className="group">
@@ -815,7 +1065,13 @@ function BlockHeader({
   );
 }
 
-function CopyButton({ value }: { value: string }) {
+function CopyButton({
+  value,
+  ariaLabel,
+}: {
+  value: string;
+  ariaLabel?: string;
+}) {
   const { t } = useTranslation();
   const toast = useToast();
   const [done, setDone] = useState(false);
@@ -835,7 +1091,7 @@ function CopyButton({ value }: { value: string }) {
     <button
       type="button"
       onClick={handle}
-      aria-label={t("requests.copySuccess")}
+      aria-label={ariaLabel ?? t("requests.copySuccess")}
       className="ml-auto inline-flex h-5 w-5 items-center justify-center rounded text-text-subtle hover:bg-surface-muted hover:text-text"
     >
       {done ? <Check size={12} /> : <Copy size={12} />}

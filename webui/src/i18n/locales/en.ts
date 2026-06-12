@@ -265,6 +265,11 @@ const en = {
     copySuccess: "Copied to clipboard.",
     copyFailed: "Copy failed.",
     payloadEmpty: "No payload captured for this request.",
+    sectionRequestHeaders: "Request headers",
+    sectionResponseHeaders: "Response headers",
+    sectionRequestBody: "Request body",
+    sectionResponseBody: "Response body",
+    sectionEnvelope: "Request envelope",
   },
   audit: {
     title: "Audit",

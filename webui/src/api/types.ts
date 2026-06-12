@@ -164,6 +164,8 @@ export interface RequestReplay {
   raw_envelope_json?: string | null;
   redacted_headers_json?: string | null;
   // Full exchange payload (joined from request_payloads).
+  egress_method?: string | null;
+  egress_path?: string | null;
   egress_headers_json?: string | null;
   egress_body?: string | null;
   egress_body_truncated?: boolean;

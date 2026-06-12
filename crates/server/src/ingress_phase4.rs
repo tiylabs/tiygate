@@ -608,13 +608,28 @@ pub fn inject_trace(
 /// `state.http_client.execute(req)`.
 pub fn finalize_egress(
     builder: reqwest::RequestBuilder,
-) -> Result<(reqwest::Request, Vec<(String, String)>), AppError> {
+) -> Result<
+    (
+        reqwest::Request,
+        Vec<(String, String)>,
+        String,
+        String,
+    ),
+    AppError,
+> {
     let req = builder.build().map_err(|e| {
         AppError::new(
             axum::http::StatusCode::BAD_GATEWAY,
             format!("build upstream request: {e}"),
         )
     })?;
+    // Snapshot the upstream HTTP method + path at freeze time so the
+    // request-log detail view can render the "POST /v1/chat/..."
+    // status line for gateway → provider traffic. The path is taken
+    // verbatim from the URL builder; the full URL (including the
+    // provider's api_base) is intentionally not captured.
+    let egress_method = req.method().to_string();
+    let egress_path = req.url().path().to_string();
     let mut headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -643,7 +658,7 @@ pub fn finalize_egress(
             headers.push(("content-length".to_string(), len.to_string()));
         }
     }
-    Ok((req, headers))
+    Ok((req, headers, egress_method, egress_path))
 }
 
 /// Charge a single request against the configured quota, returning

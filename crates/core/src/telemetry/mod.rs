@@ -136,6 +136,15 @@ pub struct LatencyBreakdown {
 pub struct ExchangeCapture {
     /// Gateway-side request id; matches `RequestEvent::request_id`.
     pub request_id: String,
+    /// HTTP method used for the gateway → provider request (e.g.
+    /// "POST"). Mirrors the value of `reqwest::Request::method()` at
+    /// capture time.
+    pub egress_method: String,
+    /// URL path used for the gateway → provider request (e.g.
+    /// "/v1/chat/completions"). Mirrors `req.url().path()` at
+    /// capture time. The full URL is intentionally not stored to
+    /// avoid leaking the provider's `api_base` plus path in the log.
+    pub egress_path: String,
     /// Gateway → Provider request headers (the headers actually sent
     /// upstream, including injected auth + traceparent).
     pub egress_headers: Vec<(String, String)>,

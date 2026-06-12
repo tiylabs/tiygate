@@ -317,6 +317,8 @@ mod tests {
     fn dummy_capture(id: &str) -> tiygate_core::ExchangeCapture {
         tiygate_core::ExchangeCapture {
             request_id: id.to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
             egress_headers: vec![("content-type".to_string(), "application/json".to_string())],
             egress_body: Some("{}".to_string()),
             upstream_status: Some(200),

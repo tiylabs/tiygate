@@ -1559,7 +1559,7 @@ async fn execute_upstream(
             stream_req = stream_req.json(&upstream_body);
         }
         // Freeze the request and snapshot the complete egress header set.
-        let (egress_req, egress_headers_capture) =
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress_phase4::finalize_egress(stream_req)?;
         let response = client.execute(egress_req).await.map_err(|e| {
             AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
@@ -1581,6 +1581,8 @@ async fn execute_upstream(
                 state,
                 tiygate_core::ExchangeCapture {
                     request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
                     egress_headers: egress_headers_capture.clone(),
                     egress_body: egress_body_capture.clone(),
                     upstream_status: Some(upstream_status_capture),
@@ -1638,6 +1640,8 @@ async fn execute_upstream(
             Some(StreamCapture {
                 request_id: request_id.to_string(),
                 telemetry: state.telemetry.clone(),
+                egress_method: egress_method.to_string(),
+                egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture,
                 egress_body: egress_body_capture,
                 upstream_status: Some(upstream_status_capture),
@@ -1692,7 +1696,7 @@ async fn execute_upstream(
             nonstream_req = nonstream_req.json(&upstream_body);
         }
         // Freeze the request and snapshot the complete egress header set.
-        let (egress_req, egress_headers_capture) =
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress_phase4::finalize_egress(nonstream_req)?;
         let response = client.execute(egress_req).await.map_err(|e| {
             AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
@@ -1718,6 +1722,8 @@ async fn execute_upstream(
                 state,
                 tiygate_core::ExchangeCapture {
                     request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
                     egress_headers: egress_headers_capture.clone(),
                     egress_body: egress_body_capture.clone(),
                     upstream_status: Some(upstream_status_capture),
@@ -1801,6 +1807,8 @@ async fn execute_upstream(
             state,
             tiygate_core::ExchangeCapture {
                 request_id: request_id.to_string(),
+                egress_method: egress_method.clone(),
+                egress_path: egress_path.clone(),
                 egress_headers: egress_headers_capture,
                 egress_body: egress_body_capture,
                 upstream_status: Some(upstream_status_capture),
@@ -1898,7 +1906,7 @@ async fn execute_messages_upstream(
             stream_req = stream_req.json(&upstream_body);
         }
         // Freeze the request and snapshot the complete egress header set.
-        let (egress_req, egress_headers_capture) =
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress_phase4::finalize_egress(stream_req)?;
         let response = client.execute(egress_req).await.map_err(|e| {
             AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
@@ -1915,6 +1923,8 @@ async fn execute_messages_upstream(
                 state,
                 tiygate_core::ExchangeCapture {
                     request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
                     egress_headers: egress_headers_capture.clone(),
                     egress_body: egress_body_capture.clone(),
                     upstream_status: Some(upstream_status_capture),
@@ -1968,6 +1978,8 @@ async fn execute_messages_upstream(
             Some(StreamCapture {
                 request_id: request_id.to_string(),
                 telemetry: state.telemetry.clone(),
+                egress_method: egress_method.to_string(),
+                egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture,
                 egress_body: egress_body_capture,
                 upstream_status: Some(upstream_status_capture),
@@ -2006,7 +2018,7 @@ async fn execute_messages_upstream(
             nonstream_req = nonstream_req.json(&upstream_body);
         }
         // Freeze the request and snapshot the complete egress header set.
-        let (egress_req, egress_headers_capture) =
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress_phase4::finalize_egress(nonstream_req)?;
         let response = client
             .execute(egress_req)
@@ -2029,6 +2041,8 @@ async fn execute_messages_upstream(
                 state,
                 tiygate_core::ExchangeCapture {
                     request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
                     egress_headers: egress_headers_capture.clone(),
                     egress_body: egress_body_capture.clone(),
                     upstream_status: Some(upstream_status_capture),
@@ -2075,6 +2089,8 @@ async fn execute_messages_upstream(
             state,
             tiygate_core::ExchangeCapture {
                 request_id: request_id.to_string(),
+                egress_method: egress_method.clone(),
+                egress_path: egress_path.clone(),
                 egress_headers: egress_headers_capture,
                 egress_body: egress_body_capture,
                 upstream_status: Some(upstream_status_capture),
@@ -2329,7 +2345,8 @@ async fn handle_embeddings(
     let builder = crate::ingress_phase4::inject_trace(client.post(&upstream_url), &trace_ctx)
         .headers(upstream_headers)
         .json(&upstream_body);
-    let (req, egress_headers_capture) = match crate::ingress_phase4::finalize_egress(builder) {
+    let (req, egress_headers_capture, egress_method, egress_path) =
+        match crate::ingress_phase4::finalize_egress(builder) {
         Ok(r) => r,
         Err(app_err) => {
             let http_status = app_err.http_status().as_u16();
@@ -2365,7 +2382,9 @@ async fn handle_embeddings(
             &state,
             tiygate_core::ExchangeCapture {
                 request_id: req_id_capture.clone(),
-                egress_headers: egress_headers_capture.clone(),
+                egress_method: egress_method.clone(),
+                egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
                 egress_body: egress_body_capture.clone(),
                 upstream_status: Some(upstream_status_capture),
                 upstream_resp_headers: upstream_resp_headers_capture.clone(),
@@ -2406,6 +2425,8 @@ async fn handle_embeddings(
         &state,
         tiygate_core::ExchangeCapture {
             request_id: req_id_capture,
+            egress_method: egress_method.to_string(),
+            egress_path: egress_path.to_string(),
             egress_headers: egress_headers_capture,
             egress_body: egress_body_capture,
             upstream_status: Some(upstream_status_capture),
@@ -2611,7 +2632,7 @@ async fn handle_responses(
             &trace_ctx,
         )
         .json(&upstream_body);
-        let (egress_req, egress_headers_capture) =
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
             match crate::ingress_phase4::finalize_egress(stream_builder) {
                 Ok(r) => r,
                 Err(app_err) => {
@@ -2640,6 +2661,8 @@ async fn handle_responses(
                 &state,
                 tiygate_core::ExchangeCapture {
                     request_id: req_id_capture.clone(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
                     egress_headers: egress_headers_capture.clone(),
                     egress_body: egress_body_capture.clone(),
                     upstream_status: Some(upstream_status_capture),
@@ -2684,6 +2707,8 @@ async fn handle_responses(
             Some(StreamCapture {
                 request_id: req_id_capture.clone(),
                 telemetry: state.telemetry.clone(),
+                egress_method: egress_method.to_string(),
+                egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture.clone(),
                 egress_body: egress_body_capture.clone(),
                 upstream_status: Some(upstream_status_capture),
@@ -2731,7 +2756,7 @@ async fn handle_responses(
         &trace_ctx,
     )
     .json(&upstream_body);
-    let (egress_req, egress_headers_capture) =
+    let (egress_req, egress_headers_capture, egress_method, egress_path) =
         match crate::ingress_phase4::finalize_egress(nonstream_builder) {
             Ok(r) => r,
             Err(app_err) => {
@@ -2769,7 +2794,9 @@ async fn handle_responses(
             &state,
             tiygate_core::ExchangeCapture {
                 request_id: req_id_capture.clone(),
-                egress_headers: egress_headers_capture.clone(),
+                egress_method: egress_method.clone(),
+                egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
                 egress_body: egress_body_capture.clone(),
                 upstream_status: Some(upstream_status_capture),
                 upstream_resp_headers: upstream_resp_headers_capture.clone(),
@@ -2814,6 +2841,8 @@ async fn handle_responses(
         &state,
         tiygate_core::ExchangeCapture {
             request_id: req_id_capture,
+            egress_method: egress_method.to_string(),
+            egress_path: egress_path.to_string(),
             egress_headers: egress_headers_capture,
             egress_body: egress_body_capture,
             upstream_status: Some(upstream_status_capture),
@@ -2984,7 +3013,7 @@ async fn handle_gemini_generate(
             &trace_ctx,
         )
         .json(&upstream_body);
-        let (egress_req, egress_headers_capture) =
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
             match crate::ingress_phase4::finalize_egress(stream_builder) {
                 Ok(r) => r,
                 Err(app_err) => {
@@ -3013,6 +3042,8 @@ async fn handle_gemini_generate(
                 &state,
                 tiygate_core::ExchangeCapture {
                     request_id: req_id_capture.clone(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
                     egress_headers: egress_headers_capture.clone(),
                     egress_body: egress_body_capture.clone(),
                     upstream_status: Some(upstream_status_capture),
@@ -3057,6 +3088,8 @@ async fn handle_gemini_generate(
             Some(StreamCapture {
                 request_id: req_id_capture.clone(),
                 telemetry: state.telemetry.clone(),
+                egress_method: egress_method.to_string(),
+                egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture.clone(),
                 egress_body: egress_body_capture.clone(),
                 upstream_status: Some(upstream_status_capture),
@@ -3105,7 +3138,7 @@ async fn handle_gemini_generate(
         &trace_ctx,
     )
     .json(&upstream_body);
-    let (egress_req, egress_headers_capture) =
+    let (egress_req, egress_headers_capture, egress_method, egress_path) =
         match crate::ingress_phase4::finalize_egress(nonstream_builder) {
             Ok(r) => r,
             Err(app_err) => {
@@ -3143,7 +3176,9 @@ async fn handle_gemini_generate(
             &state,
             tiygate_core::ExchangeCapture {
                 request_id: req_id_capture.clone(),
-                egress_headers: egress_headers_capture.clone(),
+                egress_method: egress_method.clone(),
+                egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
                 egress_body: egress_body_capture.clone(),
                 upstream_status: Some(upstream_status_capture),
                 upstream_resp_headers: upstream_resp_headers_capture.clone(),
@@ -3188,6 +3223,8 @@ async fn handle_gemini_generate(
         &state,
         tiygate_core::ExchangeCapture {
             request_id: req_id_capture,
+            egress_method: egress_method.to_string(),
+            egress_path: egress_path.to_string(),
             egress_headers: egress_headers_capture,
             egress_body: egress_body_capture,
             upstream_status: Some(upstream_status_capture),
@@ -3370,6 +3407,12 @@ impl<S: Stream<Item = Result<Bytes, axum::Error>>> Stream
 pub struct StreamCapture {
     pub request_id: String,
     pub telemetry: Arc<dyn tiygate_core::TelemetryBus>,
+    /// HTTP method used for the gateway → provider request. Captured
+    /// from `finalize_egress` so the request-log detail view can
+    /// render the "POST /v1/chat/..." status line.
+    pub egress_method: String,
+    /// URL path used for the gateway → provider request.
+    pub egress_path: String,
     pub egress_headers: Vec<(String, String)>,
     pub egress_body: Option<String>,
     pub upstream_status: Option<u16>,
@@ -3593,6 +3636,8 @@ pub fn drive_upstream_stream(
             cap.telemetry
                 .send_capture(tiygate_core::ExchangeCapture {
                     request_id: cap.request_id,
+                    egress_method: cap.egress_method,
+                    egress_path: cap.egress_path,
                     egress_headers: cap.egress_headers,
                     egress_body: cap.egress_body,
                     upstream_status: cap.upstream_status,

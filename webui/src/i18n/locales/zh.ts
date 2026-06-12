@@ -262,6 +262,11 @@ const zh: Translation = {
     copySuccess: "已复制到剪贴板。",
     copyFailed: "复制失败。",
     payloadEmpty: "此请求未捕获到载荷数据。",
+    sectionRequestHeaders: "请求头",
+    sectionResponseHeaders: "响应头",
+    sectionRequestBody: "请求体",
+    sectionResponseBody: "响应体",
+    sectionEnvelope: "请求信封",
   },
   audit: {
     title: "审计",

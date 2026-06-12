@@ -133,13 +133,16 @@ impl EventSink for OltpSink {
         let row = self.capture_to_row(capture);
         let res = sqlx::query(
             "INSERT OR REPLACE INTO request_payloads (\
-                request_id, egress_headers_json, egress_body, egress_body_truncated, \
+                request_id, egress_method, egress_path, \
+                egress_headers_json, egress_body, egress_body_truncated, \
                 upstream_status, upstream_resp_headers_json, upstream_resp_body, \
                 upstream_resp_body_truncated, client_resp_headers_json, client_resp_body, \
                 client_resp_body_truncated, is_stream, sse_parsed_json, captured_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )
         .bind(&row.request_id)
+        .bind(&row.egress_method)
+        .bind(&row.egress_path)
         .bind(&row.egress_headers_json)
         .bind(&row.egress_body)
         .bind(row.egress_body_truncated as i32)
@@ -191,6 +194,8 @@ impl EventSink for OltpSink {
 #[derive(Debug, Default)]
 struct RequestPayloadsRow {
     request_id: String,
+    egress_method: String,
+    egress_path: String,
     egress_headers_json: Option<String>,
     egress_body: Option<String>,
     egress_body_truncated: bool,
@@ -241,6 +246,8 @@ impl OltpSink {
 
         RequestPayloadsRow {
             request_id: capture.request_id.clone(),
+            egress_method: capture.egress_method.clone(),
+            egress_path: capture.egress_path.clone(),
             egress_headers_json,
             egress_body,
             egress_body_truncated,
@@ -1183,6 +1190,13 @@ pub struct RequestReplay {
     pub raw_envelope_json: Option<String>,
     pub redacted_headers_json: Option<String>,
     // ---- full exchange payload (LEFT JOIN request_payloads) ----
+    /// HTTP method used for the gateway → provider request
+    /// (e.g. "POST"). Empty when the exchange was not captured.
+    pub egress_method: Option<String>,
+    /// URL path used for the gateway → provider request
+    /// (e.g. "/v1/chat/completions"). Empty when the exchange
+    /// was not captured.
+    pub egress_path: Option<String>,
     pub egress_headers_json: Option<String>,
     pub egress_body: Option<String>,
     pub egress_body_truncated: bool,
@@ -1207,6 +1221,7 @@ pub async fn get_request_replay(
     let row = sqlx::query(
         "SELECT l.request_id AS request_id, l.raw_envelope_json AS raw_envelope_json, \
                 l.redacted_headers_json AS redacted_headers_json, \
+                p.egress_method AS egress_method, p.egress_path AS egress_path, \
                 p.egress_headers_json AS egress_headers_json, \
                 p.egress_body AS egress_body, \
                 p.egress_body_truncated AS egress_body_truncated, \
@@ -1231,6 +1246,8 @@ pub async fn get_request_replay(
             request_id: r.get("request_id"),
             raw_envelope_json: r.get("raw_envelope_json"),
             redacted_headers_json: r.get("redacted_headers_json"),
+            egress_method: r.get("egress_method"),
+            egress_path: r.get("egress_path"),
             egress_headers_json: r.get("egress_headers_json"),
             egress_body: r.get("egress_body"),
             egress_body_truncated: r
@@ -1460,6 +1477,8 @@ mod tests {
 
         let capture = ExchangeCapture {
             request_id: "req-1".to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
             egress_headers: vec![
                 ("authorization".to_string(), "Bearer sk-secret".to_string()),
                 ("content-type".to_string(), "application/json".to_string()),
@@ -1668,6 +1687,8 @@ mod tests {
 
         let capture = ExchangeCapture {
             request_id: "req-1".to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
             egress_headers: vec![],
             egress_body: None,
             upstream_status: Some(200),
@@ -1720,6 +1741,8 @@ mod tests {
                    data: [DONE]\n";
         let capture = ExchangeCapture {
             request_id: "req-1".to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
             egress_headers: vec![],
             egress_body: None,
             upstream_status: Some(200),
@@ -1751,6 +1774,8 @@ mod tests {
         // No request_logs row exists yet (capture racing ahead).
         let capture = ExchangeCapture {
             request_id: "ghost".to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
             egress_headers: vec![],
             egress_body: None,
             upstream_status: Some(200),
