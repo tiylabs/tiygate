@@ -45,5 +45,6 @@ pub use routing::{
     RetryPolicy, RoutingTable, RoutingTarget, RoutingTargetHealth, Strategy, WeightedStrategy,
 };
 pub use telemetry::{
-    EventSink, MicroUsd, PipelineEvent, PriceProvider, RequestEvent, TelemetryBus, TokenKind,
+    EventSink, ExchangeCapture, MicroUsd, PipelineEvent, PriceProvider, RequestEvent, TelemetryBus,
+    TokenKind,
 };

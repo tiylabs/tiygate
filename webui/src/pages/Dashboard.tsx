@@ -261,42 +261,45 @@ export default function Dashboard() {
           ) : (
             <Table>
               <colgroup>
-                <col className="w-2/5" />
                 <col />
+                <col style={{ width: "5rem" }} />
               </colgroup>
               <thead>
                 <tr>
                   <Th>{t("dashboard.bucket")}</Th>
-                  <Th className="whitespace-nowrap">
+                  <Th className="whitespace-nowrap text-right">
                     {t("common.status")}
                   </Th>
                 </tr>
               </thead>
               <tbody>
-                {targets.map((b) => (
-                  <Tr key={b.target}>
-                    <Td className="font-mono text-xs">{b.target}</Td>
-                    <Td className="min-w-[12rem]">
-                      <div className="flex flex-wrap items-center gap-2">
+                {targets.map((b) => {
+                  // Prefer the richer label baked in by the backend
+                  // (provider_name + model_id), but fall back gracefully
+                  // when the gateway returns the older shape.
+                  const primary =
+                    b.provider_name && b.model_id !== undefined
+                      ? `${b.provider_name} / ${b.model_id || "—"}`
+                      : b.provider_name ?? b.target;
+                  return (
+                    <Tr key={b.target}>
+                      <Td className="align-top">
+                        <BucketCell primary={primary} secondary={b.target} />
+                      </Td>
+                      <Td className="text-right align-middle whitespace-nowrap">
                         {b.healthy ? (
-                          <Badge tone="success">
+                          <Badge tone="success" title={b.status}>
                             {t("dashboard.healthy")}
                           </Badge>
                         ) : (
-                          <Badge tone="danger">
+                          <Badge tone="danger" title={b.status}>
                             {t("dashboard.unhealthy")}
                           </Badge>
                         )}
-                        <span
-                          className="break-all text-xs text-text-subtle"
-                          title={b.status}
-                        >
-                          {b.status}
-                        </span>
-                      </div>
-                    </Td>
-                  </Tr>
-                ))}
+                      </Td>
+                    </Tr>
+                  );
+                })}
               </tbody>
             </Table>
           )}

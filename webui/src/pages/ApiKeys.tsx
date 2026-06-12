@@ -23,7 +23,7 @@ import {
   Tr,
   useToast,
 } from "@/components/ui";
-import { PageHeader, fmtTime, shortId } from "@/components/PageHeader";
+import { PageHeader, fmtTime } from "@/components/PageHeader";
 
 const QUOTA_FIELDS: Array<{ key: keyof QuotaSpec; label: string }> = [
   { key: "requests_per_minute", label: "apiKeys.rpm" },
@@ -198,12 +198,20 @@ export default function ApiKeys() {
             />
           ) : (
             <Table>
+              <colgroup>
+                <col style={{ width: "20rem" }} />
+                <col style={{ width: "30%" }} />
+                <col />
+                <col style={{ width: "6rem" }} />
+                <col style={{ width: "9rem" }} />
+                <col style={{ width: "3.5rem" }} />
+              </colgroup>
               <thead>
                 <tr>
                   <Th>{t("common.name")}</Th>
                   <Th>{t("apiKeys.keyHash")}</Th>
                   <Th>{t("apiKeys.quota")}</Th>
-                  <Th>{t("common.status")}</Th>
+                  <Th className="text-center">{t("common.status")}</Th>
                   <Th>{t("common.createdAt")}</Th>
                   <Th className="text-right">{t("common.actions")}</Th>
                 </tr>
@@ -211,60 +219,68 @@ export default function ApiKeys() {
               <tbody>
                 {(data ?? []).map((k) => (
                   <Tr key={k.id}>
-                    <Td>
-                      <div className="font-medium text-text">{k.name}</div>
-                      <div className="font-mono text-xs text-text-subtle">
-                        {shortId(k.id)}
+                    <Td className="align-middle">
+                      <div
+                        className="truncate font-medium text-text"
+                        title={k.name}
+                      >
+                        {k.name}
+                      </div>
+                      <div
+                        className="break-all font-mono text-xs text-text-subtle"
+                        title={k.id}
+                      >
+                        {k.id}
                       </div>
                     </Td>
-                    <Td className="font-mono text-xs">
-                      {shortId(k.key_hash, 16)}
+                    <Td
+                      className="truncate font-mono text-xs"
+                      title={k.key_hash}
+                    >
+                      {k.key_hash}
                     </Td>
-                    <Td className="text-xs tabular-nums">
+                    <Td
+                      className="truncate text-xs tabular-nums"
+                      title={quotaSummary(k.quota)}
+                    >
                       {quotaSummary(k.quota)}
                     </Td>
-                    <Td>
+                    <Td className="text-center whitespace-nowrap">
                       {k.status === "active" ? (
-                        <Badge tone="success" title={k.status}>
-                          {k.status}
-                        </Badge>
+                        <Badge tone="success">{t("common.enabled")}</Badge>
                       ) : (
-                        <Badge tone="neutral" title={k.status}>
-                          {k.status}
-                        </Badge>
+                        <Badge tone="neutral">{t("common.disabled")}</Badge>
                       )}
                     </Td>
-                    <Td className="text-xs text-text-muted">
+                    <Td className="whitespace-nowrap text-xs text-text-muted">
                       {fmtTime(k.created_at)}
                     </Td>
                     <Td className="text-right">
-                      <div className="flex justify-end">
-                        <RowActions
-                          label={t("common.rowActions")}
-                          items={[
-                            {
-                              key: "quota",
-                              label: t("apiKeys.editQuota"),
-                              icon: <SlidersHorizontal size={14} />,
-                              onSelect: () => openQuota(k),
-                            },
-                            {
-                              key: "disable",
-                              label: t("apiKeys.disable"),
-                              icon: <Ban size={14} />,
-                              disabled: k.status !== "active",
-                              onSelect: () => setPendingDisable(k),
-                            },
-                            {
-                              key: "delete",
-                              label: t("common.delete"),
-                              icon: <Trash2 size={14} />,
-                              destructive: true,
-                              onSelect: () => setPendingDelete(k),
-                            },
-                          ]}
-                        />
-                      </div>
+                      <RowActions
+                        label={t("common.rowActions")}
+                        items={[
+                          {
+                            key: "quota",
+                            label: t("apiKeys.editQuota"),
+                            icon: <SlidersHorizontal size={14} />,
+                            onSelect: () => openQuota(k),
+                          },
+                          {
+                            key: "disable",
+                            label: t("apiKeys.disable"),
+                            icon: <Ban size={14} />,
+                            disabled: k.status !== "active",
+                            onSelect: () => setPendingDisable(k),
+                          },
+                          {
+                            key: "delete",
+                            label: t("common.delete"),
+                            icon: <Trash2 size={14} />,
+                            destructive: true,
+                            onSelect: () => setPendingDelete(k),
+                          },
+                        ]}
+                      />
                     </Td>
                   </Tr>
                 ))}

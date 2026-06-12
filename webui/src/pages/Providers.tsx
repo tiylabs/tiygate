@@ -210,13 +210,22 @@ export default function Providers() {
             />
           ) : (
             <Table>
+              <colgroup>
+                <col style={{ width: "20rem" }} />
+                <col style={{ width: "16%" }} />
+                <col />
+                <col style={{ width: "6rem" }} />
+                <col style={{ width: "6rem" }} />
+                <col style={{ width: "9rem" }} />
+                <col style={{ width: "3.5rem" }} />
+              </colgroup>
               <thead>
                 <tr>
                   <Th>{t("common.name")}</Th>
                   <Th>{t("providers.vendor")}</Th>
                   <Th>{t("providers.apiBase")}</Th>
                   <Th>{t("providers.authMode")}</Th>
-                  <Th>{t("common.status")}</Th>
+                  <Th className="text-center">{t("common.status")}</Th>
                   <Th>{t("common.updatedAt")}</Th>
                   <Th className="text-right">{t("common.actions")}</Th>
                 </tr>
@@ -224,55 +233,68 @@ export default function Providers() {
               <tbody>
                 {(data ?? []).map((p) => (
                   <Tr key={p.id}>
-                    <Td>
-                      <div className="font-medium text-text">{p.name}</div>
-                      <div className="font-mono text-xs text-text-subtle">
-                        {shortId(p.id)}
+                    <Td className="align-middle">
+                      <div
+                        className="truncate font-medium text-text"
+                        title={p.name}
+                      >
+                        {p.name}
+                      </div>
+                      <div
+                        className="break-all font-mono text-xs text-text-subtle"
+                        title={p.id}
+                      >
+                        {p.id}
                       </div>
                     </Td>
-                    <Td>
+                    <Td className="align-middle">
                       <div className="flex items-center gap-2">
                         <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary-soft text-primary">
                           <VendorIcon vendor={p.vendor} />
                         </span>
-                        <span>{catalogLabel.get(p.vendor) ?? p.vendor}</span>
+                        <span className="truncate">
+                          {catalogLabel.get(p.vendor) ?? p.vendor}
+                        </span>
                       </div>
                     </Td>
-                    <Td className="max-w-[220px] truncate font-mono text-xs" title={p.api_base}>
+                    <Td
+                      className="truncate font-mono text-xs"
+                      title={p.api_base}
+                    >
                       {p.api_base}
                     </Td>
-                    <Td>{p.auth_mode}</Td>
-                    <Td>
+                    <Td className="whitespace-nowrap font-mono text-xs">
+                      {p.auth_mode}
+                    </Td>
+                    <Td className="text-center whitespace-nowrap">
                       {p.enabled ? (
                         <Badge tone="success">{t("common.enabled")}</Badge>
                       ) : (
                         <Badge tone="neutral">{t("common.disabled")}</Badge>
                       )}
                     </Td>
-                    <Td className="text-xs text-text-muted">
+                    <Td className="text-xs text-text-muted whitespace-nowrap">
                       {fmtTime(p.updated_at)}
                     </Td>
                     <Td className="text-right">
-                      <div className="flex justify-end">
-                        <RowActions
-                          label={t("common.rowActions")}
-                          items={[
-                            {
-                              key: "edit",
-                              label: t("common.edit"),
-                              icon: <Pencil size={14} />,
-                              onSelect: () => openEdit(p),
-                            },
-                            {
-                              key: "delete",
-                              label: t("common.delete"),
-                              icon: <Trash2 size={14} />,
-                              destructive: true,
-                              onSelect: () => setPendingDelete(p),
-                            },
-                          ]}
-                        />
-                      </div>
+                      <RowActions
+                        label={t("common.rowActions")}
+                        items={[
+                          {
+                            key: "edit",
+                            label: t("common.edit"),
+                            icon: <Pencil size={14} />,
+                            onSelect: () => openEdit(p),
+                          },
+                          {
+                            key: "delete",
+                            label: t("common.delete"),
+                            icon: <Trash2 size={14} />,
+                            destructive: true,
+                            onSelect: () => setPendingDelete(p),
+                          },
+                        ]}
+                      />
                     </Td>
                   </Tr>
                 ))}

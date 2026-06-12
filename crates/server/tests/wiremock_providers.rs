@@ -666,3 +666,55 @@ async fn test_passthrough_forwards_raw_body_verbatim() {
     // via the codec, the field would be dropped and the mock would
     // respond 404 (no matching request body).
 }
+
+/// The gateway must rewrite the client's *virtual* model name to the
+/// routing target's real upstream `model_id` before forwarding. The
+/// mock only matches when the request body's `model` equals the real
+/// upstream model id ("gpt-4o"), not the virtual name ("my-smart-model").
+#[tokio::test]
+async fn test_virtual_model_rewritten_to_upstream_model_id() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "model": "gpt-4o"
+        })))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // Virtual model name is "my-smart-model"; the route maps it to the
+    // real upstream model id "gpt-4o" (see build_openai_test_app).
+    let app = build_openai_test_app(mock_server.uri(), "my-smart-model");
+
+    let body = json!({
+        "model": "my-smart-model",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    // If the gateway forwarded the virtual name "my-smart-model", the
+    // body_partial_json("gpt-4o") matcher would fail and wiremock would
+    // return 404. A 200 proves the model id was rewritten.
+    assert_eq!(response.status(), StatusCode::OK);
+}
+

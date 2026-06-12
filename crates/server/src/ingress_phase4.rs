@@ -38,7 +38,7 @@ use tiygate_core::tracing_ctx::{
 use tiygate_core::RawEnvelope;
 use tiygate_core::Usage;
 
-use crate::ingress::AppState;
+use crate::ingress::{AppError, AppState};
 
 // ---------------------------------------------------------------------------
 // ResolvedApiKey — the result of looking up the inbound credential
@@ -587,6 +587,38 @@ pub fn inject_trace(
     ctx: &TraceContext,
 ) -> reqwest::RequestBuilder {
     builder.header("traceparent", ctx.to_traceparent())
+}
+
+/// Freeze an outbound request builder into the concrete
+/// [`reqwest::Request`] that will actually be sent, and snapshot its
+/// complete header set for the request-log detail view.
+///
+/// This is the single source of truth for the gateway → provider
+/// (egress) headers we record: by capturing from the *built* request
+/// rather than the hand-assembled `HeaderMap`, the snapshot includes
+/// every header reqwest adds at finalize time (`content-type`,
+/// `content-length`, the injected `traceparent`, auth, etc.) so the
+/// recorded set matches the bytes on the wire. Redaction + truncation
+/// happen later on the telemetry background task; the returned headers
+/// are still cleartext here.
+///
+/// Callers send the returned request via
+/// `state.http_client.execute(req)`.
+pub fn finalize_egress(
+    builder: reqwest::RequestBuilder,
+) -> Result<(reqwest::Request, Vec<(String, String)>), AppError> {
+    let req = builder.build().map_err(|e| {
+        AppError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("build upstream request: {e}"),
+        )
+    })?;
+    let headers = req
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    Ok((req, headers))
 }
 
 /// Charge a single request against the configured quota, returning

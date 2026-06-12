@@ -919,6 +919,7 @@ async fn handle_chat_completions(
             is_stream,
             raw_passthrough_body.as_deref(),
             &trace_ctx,
+            &request_id,
         )
         .await
         {
@@ -1093,7 +1094,7 @@ async fn handle_messages(
     // the full rationale.
     let mut scope = crate::ingress_phase4::RequestScope::new(
         &state,
-        request_id,
+        request_id.clone(),
         "unknown",
         ingress_protocol.clone(),
         trace_ctx.clone(),
@@ -1209,6 +1210,7 @@ async fn handle_messages(
             is_stream,
             raw_passthrough_body.as_deref(),
             &trace_ctx,
+            &request_id,
         )
         .await
         {
@@ -1265,6 +1267,68 @@ async fn handle_messages(
     Err(final_err)
 }
 
+/// Convert an `http::HeaderMap` into an ordered `Vec<(name, value)>`
+/// for `ExchangeCapture`. Non-UTF8 header values are rendered lossily.
+fn header_map_to_vec(headers: &http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                v.to_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Convert a reqwest response `HeaderMap` into an ordered Vec.
+fn reqwest_headers_to_vec(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                v.to_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Overwrite the `model` field of an upstream request body with the
+/// routing target's real upstream model id.
+///
+/// The client may send a *virtual* model name (used only for routing);
+/// the upstream provider must receive `target.model_id`. We only replace
+/// the value when the body is a JSON object that already carries a
+/// `model` key — so Gemini egress (model lives in the URL, body has no
+/// `model`) is left untouched and we never inject a spurious field.
+///
+/// Returns `true` when the body's `model` value was actually changed.
+/// Callers use this to decide whether a PassThrough body can still be
+/// forwarded byte-for-byte (no change) or must be re-serialized (changed).
+fn override_model_in_body(body: &mut serde_json::Value, model_id: &str) -> bool {
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(existing) = obj.get("model") {
+            if existing.as_str() == Some(model_id) {
+                return false;
+            }
+            obj.insert("model".to_string(), serde_json::json!(model_id));
+            return true;
+        }
+    }
+    false
+}
+
+/// Fire-and-forget: send an `ExchangeCapture` to the telemetry bus.
+/// The bus uses a non-blocking `try_send`, so this never stalls the
+/// request hot path; the background drain task redacts + persists.
+fn spawn_capture(state: &AppState, capture: tiygate_core::ExchangeCapture) {
+    let bus = state.telemetry.clone();
+    tokio::spawn(async move {
+        bus.send_capture(capture).await;
+    });
+}
+
 /// Execute an upstream OpenAI-compatible request.
 #[allow(clippy::too_many_arguments)]
 async fn execute_upstream(
@@ -1276,6 +1340,7 @@ async fn execute_upstream(
     is_stream: bool,
     raw_passthrough_body: Option<&str>,
     trace: &TraceContext,
+    request_id: &str,
 ) -> Result<Response, AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
@@ -1288,7 +1353,7 @@ async fn execute_upstream(
     // upstream-specific fields (Anthropic `anthropic_version`,
     // OpenAI `metadata`, custom `user` fields, etc.) are preserved
     // exactly as the client sent them.
-    let (upstream_body, mut upstream_headers) = if let Some(raw) = raw_passthrough_body {
+    let (mut upstream_body, mut upstream_headers) = if let Some(raw) = raw_passthrough_body {
         match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(v) => (v, http::HeaderMap::new()),
             Err(e) => {
@@ -1345,11 +1410,36 @@ async fn execute_upstream(
         })?
     };
 
+    // Replace the (possibly virtual) model name with the routing
+    // target's real upstream model id before sending and before we
+    // snapshot the egress body for the request-log detail view.
+    let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
+    // PassThrough can only forward the raw client bytes verbatim when the
+    // model name did not change. If we rewrote `model`, the raw body is
+    // stale and we must send the re-serialized `upstream_body` instead.
+    let pass_through_verbatim = is_pass_through && !model_was_overridden;
+
     // Apply auth via the registered provider's AuthApplier. Falls
     // back to a static `Bearer {api_key}` if no provider is registered
     // for `target.provider_id` (e.g., test fixtures or built-in
     // OpenAI-compatible endpoints that don't need OAuth).
     apply_provider_auth(target, &mut upstream_headers).await?;
+
+    // Capture the egress request (headers + body) for the request-log
+    // detail view. We snapshot here, *after* auth injection and just
+    // before the headers are moved into the reqwest builder, then add
+    // the `traceparent` that `inject_trace` stamps on the builder so
+    // the captured set matches what is actually sent. Redaction +
+    // truncation happen later on the telemetry background task.
+    // The egress *headers* are captured from the built `reqwest::Request`
+    // (see `finalize_egress` below) so the snapshot includes every
+    // header reqwest adds at finalize time (content-type, content-length,
+    // traceparent, auth). The body snapshot is taken here.
+    let egress_body_capture = if pass_through_verbatim {
+        raw_passthrough_body.map(|s| s.to_string())
+    } else {
+        serde_json::to_string(&upstream_body).ok()
+    };
 
     let client = &state.http_client;
     let upstream_url = format!("{}/chat/completions", target.effective_api_base());
@@ -1366,7 +1456,7 @@ async fn execute_upstream(
                 .timeout(state.request_read_timeout),
             trace,
         );
-        if is_pass_through {
+        if pass_through_verbatim {
             if let Some(raw) = raw_passthrough_body {
                 stream_req = stream_req
                     .header("content-type", "application/json")
@@ -1377,7 +1467,10 @@ async fn execute_upstream(
         } else {
             stream_req = stream_req.json(&upstream_body);
         }
-        let response = stream_req.send().await.map_err(|e| {
+        // Freeze the request and snapshot the complete egress header set.
+        let (egress_req, egress_headers_capture) =
+            crate::ingress_phase4::finalize_egress(stream_req)?;
+        let response = client.execute(egress_req).await.map_err(|e| {
             AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
         })?;
 
@@ -1386,9 +1479,27 @@ async fn execute_upstream(
         let rate_limit_headers_vec: Vec<(&'static str, String)> =
             extract_rate_limit_headers(response.headers());
         let status = response.status();
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            // Capture the failed streaming exchange (the error body is
+            // not an SSE stream, so store it verbatim).
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: Some(error_body.clone()),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: true,
+                },
+            );
             let mut app_err = AppError::new(
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 format!("Upstream {}: {}", status, error_body),
@@ -1428,6 +1539,15 @@ async fn execute_upstream(
             Duration::from_secs(state.upstream_stream_idle_timeout_secs),
             Duration::from_secs(state.upstream_stream_total_timeout_secs),
             DEFAULT_SSE_KEEPALIVE_INTERVAL,
+            Some(StreamCapture {
+                request_id: request_id.to_string(),
+                telemetry: state.telemetry.clone(),
+                egress_headers: egress_headers_capture,
+                egress_body: egress_body_capture,
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                max_bytes: state.raw_envelope_max_bytes as usize,
+            }),
         );
         // Passthrough Retry-After if present
         if let Some(ra) = retry_after {
@@ -1457,7 +1577,7 @@ async fn execute_upstream(
                 .timeout(state.request_read_timeout),
             trace,
         );
-        if is_pass_through {
+        if pass_through_verbatim {
             if let Some(raw) = raw_passthrough_body {
                 nonstream_req = nonstream_req
                     .header("content-type", "application/json")
@@ -1468,7 +1588,10 @@ async fn execute_upstream(
         } else {
             nonstream_req = nonstream_req.json(&upstream_body);
         }
-        let response = nonstream_req.send().await.map_err(|e| {
+        // Freeze the request and snapshot the complete egress header set.
+        let (egress_req, egress_headers_capture) =
+            crate::ingress_phase4::finalize_egress(nonstream_req)?;
+        let response = client.execute(egress_req).await.map_err(|e| {
             AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
         })?;
 
@@ -1476,12 +1599,32 @@ async fn execute_upstream(
         let rate_limit_headers_vec: Vec<(&'static str, String)> =
             extract_rate_limit_headers(response.headers());
         let status = response.status();
+        // Snapshot upstream response headers before `.json()` consumes
+        // the body, for the request-log detail view.
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
         let response_body: Value = response
             .json()
             .await
             .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
         if !status.is_success() {
+            // Capture the failed exchange (upstream error body) so the
+            // detail view shows what the provider returned.
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: false,
+                },
+            );
             let mut app_err = AppError::new(
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 format!(
@@ -1498,6 +1641,10 @@ async fn execute_upstream(
             app_err.rate_limit_headers = rate_limit_headers_vec;
             return Err(app_err);
         }
+
+        // Keep a copy of the raw upstream body for the capture before
+        // any cross-protocol re-encoding.
+        let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
 
         // Cross-protocol re-encoding
         let response_json = if is_same_protocol {
@@ -1523,6 +1670,7 @@ async fn execute_upstream(
             })?
         };
 
+        let client_resp_body_capture = serde_json::to_string(&response_json).ok();
         let mut response = Json(response_json).into_response();
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
@@ -1539,11 +1687,27 @@ async fn execute_upstream(
                 }
             }
         }
+        // Capture the full successful exchange for the detail view.
+        spawn_capture(
+            state,
+            tiygate_core::ExchangeCapture {
+                request_id: request_id.to_string(),
+                egress_headers: egress_headers_capture,
+                egress_body: egress_body_capture,
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                upstream_resp_body: upstream_resp_body_capture,
+                client_resp_headers: header_map_to_vec(response.headers()),
+                client_resp_body: client_resp_body_capture,
+                is_stream: false,
+            },
+        );
         Ok(response)
     }
 }
 
 /// Execute an upstream Anthropic Messages request.
+#[allow(clippy::too_many_arguments)]
 async fn execute_messages_upstream(
     state: &AppState,
     codec: &MessagesCodec,
@@ -1552,11 +1716,12 @@ async fn execute_messages_upstream(
     is_stream: bool,
     raw_passthrough_body: Option<&str>,
     trace: &TraceContext,
+    request_id: &str,
 ) -> Result<Response, AppError> {
     let is_pass_through = raw_passthrough_body.is_some();
     // PassThrough: forward raw body bytes verbatim. Non-PassThrough:
     // re-encode via the codec (IR → egress format).
-    let (upstream_body, mut upstream_headers) = if let Some(raw) = raw_passthrough_body {
+    let (mut upstream_body, mut upstream_headers) = if let Some(raw) = raw_passthrough_body {
         match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(v) => (v, http::HeaderMap::new()),
             Err(e) => {
@@ -1575,12 +1740,26 @@ async fn execute_messages_upstream(
         })?
     };
 
+    // Replace the (possibly virtual) model name with the routing
+    // target's real upstream model id.
+    let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
+    // PassThrough forwards raw bytes verbatim only when `model` was
+    // unchanged; otherwise we must send the re-serialized body.
+    let pass_through_verbatim = is_pass_through && !model_was_overridden;
+
     // Apply auth via the registered provider's AuthApplier. For
     // Anthropic, this inserts the x-api-key header. The
     // `anthropic-version` header is added by the MessagesCodec's
     // `encode_request` (see protocol/messages.rs), so it survives
     // here.
     apply_provider_auth(target, &mut upstream_headers).await?;
+
+    // Capture egress request (headers + body) for the detail view.
+    let egress_body_capture = if pass_through_verbatim {
+        raw_passthrough_body.map(|s| s.to_string())
+    } else {
+        serde_json::to_string(&upstream_body).ok()
+    };
 
     let client = &state.http_client;
     let upstream_url = format!("{}/messages", target.effective_api_base());
@@ -1593,7 +1772,7 @@ async fn execute_messages_upstream(
                 .timeout(state.request_read_timeout),
             trace,
         );
-        if is_pass_through {
+        if pass_through_verbatim {
             if let Some(raw) = raw_passthrough_body {
                 stream_req = stream_req
                     .header("content-type", "application/json")
@@ -1604,15 +1783,34 @@ async fn execute_messages_upstream(
         } else {
             stream_req = stream_req.json(&upstream_body);
         }
-        let response = stream_req.send().await.map_err(|e| {
+        // Freeze the request and snapshot the complete egress header set.
+        let (egress_req, egress_headers_capture) =
+            crate::ingress_phase4::finalize_egress(stream_req)?;
+        let response = client.execute(egress_req).await.map_err(|e| {
             AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
         })?;
 
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: Some(error_body.clone()),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: true,
+                },
+            );
             let mut app_err = AppError::new(
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 format!("Upstream {}: {}", status, error_body),
@@ -1648,6 +1846,15 @@ async fn execute_messages_upstream(
             Duration::from_secs(state.upstream_stream_idle_timeout_secs),
             Duration::from_secs(state.upstream_stream_total_timeout_secs),
             DEFAULT_SSE_KEEPALIVE_INTERVAL,
+            Some(StreamCapture {
+                request_id: request_id.to_string(),
+                telemetry: state.telemetry.clone(),
+                egress_headers: egress_headers_capture,
+                egress_body: egress_body_capture,
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                max_bytes: state.raw_envelope_max_bytes as usize,
+            }),
         );
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
@@ -1657,25 +1864,55 @@ async fn execute_messages_upstream(
         }
         Ok(response)
     } else {
-        let response = crate::ingress_phase4::inject_trace(
+        let mut nonstream_req = crate::ingress_phase4::inject_trace(
             client.post(&upstream_url).headers(upstream_headers),
             trace,
-        )
-        .json(&upstream_body)
-        .send()
-        .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)))?;
+        );
+        if pass_through_verbatim {
+            if let Some(raw) = raw_passthrough_body {
+                nonstream_req = nonstream_req
+                    .header("content-type", "application/json")
+                    .body(raw.to_string());
+            } else {
+                nonstream_req = nonstream_req.json(&upstream_body);
+            }
+        } else {
+            nonstream_req = nonstream_req.json(&upstream_body);
+        }
+        // Freeze the request and snapshot the complete egress header set.
+        let (egress_req, egress_headers_capture) =
+            crate::ingress_phase4::finalize_egress(nonstream_req)?;
+        let response = client
+            .execute(egress_req)
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)))?;
 
         let retry_after = extract_retry_after(response.headers());
         let rate_limit_headers_vec: Vec<(&'static str, String)> =
             extract_rate_limit_headers(response.headers());
         let status = response.status();
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
         let response_body: Value = response
             .json()
             .await
             .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
         if !status.is_success() {
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: false,
+                },
+            );
             let mut app_err = AppError::new(
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 format!(
@@ -1693,6 +1930,8 @@ async fn execute_messages_upstream(
             return Err(app_err);
         }
 
+        let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
+        let client_resp_body_capture = upstream_resp_body_capture.clone();
         let mut response = Json(response_body).into_response();
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
@@ -1700,6 +1939,20 @@ async fn execute_messages_upstream(
                 http::HeaderValue::from_str(&ra).unwrap_or(http::HeaderValue::from_static("")),
             );
         }
+        spawn_capture(
+            state,
+            tiygate_core::ExchangeCapture {
+                request_id: request_id.to_string(),
+                egress_headers: egress_headers_capture,
+                egress_body: egress_body_capture,
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                upstream_resp_body: upstream_resp_body_capture,
+                client_resp_headers: header_map_to_vec(response.headers()),
+                client_resp_body: client_resp_body_capture,
+                is_stream: false,
+            },
+        );
         Ok(response)
     }
 }
@@ -1905,7 +2158,7 @@ async fn handle_embeddings(
     scope.set_egress(target.api_protocol.clone());
     scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
 
-    let (upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
+    let (mut upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
         Ok(b) => b,
         Err(e) => {
             let app_err = AppError::new(
@@ -1918,26 +2171,34 @@ async fn handle_embeddings(
         }
     };
 
+    // Replace the (possibly virtual) model name with the routing
+    // target's real upstream model id.
+    override_model_in_body(&mut upstream_body, &target.model_id);
+
     if let Err(e) = apply_provider_auth(target, &mut upstream_headers).await {
         let http_status = e.http_status().as_u16();
         scope.emit_error("auth_error", Some(http_status));
         return Err(e);
     }
+    // Capture egress request (headers + body) for the detail view.
+    let egress_body_capture = serde_json::to_string(&upstream_body).ok();
+    let req_id_capture = scope.request_id().to_string();
+
     let client = &state.http_client;
     let upstream_url = format!("{}/embeddings", target.effective_api_base());
 
     // Build the upstream request manually so we can inject the
     // `traceparent` header before sending. `inject_trace` stamps the
     // header on the builder so it survives the JSON body merge below.
-    let builder = crate::ingress_phase4::inject_trace(client.post(&upstream_url), &trace_ctx);
-    let req = match builder
+    // `finalize_egress` freezes the builder into the concrete request
+    // and snapshots its complete header set (content-type,
+    // content-length, traceparent, auth) for the request-log detail view.
+    let builder = crate::ingress_phase4::inject_trace(client.post(&upstream_url), &trace_ctx)
         .headers(upstream_headers)
-        .json(&upstream_body)
-        .build()
-    {
+        .json(&upstream_body);
+    let (req, egress_headers_capture) = match crate::ingress_phase4::finalize_egress(builder) {
         Ok(r) => r,
-        Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream build: {e}"));
+        Err(app_err) => {
             let http_status = app_err.http_status().as_u16();
             scope.emit_error("upstream_send_error", Some(http_status));
             return Err(app_err);
@@ -1954,6 +2215,8 @@ async fn handle_embeddings(
     };
 
     let status = response.status();
+    let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+    let upstream_status_capture = status.as_u16();
     let response_body: Value = match response.json().await {
         Ok(v) => v,
         Err(e) => {
@@ -1965,6 +2228,20 @@ async fn handle_embeddings(
     };
 
     if !status.is_success() {
+        spawn_capture(
+            &state,
+            tiygate_core::ExchangeCapture {
+                request_id: req_id_capture.clone(),
+                egress_headers: egress_headers_capture.clone(),
+                egress_body: egress_body_capture.clone(),
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                client_resp_headers: Vec::new(),
+                client_resp_body: None,
+                is_stream: false,
+            },
+        );
         let app_err = AppError::new(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             format!(
@@ -1980,6 +2257,27 @@ async fn handle_embeddings(
     }
 
     state.health.record_success(&target.health_key());
+
+    // Capture the full successful embeddings exchange for the detail
+    // view (client body == upstream body, no re-encoding here).
+    let body_str_capture = serde_json::to_string(&response_body).ok();
+    spawn_capture(
+        &state,
+        tiygate_core::ExchangeCapture {
+            request_id: req_id_capture,
+            egress_headers: egress_headers_capture,
+            egress_body: egress_body_capture,
+            upstream_status: Some(upstream_status_capture),
+            upstream_resp_headers: upstream_resp_headers_capture,
+            upstream_resp_body: body_str_capture.clone(),
+            client_resp_headers: vec![(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )],
+            client_resp_body: body_str_capture,
+            is_stream: false,
+        },
+    );
 
     // Phase 4 §4.7: store the upstream response for the next call.
     crate::ingress_phase4::embedding_cache_store(&state, &cache_key, response_body.clone()).await;
@@ -2130,7 +2428,7 @@ async fn handle_responses(
     scope.set_egress(target.api_protocol.clone());
     scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
 
-    let (upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
+    let (mut upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
         Ok(b) => b,
         Err(e) => {
             let app_err = AppError::new(
@@ -2142,11 +2440,22 @@ async fn handle_responses(
             return Err(app_err);
         }
     };
+
+    // Replace the (possibly virtual) model name with the routing
+    // target's real upstream model id.
+    override_model_in_body(&mut upstream_body, &target.model_id);
     if let Err(e) = apply_provider_auth(target, &mut upstream_headers).await {
         let http_status = e.http_status().as_u16();
         scope.emit_error("auth_error", Some(http_status));
         return Err(e);
     }
+
+    // Capture egress request (headers + body) for the detail view.
+    // The egress *headers* are snapshotted per-branch from the built
+    // `reqwest::Request` via `finalize_egress` so they include every
+    // header reqwest adds at finalize time.
+    let egress_body_capture = serde_json::to_string(&upstream_body).ok();
+    let req_id_capture = scope.request_id().to_string();
 
     let upstream_url = format!("{}/responses", target.effective_api_base());
 
@@ -2154,7 +2463,7 @@ async fn handle_responses(
         // Streaming path: tell the upstream we accept SSE and drive the
         // body through the same idle/total/keepalive bridge used by the
         // chat-completions and anthropic-messages paths.
-        let response = match crate::ingress_phase4::inject_trace(
+        let stream_builder = crate::ingress_phase4::inject_trace(
             state
                 .http_client
                 .post(&upstream_url)
@@ -2162,10 +2471,17 @@ async fn handle_responses(
                 .header(http::header::ACCEPT, "text/event-stream"),
             &trace_ctx,
         )
-        .json(&upstream_body)
-        .send()
-        .await
-        {
+        .json(&upstream_body);
+        let (egress_req, egress_headers_capture) =
+            match crate::ingress_phase4::finalize_egress(stream_builder) {
+                Ok(r) => r,
+                Err(app_err) => {
+                    let http_status = app_err.http_status().as_u16();
+                    scope.emit_error("upstream_send_error", Some(http_status));
+                    return Err(app_err);
+                }
+            };
+        let response = match state.http_client.execute(egress_req).await {
             Ok(r) => r,
             Err(e) => {
                 let app_err =
@@ -2177,8 +2493,24 @@ async fn handle_responses(
         };
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            spawn_capture(
+                &state,
+                tiygate_core::ExchangeCapture {
+                    request_id: req_id_capture.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: Some(error_body.clone()),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: true,
+                },
+            );
             let mut app_err = AppError::new(
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 format!("Upstream {}: {}", status, error_body),
@@ -2210,6 +2542,15 @@ async fn handle_responses(
             Duration::from_secs(state.upstream_stream_idle_timeout_secs),
             Duration::from_secs(state.upstream_stream_total_timeout_secs),
             DEFAULT_SSE_KEEPALIVE_INTERVAL,
+            Some(StreamCapture {
+                request_id: req_id_capture.clone(),
+                telemetry: state.telemetry.clone(),
+                egress_headers: egress_headers_capture.clone(),
+                egress_body: egress_body_capture.clone(),
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                max_bytes: state.raw_envelope_max_bytes as usize,
+            }),
         );
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
@@ -2233,17 +2574,24 @@ async fn handle_responses(
     }
 
     // Non-streaming path: read the full body and forward as JSON.
-    let response = match crate::ingress_phase4::inject_trace(
+    let nonstream_builder = crate::ingress_phase4::inject_trace(
         state
             .http_client
             .post(&upstream_url)
             .headers(upstream_headers),
         &trace_ctx,
     )
-    .json(&upstream_body)
-    .send()
-    .await
-    {
+    .json(&upstream_body);
+    let (egress_req, egress_headers_capture) =
+        match crate::ingress_phase4::finalize_egress(nonstream_builder) {
+            Ok(r) => r,
+            Err(app_err) => {
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("upstream_send_error", Some(http_status));
+                return Err(app_err);
+            }
+        };
+    let response = match state.http_client.execute(egress_req).await {
         Ok(r) => r,
         Err(e) => {
             let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"));
@@ -2256,6 +2604,8 @@ async fn handle_responses(
     let retry_after = extract_retry_after(response.headers());
     let rate_limit_headers_vec: Vec<(&'static str, String)> =
         extract_rate_limit_headers(response.headers());
+    let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+    let upstream_status_capture = status.as_u16();
     let response_body: Value = match response.json().await {
         Ok(v) => v,
         Err(e) => {
@@ -2266,6 +2616,20 @@ async fn handle_responses(
         }
     };
     if !status.is_success() {
+        spawn_capture(
+            &state,
+            tiygate_core::ExchangeCapture {
+                request_id: req_id_capture.clone(),
+                egress_headers: egress_headers_capture.clone(),
+                egress_body: egress_body_capture.clone(),
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                client_resp_headers: Vec::new(),
+                client_resp_body: None,
+                is_stream: false,
+            },
+        );
         let mut app_err = AppError::new(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             format!("Upstream {}: {}", status, response_body),
@@ -2279,6 +2643,7 @@ async fn handle_responses(
         scope.emit_error("upstream_error", Some(http_status));
         return Err(app_err);
     }
+    let body_str_capture = serde_json::to_string(&response_body).ok();
     let mut resp = Json(response_body).into_response();
     if let Some(ra) = retry_after {
         resp.headers_mut().insert(
@@ -2294,6 +2659,20 @@ async fn handle_responses(
         }
     }
     state.health.record_success(&target.health_key());
+    spawn_capture(
+        &state,
+        tiygate_core::ExchangeCapture {
+            request_id: req_id_capture,
+            egress_headers: egress_headers_capture,
+            egress_body: egress_body_capture,
+            upstream_status: Some(upstream_status_capture),
+            upstream_resp_headers: upstream_resp_headers_capture,
+            upstream_resp_body: body_str_capture.clone(),
+            client_resp_headers: header_map_to_vec(resp.headers()),
+            client_resp_body: body_str_capture,
+            is_stream: false,
+        },
+    );
     let http_status = resp.status().as_u16();
     scope.emit_ok(Some(http_status));
     Ok(resp)
@@ -2402,7 +2781,7 @@ async fn handle_gemini_generate(
     scope.set_egress(target.api_protocol.clone());
     scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
 
-    let (upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
+    let (mut upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
         Ok(b) => b,
         Err(e) => {
             let app_err = AppError::new(
@@ -2414,11 +2793,22 @@ async fn handle_gemini_generate(
             return Err(app_err);
         }
     };
+
+    // Replace the (possibly virtual) model name with the routing
+    // target's real upstream model id.
+    override_model_in_body(&mut upstream_body, &target.model_id);
     if let Err(e) = apply_provider_auth(target, &mut upstream_headers).await {
         let http_status = e.http_status().as_u16();
         scope.emit_error("auth_error", Some(http_status));
         return Err(e);
     }
+
+    // Capture egress request (headers + body) for the detail view.
+    // The egress *headers* are snapshotted per-branch from the built
+    // `reqwest::Request` via `finalize_egress` so they include every
+    // header reqwest adds at finalize time.
+    let egress_body_capture = serde_json::to_string(&upstream_body).ok();
+    let req_id_capture = scope.request_id().to_string();
 
     // Gemini uses `?alt=sse` on the query string to switch the same
     // POST endpoint into Server-Sent Events mode. The body shape is
@@ -2426,7 +2816,7 @@ async fn handle_gemini_generate(
     let base_stream_url = format!(
         "{}/v1beta/models/{}:generateContent",
         target.effective_api_base(),
-        virtual_model
+        target.model_id
     );
 
     if is_stream {
@@ -2434,17 +2824,24 @@ async fn handle_gemini_generate(
         // `drive_upstream_stream` so the client sees the same idle /
         // total / keepalive / protocol-native end-frame semantics as
         // the other streaming ingress paths.
-        let response = match crate::ingress_phase4::inject_trace(
+        let stream_builder = crate::ingress_phase4::inject_trace(
             state
                 .http_client
                 .post(format!("{base_stream_url}?alt=sse"))
                 .headers(upstream_headers),
             &trace_ctx,
         )
-        .json(&upstream_body)
-        .send()
-        .await
-        {
+        .json(&upstream_body);
+        let (egress_req, egress_headers_capture) =
+            match crate::ingress_phase4::finalize_egress(stream_builder) {
+                Ok(r) => r,
+                Err(app_err) => {
+                    let http_status = app_err.http_status().as_u16();
+                    scope.emit_error("upstream_send_error", Some(http_status));
+                    return Err(app_err);
+                }
+            };
+        let response = match state.http_client.execute(egress_req).await {
             Ok(r) => r,
             Err(e) => {
                 let app_err =
@@ -2456,8 +2853,24 @@ async fn handle_gemini_generate(
         };
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            spawn_capture(
+                &state,
+                tiygate_core::ExchangeCapture {
+                    request_id: req_id_capture.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: Some(error_body.clone()),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: true,
+                },
+            );
             let mut app_err = AppError::new(
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 format!("Upstream {}: {}", status, error_body),
@@ -2489,6 +2902,15 @@ async fn handle_gemini_generate(
             Duration::from_secs(state.upstream_stream_idle_timeout_secs),
             Duration::from_secs(state.upstream_stream_total_timeout_secs),
             DEFAULT_SSE_KEEPALIVE_INTERVAL,
+            Some(StreamCapture {
+                request_id: req_id_capture.clone(),
+                telemetry: state.telemetry.clone(),
+                egress_headers: egress_headers_capture.clone(),
+                egress_body: egress_body_capture.clone(),
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                max_bytes: state.raw_envelope_max_bytes as usize,
+            }),
         );
         if let Some(ra) = retry_after {
             response.headers_mut().insert(
@@ -2513,17 +2935,24 @@ async fn handle_gemini_generate(
 
     // Non-streaming path: read the full body and forward as JSON.
     let upstream_url = base_stream_url;
-    let response = match crate::ingress_phase4::inject_trace(
+    let nonstream_builder = crate::ingress_phase4::inject_trace(
         state
             .http_client
             .post(&upstream_url)
             .headers(upstream_headers),
         &trace_ctx,
     )
-    .json(&upstream_body)
-    .send()
-    .await
-    {
+    .json(&upstream_body);
+    let (egress_req, egress_headers_capture) =
+        match crate::ingress_phase4::finalize_egress(nonstream_builder) {
+            Ok(r) => r,
+            Err(app_err) => {
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("upstream_send_error", Some(http_status));
+                return Err(app_err);
+            }
+        };
+    let response = match state.http_client.execute(egress_req).await {
         Ok(r) => r,
         Err(e) => {
             let app_err = AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"));
@@ -2536,6 +2965,8 @@ async fn handle_gemini_generate(
     let retry_after = extract_retry_after(response.headers());
     let rate_limit_headers_vec: Vec<(&'static str, String)> =
         extract_rate_limit_headers(response.headers());
+    let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+    let upstream_status_capture = status.as_u16();
     let response_body: Value = match response.json().await {
         Ok(v) => v,
         Err(e) => {
@@ -2546,6 +2977,20 @@ async fn handle_gemini_generate(
         }
     };
     if !status.is_success() {
+        spawn_capture(
+            &state,
+            tiygate_core::ExchangeCapture {
+                request_id: req_id_capture.clone(),
+                egress_headers: egress_headers_capture.clone(),
+                egress_body: egress_body_capture.clone(),
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                client_resp_headers: Vec::new(),
+                client_resp_body: None,
+                is_stream: false,
+            },
+        );
         let mut app_err = AppError::new(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             format!("Upstream {}: {}", status, response_body),
@@ -2559,6 +3004,7 @@ async fn handle_gemini_generate(
         scope.emit_error("upstream_error", Some(http_status));
         return Err(app_err);
     }
+    let body_str_capture = serde_json::to_string(&response_body).ok();
     let mut resp = Json(response_body).into_response();
     if let Some(ra) = retry_after {
         resp.headers_mut().insert(
@@ -2574,6 +3020,20 @@ async fn handle_gemini_generate(
         }
     }
     state.health.record_success(&target.health_key());
+    spawn_capture(
+        &state,
+        tiygate_core::ExchangeCapture {
+            request_id: req_id_capture,
+            egress_headers: egress_headers_capture,
+            egress_body: egress_body_capture,
+            upstream_status: Some(upstream_status_capture),
+            upstream_resp_headers: upstream_resp_headers_capture,
+            upstream_resp_body: body_str_capture.clone(),
+            client_resp_headers: header_map_to_vec(resp.headers()),
+            client_resp_body: body_str_capture,
+            is_stream: false,
+        },
+    );
     let _ = ingress_protocol;
     let http_status = resp.status().as_u16();
     scope.emit_ok(Some(http_status));
@@ -2737,6 +3197,25 @@ impl<S: Stream<Item = Result<axum::response::sse::Event, axum::Error>>> Stream
 /// `Retry-After` / `RateLimit-*` headers from the upstream response
 /// are passed through by the caller; this function only builds the
 /// streaming body.
+/// Context for capturing a streaming (SSE) exchange into the
+/// request-log detail view. The egress request (headers + body) and
+/// the upstream response headers/status are already known when the
+/// stream starts; the response body is accumulated chunk-by-chunk as
+/// the stream is forwarded and the `ExchangeCapture` is sent to the
+/// telemetry bus once the stream terminates.
+pub struct StreamCapture {
+    pub request_id: String,
+    pub telemetry: Arc<dyn tiygate_core::TelemetryBus>,
+    pub egress_headers: Vec<(String, String)>,
+    pub egress_body: Option<String>,
+    pub upstream_status: Option<u16>,
+    pub upstream_resp_headers: Vec<(String, String)>,
+    /// Byte cap for the accumulated response body; once exceeded the
+    /// buffer stops growing (best-effort; truncation is flagged by the
+    /// sink when the body hits the persistence cap).
+    pub max_bytes: usize,
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::let_underscore_must_use,
@@ -2758,6 +3237,7 @@ pub fn drive_upstream_stream(
     idle_timeout: Duration,
     total_timeout: Duration,
     keepalive_interval: Duration,
+    capture: Option<StreamCapture>,
 ) -> Response {
     use async_stream::stream;
 
@@ -2765,6 +3245,11 @@ pub fn drive_upstream_stream(
     let total_started = Instant::now();
     let mut upstream = response.bytes_stream();
     let mut last_reason: Option<TruncationReason> = None;
+    // Streaming response-body accumulator for the request-log detail
+    // view. Bounded by `capture.max_bytes`; once the cap is hit we
+    // stop appending (the sink flags truncation on read-back).
+    let mut capture_buf: Vec<u8> = Vec::new();
+    let capture_max_bytes = capture.as_ref().map(|c| c.max_bytes).unwrap_or(0);
     let idle_timeout = if idle_timeout.is_zero() {
         // 0 means "use the keepalive cadence as a no-progress signal"
         // — but to be safe we still need *some* upper bound so a hung
@@ -2811,6 +3296,15 @@ pub fn drive_upstream_stream(
                                 }
                             } else if let Ok(mut a) = accum.lock() {
                                 a.record_chunk(&String::from_utf8_lossy(&bytes));
+                            }
+                            // Accumulate the raw SSE bytes for the detail
+                            // view, bounded by the byte cap. This is a
+                            // single memory copy and never blocks the
+                            // forward path.
+                            if capture_max_bytes > 0 && capture_buf.len() < capture_max_bytes {
+                                let remaining = capture_max_bytes - capture_buf.len();
+                                let take = remaining.min(bytes.len());
+                                capture_buf.extend_from_slice(&bytes[..take]);
                             }
                             yield Ok(axum::response::sse::Event::default()
                                 .data(String::from_utf8_lossy(&bytes)));
@@ -2910,6 +3404,37 @@ pub fn drive_upstream_stream(
         let _ = last_reason;
         // Touch the total_started clock for the same reason.
         let _ = total_started;
+
+        // Stream finished (natural end, idle, total, or upstream
+        // error). Send the accumulated exchange capture to the
+        // telemetry bus for the request-log detail view. The first
+        // version stores the upstream SSE body as both the upstream
+        // and the client response body (they are byte-identical for
+        // same-protocol streaming; cross-protocol re-encoding of the
+        // streamed client body is a known limitation).
+        if let Some(cap) = capture {
+            let body = if capture_buf.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&capture_buf).into_owned())
+            };
+            cap.telemetry
+                .send_capture(tiygate_core::ExchangeCapture {
+                    request_id: cap.request_id,
+                    egress_headers: cap.egress_headers,
+                    egress_body: cap.egress_body,
+                    upstream_status: cap.upstream_status,
+                    upstream_resp_headers: cap.upstream_resp_headers,
+                    upstream_resp_body: body.clone(),
+                    client_resp_headers: vec![(
+                        "content-type".to_string(),
+                        "text/event-stream".to_string(),
+                    )],
+                    client_resp_body: body,
+                    is_stream: true,
+                })
+                .await;
+        }
     };
 
     // Wrap the inner stream in a keepalive emitter so the downstream
@@ -2933,7 +3458,7 @@ pub struct AppError {
 }
 
 impl AppError {
-    fn new(status: StatusCode, message: String) -> Self {
+    pub(crate) fn new(status: StatusCode, message: String) -> Self {
         Self {
             status,
             message,

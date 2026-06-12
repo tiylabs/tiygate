@@ -152,20 +152,33 @@ async fn run(_args: cli::RunArgs) -> anyhow::Result<()> {
         tracing::info!("graceful shutdown: in-flight requests will be allowed to finish");
     });
 
-    if let Err(e) = server.await {
-        tracing::error!(error = %e, "server exited with error");
-        return Err(e.into());
-    }
+    // `with_graceful_shutdown` makes `server` resolve only after the drain
+    // signal fires *and* all in-flight requests have finished. That means
+    // when there is no live traffic the server returns almost immediately
+    // — no fixed wait. The `drain_timeout` is only a safety bound for the
+    // case where some request is stuck; we start counting it from the
+    // moment the drain signal arrives, not from process start.
+    let drain_deadline = drain_state.clone();
+    let timeout_guard = async move {
+        drain_deadline.wait_for_signal().await;
+        tokio::time::sleep(Duration::from_secs(server_config.drain_timeout_secs)).await;
+    };
 
-    tracing::info!(
-        "waiting for drain to complete (timeout = {}s)",
-        server_config.drain_timeout_secs
-    );
-    let _ = tokio::time::timeout(
-        Duration::from_secs(server_config.drain_timeout_secs),
-        drain_state.wait_for_drain_complete(),
-    )
-    .await;
+    tokio::select! {
+        result = server => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "server exited with error");
+                return Err(e.into());
+            }
+            tracing::info!("drain complete: all in-flight requests finished");
+        }
+        _ = timeout_guard => {
+            tracing::warn!(
+                "drain timeout ({}s) elapsed with requests still in flight — forcing shutdown",
+                server_config.drain_timeout_secs
+            );
+        }
+    }
 
     tracing::info!("TiyGate shutdown complete");
     Ok(())

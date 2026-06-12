@@ -157,10 +157,26 @@ export interface RequestReplay {
   request_id: string;
   raw_envelope_json?: string | null;
   redacted_headers_json?: string | null;
+  // Full exchange payload (joined from request_payloads).
+  egress_headers_json?: string | null;
+  egress_body?: string | null;
+  egress_body_truncated?: boolean;
+  upstream_status?: number | null;
+  upstream_resp_headers_json?: string | null;
+  upstream_resp_body?: string | null;
+  upstream_resp_body_truncated?: boolean;
+  client_resp_headers_json?: string | null;
+  client_resp_body?: string | null;
+  client_resp_body_truncated?: boolean;
+  is_stream?: boolean;
+  sse_parsed_json?: string | null;
 }
 
 export interface CircuitBreaker {
   target: string;
+  provider_id?: string;
+  provider_name?: string;
+  model_id?: string;
   healthy: boolean;
   status: string;
 }

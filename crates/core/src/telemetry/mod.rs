@@ -122,6 +122,40 @@ pub struct LatencyBreakdown {
     pub queue_ms: u64,
 }
 
+/// A full request/response exchange capture for the request-log
+/// detail view. Carries the raw (un-redacted, un-truncated) headers
+/// and bodies as captured on the request hot path. The telemetry
+/// background task redacts + truncates + (for SSE) parses these
+/// before persistence, so the hot path stays cheap (clone/move only).
+///
+/// Headers are `Vec<(name, value)>` to preserve order and duplicates.
+/// Bodies are raw `String`s (JSON for non-stream, concatenated SSE
+/// bytes for stream). All fields are best-effort; missing data is
+/// represented as empty/`None`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExchangeCapture {
+    /// Gateway-side request id; matches `RequestEvent::request_id`.
+    pub request_id: String,
+    /// Gateway → Provider request headers (the headers actually sent
+    /// upstream, including injected auth + traceparent).
+    pub egress_headers: Vec<(String, String)>,
+    /// Gateway → Provider request body (JSON serialized).
+    pub egress_body: Option<String>,
+    /// Provider → Gateway HTTP status code.
+    pub upstream_status: Option<u16>,
+    /// Provider → Gateway response headers.
+    pub upstream_resp_headers: Vec<(String, String)>,
+    /// Provider → Gateway response body (full JSON for non-stream,
+    /// concatenated raw SSE bytes for stream).
+    pub upstream_resp_body: Option<String>,
+    /// Gateway → Client response headers.
+    pub client_resp_headers: Vec<(String, String)>,
+    /// Gateway → Client response body.
+    pub client_resp_body: Option<String>,
+    /// Whether the exchange used a streaming (SSE) response.
+    pub is_stream: bool,
+}
+
 /// The telemetry bus — decouples event production from consumption.
 #[async_trait::async_trait]
 pub trait TelemetryBus: Send + Sync {
@@ -129,6 +163,12 @@ pub trait TelemetryBus: Send + Sync {
     async fn send(&self, event: PipelineEvent);
     /// Send a completed request event.
     async fn send_request_event(&self, event: RequestEvent);
+    /// Send a full request/response exchange capture (non-blocking).
+    ///
+    /// Default no-op so existing bus implementations remain valid;
+    /// the production `ChannelTelemetryBus` overrides this to enqueue
+    /// the capture for background persistence.
+    async fn send_capture(&self, _capture: ExchangeCapture) {}
 }
 
 /// A log/event sink that persists events.
@@ -138,6 +178,14 @@ pub trait EventSink: Send + Sync {
     async fn write_event(&self, event: &PipelineEvent) -> Result<(), crate::Error>;
     /// Write a completed request event.
     async fn write_request_event(&self, event: &RequestEvent) -> Result<(), crate::Error>;
+    /// Persist a full request/response exchange capture.
+    ///
+    /// Default no-op so existing sinks remain valid; the `OltpSink`
+    /// overrides this to redact, truncate, parse SSE, and write the
+    /// `request_payloads` row.
+    async fn write_capture(&self, _capture: &ExchangeCapture) -> Result<(), crate::Error> {
+        Ok(())
+    }
     /// Flush any buffered events.
     async fn flush(&self) -> Result<(), crate::Error>;
 }

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use tiygate_core::{EventSink, PipelineEvent, RequestEvent, TelemetryBus};
+use tiygate_core::{EventSink, ExchangeCapture, PipelineEvent, RequestEvent, TelemetryBus};
 
 /// Default channel capacity for the telemetry bus.
 ///
@@ -51,6 +51,11 @@ enum BusMessage {
     /// cost is negligible compared to the cost of serialising
     /// a `RequestEvent` to JSON in the sink.
     Request(Box<RequestEvent>),
+    /// A full request/response exchange capture for the detail view.
+    /// Boxed for the same uniform-slot-size reason as the other
+    /// variants; the capture carries headers + bodies and can be
+    /// large.
+    Capture(Box<ExchangeCapture>),
 }
 
 impl ChannelTelemetryBus {
@@ -73,6 +78,11 @@ impl ChannelTelemetryBus {
                     BusMessage::Request(ev) => {
                         if let Err(e) = sink.write_request_event(&ev).await {
                             warn!(error = %e, "telemetry sink: failed to write request event");
+                        }
+                    }
+                    BusMessage::Capture(cap) => {
+                        if let Err(e) = sink.write_capture(&cap).await {
+                            warn!(error = %e, "telemetry sink: failed to write exchange capture");
                         }
                     }
                 }
@@ -119,6 +129,16 @@ impl TelemetryBus for ChannelTelemetryBus {
             warn!("telemetry bus: request event dropped (channel full)");
         }
     }
+
+    async fn send_capture(&self, capture: ExchangeCapture) {
+        if self
+            .tx
+            .try_send(BusMessage::Capture(Box::new(capture)))
+            .is_err()
+        {
+            warn!("telemetry bus: exchange capture dropped (channel full)");
+        }
+    }
 }
 
 // Note: Phase 4 (产品化) replaced the in-server `StdoutTelemetrySink`
@@ -146,6 +166,7 @@ mod tests {
     struct CountingSink {
         events: Arc<AtomicUsize>,
         requests: Arc<AtomicUsize>,
+        captures: Arc<AtomicUsize>,
         write_delay: Duration,
     }
 
@@ -162,6 +183,14 @@ mod tests {
         ) -> Result<(), tiygate_core::Error> {
             tokio::time::sleep(self.write_delay).await;
             self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn write_capture(
+            &self,
+            _capture: &tiygate_core::ExchangeCapture,
+        ) -> Result<(), tiygate_core::Error> {
+            tokio::time::sleep(self.write_delay).await;
+            self.captures.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn flush(&self) -> Result<(), tiygate_core::Error> {
@@ -216,9 +245,11 @@ mod tests {
     async fn bus_drains_events_to_sink() {
         let events = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
+        let captures = Arc::new(AtomicUsize::new(0));
         let sink = Arc::new(CountingSink {
             events: events.clone(),
             requests: requests.clone(),
+            captures: captures.clone(),
             write_delay: Duration::from_millis(1),
         });
         let bus = ChannelTelemetryBus::spawn(sink, 16);
@@ -230,12 +261,16 @@ mod tests {
             bus.send_request_event(dummy_request_event(&format!("r-{i}")))
                 .await;
         }
+        for i in 0..2 {
+            bus.send_capture(dummy_capture(&format!("c-{i}"))).await;
+        }
 
         // Give the drain task a moment to consume the channel.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert_eq!(events.load(Ordering::SeqCst), 5);
         assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(captures.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -243,9 +278,11 @@ mod tests {
         // Capacity 1 + a slow sink: the producer must never block.
         let events = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
+        let captures = Arc::new(AtomicUsize::new(0));
         let sink = Arc::new(CountingSink {
             events: events.clone(),
             requests: requests.clone(),
+            captures: captures.clone(),
             write_delay: Duration::from_millis(50),
         });
         let bus = ChannelTelemetryBus::spawn(sink, 1);
@@ -255,9 +292,13 @@ mod tests {
         for i in 0..200 {
             bus.send(dummy_pipeline_event(&format!("p-{i}"))).await;
         }
+        // Captures must also be non-blocking under backpressure.
+        for i in 0..200 {
+            bus.send_capture(dummy_capture(&format!("c-{i}"))).await;
+        }
         let elapsed = start.elapsed();
 
-        // Producer must complete in << 200 * 50ms (i.e. it never blocks
+        // Producer must complete in << 400 * 50ms (i.e. it never blocks
         // on the slow sink). We allow up to 1s for the send loop.
         assert!(
             elapsed < Duration::from_secs(1),
@@ -271,5 +312,19 @@ mod tests {
         // We don't assert the exact count — drops are expected when the
         // channel is full — but at least one event must have been written.
         assert!(count >= 1, "sink never received any events");
+    }
+
+    fn dummy_capture(id: &str) -> tiygate_core::ExchangeCapture {
+        tiygate_core::ExchangeCapture {
+            request_id: id.to_string(),
+            egress_headers: vec![("content-type".to_string(), "application/json".to_string())],
+            egress_body: Some("{}".to_string()),
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: Some("{}".to_string()),
+            client_resp_headers: vec![],
+            client_resp_body: Some("{}".to_string()),
+            is_stream: false,
+        }
     }
 }

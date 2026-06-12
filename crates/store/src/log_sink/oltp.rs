@@ -22,18 +22,43 @@ use async_trait::async_trait;
 use sqlx::Row;
 use tracing::warn;
 
-use tiygate_core::{EventSink, PipelineEvent, RequestEvent};
+use tiygate_core::redaction::Redactor;
+use tiygate_core::{EventSink, ExchangeCapture, PipelineEvent, RequestEvent};
 
 use crate::db::DbPool;
+
+/// Default payload body byte cap when none is supplied. Mirrors the
+/// server's `raw_envelope_max_bytes` default (256 KiB). Bodies larger
+/// than this are truncated and flagged.
+const DEFAULT_PAYLOAD_MAX_BYTES: usize = 256 * 1024;
 
 /// An `EventSink` backed by the `request_logs` table.
 pub struct OltpSink {
     pool: Arc<DbPool>,
+    /// Redactor applied to captured headers + JSON bodies on the
+    /// background telemetry task before persistence. Defaults to the
+    /// standard credential set.
+    redactor: Redactor,
+    /// Byte cap for each captured body before truncation.
+    payload_max_bytes: usize,
 }
 
 impl OltpSink {
     pub fn new(pool: Arc<DbPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            redactor: Redactor::with_defaults(),
+            payload_max_bytes: DEFAULT_PAYLOAD_MAX_BYTES,
+        }
+    }
+
+    /// Override the per-body byte cap used when persisting captured
+    /// payloads. Keep this aligned with the server's
+    /// `raw_envelope_max_bytes` so detail-view bodies and the request
+    /// envelope share the same truncation budget.
+    pub fn with_payload_max_bytes(mut self, max: usize) -> Self {
+        self.payload_max_bytes = max;
+        self
     }
 }
 
@@ -103,9 +128,278 @@ impl EventSink for OltpSink {
         Ok(())
     }
 
+    async fn write_capture(&self, capture: &ExchangeCapture) -> Result<(), tiygate_core::Error> {
+        let row = self.capture_to_row(capture);
+        let res = sqlx::query(
+            "INSERT OR REPLACE INTO request_payloads (\
+                request_id, egress_headers_json, egress_body, egress_body_truncated, \
+                upstream_status, upstream_resp_headers_json, upstream_resp_body, \
+                upstream_resp_body_truncated, client_resp_headers_json, client_resp_body, \
+                client_resp_body_truncated, is_stream, sse_parsed_json, captured_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )
+        .bind(&row.request_id)
+        .bind(&row.egress_headers_json)
+        .bind(&row.egress_body)
+        .bind(row.egress_body_truncated as i32)
+        .bind(row.upstream_status.map(|n| n as i32))
+        .bind(&row.upstream_resp_headers_json)
+        .bind(&row.upstream_resp_body)
+        .bind(row.upstream_resp_body_truncated as i32)
+        .bind(&row.client_resp_headers_json)
+        .bind(&row.client_resp_body)
+        .bind(row.client_resp_body_truncated as i32)
+        .bind(row.is_stream as i32)
+        .bind(&row.sse_parsed_json)
+        .bind(&row.captured_at)
+        .execute(self.pool.sqlite())
+        .await;
+        if let Err(e) = res {
+            warn!(error = %e, request_id = %capture.request_id, "oltp sink: payload insert failed");
+            return Err(tiygate_core::Error::Telemetry(format!(
+                "oltp payload insert: {e}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn flush(&self) -> Result<(), tiygate_core::Error> {
         Ok(())
     }
+}
+
+/// Mirror of a `request_payloads` row after redaction + truncation.
+#[derive(Debug, Default)]
+struct RequestPayloadsRow {
+    request_id: String,
+    egress_headers_json: Option<String>,
+    egress_body: Option<String>,
+    egress_body_truncated: bool,
+    upstream_status: Option<u16>,
+    upstream_resp_headers_json: Option<String>,
+    upstream_resp_body: Option<String>,
+    upstream_resp_body_truncated: bool,
+    client_resp_headers_json: Option<String>,
+    client_resp_body: Option<String>,
+    client_resp_body_truncated: bool,
+    is_stream: bool,
+    sse_parsed_json: Option<String>,
+    captured_at: String,
+}
+
+impl OltpSink {
+    /// Convert a raw `ExchangeCapture` into a persisted row, applying
+    /// header + JSON-body redaction, byte-cap truncation, and (for
+    /// streaming responses) best-effort SSE merge parsing. This runs
+    /// on the telemetry background task, never on the request hot
+    /// path.
+    fn capture_to_row(&self, capture: &ExchangeCapture) -> RequestPayloadsRow {
+        let egress_headers_json = redact_headers_json(&self.redactor, &capture.egress_headers);
+        let upstream_resp_headers_json =
+            redact_headers_json(&self.redactor, &capture.upstream_resp_headers);
+        let client_resp_headers_json =
+            redact_headers_json(&self.redactor, &capture.client_resp_headers);
+
+        let (egress_body, egress_body_truncated) =
+            self.prepare_body(capture.egress_body.as_deref());
+        let (upstream_resp_body, upstream_resp_body_truncated) =
+            self.prepare_body(capture.upstream_resp_body.as_deref());
+        let (client_resp_body, client_resp_body_truncated) =
+            self.prepare_body(capture.client_resp_body.as_deref());
+
+        // For streaming responses, attempt to merge the SSE chunks
+        // (we parse from the *upstream* body which carries the raw
+        // SSE stream) into a structured JSON result for easier
+        // reading. Best-effort: failures leave the field None.
+        let sse_parsed_json = if capture.is_stream {
+            capture
+                .upstream_resp_body
+                .as_deref()
+                .and_then(parse_sse_to_json)
+        } else {
+            None
+        };
+
+        RequestPayloadsRow {
+            request_id: capture.request_id.clone(),
+            egress_headers_json,
+            egress_body,
+            egress_body_truncated,
+            upstream_status: capture.upstream_status,
+            upstream_resp_headers_json,
+            upstream_resp_body,
+            upstream_resp_body_truncated,
+            client_resp_headers_json,
+            client_resp_body,
+            client_resp_body_truncated,
+            is_stream: capture.is_stream,
+            sse_parsed_json,
+            captured_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// Redact a JSON body string (best-effort) and apply byte-cap
+    /// truncation. Returns `(stored_body, truncated)`.
+    fn prepare_body(&self, body: Option<&str>) -> (Option<String>, bool) {
+        let Some(raw) = body else {
+            return (None, false);
+        };
+        // Redact known credential keys when the body is valid JSON;
+        // otherwise keep the raw text (e.g. SSE streams, error pages).
+        let redacted = match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(mut value) => {
+                self.redactor.redact_value(&mut value);
+                serde_json::to_string(&value).unwrap_or_else(|_| raw.to_string())
+            }
+            Err(_) => raw.to_string(),
+        };
+        if redacted.len() > self.payload_max_bytes {
+            let mut truncated = redacted;
+            truncated.truncate(self.payload_max_bytes);
+            (Some(truncated), true)
+        } else {
+            (Some(redacted), false)
+        }
+    }
+}
+
+/// Redact a header list and serialize it to a JSON object string.
+/// Returns `None` only when serialization fails (never expected).
+fn redact_headers_json(redactor: &Redactor, headers: &[(String, String)]) -> Option<String> {
+    if headers.is_empty() {
+        return None;
+    }
+    let redacted = redactor.redact_headers(headers.iter().cloned());
+    let map: std::collections::BTreeMap<String, String> = redacted.into_iter().collect();
+    serde_json::to_string(&map).ok()
+}
+
+/// Best-effort merge of an SSE stream into a single structured JSON
+/// string. Parses `data:` lines, decodes each as JSON, and:
+///   * For OpenAI `chat.completion.chunk` events, concatenates
+///     `choices[].delta.content` into a single assistant message and
+///     carries the final `usage` when present.
+///   * For Anthropic events, concatenates `content_block_delta` text
+///     deltas and carries the `message_delta` usage.
+///   * Falls back to collecting all parsed JSON events in an array.
+/// Returns `None` when no `data:` JSON lines are found.
+pub fn parse_sse_to_json(raw: &str) -> Option<String> {
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = rest.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+            events.push(v);
+        }
+    }
+    if events.is_empty() {
+        return None;
+    }
+
+    // Detect protocol family from the first event.
+    let mut text = String::new();
+    let mut usage: Option<serde_json::Value> = None;
+    let mut model: Option<String> = None;
+    let mut finish_reason: Option<String> = None;
+    let mut is_openai = false;
+    let mut is_anthropic = false;
+
+    for ev in &events {
+        // OpenAI chat.completion.chunk
+        if ev.get("object").and_then(|o| o.as_str()) == Some("chat.completion.chunk")
+            || ev.get("choices").is_some()
+        {
+            is_openai = true;
+            if model.is_none() {
+                model = ev
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string());
+            }
+            if let Some(choices) = ev.get("choices").and_then(|c| c.as_array()) {
+                for ch in choices {
+                    if let Some(c) = ch
+                        .get("delta")
+                        .and_then(|d| d.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        text.push_str(c);
+                    }
+                    if let Some(fr) = ch.get("finish_reason").and_then(|f| f.as_str()) {
+                        finish_reason = Some(fr.to_string());
+                    }
+                }
+            }
+            if let Some(u) = ev.get("usage") {
+                if !u.is_null() {
+                    usage = Some(u.clone());
+                }
+            }
+            continue;
+        }
+        // Anthropic streaming events
+        if let Some(ty) = ev.get("type").and_then(|t| t.as_str()) {
+            is_anthropic = true;
+            match ty {
+                "content_block_delta" => {
+                    if let Some(t) = ev
+                        .get("delta")
+                        .and_then(|d| d.get("text"))
+                        .and_then(|t| t.as_str())
+                    {
+                        text.push_str(t);
+                    }
+                }
+                "message_start" => {
+                    if model.is_none() {
+                        model = ev
+                            .get("message")
+                            .and_then(|m| m.get("model"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string());
+                    }
+                }
+                "message_delta" => {
+                    if let Some(u) = ev.get("usage") {
+                        usage = Some(u.clone());
+                    }
+                    if let Some(sr) = ev
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(|s| s.as_str())
+                    {
+                        finish_reason = Some(sr.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let merged = if is_openai || is_anthropic {
+        serde_json::json!({
+            "protocol": if is_openai { "openai" } else { "anthropic" },
+            "model": model,
+            "text": text,
+            "finish_reason": finish_reason,
+            "usage": usage,
+            "event_count": events.len(),
+        })
+    } else {
+        // Unknown protocol — return the raw parsed events.
+        serde_json::json!({
+            "protocol": "unknown",
+            "events": events,
+            "event_count": events.len(),
+        })
+    };
+    serde_json::to_string_pretty(&merged).ok()
 }
 
 #[derive(Debug, Default)]
@@ -560,12 +854,27 @@ pub async fn list_requests(
 
 /// Result for a single request replay: raw envelope JSON and
 /// redacted headers JSON, so an operator can reconstruct the
-/// original request body and headers for debugging.
+/// original request body and headers for debugging. Phase 5 extends
+/// this with the full exchange payload (egress request, upstream
+/// response, client response) joined from `request_payloads`.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct RequestReplay {
     pub request_id: String,
     pub raw_envelope_json: Option<String>,
     pub redacted_headers_json: Option<String>,
+    // ---- full exchange payload (LEFT JOIN request_payloads) ----
+    pub egress_headers_json: Option<String>,
+    pub egress_body: Option<String>,
+    pub egress_body_truncated: bool,
+    pub upstream_status: Option<u16>,
+    pub upstream_resp_headers_json: Option<String>,
+    pub upstream_resp_body: Option<String>,
+    pub upstream_resp_body_truncated: bool,
+    pub client_resp_headers_json: Option<String>,
+    pub client_resp_body: Option<String>,
+    pub client_resp_body_truncated: bool,
+    pub is_stream: bool,
+    pub sse_parsed_json: Option<String>,
 }
 
 /// Fetch the raw envelope (redacted) for a given request id.
@@ -576,8 +885,23 @@ pub async fn get_request_replay(
     request_id: &str,
 ) -> Result<Option<RequestReplay>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT request_id, raw_envelope_json, redacted_headers_json \
-         FROM request_logs WHERE request_id = ?1",
+        "SELECT l.request_id AS request_id, l.raw_envelope_json AS raw_envelope_json, \
+                l.redacted_headers_json AS redacted_headers_json, \
+                p.egress_headers_json AS egress_headers_json, \
+                p.egress_body AS egress_body, \
+                p.egress_body_truncated AS egress_body_truncated, \
+                p.upstream_status AS upstream_status, \
+                p.upstream_resp_headers_json AS upstream_resp_headers_json, \
+                p.upstream_resp_body AS upstream_resp_body, \
+                p.upstream_resp_body_truncated AS upstream_resp_body_truncated, \
+                p.client_resp_headers_json AS client_resp_headers_json, \
+                p.client_resp_body AS client_resp_body, \
+                p.client_resp_body_truncated AS client_resp_body_truncated, \
+                p.is_stream AS is_stream, \
+                p.sse_parsed_json AS sse_parsed_json \
+         FROM request_logs l \
+         LEFT JOIN request_payloads p ON p.request_id = l.request_id \
+         WHERE l.request_id = ?1",
     )
     .bind(request_id)
     .fetch_optional(pool.sqlite())
@@ -587,6 +911,27 @@ pub async fn get_request_replay(
             request_id: r.get("request_id"),
             raw_envelope_json: r.get("raw_envelope_json"),
             redacted_headers_json: r.get("redacted_headers_json"),
+            egress_headers_json: r.get("egress_headers_json"),
+            egress_body: r.get("egress_body"),
+            egress_body_truncated: r
+                .get::<Option<i32>, _>("egress_body_truncated")
+                .unwrap_or(0)
+                != 0,
+            upstream_status: r.get::<Option<i32>, _>("upstream_status").map(|n| n as u16),
+            upstream_resp_headers_json: r.get("upstream_resp_headers_json"),
+            upstream_resp_body: r.get("upstream_resp_body"),
+            upstream_resp_body_truncated: r
+                .get::<Option<i32>, _>("upstream_resp_body_truncated")
+                .unwrap_or(0)
+                != 0,
+            client_resp_headers_json: r.get("client_resp_headers_json"),
+            client_resp_body: r.get("client_resp_body"),
+            client_resp_body_truncated: r
+                .get::<Option<i32>, _>("client_resp_body_truncated")
+                .unwrap_or(0)
+                != 0,
+            is_stream: r.get::<Option<i32>, _>("is_stream").unwrap_or(0) != 0,
+            sse_parsed_json: r.get("sse_parsed_json"),
         }))
     } else {
         Ok(None)
@@ -779,5 +1124,84 @@ mod tests {
         // The envelope JSON should contain model name (exact format
         // depends on serde_json serialization).
         assert!(replay.raw_envelope_json.unwrap().contains("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn write_capture_persists_and_replay_joins_payload() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(pool.sqlite()).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        // The payload row references a request_logs row via request_id;
+        // write the request event first so the LEFT JOIN has a left row.
+        sink.write_request_event(&dummy_request_event())
+            .await
+            .expect("write event");
+
+        let capture = ExchangeCapture {
+            request_id: "req-1".to_string(),
+            egress_headers: vec![
+                ("authorization".to_string(), "Bearer sk-secret".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+            egress_body: Some("{\"model\":\"gpt-4o\",\"api_key\":\"sk-leak\"}".to_string()),
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![("x-req-id".to_string(), "abc".to_string())],
+            upstream_resp_body: Some("{\"id\":\"chatcmpl-1\"}".to_string()),
+            client_resp_headers: vec![("content-type".to_string(), "application/json".to_string())],
+            client_resp_body: Some("{\"id\":\"chatcmpl-1\"}".to_string()),
+            is_stream: false,
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        let replay = get_request_replay(&pool, "req-1")
+            .await
+            .expect("replay")
+            .expect("exists");
+        // Header redaction: authorization must be masked.
+        let eh = replay.egress_headers_json.expect("egress headers");
+        assert!(eh.contains("[REDACTED]"), "authorization not redacted: {eh}");
+        // Body redaction: api_key value must be masked.
+        let eb = replay.egress_body.expect("egress body");
+        assert!(eb.contains("[REDACTED]"), "api_key not redacted: {eb}");
+        assert!(eb.contains("gpt-4o"));
+        assert_eq!(replay.upstream_status, Some(200));
+        assert!(replay.upstream_resp_body.unwrap().contains("chatcmpl-1"));
+        assert!(!replay.is_stream);
+    }
+
+    #[test]
+    fn parse_sse_merges_openai_chunks() {
+        let raw = "data: {\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\
+                   data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\
+                   data: [DONE]\n";
+        let parsed = parse_sse_to_json(raw).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(v["protocol"], "openai");
+        assert_eq!(v["text"], "Hello");
+        assert_eq!(v["finish_reason"], "stop");
+        assert_eq!(v["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn parse_sse_merges_anthropic_deltas() {
+        let raw = "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-3\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"Hi \"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"there\"}}\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n";
+        let parsed = parse_sse_to_json(raw).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(v["protocol"], "anthropic");
+        assert_eq!(v["text"], "Hi there");
+        assert_eq!(v["finish_reason"], "end_turn");
+        assert_eq!(v["model"], "claude-3");
+        assert_eq!(v["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn parse_sse_returns_none_on_garbage() {
+        assert!(parse_sse_to_json("not an sse stream").is_none());
+        assert!(parse_sse_to_json("").is_none());
+        assert!(parse_sse_to_json("data: [DONE]\n").is_none());
     }
 }

@@ -24,6 +24,9 @@ interface SelectProps {
   ariaLabel?: string;
   disabled?: boolean;
   className?: string;
+  /** Optional native tooltip rendered on the trigger (e.g. id of the
+   *  selected resource for inspection). */
+  triggerTitle?: string;
 }
 
 /** Accessible Radix Select replacing the native <select> (docs §6.7). */
@@ -35,6 +38,7 @@ export function Select({
   ariaLabel,
   disabled,
   className,
+  triggerTitle,
 }: SelectProps) {
   return (
     <RSelect.Root
@@ -44,6 +48,7 @@ export function Select({
     >
       <RSelect.Trigger
         aria-label={ariaLabel}
+        title={triggerTitle}
         className={cn(
           "inline-flex w-full items-center justify-between gap-2 rounded-sm border border-border-strong bg-surface px-3 py-1.5 text-sm text-text transition-colors duration-[var(--duration-fast)]",
           "focus-visible:outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-ring",

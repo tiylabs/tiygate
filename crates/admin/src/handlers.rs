@@ -772,6 +772,18 @@ async fn circuit_breakers(State(state): State<AdminState>) -> Result<Response, A
             )
         }
     };
+    // Resolve provider_id -> provider.name so the UI can show a friendly
+    // label instead of a raw id. We swallow store errors here (the breaker
+    // feed is best-effort) and fall back to the id when a provider has
+    // been deleted out from under the health registry.
+    let provider_names: std::collections::HashMap<String, String> =
+        match state.store.list_providers().await {
+            Ok(providers) => providers
+                .into_iter()
+                .map(|p| (p.id, p.name))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        };
     let summary: Vec<serde_json::Value> = targets
         .into_iter()
         .map(|t| {
@@ -780,8 +792,23 @@ async fn circuit_breakers(State(state): State<AdminState>) -> Result<Response, A
                 .as_ref()
                 .map(|h| h.health_status(&t))
                 .unwrap_or(tiygate_core::RoutingTargetHealth::Healthy);
+            let target_str = t.to_string();
+            // RoutingTarget::to_string() formats as "{provider_id}:{model_id}".
+            // We split on the first ":" so provider ids containing colons
+            // (rare but legal) still keep their tail.
+            let (provider_id, model_id) = match target_str.split_once(':') {
+                Some((p, m)) => (p.to_string(), m.to_string()),
+                None => (target_str.clone(), String::new()),
+            };
+            let provider_name = provider_names
+                .get(&provider_id)
+                .cloned()
+                .unwrap_or_else(|| provider_id.clone());
             json!({
-                "target": t.to_string(),
+                "target": target_str,
+                "provider_id": provider_id,
+                "provider_name": provider_name,
+                "model_id": model_id,
                 "healthy": matches!(status, tiygate_core::RoutingTargetHealth::Healthy),
                 "status": format!("{:?}", status),
             })

@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use tokio::time::sleep;
 
 /// Process-wide drain state.
 #[derive(Clone)]
@@ -57,34 +56,6 @@ impl DrainState {
         tokio::pin!(notified);
         notified.as_mut().enable();
         notified.await;
-    }
-
-    /// Wait for the drain to complete, bounded by `drain_timeout`.
-    ///
-    /// In production, "drain complete" is when the graceful-shutdown
-    /// future returns (i.e., axum has finished serving all in-flight
-    /// requests). The caller should `tokio::time::timeout` this with
-    /// the same `drain_timeout` so the process never blocks forever.
-    pub async fn wait_for_drain_complete(&self) {
-        // Currently the drain-complete signal is implicit — once
-        // `with_graceful_shutdown`'s future resolves, `main` calls this
-        // function and exits. We still enforce the bound via the caller's
-        // `timeout` wrapper. A no-op await here keeps the API symmetric
-        // for future expansions (e.g., a telemetry-drain task that
-        // explicitly signals completion).
-        sleep(self.inner.drain_timeout).await;
-    }
-
-    /// Programmatic entry point used by tests and the SIGTERM listener.
-    #[allow(dead_code)]
-    pub fn is_drain_signalled(&self) -> bool {
-        // `Notify` has no built-in `is_signalled`, so we use a small
-        // sentinel: in production we never need this — it is exposed
-        // for tests and for `/readyz` to poll the state cheaply. We
-        // approximate it with a non-blocking check on a `tokio::sync::Mutex`
-        // could be added; for now we expose the timeout-based check
-        // only and return `false` here.
-        false
     }
 
     /// Configured drain timeout.
@@ -182,19 +153,6 @@ mod tests {
         // Should complete promptly.
         let joined = tokio::time::timeout(Duration::from_millis(500), handle).await;
         assert!(joined.is_ok(), "wait_for_signal did not complete in time");
-    }
-
-    #[tokio::test]
-    async fn wait_for_drain_complete_respects_timeout() {
-        let state = DrainState::new(Duration::from_millis(50));
-        let start = Instant::now();
-        state.wait_for_drain_complete().await;
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(50),
-            "wait_for_drain_complete returned early: {:?}",
-            elapsed
-        );
     }
 
     #[tokio::test]

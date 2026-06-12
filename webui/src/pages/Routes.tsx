@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Pencil, Trash2, X } from "lucide-react";
+import { Pencil, Plus, Trash2, X } from "lucide-react";
 import { providersApi, routesApi } from "@/api/resources";
 import type { Route, RouteInput, RouteTarget } from "@/api/types";
 import {
@@ -55,6 +55,15 @@ export default function RoutesPage() {
     queryKey: ["providers"],
     queryFn: providersApi.list,
   });
+  const providerNameById = useMemo(() => {
+    const m = new Map<string, string>();
+    (providers ?? []).forEach((p) => m.set(p.id, p.name));
+    return m;
+  }, [providers]);
+  const resolveProvider = useCallback(
+    (id: string) => providerNameById.get(id),
+    [providerNameById],
+  );
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Route | null>(null);
@@ -144,9 +153,18 @@ export default function RoutesPage() {
     { value: "", label: "—" },
     ...(providers ?? []).map((p) => ({
       value: p.id,
-      label: `${p.name} (${shortId(p.id)})`,
+      // Show only the provider name in the picker — the id is a technical
+      // detail exposed via the trigger's title tooltip.
+      label: p.name,
     })),
   ];
+
+  // Map for tooltip on the selected value (hover shows id alongside name).
+  const providerLabelById = useMemo(() => {
+    const m = new Map<string, string>();
+    (providers ?? []).forEach((p) => m.set(p.id, `${p.name} (${p.id})`));
+    return m;
+  }, [providers]);
 
   return (
     <div>
@@ -184,11 +202,18 @@ export default function RoutesPage() {
             />
           ) : (
             <Table>
+              <colgroup>
+                <col style={{ width: "20rem" }} />
+                <col />
+                <col style={{ width: "6rem" }} />
+                <col style={{ width: "9rem" }} />
+                <col style={{ width: "3.5rem" }} />
+              </colgroup>
               <thead>
                 <tr>
                   <Th>{t("routes.virtualModel")}</Th>
                   <Th>{t("routes.targets")}</Th>
-                  <Th>{t("common.status")}</Th>
+                  <Th className="text-center">{t("common.status")}</Th>
                   <Th>{t("common.updatedAt")}</Th>
                   <Th className="text-right">{t("common.actions")}</Th>
                 </tr>
@@ -196,19 +221,37 @@ export default function RoutesPage() {
               <tbody>
                 {(data ?? []).map((r) => (
                   <Tr key={r.id}>
-                    <Td>
-                      <div className="font-medium text-text">
+                    <Td className="align-middle">
+                      <div
+                        className="truncate font-medium text-text"
+                        title={r.virtual_model}
+                      >
                         {r.virtual_model}
                       </div>
-                      <div className="font-mono text-xs text-text-subtle">
-                        {shortId(r.id)}
+                      <div
+                        className="break-all font-mono text-xs text-text-subtle"
+                        title={r.id}
+                      >
+                        {r.id}
                       </div>
                     </Td>
-                    <Td>
+                    <Td className="align-middle">
                       <div className="flex flex-wrap gap-1">
                         {r.targets.map((tg, i) => (
-                          <Badge key={i} tone="primary">
-                            {tg.provider_id} → {tg.model_id}
+                          <Badge key={i} tone="primary" title={`${resolveProvider(tg.provider_id) ?? tg.provider_id} → ${tg.model_id}`}>
+                            <span className="truncate font-medium">
+                              {resolveProvider(tg.provider_id) ?? tg.provider_id}
+                            </span>
+                            <span aria-hidden="true" className="text-text-subtle">
+                              {" "}
+                              →
+                            </span>
+                            <span
+                              className="truncate font-mono text-[11px]"
+                              title={tg.model_id}
+                            >
+                              {tg.model_id}
+                            </span>
                           </Badge>
                         ))}
                       </div>
@@ -317,6 +360,11 @@ export default function RoutesPage() {
                     onValueChange={(v) => updateTarget(idx, { provider_id: v })}
                     ariaLabel={t("routes.provider")}
                     options={providerOptions}
+                    triggerTitle={
+                      tg.provider_id
+                        ? (providerLabelById.get(tg.provider_id) ?? tg.provider_id)
+                        : undefined
+                    }
                   />
                 </div>
                 <div className="space-y-1">

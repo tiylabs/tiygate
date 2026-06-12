@@ -1,11 +1,10 @@
-import { useState } from "react";
+import { useCallback, useMemo, useState, type MouseEvent, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
-import { Eye, Copy } from "lucide-react";
-import { requestsApi, type RequestFilter } from "@/api/resources";
-import type { RequestLogEntry, RequestReplay } from "@/api/types";
+import { Check, ChevronRight, Copy, Eye, Info } from "lucide-react";
+import { providersApi, requestsApi, type RequestFilter } from "@/api/resources";
+import type { Provider, RequestLogEntry, RequestReplay } from "@/api/types";
 import {
-  Alert,
   Badge,
   Button,
   Card,
@@ -56,6 +55,23 @@ export default function RequestLogs() {
     queryKey: ["requests", filter],
     queryFn: () => requestsApi.list(filter),
   });
+  // Provider directory: lets us render the upstream column with provider
+  // name (e.g. "OpenAI Production") instead of a raw id. Long stale time
+  // since names rarely change.
+  const { data: providers } = useQuery<Provider[]>({
+    queryKey: ["providers"],
+    queryFn: providersApi.list,
+    staleTime: 5 * 60_000,
+  });
+  const providerNameById = useMemo(() => {
+    const m = new Map<string, string>();
+    (providers ?? []).forEach((p) => m.set(p.id, p.name));
+    return m;
+  }, [providers]);
+  const resolveProvider = useCallback(
+    (id?: string | null) => (id ? providerNameById.get(id) : undefined),
+    [providerNameById],
+  );
 
   const replayQuery = useQuery<RequestReplay>({
     queryKey: ["replay", detail?.request_id],
@@ -148,8 +164,10 @@ export default function RequestLogs() {
                 <tr>
                   <Th>{t("requests.ts")}</Th>
                   <Th>{t("requests.model")}</Th>
-                  <Th>{t("requests.provider")}</Th>
+                  <Th>{t("requests.protocol")}</Th>
+                  <Th>{t("requests.upstreamModel")}</Th>
                   <Th>{t("requests.status")}</Th>
+                  <Th className="text-right">{t("requests.httpStatus")}</Th>
                   <Th className="text-right">{t("requests.latency")}</Th>
                   <Th className="text-right">{t("requests.tokens")}</Th>
                   <Th>{t("requests.cacheHit")}</Th>
@@ -161,9 +179,27 @@ export default function RequestLogs() {
                   <Tr key={r.request_id}>
                     <Td className="text-xs text-text-muted">{fmtTime(r.ts)}</Td>
                     <Td>{r.virtual_model || "—"}</Td>
-                    <Td>{r.resolved_provider ?? "—"}</Td>
+                    <Td className="text-xs text-text-muted">
+                      <ProtocolCell
+                        ingress={r.ingress_protocol}
+                        egress={r.egress_protocol}
+                      />
+                    </Td>
+                    <Td
+                      className="text-xs"
+                      title={r.resolved_provider ?? undefined}
+                    >
+                      <UpstreamCell
+                        provider={r.resolved_provider}
+                        model={r.resolved_model}
+                        providerName={resolveProvider(r.resolved_provider)}
+                      />
+                    </Td>
                     <Td>
                       <StatusBadge status={r.status} errorClass={r.error_class} />
+                    </Td>
+                    <Td className="text-right tabular-nums">
+                      {r.http_status ?? "—"}
                     </Td>
                     <Td className="text-right tabular-nums">
                       {r.total_latency_ms}
@@ -228,7 +264,11 @@ export default function RequestLogs() {
       <Drawer
         open={detail !== null}
         onOpenChange={(o) => !o && setDetail(null)}
-        title={detail?.request_id ?? t("requests.detail")}
+        title={
+          detail
+            ? `${t("requests.requestIdLabel")} ${detail.request_id}`
+            : t("requests.detail")
+        }
         closeLabel={t("common.close")}
         footer={
           <>
@@ -250,7 +290,12 @@ export default function RequestLogs() {
             <Detail label={t("requests.model")} value={detail?.virtual_model} />
             <Detail
               label={t("requests.provider")}
-              value={detail?.resolved_provider ?? "—"}
+              value={
+                detail?.resolved_provider
+                  ? (resolveProvider(detail.resolved_provider) ??
+                    detail.resolved_provider)
+                  : "—"
+              }
             />
             <Detail label={t("requests.status")} value={detail?.status} />
             <Detail
@@ -267,9 +312,6 @@ export default function RequestLogs() {
             />
           </div>
 
-          <Alert tone="warning">{t("requests.redactedNote")}</Alert>
-          <Alert tone="info">{t("requests.snapshotNote")}</Alert>
-
           {replayQuery.isLoading ? (
             <Spinner />
           ) : replayQuery.error ? (
@@ -280,28 +322,110 @@ export default function RequestLogs() {
             />
           ) : (
             <>
-              {replayQuery.data?.redacted_headers_json ? (
-                <div>
-                  <div className="mb-1 text-xs font-medium text-text-muted">
-                    {t("requests.redactedHeaders")}
-                  </div>
-                  <pre className="max-h-40 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
-                    {replayQuery.data.redacted_headers_json}
-                  </pre>
-                </div>
-              ) : null}
-              {replayQuery.data?.raw_envelope_json ? (
-                <div>
-                  <div className="mb-1 text-xs font-medium text-text-muted">
-                    {t("requests.rawEnvelope")}
-                  </div>
-                  <pre className="max-h-80 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
-                    {replayQuery.data.raw_envelope_json}
-                  </pre>
-                </div>
-              ) : null}
+              {/* Request group: Client → Gateway / Gateway → Provider */}
+              <PayloadTabGroup
+                tabs={[
+                  {
+                    label: t("requests.sectionClientRequest"),
+                    content: (
+                      <>
+                        <PayloadBlock
+                          label={t("requests.redactedHeaders")}
+                          value={replayQuery.data?.redacted_headers_json}
+                        />
+                        <PayloadBlock
+                          label={t("requests.rawEnvelope")}
+                          value={replayQuery.data?.raw_envelope_json}
+                        />
+                      </>
+                    ),
+                  },
+                  {
+                    label: t("requests.sectionEgressRequest"),
+                    content: (
+                      <>
+                        <PayloadBlock
+                          label={t("requests.egressHeaders")}
+                          value={replayQuery.data?.egress_headers_json}
+                        />
+                        <PayloadBlock
+                          label={t("requests.egressBody")}
+                          value={replayQuery.data?.egress_body}
+                          truncated={replayQuery.data?.egress_body_truncated}
+                          truncatedNote={t("requests.truncatedNote")}
+                        />
+                      </>
+                    ),
+                  },
+                ]}
+              />
+
+              {/* Response group: Gateway → Client / Provider → Gateway */}
+              <PayloadTabGroup
+                tabs={[
+                  {
+                    label: t("requests.sectionClientResponse"),
+                    content: (
+                      <>
+                        <PayloadBlock
+                          label={t("requests.clientRespHeaders")}
+                          value={replayQuery.data?.client_resp_headers_json}
+                        />
+                        <PayloadBlock
+                          label={t("requests.clientRespBody")}
+                          value={replayQuery.data?.client_resp_body}
+                          truncated={replayQuery.data?.client_resp_body_truncated}
+                          truncatedNote={t("requests.truncatedNote")}
+                        />
+                      </>
+                    ),
+                  },
+                  {
+                    label: t("requests.sectionUpstreamResponse"),
+                    content: (
+                      <>
+                        <PayloadBlock
+                          label={t("requests.upstreamRespHeaders")}
+                          value={replayQuery.data?.upstream_resp_headers_json}
+                        />
+                        {replayQuery.data?.is_stream &&
+                        replayQuery.data?.sse_parsed_json ? (
+                          <>
+                            <SseParsedBlock
+                              label={t("requests.sseParsed")}
+                              value={replayQuery.data?.sse_parsed_json}
+                              infoTooltip={t("requests.streamNote")}
+                            />
+                            <SseRawBlock
+                              label={t("requests.sseRaw")}
+                              value={replayQuery.data?.upstream_resp_body}
+                              truncated={
+                                replayQuery.data?.upstream_resp_body_truncated
+                              }
+                              truncatedNote={t("requests.truncatedNote")}
+                            />
+                          </>
+                        ) : (
+                          <PayloadBlock
+                            label={t("requests.upstreamRespBody")}
+                            value={replayQuery.data?.upstream_resp_body}
+                            truncated={
+                              replayQuery.data?.upstream_resp_body_truncated
+                            }
+                            truncatedNote={t("requests.truncatedNote")}
+                          />
+                        )}
+                      </>
+                    ),
+                  },
+                ]}
+              />
             </>
           )}
+
+          <p className="border-t border-border pt-3 text-xs text-text-subtle">
+            {t("requests.replayNote")}
+          </p>
         </div>
       </Drawer>
     </div>
@@ -313,6 +437,237 @@ function Detail({ label, value }: { label: string; value?: string | null }) {
     <div>
       <div className="text-xs text-text-subtle">{label}</div>
       <div className="text-text">{value || "—"}</div>
+    </div>
+  );
+}
+
+function PayloadTabGroup({
+  tabs,
+}: {
+  tabs: { label: string; content: ReactNode }[];
+}) {
+  const [active, setActive] = useState(0);
+  return (
+    <div className="space-y-2 rounded-md border border-border p-3">
+      <div className="flex gap-1 border-b border-border">
+        {tabs.map((tab, i) => (
+          <button
+            key={tab.label}
+            type="button"
+            onClick={() => setActive(i)}
+            className={
+              "px-3 py-1.5 text-xs font-semibold -mb-px border-b-2 transition-colors " +
+              (i === active
+                ? "border-accent text-text"
+                : "border-transparent text-text-subtle hover:text-text")
+            }
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <div className="space-y-2 pt-1">{tabs[active]?.content}</div>
+    </div>
+  );
+}
+
+function PayloadBlock({
+  label,
+  value,
+  truncated,
+  truncatedNote,
+  infoTooltip,
+}: {
+  label: string;
+  value?: string | null;
+  truncated?: boolean;
+  truncatedNote?: string;
+  infoTooltip?: string;
+}) {
+  if (!value) return null;
+  return (
+    <div>
+      <BlockHeader
+        label={label}
+        truncated={truncated}
+        truncatedNote={truncatedNote}
+        infoTooltip={infoTooltip}
+        value={value}
+      />
+      <pre className="max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
+        {value}
+      </pre>
+    </div>
+  );
+}
+
+function SseParsedBlock({
+  label,
+  value,
+  infoTooltip,
+}: {
+  label: string;
+  value?: string | null;
+  infoTooltip?: string;
+}) {
+  if (!value) return null;
+  return (
+    <div>
+      <BlockHeader
+        label={label}
+        infoTooltip={infoTooltip}
+        value={value}
+      />
+      <pre className="max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
+        {value}
+      </pre>
+    </div>
+  );
+}
+
+function SseRawBlock({
+  label,
+  value,
+  truncated,
+  truncatedNote,
+}: {
+  label: string;
+  value?: string | null;
+  truncated?: boolean;
+  truncatedNote?: string;
+}) {
+  if (!value) return null;
+  return (
+    <details className="group">
+      <summary className="flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-text-muted select-none [&::-webkit-details-marker]:hidden">
+        <ChevronRight
+          size={12}
+          className="shrink-0 transition-transform group-open:rotate-90"
+        />
+        <span>{label}</span>
+        {truncated ? (
+          <span className="ml-1 text-text-subtle">{truncatedNote}</span>
+        ) : null}
+        <CopyButton value={value} />
+      </summary>
+      <pre className="mt-1 max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
+        {value}
+      </pre>
+    </details>
+  );
+}
+
+function BlockHeader({
+  label,
+  truncated,
+  truncatedNote,
+  infoTooltip,
+  value,
+}: {
+  label: string;
+  truncated?: boolean;
+  truncatedNote?: string;
+  infoTooltip?: string;
+  value: string;
+}) {
+  return (
+    <div className="mb-1 flex items-center gap-1 text-xs font-medium text-text-muted">
+      <span>{label}</span>
+      {truncated ? (
+        <span className="text-text-subtle">{truncatedNote}</span>
+      ) : null}
+      {infoTooltip ? (
+        <Tooltip content={infoTooltip}>
+          <button
+            type="button"
+            aria-label={infoTooltip}
+            className="inline-flex h-4 w-4 items-center justify-center rounded text-text-subtle hover:text-text"
+          >
+            <Info size={12} />
+          </button>
+        </Tooltip>
+      ) : null}
+      <CopyButton value={value} />
+    </div>
+  );
+}
+
+function CopyButton({ value }: { value: string }) {
+  const { t } = useTranslation();
+  const toast = useToast();
+  const [done, setDone] = useState(false);
+  async function handle(e: MouseEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success(t("requests.copySuccess"));
+    } catch {
+      toast.error(t("requests.copyFailed"));
+    }
+    setDone(true);
+    window.setTimeout(() => setDone(false), 1200);
+  }
+  return (
+    <button
+      type="button"
+      onClick={handle}
+      aria-label={t("requests.copySuccess")}
+      className="ml-auto inline-flex h-5 w-5 items-center justify-center rounded text-text-subtle hover:bg-surface-muted hover:text-text"
+    >
+      {done ? <Check size={12} /> : <Copy size={12} />}
+    </button>
+  );
+}
+
+function shortProtocol(p?: string | null): string {
+  if (!p) return "—";
+  // Three-segment form `suite/name/version` → show `name/version`.
+  const parts = p.split("/");
+  if (parts.length >= 3) return `${parts[1]}/${parts[2]}`;
+  return p;
+}
+
+function ProtocolCell({
+  ingress,
+  egress,
+}: {
+  ingress?: string | null;
+  egress?: string | null;
+}) {
+  const inP = shortProtocol(ingress);
+  const eP = egress ? shortProtocol(egress) : null;
+  return (
+    <Tooltip content={`${ingress ?? "—"} → ${egress ?? "—"}`}>
+      <span className="font-mono">
+        {inP}
+        {eP && eP !== inP ? ` → ${eP}` : ""}
+      </span>
+    </Tooltip>
+  );
+}
+
+function UpstreamCell({
+  provider,
+  model,
+  providerName,
+}: {
+  provider?: string | null;
+  model?: string | null;
+  providerName?: string;
+}) {
+  if (!provider && !model) return <span className="text-text-muted">—</span>;
+  // Prefer the resolved provider name; fall back to the raw id when
+  // the directory hasn't loaded (or the provider was deleted). The raw
+  // id is exposed via the parent cell's `title` for inspection without
+  // cluttering the visible cell.
+  const displayProvider = providerName ?? provider ?? "—";
+  return (
+    <div className="flex flex-col leading-tight">
+      <span>{displayProvider}</span>
+      {model ? (
+        <span className="font-mono text-[11px] text-text-muted">{model}</span>
+      ) : null}
     </div>
   );
 }
