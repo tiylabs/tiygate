@@ -70,10 +70,7 @@ impl AdminState {
 
     /// Attach a live quota counter so the single-key GET handler can
     /// surface real-time usage. Returns `self` for chaining.
-    pub fn with_quota(
-        mut self,
-        quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
-    ) -> Self {
+    pub fn with_quota(mut self, quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>) -> Self {
         self.quota = quota;
         self
     }
