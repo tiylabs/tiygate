@@ -1222,6 +1222,7 @@ async fn handle_messages(
         match execute_messages_upstream(
             &state,
             &codec,
+            &ingress_protocol,
             &ir_request,
             target,
             is_stream,
@@ -1441,14 +1442,21 @@ async fn execute_upstream(
     // OpenAI `metadata`, custom `user` fields, etc.) are preserved
     // exactly as the client sent them.
     let (mut upstream_body, mut upstream_headers) = if let Some(raw) = raw_passthrough_body {
-        match serde_json::from_str::<serde_json::Value>(raw) {
-            Ok(v) => (v, http::HeaderMap::new()),
-            Err(e) => {
-                return Err(AppError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("PassThrough: invalid raw body JSON: {}", e),
-                ));
+        if is_same_protocol {
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(v) => (v, http::HeaderMap::new()),
+                Err(e) => {
+                    return Err(AppError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("PassThrough: invalid raw body JSON: {}", e),
+                    ));
+                }
             }
+        } else {
+            // The raw passthrough body was eligible because *some* target
+            // shares the ingress suite, but this specific target is
+            // cross-protocol — convert from IR instead of forwarding bytes.
+            encode_cross_protocol(codec, &egress_protocol, ir_request)?
         }
     } else if is_same_protocol {
         codec.encode_request(ir_request).map_err(|e| {
@@ -1458,43 +1466,7 @@ async fn execute_upstream(
             )
         })?
     } else {
-        let egress_codec = get_egress_codec(&egress_protocol).ok_or_else(|| {
-            AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("No codec for protocol: {:?}", egress_protocol),
-            )
-        })?;
-
-        // Check lossy conversion against the field-level capability matrix
-        // (§3.2 + docs/protocol-capability-matrix.md). Replaces the previous
-        // single-dimension tools+function_calling check with a full per-dimension
-        // sweep: tool_choice forms, parallel tool calls, media source kinds,
-        // structured output, extended reasoning. Each rejection message names
-        // the offending dimension so the caller can fix the request.
-        let ingress_caps = codec.capabilities();
-        let egress_caps = egress_codec.capabilities();
-        if ingress_caps.lossy_default_reject || egress_caps.lossy_default_reject {
-            if let Err((dim, err)) = tiygate_core::protocol::lossy::check_lossy_conversion(
-                ir_request,
-                &egress_protocol,
-                egress_caps,
-            ) {
-                return Err(AppError::new(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "Lossy conversion rejected: {err} (dimension: {})",
-                        dim.label()
-                    ),
-                ));
-            }
-        }
-
-        egress_codec.encode_request(ir_request).map_err(|e| {
-            AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Encode error: {}", e),
-            )
-        })?
+        encode_cross_protocol(codec, &egress_protocol, ir_request)?
     };
 
     // Replace the (possibly virtual) model name with the routing
@@ -1533,7 +1505,19 @@ async fn execute_upstream(
     };
 
     let client = &state.http_client;
-    let upstream_url = format!("{}/chat/completions", target.effective_api_base());
+    // Address the upstream by the *egress* protocol (the target provider's
+    // protocol), not the ingress entrypoint. When a chat-completions request
+    // is routed to an Anthropic provider, the body is converted above and
+    // must be POSTed to `/messages`, not `/chat/completions`.
+    let upstream_url = upstream_url_for_suite(target, egress_protocol.suite).ok_or_else(|| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "No upstream path for egress protocol suite: {:?}",
+                egress_protocol.suite
+            ),
+        )
+    })?;
 
     if is_stream {
         // PassThrough: forward raw body bytes verbatim (no re-serialize).
@@ -1828,6 +1812,7 @@ async fn execute_upstream(
 async fn execute_messages_upstream(
     state: &AppState,
     codec: &MessagesCodec,
+    ingress_protocol: &tiygate_core::ProtocolEndpoint,
     ir_request: &IrRequest,
     target: &tiygate_core::RoutingTarget,
     is_stream: bool,
@@ -1836,26 +1821,36 @@ async fn execute_messages_upstream(
     request_id: &str,
     client_headers: &http::HeaderMap,
 ) -> Result<Response, AppError> {
-    let is_pass_through = raw_passthrough_body.is_some();
-    // PassThrough: forward raw body bytes verbatim. Non-PassThrough:
-    // re-encode via the codec (IR → egress format).
+    let egress_protocol = target.api_protocol.clone();
+    let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
+    let is_pass_through = raw_passthrough_body.is_some() && is_same_protocol;
+    // PassThrough: forward raw body bytes verbatim. Same-protocol: re-encode
+    // via the ingress codec. Cross-protocol: convert IR → egress format via
+    // the egress codec (e.g. Anthropic Messages → OpenAI chat-completions),
+    // mirroring `execute_upstream`.
     let (mut upstream_body, mut upstream_headers) = if let Some(raw) = raw_passthrough_body {
-        match serde_json::from_str::<serde_json::Value>(raw) {
-            Ok(v) => (v, http::HeaderMap::new()),
-            Err(e) => {
-                return Err(AppError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("PassThrough: invalid raw body JSON: {}", e),
-                ));
+        if is_same_protocol {
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(v) => (v, http::HeaderMap::new()),
+                Err(e) => {
+                    return Err(AppError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("PassThrough: invalid raw body JSON: {}", e),
+                    ));
+                }
             }
+        } else {
+            encode_cross_protocol(codec, &egress_protocol, ir_request)?
         }
-    } else {
+    } else if is_same_protocol {
         codec.encode_request(ir_request).map_err(|e| {
             AppError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Encode error: {}", e),
             )
         })?
+    } else {
+        encode_cross_protocol(codec, &egress_protocol, ir_request)?
     };
 
     // Replace the (possibly virtual) model name with the routing
@@ -1884,7 +1879,18 @@ async fn execute_messages_upstream(
     };
 
     let client = &state.http_client;
-    let upstream_url = format!("{}/messages", target.effective_api_base());
+    // Address the upstream by the *egress* protocol, not the ingress
+    // entrypoint. A `/v1/messages` request routed to an OpenAI provider is
+    // converted above and must be POSTed to `/chat/completions`.
+    let upstream_url = upstream_url_for_suite(target, egress_protocol.suite).ok_or_else(|| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "No upstream path for egress protocol suite: {:?}",
+                egress_protocol.suite
+            ),
+        )
+    })?;
 
     if is_stream {
         let mut stream_req = crate::ingress_phase4::inject_trace(
@@ -2071,8 +2077,37 @@ async fn execute_messages_upstream(
         }
 
         let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
-        let client_resp_body_capture = upstream_resp_body_capture.clone();
-        let mut response = Json(response_body).into_response();
+
+        // Cross-protocol re-encoding: when the upstream spoke a different
+        // protocol (e.g. OpenAI chat-completions) than the client's ingress
+        // (Anthropic Messages), decode the upstream body via the egress codec
+        // and re-encode it into the ingress protocol so the client sees the
+        // format it expects. Mirrors `execute_upstream`.
+        let response_json = if is_same_protocol {
+            response_body
+        } else {
+            let egress_codec = get_egress_codec(&egress_protocol).ok_or_else(|| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("No egress codec found: {:?}", egress_protocol),
+                )
+            })?;
+            let ir_response = egress_codec.decode_response(response_body).map_err(|e| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Decode response error: {}", e),
+                )
+            })?;
+            codec.encode_response(&ir_response).map_err(|e| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Encode response error: {}", e),
+                )
+            })?
+        };
+
+        let client_resp_body_capture = serde_json::to_string(&response_json).ok();
+        let mut response = Json(response_json).into_response();
         // Forward upstream response headers to the client (denylist).
         forward_upstream_resp_headers(
             &mut response,
@@ -2143,6 +2178,65 @@ fn get_egress_codec(protocol: &tiygate_core::ProtocolEndpoint) -> Option<Box<dyn
         tiygate_core::ProtocolSuite::AnthropicMessages => Some(Box::new(MessagesCodec::new())),
         _ => None,
     }
+}
+
+/// Build the upstream URL for a chat-style request, addressed by the *egress*
+/// protocol suite (the target provider's protocol) rather than the ingress
+/// entrypoint. Returns `None` for suites that have no fixed path suffix
+/// (e.g. Google Gemini, whose URL embeds the model and method).
+fn upstream_url_for_suite(
+    target: &tiygate_core::RoutingTarget,
+    suite: tiygate_core::ProtocolSuite,
+) -> Option<String> {
+    suite.upstream_path_suffix().map(|suffix| {
+        format!(
+            "{}{}",
+            target.effective_api_base().trim_end_matches('/'),
+            suffix
+        )
+    })
+}
+
+/// Convert an IR request into the egress protocol's wire format, running the
+/// field-level lossy-conversion check first. Shared by the chat-completions
+/// and messages egress paths so cross-protocol routing behaves identically
+/// regardless of the ingress entrypoint.
+fn encode_cross_protocol<C: EndpointCodec + ?Sized>(
+    ingress_codec: &C,
+    egress_protocol: &tiygate_core::ProtocolEndpoint,
+    ir_request: &IrRequest,
+) -> Result<(serde_json::Value, http::HeaderMap), AppError> {
+    let egress_codec = get_egress_codec(egress_protocol).ok_or_else(|| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("No codec for protocol: {:?}", egress_protocol),
+        )
+    })?;
+
+    let ingress_caps = ingress_codec.capabilities();
+    let egress_caps = egress_codec.capabilities();
+    if ingress_caps.lossy_default_reject || egress_caps.lossy_default_reject {
+        if let Err((dim, err)) = tiygate_core::protocol::lossy::check_lossy_conversion(
+            ir_request,
+            egress_protocol,
+            egress_caps,
+        ) {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Lossy conversion rejected: {err} (dimension: {})",
+                    dim.label()
+                ),
+            ));
+        }
+    }
+
+    egress_codec.encode_request(ir_request).map_err(|e| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Encode error: {}", e),
+        )
+    })
 }
 
 /// Handle POST /v1/embeddings.

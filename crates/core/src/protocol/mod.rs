@@ -58,6 +58,24 @@ impl ProtocolSuite {
         let (name, version) = self.default_endpoint_id();
         ProtocolEndpoint::new(self, name, version)
     }
+
+    /// The upstream HTTP path suffix for this suite's primary chat-style
+    /// endpoint, appended to the provider's `api_base`.
+    ///
+    /// This lets the egress layer address the correct upstream route based
+    /// on the *target* protocol (the provider's protocol) rather than the
+    /// ingress entrypoint. Returns `None` for suites whose path is not a
+    /// fixed suffix — Google Gemini encodes the model and method in the URL
+    /// (`/v1beta/models/{model}:generateContent`) and must be built
+    /// separately by the caller.
+    pub fn upstream_path_suffix(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAiCompatible => Some("/chat/completions"),
+            Self::OpenAiResponses => Some("/responses"),
+            Self::AnthropicMessages => Some("/messages"),
+            Self::GoogleGemini => None,
+        }
+    }
 }
 
 /// Three-segment protocol identity: `{suite}/{name}/{version}`.
