@@ -126,14 +126,25 @@ impl EndpointCodec for ChatCompletionsCodec {
             }
         }
 
-        // Extract system message if present
-        let system = messages
+        // Extract system message(s) if present. OpenAI permits multiple
+        // system/developer messages anywhere in the list; concatenate all of
+        // their text parts so none are lost. The previous implementation only
+        // captured the first text part of the first system message.
+        let system_chunks: Vec<String> = messages
             .iter()
-            .find(|m| m.role == Role::System)
-            .and_then(|m| match &m.content.first() {
-                Some(Content::Text { text }) => Some(text.clone()),
-                _ => None,
-            });
+            .filter(|m| m.role == Role::System)
+            .flat_map(|m| {
+                m.content.iter().filter_map(|c| match c {
+                    Content::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        let system = if system_chunks.is_empty() {
+            None
+        } else {
+            Some(system_chunks.join("\n"))
+        };
 
         // Filter out system messages from the list
         let messages: Vec<Message> = messages
@@ -142,6 +153,24 @@ impl EndpointCodec for ChatCompletionsCodec {
             .collect();
 
         // Parse tools
+        // OpenAI's `parallel_tool_calls` (default true when tools are present)
+        // has no representation in the IR beyond `Tool.required`. The lossy
+        // check treats any required tool as "parallel tool calls requested" so
+        // it can reject crossings to protocols (Anthropic/Gemini) that cannot
+        // express concurrent fan-out. We only set it when tools are actually
+        // offered and tool usage is not disabled via tool_choice="none".
+        let tool_choice_is_none = body
+            .get("tool_choice")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "none")
+            .unwrap_or(false);
+        // Per docs/protocol-capability-matrix.md §1, the chat→messages /
+        // chat→gemini crossing is only rejected when the request EXPLICITLY
+        // opts into `parallel_tool_calls=true`. A plain tools request (flag
+        // absent) must still convert, so we default to false here rather than
+        // mirroring OpenAI's API-level default of true.
+        let parallel_tool_calls = body["parallel_tool_calls"].as_bool().unwrap_or(false);
+        let mark_required = parallel_tool_calls && !tool_choice_is_none;
         let tools: Vec<Tool> = body["tools"]
             .as_array()
             .map(|arr| {
@@ -150,7 +179,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         name: t["function"]["name"].as_str().unwrap_or("").to_string(),
                         description: t["function"]["description"].as_str().map(|s| s.to_string()),
                         parameters: Some(t["function"]["parameters"].clone()),
-                        required: false,
+                        required: mark_required,
                     })
                     .collect()
             })
@@ -639,13 +668,23 @@ impl EndpointCodec for ChatCompletionsCodec {
                 }
             });
 
-        let usage = body.get("usage").map(|u| Usage {
-            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
-            total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
-            reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"].as_u64(),
-            cache_read_tokens: u["prompt_tokens_details"]["cached_tokens"].as_u64(),
-            ..Default::default()
+        let usage = body.get("usage").map(|u| {
+            let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
+            // OpenAI's `prompt_tokens` INCLUDES the cached portion. The IR
+            // convention is that `prompt_tokens` is the NON-cached prompt and
+            // cache lives in its own bucket, so subtract the cache here. This
+            // prevents double-counting when the IR is later re-encoded to a
+            // protocol whose encoder adds the cache back into prompt_tokens.
+            let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
+            let prompt_excl_cache = raw_prompt.saturating_sub(cache_read.unwrap_or(0));
+            Usage {
+                prompt_tokens: prompt_excl_cache,
+                completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+                reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"].as_u64(),
+                cache_read_tokens: cache_read,
+                ..Default::default()
+            }
         });
 
         Ok(IrResponse {
@@ -667,6 +706,10 @@ impl EndpointCodec for ChatCompletionsCodec {
 
 pub struct ChatCompletionsStreamEncoder {
     response_id: Option<String>,
+    /// Maps a tool-call `id` to a stable, monotonically-assigned
+    /// `tool_calls[].index`. OpenAI clients reassemble streamed tool calls by
+    /// this index, so two distinct tool calls must NOT share index 0.
+    tool_call_indices: std::collections::HashMap<String, usize>,
 }
 
 impl Default for ChatCompletionsStreamEncoder {
@@ -677,7 +720,22 @@ impl Default for ChatCompletionsStreamEncoder {
 
 impl ChatCompletionsStreamEncoder {
     pub fn new() -> Self {
-        Self { response_id: None }
+        Self {
+            response_id: None,
+            tool_call_indices: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Resolve the stable `tool_calls[].index` for a given tool-call id,
+    /// allocating the next index the first time an id is seen. An empty id
+    /// (some providers omit it on argument-only fragments) falls back to the
+    /// most-recently allocated index so fragments append to the open call.
+    fn tool_call_index(&mut self, id: &str) -> usize {
+        if id.is_empty() {
+            return self.tool_call_indices.len().saturating_sub(1);
+        }
+        let next = self.tool_call_indices.len();
+        *self.tool_call_indices.entry(id.to_string()).or_insert(next)
     }
 }
 
@@ -727,10 +785,11 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                 name,
                 arguments,
             } => {
-                let resp_id = self.response_id.as_deref().unwrap_or("");
+                let tc_index = self.tool_call_index(id);
+                let resp_id = self.response_id.clone().unwrap_or_default();
                 let mut delta = json!({
                     "tool_calls": [{
-                        "index": 0,
+                        "index": tc_index,
                         "id": id,
                         "type": "function",
                         "function": {
@@ -756,10 +815,17 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
             }
             StreamPart::Usage { usage } => {
                 let id = self.response_id.as_deref().unwrap_or("");
+                // The IR keeps prompt_tokens cache-free; OpenAI's wire format
+                // requires prompt_tokens to INCLUDE cache. Mirror the
+                // non-stream encoder so streamed usage stays self-consistent
+                // (prompt + completion == total).
+                let cache_read = usage.cache_read_tokens.unwrap_or(0);
+                let cache_write = usage.cache_write_tokens.unwrap_or(0);
+                let prompt_for_openai = usage.prompt_tokens + cache_read + cache_write;
                 let mut usage_obj = json!({
-                    "prompt_tokens": usage.prompt_tokens,
+                    "prompt_tokens": prompt_for_openai,
                     "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens,
+                    "total_tokens": prompt_for_openai + usage.completion_tokens,
                 });
                 if let Some(cr) = usage.cache_read_tokens {
                     if cr > 0 {
@@ -1010,13 +1076,17 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
 
                 // Usage
                 if let Some(usage) = chunk.get("usage") {
-                    let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+                    let raw_prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
                     let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
                     let total = usage["total_tokens"]
                         .as_u64()
-                        .unwrap_or(prompt + completion);
+                        .unwrap_or(raw_prompt + completion);
                     let cache_read = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
                     let reasoning = usage["completion_tokens_details"]["reasoning_tokens"].as_u64();
+                    // OpenAI's prompt_tokens includes cache; the IR convention
+                    // keeps prompt_tokens cache-free. Subtract to avoid double
+                    // counting on re-encode.
+                    let prompt = raw_prompt.saturating_sub(cache_read.unwrap_or(0));
                     parts.push(StreamPart::Usage {
                         usage: Usage {
                             prompt_tokens: prompt,
@@ -1039,11 +1109,11 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                     code: error["code"].as_str().map(String::from),
                 });
             }
-            Some(other) => {
-                parts.push(StreamPart::Error {
-                    message: format!("Unknown SSE object type: {}", other),
-                    code: Some("unknown_object".to_string()),
-                });
+            Some(_other) => {
+                // Unknown / vendor-specific object types (keepalive pings,
+                // experimental chunk shapes, etc.) must NOT abort the stream.
+                // Per the capability matrix's UnknownFieldPolicy::Drop, we
+                // silently ignore them instead of injecting an error frame.
             }
         }
 

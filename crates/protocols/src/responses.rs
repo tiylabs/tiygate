@@ -470,13 +470,20 @@ impl EndpointCodec for ResponsesCodec {
             }
             other => FinishReason::Other(other.to_string()),
         });
-        let usage = body.get("usage").map(|u| Usage {
-            prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
-            total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
-            reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
-            cache_read_tokens: u["input_tokens_details"]["cached_tokens"].as_u64(),
-            ..Default::default()
+        let usage = body.get("usage").map(|u| {
+            let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
+            // Responses' `input_tokens` includes the cached portion; the IR
+            // convention keeps prompt_tokens cache-free. Subtract to avoid
+            // double-counting when re-encoded downstream.
+            let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
+            Usage {
+                prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
+                completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+                total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+                reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
+                cache_read_tokens: cache_read,
+                ..Default::default()
+            }
         });
         Ok(IrResponse {
             content,
@@ -491,7 +498,16 @@ impl EndpointCodec for ResponsesCodec {
 
 pub struct ResponsesStreamEncoder {
     response_id: Option<String>,
-    text_index: u32,
+    /// Next output item index to allocate. The text message and each function
+    /// call occupy distinct output_index slots so a Responses client can
+    /// reassemble them independently.
+    next_output_index: u32,
+    /// output_index assigned to the assistant text message (lazily allocated
+    /// on the first TextDelta), so all text fragments share one index.
+    text_output_index: Option<u32>,
+    /// Maps a function-call id to its allocated output_index, so argument
+    /// fragments target the correct call.
+    tool_output_indices: std::collections::HashMap<String, u32>,
 }
 impl Default for ResponsesStreamEncoder {
     fn default() -> Self {
@@ -503,7 +519,9 @@ impl ResponsesStreamEncoder {
     pub fn new() -> Self {
         Self {
             response_id: None,
-            text_index: 0,
+            next_output_index: 0,
+            text_output_index: None,
+            tool_output_indices: std::collections::HashMap::new(),
         }
     }
 }
@@ -519,8 +537,13 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 )
             }
             StreamPart::TextDelta { text } => {
-                let idx = self.text_index;
-                self.text_index += 1;
+                // All text fragments belong to one assistant message item;
+                // allocate its output_index once and reuse it.
+                let idx = *self.text_output_index.get_or_insert_with(|| {
+                    let i = self.next_output_index;
+                    self.next_output_index += 1;
+                    i
+                });
                 format!(
                     "data: {}\n\n",
                     json!({"type": "response.output_text.delta", "item_id": format!("{}_msg", self.response_id.as_deref().unwrap_or("")), "output_index": idx, "content_index": 0, "delta": text})
@@ -538,21 +561,31 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 arguments,
             } => {
                 if let Some(n) = name {
+                    // Opener: allocate a distinct output_index for this call.
+                    let idx = self.next_output_index;
+                    self.next_output_index += 1;
+                    self.tool_output_indices.insert(id.clone(), idx);
                     format!(
                         "data: {}\n\n",
-                        json!({"type": "response.output_item.added", "output_index": 0, "item": {"id": id, "type": "function_call", "name": n, "arguments": "", "status": "in_progress"}})
+                        json!({"type": "response.output_item.added", "output_index": idx, "item": {"id": id, "type": "function_call", "name": n, "arguments": "", "status": "in_progress"}})
                     )
                 } else {
+                    let idx = self.tool_output_indices.get(id).copied().unwrap_or(0);
                     format!(
                         "data: {}\n\n",
-                        json!({"type": "response.function_call_arguments.delta", "item_id": id, "output_index": 0, "delta": arguments})
+                        json!({"type": "response.function_call_arguments.delta", "item_id": id, "output_index": idx, "delta": arguments})
                     )
                 }
             }
             StreamPart::Usage { usage } => {
+                // IR prompt_tokens is cache-free; Responses requires input_tokens
+                // to include cache. Re-add so streamed usage stays consistent.
+                let cache_read = usage.cache_read_tokens.unwrap_or(0);
+                let cache_write = usage.cache_write_tokens.unwrap_or(0);
+                let input_for_responses = usage.prompt_tokens + cache_read + cache_write;
                 format!(
                     "data: {}\n\n",
-                    json!({"type": "response.completed", "response": {"id": self.response_id.as_deref().unwrap_or(""), "usage": {"input_tokens": usage.prompt_tokens, "output_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens}}})
+                    json!({"type": "response.completed", "response": {"id": self.response_id.as_deref().unwrap_or(""), "usage": {"input_tokens": input_for_responses, "output_tokens": usage.completion_tokens, "total_tokens": input_for_responses + usage.completion_tokens}}})
                 )
             }
             StreamPart::Finish { reason } => {
@@ -647,7 +680,8 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     });
                 }
             }
-            Some("response.reasoning_text.delta") => {
+            Some("response.reasoning_text.delta")
+            | Some("response.reasoning_summary_text.delta") => {
                 if let Some(text) = event["delta"].as_str() {
                     parts.push(StreamPart::ReasoningDelta {
                         text: text.to_string(),
@@ -684,14 +718,36 @@ impl StreamDecoder for ResponsesStreamDecoder {
                 self.current_call_id = None;
                 self.current_call_name = None;
             }
+            // Lifecycle / bookkeeping events that carry no IR-relevant payload.
+            // OpenAI Responses streams interleave many of these; they must be
+            // consumed silently (NOT turned into error frames) so the stream
+            // is not corrupted. See the Responses streaming event reference.
+            Some("response.in_progress")
+            | Some("response.content_part.added")
+            | Some("response.content_part.done")
+            | Some("response.output_text.done")
+            | Some("response.output_text.annotation.added")
+            | Some("response.function_call_arguments.done")
+            | Some("response.reasoning_text.done")
+            | Some("response.reasoning_summary_text.done")
+            | Some("response.reasoning_summary_part.added")
+            | Some("response.reasoning_summary_part.done")
+            | Some("response.queued") => {
+                // no-op: lifecycle marker
+            }
             Some("response.completed") => {
                 if let Some(usage) = event["response"]["usage"].as_object() {
+                    let cache_read = usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d["cached_tokens"].as_u64());
+                    let raw_input = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     parts.push(StreamPart::Usage {
                         usage: Usage {
-                            prompt_tokens: usage
-                                .get("input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
+                            // input_tokens includes cache; IR keeps it cache-free.
+                            prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
                             completion_tokens: usage
                                 .get("output_tokens")
                                 .and_then(|v| v.as_u64())
@@ -703,6 +759,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                             reasoning_tokens: usage
                                 .get("output_tokens_details")
                                 .and_then(|d| d["reasoning_tokens"].as_u64()),
+                            cache_read_tokens: cache_read,
                             ..Default::default()
                         },
                     });
@@ -721,26 +778,31 @@ impl StreamDecoder for ResponsesStreamDecoder {
                 };
                 parts.push(StreamPart::Finish { reason });
             }
-            Some("error") => {
+            Some("error") | Some("response.failed") => {
+                let err = if event.get("error").is_some() {
+                    &event["error"]
+                } else {
+                    &event["response"]["error"]
+                };
                 parts.push(StreamPart::Error {
-                    message: event["error"]["message"]
-                        .as_str()
-                        .unwrap_or("Unknown")
-                        .to_string(),
-                    code: event["error"]["type"].as_str().map(String::from),
+                    message: err["message"].as_str().unwrap_or("Unknown").to_string(),
+                    code: err["type"].as_str().map(String::from),
                 });
             }
-            Some(other) => {
-                parts.push(StreamPart::Error {
-                    message: format!("Unknown Responses SSE event type: {}", other),
-                    code: Some("unknown_event".to_string()),
-                });
+            Some("response.incomplete") => {
+                let reason = if self.in_function_call {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Length
+                };
+                parts.push(StreamPart::Finish { reason });
+            }
+            Some(_other) => {
+                // Unknown / future Responses event types must NOT abort the
+                // stream. Ignore per UnknownFieldPolicy::Drop.
             }
             None => {
-                parts.push(StreamPart::Error {
-                    message: "Responses SSE event with no type field".to_string(),
-                    code: Some("missing_type".to_string()),
-                });
+                // SSE comment/keepalive lines without a `type` field are ignored.
             }
         }
         Ok(parts)

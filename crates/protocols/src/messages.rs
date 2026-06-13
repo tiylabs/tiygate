@@ -12,6 +12,35 @@ use tiygate_core::{
     Tool, Usage,
 };
 
+/// Flatten an Anthropic `tool_result.content` value into a plain string.
+///
+/// Anthropic accepts either a bare string OR an array of content blocks
+/// (e.g. `[{"type":"text","text":"..."}]`). The previous implementation only
+/// handled the string form and silently dropped array payloads. We now also
+/// concatenate the `text` of any text blocks so multi-turn tool results
+/// survive the round-trip.
+fn flatten_anthropic_content(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = value.as_array() {
+        let mut out = String::new();
+        for block in arr {
+            if let Some(text) = block["text"].as_str() {
+                out.push_str(text);
+            } else if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                // text block missing the field — skip gracefully
+            } else if !block.is_null() {
+                // Non-text block (image, etc.): preserve its JSON so the
+                // information is not silently discarded.
+                out.push_str(&block.to_string());
+            }
+        }
+        return out;
+    }
+    String::new()
+}
+
 pub struct MessagesCodec {
     id: ProtocolEndpoint,
     capabilities: EndpointCapabilities,
@@ -130,7 +159,7 @@ impl EndpointCodec for MessagesCodec {
                                         .unwrap_or("")
                                         .to_string(),
                                     name: String::new(),
-                                    content: block["content"].as_str().unwrap_or("").to_string(),
+                                    content: flatten_anthropic_content(&block["content"]),
                                 });
                             }
                             Some("image") => {
@@ -540,6 +569,12 @@ impl EndpointCodec for MessagesCodec {
 
 pub struct MessagesStreamEncoder {
     message_started: bool,
+    /// Index of the currently-open content block, if any.
+    current_index: Option<usize>,
+    /// Type of the currently-open block ("text" / "thinking" / "tool_use").
+    current_kind: Option<&'static str>,
+    /// Next content-block index to allocate.
+    next_index: usize,
 }
 
 impl Default for MessagesStreamEncoder {
@@ -552,7 +587,48 @@ impl MessagesStreamEncoder {
     pub fn new() -> Self {
         Self {
             message_started: false,
+            current_index: None,
+            current_kind: None,
+            next_index: 0,
         }
+    }
+
+    /// Emit a `content_block_stop` for the open block, if any.
+    fn close_block(&mut self) -> String {
+        if let Some(idx) = self.current_index.take() {
+            self.current_kind = None;
+            let data = json!({"type": "content_block_stop", "index": idx});
+            format!(
+                "event: content_block_stop\ndata: {}\n\n",
+                serde_json::to_string(&data).unwrap_or_default()
+            )
+        } else {
+            String::new()
+        }
+    }
+
+    /// Ensure a block of `kind` is open, closing a mismatched block and
+    /// opening a new one (with `content_block_start`) as needed. Returns any
+    /// SSE bytes that must be emitted before the caller's delta.
+    fn ensure_block(&mut self, kind: &'static str, content_block: Value) -> String {
+        if self.current_kind == Some(kind) {
+            return String::new();
+        }
+        let mut out = self.close_block();
+        let idx = self.next_index;
+        self.next_index += 1;
+        self.current_index = Some(idx);
+        self.current_kind = Some(kind);
+        let data = json!({
+            "type": "content_block_start",
+            "index": idx,
+            "content_block": content_block,
+        });
+        out.push_str(&format!(
+            "event: content_block_start\ndata: {}\n\n",
+            serde_json::to_string(&data).unwrap_or_default()
+        ));
+        out
     }
 }
 
@@ -571,47 +647,54 @@ impl StreamEncoder for MessagesStreamEncoder {
                 )
             }
             StreamPart::TextDelta { text } => {
+                // Open (or keep) a text block at the correct index, then emit
+                // the delta against that same index.
+                let mut out = self.ensure_block("text", json!({"type": "text", "text": ""}));
+                let idx = self.current_index.unwrap_or(0);
                 let data = json!({
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": idx,
                     "delta": {"type": "text_delta", "text": text},
                 });
-                format!(
+                out.push_str(&format!(
                     "event: content_block_delta\ndata: {}\n\n",
                     serde_json::to_string(&data).unwrap_or_default()
-                )
+                ));
+                out
             }
             StreamPart::ReasoningDelta { text } => {
+                let mut out =
+                    self.ensure_block("thinking", json!({"type": "thinking", "thinking": ""}));
+                let idx = self.current_index.unwrap_or(0);
                 let data = json!({
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": idx,
                     "delta": {"type": "thinking_delta", "thinking": text},
                 });
-                format!(
+                out.push_str(&format!(
                     "event: content_block_delta\ndata: {}\n\n",
                     serde_json::to_string(&data).unwrap_or_default()
-                )
+                ));
+                out
             }
             StreamPart::ToolCallDelta {
                 id,
                 name,
                 arguments,
             } => {
-                // For Anthropic, tool_use blocks are emitted with content_block_start then deltas
+                // The opener carries `name`: close any prior block and open a
+                // fresh tool_use block at the next index. Argument-only
+                // fragments (`name == None`) append to the open tool_use block.
                 if let Some(n) = name {
-                    let data = json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "tool_use", "id": id, "name": n, "input": json!({})},
-                    });
-                    format!(
-                        "event: content_block_start\ndata: {}\n\n",
-                        serde_json::to_string(&data).unwrap_or_default()
+                    self.ensure_block(
+                        "tool_use",
+                        json!({"type": "tool_use", "id": id, "name": n, "input": {}}),
                     )
                 } else {
+                    let idx = self.current_index.unwrap_or(0);
                     let data = json!({
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": idx,
                         "delta": {"type": "input_json_delta", "partial_json": arguments},
                     });
                     format!(
@@ -648,22 +731,28 @@ impl StreamEncoder for MessagesStreamEncoder {
                     FinishReason::ToolCalls => "tool_use",
                     _ => "end_turn",
                 };
+                // Close any open content block before signalling the stop
+                // reason, per the Anthropic streaming contract.
+                let mut out = self.close_block();
                 let data = json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason},
                     "usage": {"output_tokens": 0},
                 });
-                format!(
+                out.push_str(&format!(
                     "event: message_delta\ndata: {}\n\n",
                     serde_json::to_string(&data).unwrap_or_default()
-                )
+                ));
+                out
             }
             StreamPart::ResponseCompleted { .. } => {
+                let mut out = self.close_block();
                 let data = json!({"type": "message_stop"});
-                format!(
+                out.push_str(&format!(
                     "event: message_stop\ndata: {}\n\n",
                     serde_json::to_string(&data).unwrap_or_default()
-                )
+                ));
+                out
             }
             StreamPart::Error { message, code: _ } => {
                 format!(
@@ -922,17 +1011,14 @@ impl StreamDecoder for MessagesStreamDecoder {
                     code: event["error"]["type"].as_str().map(String::from),
                 });
             }
-            Some(other) => {
-                parts.push(StreamPart::Error {
-                    message: format!("Unknown Anthropic SSE event type: {}", other),
-                    code: Some("unknown_event".to_string()),
-                });
+            Some(_other) => {
+                // Anthropic emits keepalive `ping` events and may introduce
+                // new event types over time. These must NOT abort the stream;
+                // ignore unrecognized events per UnknownFieldPolicy::Drop.
             }
             None => {
-                parts.push(StreamPart::Error {
-                    message: "Anthropic SSE event with no type field".to_string(),
-                    code: Some("missing_type".to_string()),
-                });
+                // SSE comment/keepalive lines or events without a `type`
+                // field are ignored rather than treated as fatal errors.
             }
         }
 

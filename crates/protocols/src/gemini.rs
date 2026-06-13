@@ -10,6 +10,20 @@ use tiygate_core::{
     Tool, Usage,
 };
 
+/// Synthesize a deterministic tool-call id for Gemini function calls.
+///
+/// Gemini's `functionCall` / `functionResponse` parts have no explicit call
+/// id; they are paired by function name. To let cross-protocol targets
+/// (OpenAI/Anthropic) pair a call with its result, we derive a stable id from
+/// the name. Using a fixed prefix keeps it recognizable in logs.
+fn synth_gemini_call_id(name: &str) -> String {
+    if name.is_empty() {
+        String::new()
+    } else {
+        format!("gemini_call_{name}")
+    }
+}
+
 pub struct GeminiCodec {
     id: ProtocolEndpoint,
     capabilities: EndpointCapabilities,
@@ -102,15 +116,22 @@ impl EndpointCodec for GeminiCodec {
                                 text: text.to_string(),
                             });
                         } else if let Some(fc) = part.get("functionCall") {
+                            let name = fc["name"].as_str().unwrap_or("").to_string();
                             cp.push(Content::ToolCall {
-                                id: String::new(),
-                                name: fc["name"].as_str().unwrap_or("").to_string(),
+                                // Gemini has no native call id; synthesize a
+                                // deterministic one from the function name so
+                                // cross-protocol targets (OpenAI/Anthropic) can
+                                // pair the call with its result. Gemini itself
+                                // pairs functionCall/functionResponse by name.
+                                id: synth_gemini_call_id(&name),
+                                name,
                                 arguments: fc["args"].clone(),
                             });
                         } else if let Some(fr) = part.get("functionResponse") {
+                            let name = fr["name"].as_str().unwrap_or("").to_string();
                             cp.push(Content::ToolResult {
-                                tool_call_id: String::new(),
-                                name: fr["name"].as_str().unwrap_or("").to_string(),
+                                tool_call_id: synth_gemini_call_id(&name),
+                                name: name.clone(),
                                 content: fr["response"]
                                     .as_object()
                                     .map(|o| serde_json::to_string(o).unwrap_or_default())
@@ -397,9 +418,15 @@ impl EndpointCodec for GeminiCodec {
                                     text: t.to_string(),
                                 });
                             } else if let Some(fc) = part.get("functionCall") {
+                                let name = fc["name"].as_str().unwrap_or("").to_string();
+                                let id = fc["id"]
+                                    .as_str()
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from)
+                                    .unwrap_or_else(|| synth_gemini_call_id(&name));
                                 content.push(Content::ToolCall {
-                                    id: fc["id"].as_str().unwrap_or("").to_string(),
-                                    name: fc["name"].as_str().unwrap_or("").to_string(),
+                                    id,
+                                    name,
                                     arguments: fc["args"].clone(),
                                 });
                             }
@@ -424,13 +451,19 @@ impl EndpointCodec for GeminiCodec {
                 "SAFETY" => FinishReason::ContentFilter,
                 other => FinishReason::Other(other.to_string()),
             });
-        let usage = body.get("usageMetadata").map(|u| Usage {
-            prompt_tokens: u["promptTokenCount"].as_u64().unwrap_or(0),
-            completion_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0),
-            total_tokens: u["totalTokenCount"].as_u64().unwrap_or(0),
-            reasoning_tokens: u["thoughtsTokenCount"].as_u64(),
-            cache_read_tokens: u["cachedContentTokenCount"].as_u64(),
-            ..Default::default()
+        let usage = body.get("usageMetadata").map(|u| {
+            let cache_read = u["cachedContentTokenCount"].as_u64();
+            // Gemini's promptTokenCount includes cached content; the IR keeps
+            // prompt_tokens cache-free to avoid double-counting on re-encode.
+            let raw_prompt = u["promptTokenCount"].as_u64().unwrap_or(0);
+            Usage {
+                prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
+                completion_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0),
+                total_tokens: u["totalTokenCount"].as_u64().unwrap_or(0),
+                reasoning_tokens: u["thoughtsTokenCount"].as_u64(),
+                cache_read_tokens: cache_read,
+                ..Default::default()
+            }
         });
         Ok(IrResponse {
             content,
@@ -471,10 +504,15 @@ impl StreamEncoder for GeminiStreamEncoder {
                 }
             }
             StreamPart::Usage { usage } => {
+                // IR prompt_tokens is cache-free; Gemini's promptTokenCount
+                // includes cached content. Re-add so streamed usage matches the
+                // non-stream encoder and totalTokenCount stays consistent.
+                let cache_read = usage.cache_read_tokens.unwrap_or(0);
+                let prompt_for_gemini = usage.prompt_tokens + cache_read;
                 let mut um = json!({
-                    "promptTokenCount": usage.prompt_tokens,
+                    "promptTokenCount": prompt_for_gemini,
                     "candidatesTokenCount": usage.completion_tokens,
-                    "totalTokenCount": usage.total_tokens,
+                    "totalTokenCount": prompt_for_gemini + usage.completion_tokens,
                 });
                 if let Some(rt) = usage.reasoning_tokens {
                     if rt > 0 {
@@ -620,11 +658,16 @@ impl StreamDecoder for GeminiStreamDecoder {
             }
         }
         if let Some(usage) = event.get("usageMetadata") {
+            let cache_read = usage["cachedContentTokenCount"].as_u64();
+            let raw_prompt = usage["promptTokenCount"].as_u64().unwrap_or(0);
             parts.push(StreamPart::Usage {
                 usage: Usage {
-                    prompt_tokens: usage["promptTokenCount"].as_u64().unwrap_or(0),
+                    // promptTokenCount includes cache; IR keeps it cache-free.
+                    prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
                     completion_tokens: usage["candidatesTokenCount"].as_u64().unwrap_or(0),
                     total_tokens: usage["totalTokenCount"].as_u64().unwrap_or(0),
+                    reasoning_tokens: usage["thoughtsTokenCount"].as_u64(),
+                    cache_read_tokens: cache_read,
                     ..Default::default()
                 },
             });
@@ -784,7 +827,10 @@ mod tests {
         };
         let bytes = enc.encode_part(&StreamPart::Usage { usage }).unwrap();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("\"totalTokenCount\":15"));
+        // IR prompt_tokens (10) is cache-free; encoder re-adds cache (8) →
+        // promptTokenCount 18, totalTokenCount 18+5=23.
+        assert!(s.contains("\"promptTokenCount\":18"));
+        assert!(s.contains("\"totalTokenCount\":23"));
         assert!(s.contains("\"thoughtsTokenCount\":20"));
         assert!(s.contains("\"cachedContentTokenCount\":8"));
     }

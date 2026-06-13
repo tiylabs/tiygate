@@ -339,7 +339,8 @@ fn stream_chat_completions_usage_preserves_cached_tokens() {
             _ => None,
         })
         .expect("Usage frame expected");
-    assert_eq!(usage.prompt_tokens, 1020);
+    // IR convention: prompt_tokens excludes cache (1020 upstream - 1000 cached).
+    assert_eq!(usage.prompt_tokens, 20);
     assert_eq!(usage.completion_tokens, 30);
     assert_eq!(usage.total_tokens, 1050);
     assert_eq!(usage.cache_read_tokens, Some(1000));
@@ -444,7 +445,9 @@ fn stream_gemini_usage_writes_total_and_cached() {
     };
     let bytes = enc.encode_part(&StreamPart::Usage { usage }).unwrap();
     let s = String::from_utf8_lossy(&bytes);
-    assert!(s.contains("\"totalTokenCount\":15"));
+    // IR prompt_tokens (10) is cache-free; the encoder re-adds cache (8) so
+    // promptTokenCount=18 and totalTokenCount=18+5=23.
+    assert!(s.contains("\"totalTokenCount\":23"));
     assert!(s.contains("\"thoughtsTokenCount\":20"));
     assert!(s.contains("\"cachedContentTokenCount\":8"));
 }

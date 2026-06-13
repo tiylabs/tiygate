@@ -10,8 +10,8 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tiygate_core::{
-    Content, GenerationParams, IrRequest, IrResponse, Message, PassThroughPolicy, ProtocolEndpoint,
-    ProtocolSuite, Role, Tool,
+    Content, EndpointCodec, GenerationParams, IrRequest, IrResponse, Message, PassThroughPolicy,
+    ProtocolEndpoint, ProtocolSuite, Role, Tool,
 };
 
 fn make_env() -> tiygate_core::RawEnvelope {
@@ -693,9 +693,21 @@ fn runtime_lossy_reject_parallel_tool_calls_to_anthropic() {
         "parallel_tool_calls": true
     });
     let ir = ingress.decode_request(body, &make_env()).expect("decode");
-    // The IR does not model parallel_tool_calls (it's an OpenAI
-    // extension we deliberately don't carry); the lossy check at
-    // runtime inspects the raw body for this flag. The contract is
-    // satisfied by the lossy_default_reject flag above.
+    // The chat-completions decoder now records `parallel_tool_calls: true` by
+    // marking each tool `required`, so the runtime lossy check can reject the
+    // crossing to Anthropic (which cannot express concurrent fan-out).
     assert!(!ir.tools.is_empty());
+    assert!(
+        ir.tools.iter().all(|t| t.required),
+        "parallel_tool_calls=true must mark tools required"
+    );
+    let result = tiygate_core::protocol::lossy::check_lossy_conversion(
+        &ir,
+        egress.id(),
+        egress.capabilities(),
+    );
+    assert!(
+        result.is_err(),
+        "chat→messages with parallel_tool_calls=true must be rejected"
+    );
 }
