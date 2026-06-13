@@ -90,7 +90,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                     _ => Role::User,
                 };
 
-                let content = if role == Role::Tool {
+                let mut content = if role == Role::Tool {
                     // OpenAI tool messages carry the result as a top-level
                     // string `content` with the `tool_call_id` as a sibling
                     // field. Without this branch the string path below would
@@ -110,15 +110,30 @@ impl EndpointCodec for ChatCompletionsCodec {
                         }]
                     }
                 } else if let Some(text) = msg["content"].as_str() {
-                    vec![Content::Text {
-                        text: text.to_string(),
-                    }]
+                    // A non-empty assistant text alongside tool_calls is common;
+                    // skip empty strings to avoid emitting blank text blocks.
+                    if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![Content::Text {
+                            text: text.to_string(),
+                        }]
+                    }
                 } else if let Some(arr) = msg["content"].as_array() {
                     parse_content_array(arr, &role)
-                } else if msg["content"].is_null() && msg["tool_calls"].is_array() {
-                    // Tool call response from assistant
-                    let mut parts = Vec::new();
-                    for tc in msg["tool_calls"].as_array().unwrap_or(&vec![]) {
+                } else {
+                    Vec::new()
+                };
+
+                // OpenAI assistant messages may carry `tool_calls` ALONGSIDE a
+                // textual `content` (string or array), not only when content is
+                // null. Parse them independently and append so the resulting IR
+                // keeps both the assistant text and the ToolCall blocks. Missing
+                // this caused the re-encoded Anthropic request to omit the
+                // `tool_use` block, so a later `tool_result` referenced an
+                // unknown id (upstream 400 invalid_params).
+                if let Some(tool_calls) = msg["tool_calls"].as_array() {
+                    for tc in tool_calls {
                         let arguments = match &tc["function"]["arguments"] {
                             // OpenAI sends arguments as a JSON string; parse to object.
                             serde_json::Value::String(s) => {
@@ -128,18 +143,21 @@ impl EndpointCodec for ChatCompletionsCodec {
                             serde_json::Value::Null => json!({}),
                             other => other.clone(),
                         };
-                        parts.push(Content::ToolCall {
+                        content.push(Content::ToolCall {
                             id: tc["id"].as_str().unwrap_or("").to_string(),
                             name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
                             arguments,
                         });
                     }
-                    parts
-                } else {
-                    vec![Content::Text {
+                }
+
+                // Guarantee at least one content block so downstream encoders
+                // never emit an empty `content` array.
+                if content.is_empty() {
+                    content.push(Content::Text {
                         text: String::new(),
-                    }]
-                };
+                    });
+                }
 
                 messages.push(Message { role, content });
             }
@@ -1295,6 +1313,71 @@ mod tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_decode_assistant_text_with_tool_calls() {
+        // Regression: an OpenAI assistant message may carry BOTH a string
+        // `content` and `tool_calls`. Both must survive into the IR, otherwise
+        // the re-encoded Anthropic request omits the `tool_use` block and a
+        // later `tool_result` references an unknown id (upstream 400).
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let req = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "List files."},
+                {"role": "assistant", "content": "Let me check.", "tool_calls": [{
+                    "id": "call_xyz",
+                    "type": "function",
+                    "function": {"name": "list", "arguments": "{\"path\":\".\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_xyz", "content": "{\"ok\":true}"}
+            ]
+        });
+        let ir = codec.decode_request(req, &env).unwrap();
+        let asst = ir
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .expect("assistant message present");
+        // Expect both the text and the tool call, in order.
+        assert_eq!(asst.content.len(), 2);
+        assert!(matches!(&asst.content[0], Content::Text { text } if text == "Let me check."));
+        match &asst.content[1] {
+            Content::ToolCall { id, name, .. } => {
+                assert_eq!(id, "call_xyz");
+                assert_eq!(name, "list");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_assistant_null_content_with_tool_calls() {
+        // assistant with null content + tool_calls should yield ONLY the tool
+        // call (no empty text block).
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let req = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "List."},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "list", "arguments": "{}"}
+                }]}
+            ]
+        });
+        let ir = codec.decode_request(req, &env).unwrap();
+        let asst = ir
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .expect("assistant message present");
+        assert_eq!(asst.content.len(), 1);
+        assert!(matches!(&asst.content[0], Content::ToolCall { id, .. } if id == "call_1"));
     }
 
     #[test]
