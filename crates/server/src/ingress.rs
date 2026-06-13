@@ -3230,6 +3230,12 @@ async fn handle_responses(
         scope.emit_error("upstream_error", Some(http_status));
         return Err(app_err);
     }
+    // Snapshot the raw upstream body before any cross-protocol
+    // re-encoding so the request-log detail view preserves what
+    // actually came back from the provider (e.g. an Anthropic
+    // messages response that gets transcoded to Responses format
+    // for the client).
+    let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
     // Cross-protocol response re-encode: when the upstream spoke a
     // different protocol than the Responses client, decode the upstream
     // body via the egress codec and re-encode it into the Responses
@@ -3302,7 +3308,7 @@ async fn handle_responses(
             egress_body: egress_body_capture,
             upstream_status: Some(upstream_status_capture),
             upstream_resp_headers: upstream_resp_headers_capture,
-            upstream_resp_body: body_str_capture.clone(),
+            upstream_resp_body: upstream_resp_body_capture,
             client_resp_headers: header_map_to_vec(resp.headers()),
             client_resp_body: body_str_capture,
             is_stream: false,
@@ -3726,6 +3732,12 @@ async fn handle_gemini_generate(
         scope.emit_error("upstream_error", Some(http_status));
         return Err(app_err);
     }
+    // Snapshot the raw upstream body before any cross-protocol
+    // re-encoding so the request-log detail view preserves what
+    // actually came back from the provider (e.g. an Anthropic
+    // messages response that gets transcoded to Gemini format
+    // for the client).
+    let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
     // Cross-protocol response re-encode: when the upstream spoke a
     // different protocol than the Gemini client, decode the upstream body
     // via the egress codec and re-encode it into the Gemini format so the
@@ -3798,7 +3810,7 @@ async fn handle_gemini_generate(
             egress_body: egress_body_capture,
             upstream_status: Some(upstream_status_capture),
             upstream_resp_headers: upstream_resp_headers_capture,
-            upstream_resp_body: body_str_capture.clone(),
+            upstream_resp_body: upstream_resp_body_capture,
             client_resp_headers: header_map_to_vec(resp.headers()),
             client_resp_body: body_str_capture,
             is_stream: false,

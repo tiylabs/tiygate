@@ -75,8 +75,17 @@ impl EventSink for OltpSink {
 
     async fn write_request_event(&self, event: &RequestEvent) -> Result<(), tiygate_core::Error> {
         let row = request_event_to_row(event);
+        // Use an upsert that preserves the token/cost columns written
+        // by `update_request_tokens` (capture stage) when this
+        // `RequestEvent` arrives after the capture. The hot path always
+        // emits `tokens: None`, so on a normal hot-path-only insert we
+        // fall through to the `excluded` (NULL) values which the
+        // COALESCE bridges back to the existing row. On a fresh insert
+        // (`update_request_tokens` did not run first) the row did not
+        // exist, so `request_logs.<col>` is NULL and we accept the
+        // `excluded` value.
         let res = sqlx::query(
-            "INSERT OR REPLACE INTO request_logs (\
+            "INSERT INTO request_logs (\
                 request_id, ts, virtual_model, resolved_provider, resolved_model, account_label, \
                 trace_id, span_id, traceparent, ingress_protocol, egress_protocol, \
                 lossy, cache_hit, status, error_class, http_status, error_source, \
@@ -85,7 +94,40 @@ impl EventSink for OltpSink {
                 cache_write_tokens, total_tokens, cost, api_key_id, client_ip, user_agent, \
                 raw_envelope_json, redacted_headers_json) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33) \
+             ON CONFLICT(request_id) DO UPDATE SET \
+                ts = excluded.ts, \
+                virtual_model = excluded.virtual_model, \
+                resolved_provider = excluded.resolved_provider, \
+                resolved_model = excluded.resolved_model, \
+                account_label = excluded.account_label, \
+                trace_id = excluded.trace_id, \
+                span_id = excluded.span_id, \
+                traceparent = excluded.traceparent, \
+                ingress_protocol = excluded.ingress_protocol, \
+                egress_protocol = excluded.egress_protocol, \
+                lossy = excluded.lossy, \
+                cache_hit = excluded.cache_hit, \
+                status = excluded.status, \
+                error_class = excluded.error_class, \
+                http_status = excluded.http_status, \
+                error_source = excluded.error_source, \
+                total_latency_ms = excluded.total_latency_ms, \
+                upstream_latency_ms = excluded.upstream_latency_ms, \
+                queue_latency_ms = excluded.queue_latency_ms, \
+                ttfb_ms = excluded.ttfb_ms, \
+                prompt_tokens = COALESCE(excluded.prompt_tokens, request_logs.prompt_tokens), \
+                completion_tokens = COALESCE(excluded.completion_tokens, request_logs.completion_tokens), \
+                reasoning_tokens = COALESCE(excluded.reasoning_tokens, request_logs.reasoning_tokens), \
+                cache_read_tokens = COALESCE(excluded.cache_read_tokens, request_logs.cache_read_tokens), \
+                cache_write_tokens = COALESCE(excluded.cache_write_tokens, request_logs.cache_write_tokens), \
+                total_tokens = COALESCE(excluded.total_tokens, request_logs.total_tokens), \
+                cost = COALESCE(excluded.cost, request_logs.cost), \
+                api_key_id = excluded.api_key_id, \
+                client_ip = excluded.client_ip, \
+                user_agent = excluded.user_agent, \
+                raw_envelope_json = excluded.raw_envelope_json, \
+                redacted_headers_json = excluded.redacted_headers_json",
         )
         .bind(&row.request_id)
         .bind(&row.ts)
@@ -282,29 +324,57 @@ impl OltpSink {
         }
     }
 
-    /// Update only the six token columns on an existing `request_logs`
-    /// row, keyed by `request_id`. Runs on the telemetry background
-    /// task after a capture is persisted. When the row does not exist
-    /// yet (capture arrived before the `RequestEvent` insert) the
-    /// UPDATE affects zero rows and returns `Ok` — a benign no-op.
+    /// Persist the recovered token usage onto the `request_logs` row,
+    /// keyed by `request_id`. Runs on the telemetry background task
+    /// after a capture is persisted.
+    ///
+    /// Capture and the `RequestEvent` insert are dispatched over the
+    /// same channel and may interleave: a capture whose `write_capture`
+    /// runs before `write_request_event` would otherwise UPDATE a
+    /// row that does not exist yet (rows_affected = 0) and the
+    /// subsequent `INSERT OR REPLACE` from `write_request_event`
+    /// would re-create the row with `token` columns reset to NULL.
+    /// To make the writeback order-independent we use an upsert that
+    /// inserts a minimal placeholder when the row is missing and
+    /// updates only the token columns when it is already present —
+    /// the later `INSERT OR REPLACE` from `write_request_event` is
+    /// itself rewritten to `INSERT ... ON CONFLICT DO UPDATE` so it
+    /// does not clobber the token columns.
     async fn update_request_tokens(
         &self,
         request_id: &str,
         usage: &Usage,
     ) -> Result<(), sqlx::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        // Placeholder values for the NOT-NULL columns when we have to
+        // insert a row that `write_request_event` has not yet
+        // produced. `write_request_event`'s later
+        // `ON CONFLICT DO UPDATE` will overwrite every column except
+        // the token group and `cost`, preserving the usage we
+        // recovered here.
         sqlx::query(
-            "UPDATE request_logs SET \
-                prompt_tokens = ?1, completion_tokens = ?2, reasoning_tokens = ?3, \
-                cache_read_tokens = ?4, cache_write_tokens = ?5, total_tokens = ?6 \
-             WHERE request_id = ?7",
+            "INSERT INTO request_logs (\
+                request_id, ts, virtual_model, ingress_protocol, status, \
+                total_latency_ms, upstream_latency_ms, queue_latency_ms, lossy, \
+                prompt_tokens, completion_tokens, reasoning_tokens, \
+                cache_read_tokens, cache_write_tokens, total_tokens) \
+             VALUES (?1, ?2, '', '', 'pending', 0, 0, 0, 0, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(request_id) DO UPDATE SET \
+                prompt_tokens = excluded.prompt_tokens, \
+                completion_tokens = excluded.completion_tokens, \
+                reasoning_tokens = excluded.reasoning_tokens, \
+                cache_read_tokens = excluded.cache_read_tokens, \
+                cache_write_tokens = excluded.cache_write_tokens, \
+                total_tokens = excluded.total_tokens",
         )
+        .bind(request_id)
+        .bind(now)
         .bind(usage.prompt_tokens as i64)
         .bind(usage.completion_tokens as i64)
         .bind(usage.reasoning_tokens.map(|n| n as i64))
         .bind(usage.cache_read_tokens.map(|n| n as i64))
         .bind(usage.cache_write_tokens.map(|n| n as i64))
         .bind(usage.total_tokens as i64)
-        .bind(request_id)
         .execute(self.pool.sqlite())
         .await?;
         Ok(())
@@ -2065,6 +2135,54 @@ mod tests {
         assert_eq!(by_model[0].cache_read_tokens, 5);
     }
 
+    /// Capture arrives BEFORE the `RequestEvent` (the ordering that
+    /// broke before the upsert refactor: the placeholder `UPDATE`
+    /// affected zero rows and the later `INSERT OR REPLACE` reset
+    /// the token columns to NULL). After the fix, the recovered
+    /// tokens must survive the eventual `RequestEvent` insert.
+    #[tokio::test]
+    async fn write_capture_then_request_event_preserves_tokens() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(pool.sqlite()).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        let capture = ExchangeCapture {
+            request_id: "req-2".to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: Some(
+                "{\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":11,\"total_tokens\":18}}"
+                    .to_string(),
+            ),
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: false,
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        // Now the terminal RequestEvent arrives with no token data
+        // (mirrors the production hot path).
+        let mut ev = dummy_request_event_no_tokens();
+        ev.request_id = "req-2".to_string();
+        sink.write_request_event(&ev).await.expect("write event");
+
+        let row = sqlx::query(
+            "SELECT prompt_tokens, completion_tokens, total_tokens \
+             FROM request_logs WHERE request_id = ?1",
+        )
+        .bind("req-2")
+        .fetch_one(pool.sqlite())
+        .await
+        .expect("query");
+        assert_eq!(row.get::<Option<i64>, _>("prompt_tokens"), Some(7));
+        assert_eq!(row.get::<Option<i64>, _>("completion_tokens"), Some(11));
+        assert_eq!(row.get::<Option<i64>, _>("total_tokens"), Some(18));
+    }
+
     #[tokio::test]
     async fn write_capture_backfills_tokens_streaming() {
         let pool = db::open_pool("sqlite::memory:").await.expect("pool");
@@ -2110,7 +2228,11 @@ mod tests {
         db::run_migrations(pool.sqlite()).await.expect("migrate");
         let sink = OltpSink::new(Arc::new(pool.clone()));
 
-        // No request_logs row exists yet (capture racing ahead).
+        // No request_logs row exists yet (capture racing ahead of
+        // the RequestEvent). The token writeback is an upsert: it
+        // inserts a minimal placeholder row carrying the recovered
+        // usage so the subsequent `write_request_event` (when it
+        // arrives) does not clobber the token columns.
         let capture = ExchangeCapture {
             request_id: "ghost".to_string(),
             egress_method: "POST".to_string(),
@@ -2127,7 +2249,6 @@ mod tests {
             client_resp_body: None,
             is_stream: false,
         };
-        // Should succeed (UPDATE affects zero rows; payload row still inserts).
         sink.write_capture(&capture).await.expect("write capture");
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE request_id = ?1")
@@ -2135,6 +2256,17 @@ mod tests {
                 .fetch_one(pool.sqlite())
                 .await
                 .expect("count");
-        assert_eq!(count, 0);
+        assert_eq!(count, 1, "capture-stage upsert should have inserted the row");
+        let prompt: Option<i64> =
+            sqlx::query_scalar("SELECT prompt_tokens FROM request_logs WHERE request_id = ?1")
+                .bind("ghost")
+                .fetch_one(pool.sqlite())
+                .await
+                .expect("prompt");
+        assert_eq!(
+            prompt,
+            Some(1),
+            "recovered prompt_tokens must survive the upsert before RequestEvent arrives"
+        );
     }
 }
