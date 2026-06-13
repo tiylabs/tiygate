@@ -347,15 +347,60 @@ fn redact_headers_json(redactor: &Redactor, headers: &[(String, String)]) -> Opt
 }
 
 /// Best-effort merge of an SSE stream into a single structured JSON
-/// string. Parses `data:` lines, decodes each as JSON, and:
-///   * For OpenAI `chat.completion.chunk` events, concatenates
+/// string. Parses `data:` lines, decodes each as JSON, detects the
+/// protocol family, and runs the corresponding merge routine:
+///
+///   * OpenAI `chat.completion.chunk` — concatenates
 ///     `choices[].delta.content` into a single assistant message and
 ///     carries the final `usage` when present.
-///   * For Anthropic events, concatenates `content_block_delta` text
-///     deltas and carries the `message_delta` usage.
-///   * Falls back to collecting all parsed JSON events in an array.
-/// Returns `None` when no `data:` JSON lines are found.
+///   * OpenAI Responses — concatenates `response.output_text.delta`
+///     payloads, picks up `response.created.response.model`, and
+///     carries the last `response.completed.response.usage`. Maps the
+///     terminal `response.completed.response.status` to a normalized
+///     `finish_reason`.
+///   * Anthropic Messages — concatenates `content_block_delta` text
+///     deltas and carries the `message_delta` usage / stop reason.
+///   * Google Gemini — concatenates `candidates[].content.parts[].text`
+///     and `parts[].thought` separately, counts `parts[].functionCall`
+///     tool calls, carries `usageMetadata` and the last
+///     `candidates[].finishReason`.
+///
+/// Returns `None` when no `data:` JSON lines are found. Falls back to
+/// a `protocol: "unknown"` envelope carrying the raw event array when
+/// no family is recognized, so the detail view can still show the raw
+/// stream.
 pub fn parse_sse_to_json(raw: &str) -> Option<String> {
+    let events = parse_data_lines(raw);
+    if events.is_empty() {
+        return None;
+    }
+    let family = detect_family(&events);
+    let event_count = events.len();
+    let merged = match family {
+        Family::OpenAiChat => merge_openai_chat(&events),
+        Family::OpenAiResponses => merge_openai_responses(&events),
+        Family::Anthropic => merge_anthropic(&events),
+        Family::Gemini => merge_gemini(&events),
+        Family::Unknown => {
+            let obj = serde_json::json!({
+                "protocol": "unknown",
+                "events": events,
+                "event_count": event_count,
+            });
+            return serde_json::to_string_pretty(&obj).ok();
+        }
+    };
+    let view = build_view(merged, event_count);
+    serde_json::to_string_pretty(&view).ok()
+}
+
+/// Parse every `data:` line out of an SSE buffer and decode it as
+/// JSON. Lines that do not start with `data:`, are empty, equal
+/// `[DONE]`, or fail to parse as JSON are silently skipped — this
+/// matches the lenient behavior the prior implementation had and
+/// keeps TCP packet boundary handling consistent with the
+/// `split_sse_lines` helper in `ingress.rs`.
+fn parse_data_lines(raw: &str) -> Vec<serde_json::Value> {
     let mut events: Vec<serde_json::Value> = Vec::new();
     for line in raw.lines() {
         let line = line.trim_start();
@@ -370,132 +415,303 @@ pub fn parse_sse_to_json(raw: &str) -> Option<String> {
             events.push(v);
         }
     }
-    if events.is_empty() {
-        return None;
-    }
+    events
+}
 
-    // Detect protocol family from the first event.
-    let mut text = String::new();
-    let mut usage: Option<serde_json::Value> = None;
-    let mut model: Option<String> = None;
-    let mut finish_reason: Option<String> = None;
-    let mut is_openai = false;
-    let mut is_anthropic = false;
+/// Protocol family. Adding a new SSE family means adding a variant
+/// here, a `detect_family` arm, and a merge fn — `parse_sse_to_json`
+/// then dispatches to it automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    OpenAiChat,
+    OpenAiResponses,
+    Anthropic,
+    Gemini,
+    Unknown,
+}
 
-    for ev in &events {
-        // OpenAI chat.completion.chunk
+/// Decide which protocol family produced this SSE stream. Order
+/// matters: `OpenAiChat` is checked first because the OpenAI-compatible
+/// family (DeepSeek / Moonshot / Zhipu) is the most common, then
+/// `OpenAiResponses` before `Anthropic` because both carry a top-level
+/// `type` field and the only thing that disambiguates them is the
+/// `response.` / `message_` / `content_block_` prefix. Gemini uses
+/// its own keys (`candidates` / `usageMetadata`) so it can never be
+/// confused with the `type`-based families.
+fn detect_family(events: &[serde_json::Value]) -> Family {
+    for ev in events {
+        // OpenAI Chat Completions (and OpenAI-compatible providers
+        // that reuse the same envelope). `object == "chat.completion.chunk"`
+        // is the canonical marker; some providers omit it but still
+        // emit a top-level `choices` array — that is also accepted.
         if ev.get("object").and_then(|o| o.as_str()) == Some("chat.completion.chunk")
             || ev.get("choices").is_some()
         {
-            is_openai = true;
-            if model.is_none() {
-                model = ev
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string());
-            }
-            if let Some(choices) = ev.get("choices").and_then(|c| c.as_array()) {
-                for ch in choices {
-                    if let Some(c) = ch
-                        .get("delta")
-                        .and_then(|d| d.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        text.push_str(c);
-                    }
-                    if let Some(fr) = ch.get("finish_reason").and_then(|f| f.as_str()) {
-                        finish_reason = Some(fr.to_string());
-                    }
-                }
-            }
-            if let Some(u) = ev.get("usage") {
-                if !u.is_null() {
-                    usage = Some(u.clone());
-                }
-            }
-            continue;
+            return Family::OpenAiChat;
         }
-        // Anthropic streaming events
+        // OpenAI Responses: `type` is namespaced under `response.*`.
         if let Some(ty) = ev.get("type").and_then(|t| t.as_str()) {
-            is_anthropic = true;
-            match ty {
-                "content_block_delta" => {
-                    if let Some(t) = ev
-                        .get("delta")
-                        .and_then(|d| d.get("text"))
-                        .and_then(|t| t.as_str())
-                    {
-                        text.push_str(t);
-                    }
+            if ty.starts_with("response.") {
+                return Family::OpenAiResponses;
+            }
+            if ty.starts_with("message_") || ty.starts_with("content_block_") {
+                return Family::Anthropic;
+            }
+        }
+        // Gemini: no `type` field, but a `candidates` or `usageMetadata`
+        // block is present.
+        if ev.get("candidates").is_some() || ev.get("usageMetadata").is_some() {
+            return Family::Gemini;
+        }
+    }
+    Family::Unknown
+}
+
+/// Canonical merged view produced by every per-family merge fn.
+/// `tool_calls` and `reasoning` default to empty/zero so a family that
+/// does not have a concept (e.g. OpenAI Chat has no `thought` deltas)
+/// can simply leave them unset and `build_view` will omit them.
+#[derive(Debug, Default)]
+struct Merged {
+    protocol: &'static str,
+    model: Option<String>,
+    text: String,
+    reasoning: String,
+    finish_reason: Option<String>,
+    usage: Option<serde_json::Value>,
+    tool_calls: usize,
+}
+
+fn merge_openai_chat(events: &[serde_json::Value]) -> Merged {
+    let mut m = Merged {
+        protocol: "openai",
+        ..Default::default()
+    };
+    for ev in events {
+        if m.model.is_none() {
+            m.model = ev
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if let Some(choices) = ev.get("choices").and_then(|c| c.as_array()) {
+            for ch in choices {
+                if let Some(c) = ch
+                    .get("delta")
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    m.text.push_str(c);
                 }
-                "message_start" => {
-                    if model.is_none() {
-                        model = ev
-                            .get("message")
-                            .and_then(|m| m.get("model"))
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string());
-                    }
+                if let Some(fr) = ch.get("finish_reason").and_then(|f| f.as_str()) {
+                    m.finish_reason = Some(fr.to_string());
                 }
-                "message_delta" => {
-                    if let Some(u) = ev.get("usage") {
-                        usage = Some(u.clone());
-                    }
-                    if let Some(sr) = ev
-                        .get("delta")
-                        .and_then(|d| d.get("stop_reason"))
-                        .and_then(|s| s.as_str())
-                    {
-                        finish_reason = Some(sr.to_string());
-                    }
-                }
-                _ => {}
+            }
+        }
+        if let Some(u) = ev.get("usage") {
+            if !u.is_null() {
+                m.usage = Some(u.clone());
             }
         }
     }
+    m
+}
 
-    let merged = if is_openai || is_anthropic {
-        // Build a compact object that omits unset fields rather than
-        // emitting explicit `null`s. The SSE stream itself may not
-        // carry a model name on every frame (e.g. OpenAI chat
-        // completion chunks and transcode-mode re-encodings don't
-        // include `model`), so a present-but-null `model` field in the
-        // detail view is misleading.
-        let mut obj = serde_json::Map::new();
-        obj.insert(
-            "protocol".to_string(),
-            serde_json::Value::String(if is_openai {
-                "openai".to_string()
-            } else {
-                "anthropic".to_string()
-            }),
-        );
-        if let Some(m) = model {
-            obj.insert("model".to_string(), serde_json::Value::String(m));
-        }
-        if !text.is_empty() {
-            obj.insert("text".to_string(), serde_json::Value::String(text));
-        }
-        if let Some(fr) = finish_reason {
-            obj.insert("finish_reason".to_string(), serde_json::Value::String(fr));
-        }
-        if let Some(u) = usage {
-            obj.insert("usage".to_string(), u);
-        }
-        obj.insert(
-            "event_count".to_string(),
-            serde_json::Value::Number(events.len().into()),
-        );
-        serde_json::Value::Object(obj)
-    } else {
-        // Unknown protocol — return the raw parsed events.
-        serde_json::json!({
-            "protocol": "unknown",
-            "events": events,
-            "event_count": events.len(),
-        })
+fn merge_anthropic(events: &[serde_json::Value]) -> Merged {
+    let mut m = Merged {
+        protocol: "anthropic",
+        ..Default::default()
     };
-    serde_json::to_string_pretty(&merged).ok()
+    for ev in events {
+        let Some(ty) = ev.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        match ty {
+            "content_block_delta" => {
+                if let Some(t) = ev
+                    .get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    m.text.push_str(t);
+                }
+            }
+            "message_start" => {
+                if m.model.is_none() {
+                    m.model = ev
+                        .get("message")
+                        .and_then(|m| m.get("model"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+            "message_delta" => {
+                if let Some(u) = ev.get("usage") {
+                    if !u.is_null() {
+                        m.usage = Some(u.clone());
+                    }
+                }
+                if let Some(sr) = ev
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|s| s.as_str())
+                {
+                    m.finish_reason = Some(sr.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
+fn merge_openai_responses(events: &[serde_json::Value]) -> Merged {
+    let mut m = Merged {
+        protocol: "openai_responses",
+        ..Default::default()
+    };
+    for ev in events {
+        let Some(ty) = ev.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let response = ev.get("response");
+        match ty {
+            "response.output_text.delta" => {
+                // The delta can be an empty string on the very first
+                // frame; the OpenAI Responses stream emits a no-op
+                // delta to establish the item context. Always run the
+                // push (no-op for empty string) so behavior matches
+                // the upstream wire format.
+                if let Some(d) = ev.get("delta").and_then(|d| d.as_str()) {
+                    m.text.push_str(d);
+                }
+            }
+            "response.created" => {
+                if m.model.is_none() {
+                    m.model = response
+                        .and_then(|r| r.get("model"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+            "response.completed" => {
+                // Usage is overwritten on every terminal frame so the
+                // final value wins (the OpenAI Responses stream emits
+                // one `response.completed` per response, and any
+                // intermediate `response.incomplete` carries the most
+                // accurate counts).
+                if let Some(u) = response.and_then(|r| r.get("usage")) {
+                    if !u.is_null() {
+                        m.usage = Some(u.clone());
+                    }
+                }
+                if let Some(status) =
+                    response.and_then(|r| r.get("status")).and_then(|s| s.as_str())
+                {
+                    m.finish_reason = Some(match status {
+                        "completed" => "stop".to_string(),
+                        "incomplete" => "length".to_string(),
+                        "failed" => "error".to_string(),
+                        other => other.to_string(),
+                    });
+                }
+            }
+            "response.function_call_arguments.done" => {
+                m.tool_calls += 1;
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
+fn merge_gemini(events: &[serde_json::Value]) -> Merged {
+    let mut m = Merged {
+        protocol: "gemini",
+        ..Default::default()
+    };
+    for ev in events {
+        if m.model.is_none() {
+            m.model = ev
+                .get("modelVersion")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        if let Some(candidates) = ev.get("candidates").and_then(|c| c.as_array()) {
+            for c in candidates {
+                if let Some(parts) = c
+                    .get("content")
+                    .and_then(|co| co.get("parts"))
+                    .and_then(|p| p.as_array())
+                {
+                    for part in parts {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            m.text.push_str(t);
+                        }
+                        if let Some(t) = part.get("thought").and_then(|t| t.as_str()) {
+                            m.reasoning.push_str(t);
+                        }
+                        if part.get("functionCall").is_some() {
+                            m.tool_calls += 1;
+                        }
+                    }
+                }
+                if let Some(fr) = c.get("finishReason").and_then(|f| f.as_str()) {
+                    if !fr.is_empty() {
+                        m.finish_reason = Some(fr.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(u) = ev.get("usageMetadata") {
+            if !u.is_null() {
+                m.usage = Some(u.clone());
+            }
+        }
+    }
+    m
+}
+
+/// Assemble the final detail-view JSON. Mirrors the prior
+/// implementation's "omit unset" rule: `model`, `finish_reason`,
+/// `usage`, `reasoning`, and `tool_calls` are only emitted when they
+/// actually carry data, so the detail view never shows a stray
+/// `null` field for families that don't track that dimension.
+fn build_view(m: Merged, event_count: usize) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "protocol".to_string(),
+        serde_json::Value::String(m.protocol.to_string()),
+    );
+    if let Some(model) = m.model {
+        obj.insert("model".to_string(), serde_json::Value::String(model));
+    }
+    if !m.text.is_empty() {
+        obj.insert("text".to_string(), serde_json::Value::String(m.text));
+    }
+    if !m.reasoning.is_empty() {
+        obj.insert(
+            "reasoning".to_string(),
+            serde_json::Value::String(m.reasoning),
+        );
+    }
+    if let Some(fr) = m.finish_reason {
+        obj.insert("finish_reason".to_string(), serde_json::Value::String(fr));
+    }
+    if let Some(u) = m.usage {
+        obj.insert("usage".to_string(), u);
+    }
+    if m.tool_calls > 0 {
+        obj.insert(
+            "tool_call_count".to_string(),
+            serde_json::Value::Number(m.tool_calls.into()),
+        );
+    }
+    obj.insert(
+        "event_count".to_string(),
+        serde_json::Value::Number(event_count.into()),
+    );
+    serde_json::Value::Object(obj)
 }
 
 /// Returns true when a usage struct carries no meaningful token data
@@ -1587,6 +1803,84 @@ mod tests {
         assert!(parse_sse_to_json("not an sse stream").is_none());
         assert!(parse_sse_to_json("").is_none());
         assert!(parse_sse_to_json("data: [DONE]\n").is_none());
+    }
+
+    #[test]
+    fn parse_sse_merges_openai_responses() {
+        // 7-frame sample lifted from the production request log —
+        // matches the G→C transcode case that was previously being
+        // mislabeled as Anthropic.
+        let raw = "data: {\"response\":{\"id\":\"r1\",\"object\":\"response\",\"status\":\"in_progress\"},\"type\":\"response.created\"}\n\
+                   data: {\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":55,\"output_tokens\":0,\"total_tokens\":169}},\"type\":\"response.completed\"}\n\
+                   data: {\"content_index\":0,\"delta\":\"\",\"item_id\":\"r1_msg\",\"output_index\":0,\"type\":\"response.output_text.delta\"}\n\
+                   data: {\"content_index\":0,\"delta\":\"P\",\"item_id\":\"r1_msg\",\"output_index\":1,\"type\":\"response.output_text.delta\"}\n\
+                   data: {\"content_index\":0,\"delta\":\"ong! 👋 TiyCode, got your ping loud and clear.\",\"item_id\":\"r1_msg\",\"output_index\":2,\"type\":\"response.output_text.delta\"}\n\
+                   data: {\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":55,\"output_tokens\":16,\"total_tokens\":185}},\"type\":\"response.completed\"}\n\
+                   data: {\"response\":{\"id\":\"r1\",\"status\":\"incomplete\"},\"type\":\"response.completed\"}\n\
+                   data: [DONE]\n";
+        let parsed = parse_sse_to_json(raw).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(v["protocol"], "openai_responses");
+        assert_eq!(v["text"], "Pong! 👋 TiyCode, got your ping loud and clear.");
+        // Last `response.completed` wins → input_tokens=55, output_tokens=16, total_tokens=185.
+        assert_eq!(v["usage"]["input_tokens"], 55);
+        assert_eq!(v["usage"]["output_tokens"], 16);
+        assert_eq!(v["usage"]["total_tokens"], 185);
+        // Last `response.completed.response.status` is "incomplete" → "length".
+        assert_eq!(v["finish_reason"], "length");
+        // [DONE] is not counted.
+        assert_eq!(v["event_count"], 7);
+        // No `response.created` in this sample, so model is absent.
+        assert!(v.get("model").is_none());
+    }
+
+    #[test]
+    fn parse_sse_does_not_mislabel_responses_as_anthropic() {
+        // Regression guard: a Responses stream whose first event is
+        // `response.created` must never be classified as Anthropic,
+        // even though both protocols use a top-level `type` field.
+        let raw = "data: {\"response\":{\"id\":\"r2\",\"model\":\"gpt-4o\",\"object\":\"response\",\"status\":\"in_progress\"},\"type\":\"response.created\"}\n\
+                   data: {\"content_index\":0,\"delta\":\"hi\",\"item_id\":\"r2_msg\",\"output_index\":0,\"type\":\"response.output_text.delta\"}\n\
+                   data: {\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}},\"type\":\"response.completed\"}\n";
+        let parsed = parse_sse_to_json(raw).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(v["protocol"], "openai_responses");
+        assert_eq!(v["model"], "gpt-4o");
+        assert_eq!(v["text"], "hi");
+        assert_eq!(v["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn parse_sse_merges_gemini_stream() {
+        let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}],\"modelVersion\":\"gemini-1.5-pro\"}\n\
+                   data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]}}]}\n\
+                   data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\
+                   data: {\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2,\"totalTokenCount\":7}}\n";
+        let parsed = parse_sse_to_json(raw).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(v["protocol"], "gemini");
+        assert_eq!(v["model"], "gemini-1.5-pro");
+        assert_eq!(v["text"], "Hello");
+        assert_eq!(v["finish_reason"], "STOP");
+        assert_eq!(v["usage"]["totalTokenCount"], 7);
+    }
+
+    #[test]
+    fn parse_sse_merges_gemini_reasoning_and_tool() {
+        // Reasoning (thought) deltas must land in `reasoning`, not
+        // `text`. functionCall parts bump `tool_call_count` and must
+        // not contribute to the visible text.
+        let raw = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":\"Plan: call tool\"}]}}]}\n\
+                   data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Calling \"}]}}]}\n\
+                   data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{}}}]}}]}\n\
+                   data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done.\"}]},\"finishReason\":\"STOP\"}]}\n";
+        let parsed = parse_sse_to_json(raw).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(v["protocol"], "gemini");
+        assert_eq!(v["text"], "Calling done.");
+        assert_eq!(v["reasoning"], "Plan: call tool");
+        assert_eq!(v["tool_call_count"], 1);
+        assert_eq!(v["finish_reason"], "STOP");
     }
 
     #[test]

@@ -76,11 +76,36 @@ pub fn set_test_admin_token_for_current_thread(token: Option<&str>) {
 /// `401 Unauthorized` when the token is missing or invalid, and
 /// `503 Service Unavailable` when admin auth has not been
 /// configured at all.
+///
+/// **Path-scoping.** This middleware is applied to the admin router
+/// before it is `Router::merge`d into the data-plane router in
+/// `tiygate_server::app::App::router`. Empirically (and per the
+/// internal `ingress` ↔ `admin` trace log captured on 2026-06-13)
+/// `Router::merge` in axum 0.7 propagates the inner router's
+/// `Layer` to the merged router's *routing pass*, so the
+/// `require_admin_token` middleware ends up being evaluated for
+/// every request the merged router receives, not just the admin
+/// routes. As a defense-in-depth measure we explicitly no-op for
+/// any URI that does not begin with `/admin/` — i.e. the data
+/// plane (`/v1/...`, `/v1beta/...`, `/v1/embeddings`, `/healthz`,
+/// …) must never be bearer-gated by the admin token. The check is
+/// applied **before** reading the Authorization header so an
+/// unauthenticated data-plane request returns the data-plane
+/// handler's response (or 404) and never leaks the
+/// `admin_auth` error envelope.
 pub async fn require_admin_token(
     State(_state): State<AdminState>,
     req: Request,
     next: Next,
 ) -> Response {
+    let path = req.uri().path();
+    if !is_admin_path(path) {
+        // Not an admin route — let the data plane handle it (or
+        // return 404 from the merged router's fallthrough). This
+        // MUST happen before any auth-header inspection so we
+        // never accidentally gate a non-admin route.
+        return next.run(req).await;
+    }
     let header_value = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -119,6 +144,23 @@ fn error_response(status: StatusCode, message: &str, source: &str) -> Response {
     (status, body).into_response()
 }
 
+/// Returns `true` when `path` is an admin route that
+/// `require_admin_token` should gate. The admin surface today lives
+/// entirely under `/admin/...` (see
+/// `crates/admin/src/handlers.rs::router` and the OAuth router).
+///
+/// We accept the exact prefix `/admin` and `/admin/...` so that
+/// future top-level admin helpers (e.g. `/admin` as a redirect
+/// index) can also be gated. Anything else — including the data
+/// plane (`/v1/...`, `/v1beta/...`, `/v1/embeddings`, `/healthz`,
+/// …) — is left to the data-plane handler chain. This is
+/// defense-in-depth: the `Router::merge` call in
+/// `tiygate_server::app::App::router` does not (reliably) scope a
+/// layer to only the inner router's paths in axum 0.7.
+fn is_admin_path(path: &str) -> bool {
+    path == "/admin" || path.starts_with("/admin/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +186,43 @@ mod tests {
         assert!(!verify_admin_token("topsecre"));
         assert!(!verify_admin_token("topsecret1"));
         set_test_admin_token_for_current_thread(None);
+    }
+
+    #[test]
+    fn is_admin_path_recognises_admin_routes() {
+        // Positive cases — must be gated.
+        assert!(is_admin_path("/admin"));
+        assert!(is_admin_path("/admin/"));
+        assert!(is_admin_path("/admin/v1/health"));
+        assert!(is_admin_path("/admin/v1/providers"));
+        assert!(is_admin_path("/admin/v1/api-keys"));
+        assert!(is_admin_path("/admin/v1/api-keys/abc-123"));
+        assert!(is_admin_path("/admin/v1/oauth/start"));
+    }
+
+    #[test]
+    fn is_admin_path_leaves_data_plane_alone() {
+        // Negative cases — must NOT be gated by require_admin_token.
+        // Each of these used to leak through (regression captured
+        // 2026-06-13: Gemini clients hitting
+        // `/v1beta/models/...:generateContent` were getting the
+        // `admin_auth` 401 envelope).
+        assert!(!is_admin_path("/"));
+        assert!(!is_admin_path("/v1/chat/completions"));
+        assert!(!is_admin_path("/v1/messages"));
+        assert!(!is_admin_path("/v1/embeddings"));
+        assert!(!is_admin_path("/v1/responses"));
+        assert!(!is_admin_path(
+            "/v1beta/models/anthropic%2Fclaude-opus-4.8:generateContent"
+        ));
+        assert!(!is_admin_path("/healthz"));
+        assert!(!is_admin_path("/readyz"));
+
+        // Prefix-collision traps: a path that *contains* the
+        // substring "/admin" but does not start with it must NOT
+        // be gated.
+        assert!(!is_admin_path("/v1/admin-tools"));
+        assert!(!is_admin_path("/foo/admin"));
+        assert!(!is_admin_path("/administrator"));
     }
 }

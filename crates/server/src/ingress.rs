@@ -212,6 +212,29 @@ pub fn router_with_telemetry_full(
     embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
     db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
 ) -> Router {
+    build_data_plane_router(
+        config,
+        health,
+        server_config,
+        telemetry,
+        quota,
+        embedding_cache,
+        db_store,
+    )
+}
+
+/// Internal builder kept separate from the public `router_with_telemetry_full`
+/// so we can also expose the bare `Router<AppState>` for tests and inspection
+/// harnesses.
+fn build_data_plane_router(
+    config: ConfigStore,
+    health: Arc<HealthRegistry>,
+    server_config: &ServerConfig,
+    telemetry: Arc<dyn TelemetryBus>,
+    quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
+    embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
+    db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
+) -> Router {
     let semaphore = Arc::new(Semaphore::new(server_config.max_inflight_requests));
     let state = AppState {
         config: Arc::new(config),
@@ -255,8 +278,38 @@ pub fn router_with_telemetry_full(
         .route("/v1/messages", post(handle_messages))
         .route("/v1/embeddings", post(handle_embeddings))
         .route("/v1/responses", post(handle_responses))
+        // Google Gemini — two path shapes are accepted to cover the
+        // divergence between the public Gemini docs (which use
+        // `models/{model}:generateContent` with a colon) and
+        // OpenAI-style path conventions that use a slash before the
+        // method verb. The colon shape is the official one per
+        // https://ai.google.dev/api/generate-content; the slash
+        // shape is a convenience for SDKs that prefer URL
+        // hierarchies. Both routes are routed to the same handler.
+        //
+        // Implementation note: axum 0.7 does not allow two captures
+        // in the same path segment (e.g. `:model:generateContent`
+        // panics at router-construction time with "only one
+        // parameter is allowed per path segment"). To capture the
+        // colon form we use a single-segment capture that swallows
+        // the colon: `/v1beta/models/:capture` — here the value
+        // captured for `capture` is the entire `foo:generateContent`
+        // token, which we then split on the last `:` in
+        // `split_gemini_capture` (handler entrypoint). The slash
+        // form uses a regular `:model` capture with the literal
+        // `generateContent` / `streamGenerateContent` segments
+        // consumed by the static route suffix.
+        .route(
+            "/v1beta/models/:capture",
+            post(handle_gemini_generate),
+        )
         .route(
             "/v1beta/models/:model/generateContent",
+            post(handle_gemini_generate),
+        )
+        // Streaming variants (`:streamGenerateContent?alt=sse`).
+        .route(
+            "/v1beta/models/:model/streamGenerateContent",
             post(handle_gemini_generate),
         )
         .route("/healthz", axum::routing::get(handle_healthz))
@@ -314,8 +367,14 @@ pub async fn apply_provider_auth(
         return Ok(());
     }
     // Protocol-aware fallback when no provider is registered for the
-    // given `provider_id`. Anthropic-style targets use the x-api-key
-    // header; everything else uses Bearer.
+    // given `provider_id`.
+    //   - Anthropic: `x-api-key` header + `anthropic-version`.
+    //   - Google Gemini (Public, `generativelanguage.googleapis.com`):
+    //     `x-goog-api-key: <KEY>` header per the official Google AI for
+    //     Developers spec. (`?key=<KEY>` query is also supported by the
+    //     official endpoint; the URL builders do not append it by default
+    //     because the header is the recommended form.)
+    //   - Everything else: `Authorization: Bearer <KEY>`.
     use tiygate_core::ProtocolSuite;
     if matches!(target.api_protocol.suite, ProtocolSuite::AnthropicMessages) {
         let api_key = target.effective_api_key();
@@ -330,6 +389,15 @@ pub async fn apply_provider_auth(
             http::HeaderName::from_static("anthropic-version"),
             http::HeaderValue::from_static("2023-06-01"),
         );
+    } else if matches!(target.api_protocol.suite, ProtocolSuite::GoogleGemini) {
+        tiygate_providers::gemini::apply_gemini_default_auth(target, upstream_headers).map_err(
+            |e| {
+                AppError::new(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Invalid x-goog-api-key header value: {e}"),
+                )
+            },
+        )?;
     } else {
         let api_key = target.effective_api_key();
         let hv = http::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
@@ -657,6 +725,112 @@ mod streaming_helper_tests {
 /// Health check — always returns 200 while process is alive.
 async fn handle_healthz() -> StatusCode {
     StatusCode::OK
+}
+
+/// Split a Gemini path-capture into `(model_id, method)`.
+///
+/// The Google Gemini endpoint grammar allows two shapes:
+///   * colon form  — `models/{model}:{method}`     (e.g. `foo:generateContent`)
+///   * slash form  — `models/{model}/{method}`     (e.g. `foo/generateContent`)
+///
+/// Both shapes are normalised by the router into a single
+/// `:capture` value. The slash form arrives here as just `foo`
+/// (the verb is consumed by the static route suffix). The colon
+/// form arrives as `foo:generateContent`.
+///
+/// Returns `None` for inputs that contain none of the recognised
+/// methods or contain multiple `:` separators.
+fn split_gemini_capture(capture: &str) -> Option<(&str, &str)> {
+    const METHODS: &[&str] = &[
+        "generateContent",
+        "streamGenerateContent",
+        "countTokens",
+        "embedContent",
+        "batchGenerateContent",
+    ];
+    if let Some((model, method)) = capture.rsplit_once(':') {
+        // colon form: ensure the suffix is a known method, and the
+        // model id does not contain another `:` (so `a:b:generate`
+        // does not get matched as model=`a:b`, method=`generate`).
+        if model.contains(':') {
+            return None;
+        }
+        if METHODS.contains(&method) {
+            return Some((model, method));
+        }
+        return None;
+    }
+    // No colon — the slash form. The trailing verb has already
+    // been consumed by the static route suffix, so we can hand
+    // back the bare capture as the model id with an empty method.
+    Some((capture, ""))
+}
+
+/// Strip a known Gemini method-verb suffix from a bare model id
+/// (legacy helper kept for unit-test coverage; the colon-form
+/// path-capture is split via `split_gemini_capture` instead).
+#[cfg(test)]
+fn strip_gemini_method_suffix(captured: &str) -> &str {
+    const SUFFIXES: &[&str] = &[
+        ":generateContent",
+        ":streamGenerateContent",
+        ":countTokens",
+        ":embedContent",
+        ":batchGenerateContent",
+    ];
+    for s in SUFFIXES {
+        if let Some(stripped) = captured.strip_suffix(s) {
+            return stripped;
+        }
+    }
+    captured
+}
+
+#[cfg(test)]
+mod gemini_path_tests {
+    use super::{split_gemini_capture, strip_gemini_method_suffix};
+
+    #[test]
+    fn splits_colon_generate_content() {
+        let (m, v) = split_gemini_capture("foo:generateContent").unwrap();
+        assert_eq!(m, "foo");
+        assert_eq!(v, "generateContent");
+    }
+
+    #[test]
+    fn splits_colon_stream_generate_content_with_slashes() {
+        let (m, v) =
+            split_gemini_capture("anthropic/claude-opus-4.8:streamGenerateContent").unwrap();
+        assert_eq!(m, "anthropic/claude-opus-4.8");
+        assert_eq!(v, "streamGenerateContent");
+    }
+
+    #[test]
+    fn handles_slash_form_capture() {
+        // Slash form arrives at the handler as just the model id;
+        // the verb was consumed by the static route suffix.
+        let (m, v) = split_gemini_capture("foo").unwrap();
+        assert_eq!(m, "foo");
+        assert_eq!(v, "");
+    }
+
+    #[test]
+    fn rejects_unknown_colon_suffix() {
+        assert!(split_gemini_capture("foo:unknown").is_none());
+    }
+
+    #[test]
+    fn rejects_multiple_colons_in_model() {
+        // `a:b:generate` should NOT match model=`a:b`, method=`generate`.
+        assert!(split_gemini_capture("a:b:generateContent").is_none());
+    }
+
+    #[test]
+    fn legacy_strip_helper_still_works() {
+        assert_eq!(strip_gemini_method_suffix("foo:generateContent"), "foo");
+        assert_eq!(strip_gemini_method_suffix("foo"), "foo");
+        assert_eq!(strip_gemini_method_suffix("foo:unknown"), "foo:unknown");
+    }
 }
 
 /// Readiness check — returns 200 by default, 503 once draining starts so
@@ -3125,9 +3299,30 @@ async fn handle_responses(
 async fn handle_gemini_generate(
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Path(model): axum::extract::Path<String>,
+    axum::extract::Path(capture): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
+    // The router registers two path shapes for Gemini ingress:
+    //   * colon shape  — `/v1beta/models/:capture`  (the `:capture`
+    //     value is e.g. `foo:generateContent` per the Google
+    //     official URL grammar)
+    //   * slash shape  — `/v1beta/models/:model/generateContent`
+    //     (the `:model` value is the bare id; the verb is consumed
+    //     by the static suffix)
+    //
+    // `split_gemini_capture` normalises both shapes into
+    // `(model_id, method)` and rejects malformed inputs.
+    let (model, method) = match split_gemini_capture(&capture) {
+        Some(pair) => pair,
+        None => {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid Gemini path capture: {capture:?}"),
+            ));
+        }
+    };
+    let _ = method; // We currently route all methods to one handler.
+    let model = model.to_string();
     let _permit = acquire_permit(&state).await?;
     let codec = GeminiCodec::new();
     let ingress_protocol = codec.id().clone();
