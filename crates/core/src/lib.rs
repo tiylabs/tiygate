@@ -44,7 +44,8 @@ pub use provider::{
 pub use routing::{
     classify_error, CooldownStrategy, DefaultFallbackPolicy, ErrorClass, ErrorClassification,
     FallbackDecision, FallbackPolicy, HealthRegistry, LatencyStrategy, PriorityStrategy,
-    RetryPolicy, RoutingTable, RoutingTarget, RoutingTargetHealth, Strategy, WeightedStrategy,
+    RetryPolicy, RouteEntry, RoutingStrategyName, RoutingTable, RoutingTarget, RoutingTargetHealth,
+    Strategy, WeightedStrategy,
 };
 pub use telemetry::{
     EventSink, ExchangeCapture, MicroUsd, PipelineEvent, PriceProvider, RequestEvent, TelemetryBus,

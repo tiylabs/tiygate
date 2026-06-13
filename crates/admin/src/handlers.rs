@@ -69,6 +69,107 @@ async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
 
+// ---- audit snapshot / diff helpers ----
+//
+// Audit `details` follow a stable structured schema so the UI can
+// render them predictably:
+//   {"snapshot": {redacted full object...}, "changes": [{field,before,after}...]}
+// create operations carry only a snapshot; update/upsert carry both;
+// delete records the snapshot of the removed object.
+
+/// Build a redacted JSON snapshot of a provider. Sensitive credentials
+/// (`api_key`, `oauth_meta`) go through [`KeyEncryption::redact`] so the
+/// audit table never stores cleartext secrets.
+fn provider_snapshot(p: &Provider) -> serde_json::Value {
+    json!({
+        "id": p.id,
+        "name": p.name,
+        "vendor": p.vendor,
+        "api_base": p.api_base,
+        "auth_mode": p.auth_mode.as_str(),
+        "enabled": p.enabled,
+        "metadata": p.metadata_json,
+        "api_key": tiygate_store::encryption::KeyEncryption::redact(&p.encrypted_api_key),
+        "oauth_meta": tiygate_store::encryption::KeyEncryption::redact(&p.encrypted_oauth_meta),
+    })
+}
+
+/// Build a JSON snapshot of a route, including full target details.
+fn route_snapshot(r: &Route) -> serde_json::Value {
+    json!({
+        "id": r.id,
+        "virtual_model": r.virtual_model,
+        "targets": r.targets,
+        "routing_strategy": r.routing_strategy,
+        "enabled": r.enabled,
+    })
+}
+
+/// Build a JSON snapshot of an api key. The secret hash is intentionally
+/// excluded — only operator-facing metadata is recorded.
+fn api_key_snapshot(k: &tiygate_store::models::ApiKey) -> serde_json::Value {
+    json!({
+        "id": k.id,
+        "name": k.name,
+        "status": k.status.as_str(),
+        "quota": k.quota_json,
+    })
+}
+
+/// Compute field-level changes between two flat JSON object snapshots.
+/// Walks the union of keys; any key whose value differs yields a
+/// `{field, before, after}` entry. Array/object values are compared as
+/// whole JSON (e.g. route `targets`).
+fn diff_fields(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let empty = serde_json::Map::new();
+    let before_obj = before.as_object().unwrap_or(&empty);
+    let after_obj = after.as_object().unwrap_or(&empty);
+    // Stable key order: after's keys first (insertion order), then any
+    // before-only keys not already seen.
+    let mut keys: Vec<&String> = after_obj.keys().collect();
+    for k in before_obj.keys() {
+        if !after_obj.contains_key(k) {
+            keys.push(k);
+        }
+    }
+    let null = serde_json::Value::Null;
+    for k in keys {
+        let b = before_obj.get(k).unwrap_or(&null);
+        let a = after_obj.get(k).unwrap_or(&null);
+        if b != a {
+            out.push(json!({"field": k, "before": b, "after": a}));
+        }
+    }
+    out
+}
+
+/// Assemble the structured audit `details` payload. `after` is the
+/// post-write snapshot (used as `snapshot`); when `before` is present a
+/// field-level `changes` list is computed against it.
+fn audit_details(
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(after) = after {
+        obj.insert("snapshot".to_string(), after.clone());
+        if let Some(before) = before {
+            obj.insert(
+                "changes".to_string(),
+                serde_json::Value::Array(diff_fields(before, after)),
+            );
+        }
+    } else if let Some(before) = before {
+        // delete: record the removed object's snapshot.
+        obj.insert("snapshot".to_string(), before.clone());
+    }
+    serde_json::Value::Object(obj)
+}
+
 // ---- providers ----
 
 #[derive(Debug, Deserialize)]
@@ -175,13 +276,14 @@ async fn create_provider(
             req.enabled.unwrap_or(true),
         )
         .await?;
+    let snap = provider_snapshot(&p);
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
         "admin",
         "upsert",
         "provider",
         &p.id,
-        &json!({"name": p.name}),
+        &audit_details(None, Some(&snap)),
     )
     .await;
     Ok((StatusCode::CREATED, Json(ProviderView::from(p))).into_response())
@@ -197,6 +299,15 @@ async fn update_provider(
         .as_deref()
         .and_then(AuthMode::parse)
         .unwrap_or(AuthMode::ApiKey);
+    // Read the existing row first so we can record a field-level diff.
+    // Best-effort: a read failure simply yields no `before` snapshot.
+    let before = state
+        .store
+        .get_provider(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| provider_snapshot(&p));
     let p = state
         .store
         .upsert_provider(
@@ -211,6 +322,16 @@ async fn update_provider(
             req.enabled.unwrap_or(true),
         )
         .await?;
+    let snap = provider_snapshot(&p);
+    let _ = tiygate_store::audit::record(
+        state.pool.as_ref(),
+        "admin",
+        "upsert",
+        "provider",
+        &p.id,
+        &audit_details(before.as_ref(), Some(&snap)),
+    )
+    .await;
     Ok(Json(ProviderView::from(p)).into_response())
 }
 
@@ -218,6 +339,13 @@ async fn delete_provider(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> Result<Response, AdminError> {
+    let before = state
+        .store
+        .get_provider(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| provider_snapshot(&p));
     state.store.delete_provider(&id).await?;
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
@@ -225,7 +353,7 @@ async fn delete_provider(
         "delete",
         "provider",
         &id,
-        &json!({}),
+        &audit_details(before.as_ref(), None),
     )
     .await;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -292,6 +420,8 @@ struct RouteRequest {
     id: Option<String>,
     virtual_model: String,
     targets: Vec<RouteTarget>,
+    #[serde(default)]
+    routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
     enabled: Option<bool>,
 }
 
@@ -300,6 +430,8 @@ struct RouteView {
     id: String,
     virtual_model: String,
     targets: Vec<RouteTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
     enabled: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -311,6 +443,7 @@ impl From<Route> for RouteView {
             id: r.id,
             virtual_model: r.virtual_model,
             targets: r.targets,
+            routing_strategy: r.routing_strategy,
             enabled: r.enabled,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -347,16 +480,18 @@ async fn create_route(
             &id,
             &req.virtual_model,
             &req.targets,
+            req.routing_strategy,
             req.enabled.unwrap_or(true),
         )
         .await?;
+    let snap = route_snapshot(&r);
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
         "admin",
         "upsert",
         "route",
         &r.id,
-        &json!({"virtual_model": r.virtual_model, "targets": r.targets.len()}),
+        &audit_details(None, Some(&snap)),
     )
     .await;
     Ok((StatusCode::CREATED, Json(RouteView::from(r))).into_response())
@@ -367,15 +502,33 @@ async fn update_route(
     Path(id): Path<String>,
     Json(req): Json<RouteRequest>,
 ) -> Result<Response, AdminError> {
+    let before = state
+        .store
+        .get_route(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| route_snapshot(&r));
     let r = state
         .store
         .upsert_route(
             &id,
             &req.virtual_model,
             &req.targets,
+            req.routing_strategy,
             req.enabled.unwrap_or(true),
         )
         .await?;
+    let snap = route_snapshot(&r);
+    let _ = tiygate_store::audit::record(
+        state.pool.as_ref(),
+        "admin",
+        "upsert",
+        "route",
+        &r.id,
+        &audit_details(before.as_ref(), Some(&snap)),
+    )
+    .await;
     Ok(Json(RouteView::from(r)).into_response())
 }
 
@@ -383,6 +536,13 @@ async fn delete_route(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> Result<Response, AdminError> {
+    let before = state
+        .store
+        .get_route(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| route_snapshot(&r));
     state.store.delete_route(&id).await?;
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
@@ -390,7 +550,7 @@ async fn delete_route(
         "delete",
         "route",
         &id,
-        &json!({}),
+        &audit_details(before.as_ref(), None),
     )
     .await;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -475,7 +635,7 @@ async fn create_api_key(
         "create",
         "api_key",
         &key.id,
-        &json!({"name": key.name}),
+        &audit_details(None, Some(&api_key_snapshot(&key))),
     )
     .await;
     let resp = CreateApiKeyResponse {
@@ -493,6 +653,13 @@ async fn delete_api_key(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> Result<Response, AdminError> {
+    let before = state
+        .store
+        .get_api_key(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|k| api_key_snapshot(&k));
     state.store.delete_api_key(&id).await?;
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
@@ -500,7 +667,7 @@ async fn delete_api_key(
         "delete",
         "api_key",
         &id,
-        &json!({}),
+        &audit_details(before.as_ref(), None),
     )
     .await;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -510,14 +677,30 @@ async fn disable_api_key(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> Result<Response, AdminError> {
+    let before = state
+        .store
+        .get_api_key(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|k| api_key_snapshot(&k));
     state.store.disable_api_key(&id).await?;
+    // Record the status transition by diffing the post-disable snapshot
+    // against the pre-disable one when available.
+    let after = state
+        .store
+        .get_api_key(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|k| api_key_snapshot(&k));
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
         "admin",
         "disable",
         "api_key",
         &id,
-        &json!({}),
+        &audit_details(before.as_ref(), after.as_ref()),
     )
     .await;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -589,6 +772,13 @@ async fn update_api_key_quota(
     Path(id): Path<String>,
     Json(req): Json<UpdateQuotaRequest>,
 ) -> Result<Response, AdminError> {
+    let before = state
+        .store
+        .get_api_key(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|k| api_key_snapshot(&k));
     let key = state.store.update_api_key_quota(&id, req.quota).await?;
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
@@ -596,7 +786,7 @@ async fn update_api_key_quota(
         "update_quota",
         "api_key",
         &key.id,
-        &json!({"quota": key.quota_json}),
+        &audit_details(before.as_ref(), Some(&api_key_snapshot(&key))),
     )
     .await;
     Ok(Json(ApiKeyView::from(key)).into_response())

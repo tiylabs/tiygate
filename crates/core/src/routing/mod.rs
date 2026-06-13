@@ -56,11 +56,84 @@ impl RoutingTarget {
     }
 }
 
+/// Routing strategy selector.
+///
+/// §3.4 names `Weighted` as the document-level default; we expose all four so
+/// operators can pick the one that matches their traffic shape without code
+/// changes. `Latency`/`Cooldown` need a `HealthRegistry` handle, which the
+/// handler supplies when it constructs the concrete `Strategy`.
+///
+/// This type lives in `core` (rather than the server crate) so the routing
+/// table — and the persistence layer that feeds it — can carry a strongly
+/// typed per-route strategy override without depending on the server crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingStrategyName {
+    /// Weighted random shuffle (default per §3.4).
+    #[default]
+    Weighted,
+    /// Sort by weight desc — useful for tiered providers.
+    Priority,
+    /// Prefer healthy targets, then by weight.
+    Cooldown,
+    /// Prefer healthy + lowest EWMA latency.
+    Latency,
+}
+
+impl RoutingStrategyName {
+    /// The canonical `snake_case` token for this strategy. Matches the
+    /// serde representation and the persisted DB column value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Weighted => "weighted",
+            Self::Priority => "priority",
+            Self::Cooldown => "cooldown",
+            Self::Latency => "latency",
+        }
+    }
+
+    /// Parse a `snake_case` token into a strategy. Unknown tokens return
+    /// `None`, letting callers fall back to the global default rather than
+    /// failing the whole config load.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "weighted" => Some(Self::Weighted),
+            "priority" => Some(Self::Priority),
+            "cooldown" => Some(Self::Cooldown),
+            "latency" => Some(Self::Latency),
+            _ => None,
+        }
+    }
+}
+
+/// A single entry in the routing table: the ordered target chain for a
+/// virtual model plus an optional per-route strategy override.
+///
+/// `strategy == None` means "inherit the gateway's default strategy"
+/// (the `routing_strategy` configured on `ServerConfig`/`AppState`).
+#[derive(Debug, Clone)]
+pub struct RouteEntry {
+    /// Ordered list of routing targets (fallback chain).
+    pub targets: Vec<RoutingTarget>,
+    /// Optional per-route strategy override. `None` → inherit default.
+    pub strategy: Option<RoutingStrategyName>,
+}
+
+impl RouteEntry {
+    /// Construct an entry with no strategy override (inherits default).
+    pub fn new(targets: Vec<RoutingTarget>) -> Self {
+        Self {
+            targets,
+            strategy: None,
+        }
+    }
+}
+
 /// A routing table mapping virtual model names to ordered target chains.
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
-    /// Virtual model name → ordered list of routing targets (fallback chain).
-    pub routes: HashMap<String, Vec<RoutingTarget>>,
+    /// Virtual model name → route entry (target chain + optional strategy).
+    pub routes: HashMap<String, RouteEntry>,
 }
 
 impl RoutingTable {
@@ -73,12 +146,30 @@ impl RoutingTable {
 
     /// Look up the routing chain for a virtual model name.
     pub fn resolve(&self, virtual_model: &str) -> Option<Vec<RoutingTarget>> {
-        self.routes.get(virtual_model).cloned()
+        self.routes.get(virtual_model).map(|e| e.targets.clone())
     }
 
-    /// Register a route.
+    /// Look up the per-route strategy override for a virtual model.
+    /// Returns `None` when the route is missing *or* carries no override
+    /// — both cases mean "use the gateway default strategy".
+    pub fn resolve_strategy(&self, virtual_model: &str) -> Option<RoutingStrategyName> {
+        self.routes.get(virtual_model).and_then(|e| e.strategy)
+    }
+
+    /// Borrow the full route entry (targets + strategy) for a virtual model.
+    pub fn resolve_entry(&self, virtual_model: &str) -> Option<&RouteEntry> {
+        self.routes.get(virtual_model)
+    }
+
+    /// Register a route with no strategy override (inherits default).
     pub fn insert(&mut self, virtual_model: String, targets: Vec<RoutingTarget>) {
-        self.routes.insert(virtual_model, targets);
+        self.routes
+            .insert(virtual_model, RouteEntry::new(targets));
+    }
+
+    /// Register a route entry carrying targets and an optional strategy.
+    pub fn insert_entry(&mut self, virtual_model: String, entry: RouteEntry) {
+        self.routes.insert(virtual_model, entry);
     }
 }
 

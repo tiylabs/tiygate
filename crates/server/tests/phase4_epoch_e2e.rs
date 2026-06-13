@@ -76,6 +76,7 @@ async fn data_plane_sees_admin_writes_via_epoch_poll() {
                 api_key_override: None,
                 api_base_override: None,
             }],
+            None,
             true,
         )
         .await

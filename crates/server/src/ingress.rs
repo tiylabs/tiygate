@@ -1030,10 +1030,17 @@ async fn handle_chat_completions(
     let mut last_error: Option<AppError> = None;
     let bytes_emitted: u64 = 0;
 
-    // Apply the routing strategy chosen by config (default `Weighted` per §3.4).
-    // The strategy is consulted once at the top of the request — targets are
-    // re-ordered every iteration so a slow/unhealthy target is not retried first.
-    let (strategy, strategy_label) = build_strategy(state.routing_strategy, state.health.clone());
+    // Apply the routing strategy: a per-route override (if the virtual model
+    // carries one) takes precedence over the gateway-wide default
+    // (`state.routing_strategy`). The strategy is consulted once at the top of
+    // the request — targets are re-ordered every iteration so a slow/unhealthy
+    // target is not retried first.
+    let effective_strategy = state
+        .current_config()
+        .routing_table
+        .resolve_strategy(&virtual_model)
+        .unwrap_or(state.routing_strategy);
+    let (strategy, strategy_label) = build_strategy(effective_strategy, state.health.clone());
     let ordered_targets: Vec<&tiygate_core::RoutingTarget> = strategy.order(&targets);
 
     // Telemetry: emit a RequestStarted event so the event stream has
@@ -1382,8 +1389,14 @@ async fn handle_messages(
     let mut last_error: Option<AppError> = None;
     let bytes_emitted: u64 = 0;
 
-    // Apply the routing strategy chosen by config (default `Weighted` per §3.4).
-    let (strategy, _strategy_label) = build_strategy(state.routing_strategy, state.health.clone());
+    // Apply the routing strategy: a per-route override takes precedence over
+    // the gateway-wide default (`state.routing_strategy`).
+    let effective_strategy = state
+        .current_config()
+        .routing_table
+        .resolve_strategy(&virtual_model)
+        .unwrap_or(state.routing_strategy);
+    let (strategy, _strategy_label) = build_strategy(effective_strategy, state.health.clone());
     let ordered_targets: Vec<&tiygate_core::RoutingTarget> = strategy.order(&targets);
 
     while target_index < ordered_targets.len() && attempt < max_attempts {

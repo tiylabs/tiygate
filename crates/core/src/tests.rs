@@ -35,6 +35,62 @@ mod tests {
     }
 
     #[test]
+    fn test_routing_table_per_route_strategy() {
+        let mk_target = || RoutingTarget {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            api_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+        };
+
+        let mut table = RoutingTable::new();
+        // Route A carries an explicit Priority override.
+        table.insert_entry(
+            "model-a".to_string(),
+            RouteEntry {
+                targets: vec![mk_target()],
+                strategy: Some(RoutingStrategyName::Priority),
+            },
+        );
+        // Route B carries no override (inherits the gateway default).
+        table.insert("model-b".to_string(), vec![mk_target()]);
+
+        assert_eq!(
+            table.resolve_strategy("model-a"),
+            Some(RoutingStrategyName::Priority)
+        );
+        assert_eq!(table.resolve_strategy("model-b"), None);
+        // Missing routes also resolve to None (→ inherit default).
+        assert_eq!(table.resolve_strategy("nonexistent"), None);
+        // Targets remain resolvable in both cases.
+        assert_eq!(table.resolve("model-a").unwrap().len(), 1);
+        assert_eq!(table.resolve("model-b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_routing_strategy_name_roundtrip() {
+        for s in [
+            RoutingStrategyName::Weighted,
+            RoutingStrategyName::Priority,
+            RoutingStrategyName::Cooldown,
+            RoutingStrategyName::Latency,
+        ] {
+            assert_eq!(RoutingStrategyName::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(RoutingStrategyName::parse("bogus"), None);
+        assert_eq!(RoutingStrategyName::default(), RoutingStrategyName::Weighted);
+    }
+
+    #[test]
     fn test_routing_target_effective_key() {
         let target = RoutingTarget {
             provider_id: "test".to_string(),

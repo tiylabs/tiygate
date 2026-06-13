@@ -16,24 +16,11 @@ pub enum DeployMode {
 
 /// Routing strategy selector.
 ///
-/// §3.4 names `Weighted` as the document-level default; we expose all four so
-/// operators can pick the one that matches their traffic shape without code
-/// changes. LatencyStrategy needs a `HealthRegistry` handle, which the
-/// `strategy_arg` config string captures statically — the corresponding
-/// strategy is constructed inside the handler where the registry is available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RoutingStrategyName {
-    /// Weighted random shuffle (default per §3.4).
-    #[default]
-    Weighted,
-    /// Sort by weight desc — useful for tiered providers.
-    Priority,
-    /// Prefer healthy targets, then by weight.
-    Cooldown,
-    /// Prefer healthy + lowest EWMA latency.
-    Latency,
-}
+/// The enum now lives in `tiygate_core::routing` so the routing table and the
+/// persistence layer can carry a strongly typed per-route strategy override.
+/// We re-export it here to keep the existing `crate::config::RoutingStrategyName`
+/// references working unchanged.
+pub use tiygate_core::routing::RoutingStrategyName;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -68,7 +55,11 @@ pub struct ServerConfig {
     /// the stream with a protocol-native error frame. Set to 0 to
     /// disable the total budget entirely. Default: 0 (disabled).
     pub upstream_stream_total_timeout_secs: u64,
-    /// Routing strategy (default `Weighted`, per §3.4).
+    /// Default routing strategy (default `Weighted`, per §3.4).
+    ///
+    /// This is the gateway-wide fallback: a virtual model whose route
+    /// carries no strategy override (`routing_strategy = NULL`) is served
+    /// with this strategy. Set via `TIYGATE_ROUTING_STRATEGY`.
     pub routing_strategy: RoutingStrategyName,
     /// Database URL for the control plane. When unset, the server
     /// runs in legacy in-memory mode (no admin router, no log

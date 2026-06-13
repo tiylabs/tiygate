@@ -101,7 +101,7 @@ async fn acceptance_1_admin_crud_propagates_to_routing_table() {
     // The data-plane ConfigStore must see the new route.
     let cs = store.config_store();
     assert!(cs.routing_table.routes.contains_key("gpt-4o"));
-    let targets = &cs.routing_table.routes["gpt-4o"];
+    let targets = &cs.routing_table.routes["gpt-4o"].targets;
     assert_eq!(targets[0].provider_id, "openai");
     // The api key on the routing-table target must be the cleartext
     // we supplied at admin-time, so the data plane can forward

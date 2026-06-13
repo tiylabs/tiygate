@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use tiygate_core::protocol::{ProtocolEndpoint, ProtocolSuite};
-use tiygate_core::routing::{RoutingTable, RoutingTarget};
+use tiygate_core::routing::{RouteEntry, RoutingTable, RoutingTarget};
 
 use crate::db::DbPool;
 use crate::encryption::KeyEncryption;
@@ -246,7 +246,13 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
             });
         }
         if !targets.is_empty() {
-            table.insert(virtual_model.clone(), targets);
+            table.insert_entry(
+                virtual_model.clone(),
+                RouteEntry {
+                    targets,
+                    strategy: route.routing_strategy,
+                },
+            );
         }
     }
     table
@@ -570,7 +576,7 @@ impl DbConfigStore {
 
     pub async fn get_route(&self, id: &str) -> Result<Option<Route>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, enabled, created_at, updated_at \
              FROM routes WHERE id = ?1",
         )
         .bind(id)
@@ -584,6 +590,7 @@ impl DbConfigStore {
         id: &str,
         virtual_model: &str,
         targets: &[RouteTarget],
+        routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
         enabled: bool,
     ) -> Result<Route, StoreError> {
         if targets.is_empty() {
@@ -598,18 +605,21 @@ impl DbConfigStore {
             .map(|r| r.created_at.to_rfc3339())
             .unwrap_or_else(|| now.clone());
         let targets_json = serde_json::to_string(targets)?;
+        let strategy_str = routing_strategy.map(|s| s.as_str());
         let enabled_int: i32 = if enabled { 1 } else { 0 };
 
         sqlx::query(
-            "INSERT INTO routes (id, virtual_model, targets_json, enabled, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+            "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, enabled, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT(id) DO UPDATE SET \
                 virtual_model=excluded.virtual_model, targets_json=excluded.targets_json, \
+                routing_strategy=excluded.routing_strategy, \
                 enabled=excluded.enabled, updated_at=excluded.updated_at",
         )
         .bind(id)
         .bind(virtual_model)
         .bind(&targets_json)
+        .bind(strategy_str)
         .bind(enabled_int)
         .bind(&created_at)
         .bind(&now)
@@ -636,7 +646,7 @@ impl DbConfigStore {
 
     async fn load_routes(&self) -> Result<Vec<Route>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, enabled, created_at, updated_at \
              FROM routes",
         )
         .fetch_all(self.pool.sqlite())
@@ -833,10 +843,18 @@ fn row_to_route(row: sqlx::sqlite::SqliteRow) -> Result<Route, StoreError> {
     let targets_str: String = row.get("targets_json");
     let targets: Vec<RouteTarget> = serde_json::from_str(&targets_str)?;
     let enabled_int: i32 = row.get("enabled");
+    // `routing_strategy` is a nullable TEXT column. Unknown / unparsable
+    // tokens are treated as `None` (inherit the gateway default) rather
+    // than failing the whole snapshot load.
+    let routing_strategy: Option<String> = row.get("routing_strategy");
+    let routing_strategy = routing_strategy
+        .as_deref()
+        .and_then(tiygate_core::routing::RoutingStrategyName::parse);
     Ok(Route {
         id: row.get("id"),
         virtual_model: row.get("virtual_model"),
         targets,
+        routing_strategy,
         enabled: enabled_int != 0,
         created_at: parse_dt(row.get("created_at"))?,
         updated_at: parse_dt(row.get("updated_at"))?,

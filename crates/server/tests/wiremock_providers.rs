@@ -30,7 +30,7 @@ fn build_test_app_with_config(
     server_config: ServerConfig,
 ) -> axum::Router {
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
             provider_id: "openai".to_string(),
@@ -57,7 +57,7 @@ fn build_test_app_with_config(
 /// Build a test app with a single Anthropic Messages route to a wiremock upstream.
 fn build_anthropic_test_app(upstream_url: String, model: &str) -> axum::Router {
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
             provider_id: "anthropic".to_string(),
@@ -89,7 +89,7 @@ fn build_openai_compatible_test_app(
     api_key: &str,
 ) -> axum::Router {
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
             provider_id: "openai-compatible".to_string(),
@@ -477,7 +477,7 @@ async fn test_multi_target_fallback_5xx_transfers() {
 
     // Build app with two targets on the same model.
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         "gpt-4o".to_string(),
         vec![
             tiygate_core::RoutingTarget {
@@ -844,7 +844,7 @@ async fn test_streaming_appends_done_when_upstream_omits_it() {
 /// whose single route targets an Anthropic Messages upstream (cross-protocol).
 fn build_chat_ingress_anthropic_egress_app(upstream_url: String, model: &str) -> axum::Router {
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
             provider_id: "anthropic".to_string(),
@@ -871,7 +871,7 @@ fn build_chat_ingress_anthropic_egress_app(upstream_url: String, model: &str) ->
 /// single route targets an OpenAI chat-completions upstream (cross-protocol).
 fn build_messages_ingress_openai_egress_app(upstream_url: String, model: &str) -> axum::Router {
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
             provider_id: "openai".to_string(),
@@ -1033,7 +1033,7 @@ async fn test_streaming_messages_ingress_openai_egress_transcodes_to_anthropic()
 /// OpenAI chat-completions upstream (cross-protocol).
 fn build_responses_ingress_openai_egress_app(upstream_url: String, model: &str) -> axum::Router {
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
             provider_id: "openai".to_string(),
@@ -1060,7 +1060,7 @@ fn build_responses_ingress_openai_egress_app(upstream_url: String, model: &str) 
 /// OpenAI chat-completions upstream (cross-protocol).
 fn build_gemini_ingress_openai_egress_app(upstream_url: String, model: &str) -> axum::Router {
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
             provider_id: "openai".to_string(),
@@ -1296,7 +1296,7 @@ async fn test_nonstream_gemini_ingress_openai_egress_transcodes_to_gemini() {
 /// Build a same-protocol Responses app (Responses ingress → Responses upstream).
 fn build_responses_same_protocol_app(upstream_url: String, model: &str) -> axum::Router {
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
             provider_id: "openai".to_string(),
@@ -1318,7 +1318,7 @@ fn build_responses_same_protocol_app(upstream_url: String, model: &str) -> axum:
 /// Build a same-protocol Gemini app (Gemini ingress → Gemini upstream).
 fn build_gemini_same_protocol_app(upstream_url: String, model: &str) -> axum::Router {
     let mut routing_table = RoutingTable::new();
-    routing_table.routes.insert(
+    routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
             provider_id: "google".to_string(),

@@ -84,6 +84,10 @@ pub struct Route {
     pub id: String,
     pub virtual_model: String,
     pub targets: Vec<RouteTarget>,
+    /// Optional per-route routing strategy override. `None` means the
+    /// route inherits the gateway-wide default (`ServerConfig.routing_strategy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
     pub enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
