@@ -38,17 +38,28 @@ export interface ProviderCatalogEntry {
   auth_mode: string;
 }
 
+/** Per-route routing strategy. Mirrors `tiygate_core::routing::RoutingStrategyName`
+ *  (snake_case). `undefined`/absent means the route inherits the gateway-wide
+ *  default strategy. */
+export type RoutingStrategyName =
+  | "weighted"
+  | "priority"
+  | "cooldown"
+  | "latency";
+
 export interface RouteTarget {
   provider_id: string;
   model_id: string;
+  // Backend persists only `weight`. The `priority` strategy reuses this same
+  // value (sorted descending), so the UI just relabels the column per strategy.
   weight?: number | null;
-  priority?: number | null;
 }
 
 export interface Route {
   id: string;
   virtual_model: string;
   targets: RouteTarget[];
+  routing_strategy?: RoutingStrategyName | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -58,6 +69,7 @@ export interface RouteInput {
   id?: string;
   virtual_model: string;
   targets: RouteTarget[];
+  routing_strategy?: RoutingStrategyName | null;
   enabled?: boolean;
 }
 

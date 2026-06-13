@@ -3,7 +3,12 @@ import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, Pencil, Plus, Trash2, X } from "lucide-react";
 import { providersApi, routesApi } from "@/api/resources";
-import type { Route, RouteInput, RouteTarget } from "@/api/types";
+import type {
+  Route,
+  RouteInput,
+  RouteTarget,
+  RoutingStrategyName,
+} from "@/api/types";
 import {
   Badge,
   Button,
@@ -32,13 +37,31 @@ interface FormState {
   id?: string;
   virtual_model: string;
   targets: RouteTarget[];
+  routing_strategy: RoutingStrategyName | "";
   enabled: boolean;
+}
+
+// Strategies that consume a per-target numeric value (`weight`). For
+// `priority` the backend reuses `weight` (sorted descending), so we relabel
+// the same column rather than introducing a separate field. `cooldown` and
+// `latency` select targets from runtime health/latency data and need no
+// per-target input, so the column is hidden for them.
+const STRATEGY_OPTIONS: RoutingStrategyName[] = [
+  "weighted",
+  "priority",
+  "cooldown",
+  "latency",
+];
+
+function strategyUsesValue(s: RoutingStrategyName | ""): boolean {
+  return s === "" || s === "weighted" || s === "priority";
 }
 
 function emptyForm(): FormState {
   return {
     virtual_model: "",
     targets: [{ provider_id: "", model_id: "" }],
+    routing_strategy: "",
     enabled: true,
   };
 }
@@ -109,8 +132,8 @@ export default function RoutesPage() {
           provider_id: tg.provider_id,
           model_id: tg.model_id,
           weight: tg.weight ?? undefined,
-          priority: tg.priority ?? undefined,
         })),
+        routing_strategy: r.routing_strategy ?? undefined,
         enabled: false,
       };
       return routesApi.create(body);
@@ -137,6 +160,7 @@ export default function RoutesPage() {
       targets: r.targets.length
         ? r.targets.map((tg) => ({ ...tg }))
         : [{ provider_id: "", model_id: "" }],
+      routing_strategy: r.routing_strategy ?? "",
       enabled: r.enabled,
     });
     setFormError(null);
@@ -152,13 +176,14 @@ export default function RoutesPage() {
 
   function submit() {
     setFormError(null);
+    const usesValue = strategyUsesValue(form.routing_strategy);
     const targets = form.targets
       .filter((tg) => tg.provider_id && tg.model_id)
       .map((tg) => ({
         provider_id: tg.provider_id,
         model_id: tg.model_id,
-        weight: tg.weight ?? undefined,
-        priority: tg.priority ?? undefined,
+        // Only send the numeric value for strategies that consume it.
+        weight: usesValue ? (tg.weight ?? undefined) : undefined,
       }));
     if (!form.virtual_model || targets.length === 0) {
       setFormError(t("routes.validationError"));
@@ -167,6 +192,7 @@ export default function RoutesPage() {
     const body: RouteInput = {
       virtual_model: form.virtual_model,
       targets,
+      routing_strategy: form.routing_strategy || undefined,
       enabled: form.enabled,
     };
     saveMutation.mutate({ id: editing?.id, body });
@@ -188,6 +214,24 @@ export default function RoutesPage() {
     (providers ?? []).forEach((p) => m.set(p.id, `${p.name} (${p.id})`));
     return m;
   }, [providers]);
+
+  // Strategy picker: empty value → inherit gateway default.
+  const strategyOptions = useMemo(
+    () => [
+      { value: "", label: t("routes.strategyDefault") },
+      ...STRATEGY_OPTIONS.map((s) => ({
+        value: s,
+        label: t(`routes.strategyOptions.${s}`),
+      })),
+    ],
+    [t],
+  );
+  const showValueColumn = strategyUsesValue(form.routing_strategy);
+  // For the `priority` strategy the same `weight` value is relabeled.
+  const valueLabel =
+    form.routing_strategy === "priority"
+      ? t("routes.priority")
+      : t("routes.weight");
 
   return (
     <div>
@@ -363,6 +407,23 @@ export default function RoutesPage() {
             />
           </Field>
 
+          <Field
+            label={t("routes.strategy")}
+            hint={t("routes.strategyHint")}
+          >
+            <Select
+              value={form.routing_strategy}
+              onValueChange={(v) =>
+                setForm((f) => ({
+                  ...f,
+                  routing_strategy: v as RoutingStrategyName | "",
+                }))
+              }
+              ariaLabel={t("routes.strategy")}
+              options={strategyOptions}
+            />
+          </Field>
+
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-sm font-medium text-text">
@@ -385,7 +446,11 @@ export default function RoutesPage() {
             {form.targets.map((tg, idx) => (
               <div
                 key={idx}
-                className="grid grid-cols-1 gap-2 rounded-md border border-border p-3 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_56px_56px_auto] sm:items-end"
+                className={
+                  showValueColumn
+                    ? "grid grid-cols-1 gap-2 rounded-md border border-border p-3 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_72px_auto] sm:items-end"
+                    : "grid grid-cols-1 gap-2 rounded-md border border-border p-3 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto] sm:items-end"
+                }
               >
                 <div className="space-y-1">
                   <Label>{t("routes.provider")}</Label>
@@ -408,32 +473,20 @@ export default function RoutesPage() {
                     onChange={(e) => updateTarget(idx, { model_id: e.target.value })}
                   />
                 </div>
-                <div className="space-y-1">
-                  <Label>{t("routes.weight")}</Label>
-                  <Input
-                    type="number"
-                    value={tg.weight ?? ""}
-                    onChange={(e) =>
-                      updateTarget(idx, {
-                        weight: e.target.value ? Number(e.target.value) : null,
-                      })
-                    }
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label>{t("routes.priority")}</Label>
-                  <Input
-                    type="number"
-                    value={tg.priority ?? ""}
-                    onChange={(e) =>
-                      updateTarget(idx, {
-                        priority: e.target.value
-                          ? Number(e.target.value)
-                          : null,
-                      })
-                    }
-                  />
-                </div>
+                {showValueColumn ? (
+                  <div className="space-y-1">
+                    <Label>{valueLabel}</Label>
+                    <Input
+                      type="number"
+                      value={tg.weight ?? ""}
+                      onChange={(e) =>
+                        updateTarget(idx, {
+                          weight: e.target.value ? Number(e.target.value) : null,
+                        })
+                      }
+                    />
+                  </div>
+                ) : null}
                 <Button
                   variant="ghost"
                   size="sm"
