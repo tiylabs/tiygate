@@ -55,8 +55,10 @@ export function Select({
           "disabled:cursor-not-allowed disabled:opacity-50 data-[placeholder]:text-text-subtle",
           // Radix Select.Value strips its own className to preserve
           // positioning, so style the inner text node via a child selector
-          // to enable single-line truncation with ellipsis.
-          "[&>span]:min-w-0 [&>span]:flex-1 [&>span]:truncate [&>span]:text-left",
+          // to enable single-line truncation with ellipsis. Scope to the
+          // first span so the trailing Icon span (rendered by Radix) keeps
+          // its shrink-0 sizing instead of also stretching to flex-1.
+          "[&>span:first-child]:min-w-0 [&>span:first-child]:flex-1 [&>span:first-child]:truncate [&>span:first-child]:text-left",
           className,
         )}
       >
