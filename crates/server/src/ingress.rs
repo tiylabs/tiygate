@@ -3849,10 +3849,22 @@ pub fn drive_upstream_stream(
     let total_started = Instant::now();
     let mut upstream = response.bytes_stream();
     let mut last_reason: Option<TruncationReason> = None;
-    // Streaming response-body accumulator for the request-log detail
+    // Streaming response-body accumulators for the request-log detail
     // view. Bounded by `capture.max_bytes`; once the cap is hit we
     // stop appending (the sink flags truncation on read-back).
+    //
+    // `capture_buf` always records the raw upstream SSE bytes, so
+    // `upstream_resp_body` in the persisted row reflects what came
+    // from the provider. `client_capture_buf` records the bytes that
+    // were actually yielded to the downstream client:
+    //  * In verbatim / same-protocol mode it is appended with the same
+    //    upstream bytes, so `client_resp_body == upstream_resp_body`.
+    //  * In transcode / cross-protocol mode it is appended with the
+    //    ingress encoder's output (Anthropic SSE → OpenAI chunks, etc.),
+    //    so the request-log detail view shows what the client really
+    //    received, not a byte-identical copy of the upstream stream.
     let mut capture_buf: Vec<u8> = Vec::new();
+    let mut client_capture_buf: Vec<u8> = Vec::new();
     let capture_max_bytes = capture.as_ref().map(|c| c.max_bytes).unwrap_or(0);
     // Rolling tail of the most recently forwarded upstream bytes. Used
     // on natural close to detect whether the upstream already emitted
@@ -3974,6 +3986,18 @@ pub fn drive_upstream_stream(
                                     }
                                 }
                                 if !out.is_empty() {
+                                    // Mirror the re-encoded bytes into the
+                                    // client capture so cross-protocol streams
+                                    // persist the ingress-format body in
+                                    // `client_resp_body`, not the raw
+                                    // upstream SSE.
+                                    if capture_max_bytes > 0
+                                        && client_capture_buf.len() < capture_max_bytes
+                                    {
+                                        let remaining = capture_max_bytes - client_capture_buf.len();
+                                        let take = remaining.min(out.len());
+                                        client_capture_buf.extend_from_slice(&out[..take]);
+                                    }
                                     yield Ok(Bytes::from(out));
                                 }
                             } else {
@@ -3982,6 +4006,13 @@ pub fn drive_upstream_stream(
                                 // (`data: ...\n\n`); wrapping it in an axum
                                 // `Event` would double-prefix `data:` and
                                 // corrupt the stream. Pass the raw bytes.
+                                if capture_max_bytes > 0
+                                    && client_capture_buf.len() < capture_max_bytes
+                                {
+                                    let remaining = capture_max_bytes - client_capture_buf.len();
+                                    let take = remaining.min(bytes.len());
+                                    client_capture_buf.extend_from_slice(&bytes[..take]);
+                                }
                                 yield Ok(bytes);
                             }
                         }
@@ -4004,9 +4035,26 @@ pub fn drive_upstream_stream(
                                     Some("upstream_error"),
                                 );
                                 if !ef.is_empty() {
+                                    if capture_max_bytes > 0
+                                        && client_capture_buf.len() < capture_max_bytes
+                                    {
+                                        let remaining =
+                                            capture_max_bytes - client_capture_buf.len();
+                                        let take = remaining.min(ef.len());
+                                        client_capture_buf.extend_from_slice(&ef[..take]);
+                                    }
                                     yield Ok(Bytes::from(ef));
                                 }
                             } else if !error_marker.is_empty() {
+                                if capture_max_bytes > 0
+                                    && client_capture_buf.len() < capture_max_bytes
+                                {
+                                    let remaining =
+                                        capture_max_bytes - client_capture_buf.len();
+                                    let take = remaining.min(error_marker.len());
+                                    client_capture_buf
+                                        .extend_from_slice(&error_marker[..take]);
+                                }
                                 yield Ok(Bytes::from(error_marker.clone()));
                             }
                             break;
@@ -4020,9 +4068,18 @@ pub fn drive_upstream_stream(
                             }
                             if let Some(tc) = transcode.as_mut() {
                                 // Transcode mode: flush any buffered partial
-                                // line, drain decoder.finish() parts, then
-                                // emit the ingress encoder's done frame so the
-                                // client sees its own protocol terminator.
+                                // line and drain decoder.finish(). The
+                                // ingress encoder emits its protocol-native
+                                // done frame (e.g. `data: [DONE]\n\n` for
+                                // ChatCompletions, `event: message_stop` for
+                                // Anthropic) from the feed path when the
+                                // upstream sends its terminal event, so we
+                                // must NOT call `tc.encoder.encode_done()`
+                                // here — that would append a *second*
+                                // terminator (the dedup check uses a
+                                // fresh local `out` that has no view of
+                                // what was already yielded in previous
+                                // chunks, so it would never fire).
                                 let mut out: Vec<u8> = Vec::new();
                                 if !frame_buf.trim().is_empty() {
                                     if let Ok(parts) = tc.decoder.feed(&frame_buf) {
@@ -4041,13 +4098,15 @@ pub fn drive_upstream_stream(
                                         }
                                     }
                                 }
-                                let done = tc.encoder.encode_done();
-                                if !done.is_empty()
-                                    && !tail_ends_with_marker(&out, &done)
-                                {
-                                    out.extend_from_slice(&done);
-                                }
                                 if !out.is_empty() {
+                                    if capture_max_bytes > 0
+                                        && client_capture_buf.len() < capture_max_bytes
+                                    {
+                                        let remaining =
+                                            capture_max_bytes - client_capture_buf.len();
+                                        let take = remaining.min(out.len());
+                                        client_capture_buf.extend_from_slice(&out[..take]);
+                                    }
                                     yield Ok(Bytes::from(out));
                                 }
                             } else if !end_marker.is_empty()
@@ -4057,6 +4116,14 @@ pub fn drive_upstream_stream(
                                 // did NOT already send an identical terminal
                                 // frame (avoids the duplicate `[DONE]` the old
                                 // code produced). Bytes forwarded verbatim.
+                                if capture_max_bytes > 0
+                                    && client_capture_buf.len() < capture_max_bytes
+                                {
+                                    let remaining =
+                                        capture_max_bytes - client_capture_buf.len();
+                                    let take = remaining.min(end_marker.len());
+                                    client_capture_buf.extend_from_slice(&end_marker[..take]);
+                                }
                                 yield Ok(Bytes::from(end_marker.clone()));
                             }
                             break;
@@ -4075,11 +4142,25 @@ pub fn drive_upstream_stream(
                     if let Some(tc) = transcode.as_mut() {
                         let done = tc.encoder.encode_done();
                         if !done.is_empty() {
+                            if capture_max_bytes > 0
+                                && client_capture_buf.len() < capture_max_bytes
+                            {
+                                let remaining = capture_max_bytes - client_capture_buf.len();
+                                let take = remaining.min(done.len());
+                                client_capture_buf.extend_from_slice(&done[..take]);
+                            }
                             yield Ok(Bytes::from(done));
                         }
                     } else if !end_marker.is_empty()
                         && !tail_ends_with_marker(&tail_buf, &end_marker)
                     {
+                        if capture_max_bytes > 0
+                            && client_capture_buf.len() < capture_max_bytes
+                        {
+                            let remaining = capture_max_bytes - client_capture_buf.len();
+                            let take = remaining.min(end_marker.len());
+                            client_capture_buf.extend_from_slice(&end_marker[..take]);
+                        }
                         yield Ok(Bytes::from(end_marker.clone()));
                     }
                     break;
@@ -4106,9 +4187,23 @@ pub fn drive_upstream_stream(
                             Some("upstream_timeout"),
                         );
                         if !ef.is_empty() {
+                            if capture_max_bytes > 0
+                                && client_capture_buf.len() < capture_max_bytes
+                            {
+                                let remaining = capture_max_bytes - client_capture_buf.len();
+                                let take = remaining.min(ef.len());
+                                client_capture_buf.extend_from_slice(&ef[..take]);
+                            }
                             yield Ok(Bytes::from(ef));
                         }
                     } else if !error_marker.is_empty() {
+                        if capture_max_bytes > 0
+                            && client_capture_buf.len() < capture_max_bytes
+                        {
+                            let remaining = capture_max_bytes - client_capture_buf.len();
+                            let take = remaining.min(error_marker.len());
+                            client_capture_buf.extend_from_slice(&error_marker[..take]);
+                        }
                         yield Ok(Bytes::from(error_marker.clone()));
                     }
                     break;
@@ -4124,16 +4219,26 @@ pub fn drive_upstream_stream(
 
         // Stream finished (natural end, idle, total, or upstream
         // error). Send the accumulated exchange capture to the
-        // telemetry bus for the request-log detail view. The first
-        // version stores the upstream SSE body as both the upstream
-        // and the client response body (they are byte-identical for
-        // same-protocol streaming; cross-protocol re-encoding of the
-        // streamed client body is a known limitation).
+        // telemetry bus for the request-log detail view.
+        //  * `upstream_resp_body` always records the raw upstream
+        //    SSE bytes captured at chunk arrival time.
+        //  * `client_resp_body` records the bytes that were actually
+        //    yielded to the downstream client. In verbatim /
+        //    same-protocol mode this is byte-identical to the
+        //    upstream body; in cross-protocol / transcode mode it is
+        //    the ingress-format SSE produced by the encoder (e.g.
+        //    OpenAI `chat.completion.chunk` data lines decoded from
+        //    Anthropic `content_block_delta` events).
         if let Some(cap) = capture {
-            let body = if capture_buf.is_empty() {
+            let upstream_body = if capture_buf.is_empty() {
                 None
             } else {
                 Some(String::from_utf8_lossy(&capture_buf).into_owned())
+            };
+            let client_body = if client_capture_buf.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&client_capture_buf).into_owned())
             };
             cap.telemetry
                 .send_capture(tiygate_core::ExchangeCapture {
@@ -4144,9 +4249,9 @@ pub fn drive_upstream_stream(
                     egress_body: cap.egress_body,
                     upstream_status: cap.upstream_status,
                     upstream_resp_headers: cap.upstream_resp_headers,
-                    upstream_resp_body: body.clone(),
+                    upstream_resp_body: upstream_body,
                     client_resp_headers: cap.client_resp_headers,
-                    client_resp_body: body,
+                    client_resp_body: client_body,
                     is_stream: true,
                 })
                 .await;

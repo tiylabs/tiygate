@@ -100,10 +100,19 @@ impl EndpointCodec for ChatCompletionsCodec {
                     // Tool call response from assistant
                     let mut parts = Vec::new();
                     for tc in msg["tool_calls"].as_array().unwrap_or(&vec![]) {
+                        let arguments = match &tc["function"]["arguments"] {
+                            // OpenAI sends arguments as a JSON string; parse to object.
+                            serde_json::Value::String(s) => {
+                                serde_json::from_str(s).unwrap_or_else(|_| json!({}))
+                            }
+                            // Some compatible providers may already send an object.
+                            serde_json::Value::Null => json!({}),
+                            other => other.clone(),
+                        };
                         parts.push(Content::ToolCall {
                             id: tc["id"].as_str().unwrap_or("").to_string(),
                             name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                            arguments: tc["function"]["arguments"].clone(),
+                            arguments,
                         });
                     }
                     parts

@@ -455,14 +455,38 @@ pub fn parse_sse_to_json(raw: &str) -> Option<String> {
     }
 
     let merged = if is_openai || is_anthropic {
-        serde_json::json!({
-            "protocol": if is_openai { "openai" } else { "anthropic" },
-            "model": model,
-            "text": text,
-            "finish_reason": finish_reason,
-            "usage": usage,
-            "event_count": events.len(),
-        })
+        // Build a compact object that omits unset fields rather than
+        // emitting explicit `null`s. The SSE stream itself may not
+        // carry a model name on every frame (e.g. OpenAI chat
+        // completion chunks and transcode-mode re-encodings don't
+        // include `model`), so a present-but-null `model` field in the
+        // detail view is misleading.
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "protocol".to_string(),
+            serde_json::Value::String(if is_openai {
+                "openai".to_string()
+            } else {
+                "anthropic".to_string()
+            }),
+        );
+        if let Some(m) = model {
+            obj.insert("model".to_string(), serde_json::Value::String(m));
+        }
+        if !text.is_empty() {
+            obj.insert("text".to_string(), serde_json::Value::String(text));
+        }
+        if let Some(fr) = finish_reason {
+            obj.insert("finish_reason".to_string(), serde_json::Value::String(fr));
+        }
+        if let Some(u) = usage {
+            obj.insert("usage".to_string(), u);
+        }
+        obj.insert(
+            "event_count".to_string(),
+            serde_json::Value::Number(events.len().into()),
+        );
+        serde_json::Value::Object(obj)
     } else {
         // Unknown protocol — return the raw parsed events.
         serde_json::json!({
