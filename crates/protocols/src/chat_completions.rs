@@ -90,7 +90,26 @@ impl EndpointCodec for ChatCompletionsCodec {
                     _ => Role::User,
                 };
 
-                let content = if let Some(text) = msg["content"].as_str() {
+                let content = if role == Role::Tool {
+                    // OpenAI tool messages carry the result as a top-level
+                    // string `content` with the `tool_call_id` as a sibling
+                    // field. Without this branch the string path below would
+                    // turn it into a plain `Content::Text`, dropping the
+                    // `tool_call_id` and producing an Anthropic/Gemini request
+                    // whose `tool_use` blocks have no matching `tool_result`
+                    // (upstream 400 invalid_params). The content may also be an
+                    // array of content parts in newer OpenAI variants, which
+                    // `parse_content_array` already handles for Role::Tool.
+                    if let Some(arr) = msg["content"].as_array() {
+                        parse_content_array(arr, &role)
+                    } else {
+                        vec![Content::ToolResult {
+                            tool_call_id: msg["tool_call_id"].as_str().unwrap_or("").to_string(),
+                            name: msg["name"].as_str().unwrap_or("").to_string(),
+                            content: msg["content"].as_str().unwrap_or("").to_string(),
+                        }]
+                    }
+                } else if let Some(text) = msg["content"].as_str() {
                     vec![Content::Text {
                         text: text.to_string(),
                     }]
@@ -1235,6 +1254,47 @@ mod tests {
         let ir = codec.decode_request(make_tool_request(), &env).unwrap();
         assert_eq!(ir.tools.len(), 1);
         assert_eq!(ir.tools[0].name, "get_weather");
+    }
+
+    #[test]
+    fn test_decode_tool_result_message() {
+        // Regression: an OpenAI `role:tool` message carries the result as a
+        // top-level string `content` with `tool_call_id` as a sibling field.
+        // It must decode to Content::ToolResult (not Content::Text), otherwise
+        // re-encoding to Anthropic/Gemini drops the matching tool_result block
+        // and the upstream rejects with 400 invalid_params.
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let req = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "List files."},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "list", "arguments": "{\"path\":\".\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_abc", "name": "list", "content": "{\"ok\":true}"}
+            ]
+        });
+        let ir = codec.decode_request(req, &env).unwrap();
+        // messages: user, assistant(tool_call), tool(tool_result)
+        let tool_msg = ir
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool message present");
+        match &tool_msg.content[0] {
+            Content::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "call_abc");
+                assert_eq!(content, "{\"ok\":true}");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 
     #[test]
