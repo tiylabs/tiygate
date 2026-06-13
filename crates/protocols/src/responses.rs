@@ -669,9 +669,12 @@ impl StreamDecoder for ResponsesStreamDecoder {
             }
             Some("response.function_call_arguments.delta") => {
                 if let Some(args) = event["delta"].as_str() {
+                    // Argument fragment: `name: None` so cross-protocol
+                    // encoders route this to their argument-delta event
+                    // instead of re-opening the tool-call block.
                     parts.push(StreamPart::ToolCallDelta {
                         id: self.current_call_id.clone().unwrap_or_default(),
-                        name: self.current_call_name.clone(),
+                        name: None,
                         arguments: args.to_string(),
                     });
                 }

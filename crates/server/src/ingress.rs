@@ -1508,8 +1508,15 @@ async fn execute_upstream(
     // Address the upstream by the *egress* protocol (the target provider's
     // protocol), not the ingress entrypoint. When a chat-completions request
     // is routed to an Anthropic provider, the body is converted above and
-    // must be POSTed to `/messages`, not `/chat/completions`.
-    let upstream_url = upstream_url_for_suite(target, egress_protocol.suite).ok_or_else(|| {
+    // must be POSTed to `/messages`, not `/chat/completions`. Google Gemini
+    // has no fixed suffix — its URL embeds the model and method, and the
+    // streaming variant uses `:streamGenerateContent?alt=sse`.
+    let upstream_url = if is_stream {
+        upstream_stream_url_for_suite(target, egress_protocol.suite)
+    } else {
+        gemini_aware_upstream_url(target, egress_protocol.suite)
+    }
+    .ok_or_else(|| {
         AppError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
@@ -1633,6 +1640,7 @@ async fn execute_upstream(
                 client_resp_headers: forwarded_resp_headers,
                 max_bytes: state.raw_envelope_max_bytes as usize,
             }),
+            build_stream_transcode(ingress_protocol, &egress_protocol),
         );
         // Forward upstream response headers to the client (denylist).
         forward_upstream_resp_headers(
@@ -1881,8 +1889,14 @@ async fn execute_messages_upstream(
     let client = &state.http_client;
     // Address the upstream by the *egress* protocol, not the ingress
     // entrypoint. A `/v1/messages` request routed to an OpenAI provider is
-    // converted above and must be POSTed to `/chat/completions`.
-    let upstream_url = upstream_url_for_suite(target, egress_protocol.suite).ok_or_else(|| {
+    // converted above and must be POSTed to `/chat/completions`. Gemini
+    // egress embeds the model and method (stream vs non-stream) in the URL.
+    let upstream_url = if is_stream {
+        upstream_stream_url_for_suite(target, egress_protocol.suite)
+    } else {
+        gemini_aware_upstream_url(target, egress_protocol.suite)
+    }
+    .ok_or_else(|| {
         AppError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
@@ -1993,6 +2007,7 @@ async fn execute_messages_upstream(
                 client_resp_headers: forwarded_resp_headers,
                 max_bytes: state.raw_envelope_max_bytes as usize,
             }),
+            build_stream_transcode(ingress_protocol, &egress_protocol),
         );
         // Forward upstream response headers to the client (denylist).
         forward_upstream_resp_headers(
@@ -2176,7 +2191,67 @@ fn get_egress_codec(protocol: &tiygate_core::ProtocolEndpoint) -> Option<Box<dyn
             Some(Box::new(ChatCompletionsCodec::new()))
         }
         tiygate_core::ProtocolSuite::AnthropicMessages => Some(Box::new(MessagesCodec::new())),
-        _ => None,
+        tiygate_core::ProtocolSuite::GoogleGemini => Some(Box::new(GeminiCodec::new())),
+        tiygate_core::ProtocolSuite::OpenAiResponses => Some(Box::new(ResponsesCodec::new())),
+    }
+}
+
+/// Build the non-streaming upstream URL by egress suite, with Gemini support.
+/// Google Gemini's non-streaming URL embeds the model and uses the
+/// `:generateContent` method; the other suites have a fixed path suffix.
+fn gemini_aware_upstream_url(
+    target: &tiygate_core::RoutingTarget,
+    suite: tiygate_core::ProtocolSuite,
+) -> Option<String> {
+    match suite {
+        tiygate_core::ProtocolSuite::GoogleGemini => Some(format!(
+            "{}/v1beta/models/{}:generateContent",
+            target.effective_api_base().trim_end_matches('/'),
+            target.model_id
+        )),
+        _ => upstream_url_for_suite(target, suite),
+    }
+}
+
+/// Build a [`StreamTranscode`] for a streaming response when the ingress and
+/// egress protocol suites differ. Returns `None` for same-protocol streams so
+/// the caller forwards bytes verbatim (zero-loss fast path). The egress codec
+/// supplies the upstream decoder; the ingress codec supplies the client
+/// encoder. Returns `None` (verbatim) if either codec is unavailable rather
+/// than failing the request.
+fn build_stream_transcode(
+    ingress_protocol: &tiygate_core::ProtocolEndpoint,
+    egress_protocol: &tiygate_core::ProtocolEndpoint,
+) -> Option<StreamTranscode> {
+    if ingress_protocol.suite == egress_protocol.suite {
+        return None;
+    }
+    let egress_codec = get_egress_codec(egress_protocol)?;
+    let ingress_codec = get_egress_codec(ingress_protocol)?;
+    Some(StreamTranscode {
+        decoder: egress_codec.stream_decoder(),
+        encoder: ingress_codec.stream_encoder(),
+    })
+}
+
+/// Build the upstream URL for a *streaming* chat-style request, addressed by
+/// the egress protocol suite. Identical to [`upstream_url_for_suite`] for the
+/// fixed-suffix suites (chat-completions, responses, anthropic messages), but
+/// Google Gemini has no fixed suffix — its URL embeds the model and uses the
+/// `:streamGenerateContent` method plus the `?alt=sse` query string to switch
+/// the endpoint into Server-Sent Events mode. Returns `None` only if the base
+/// URL cannot be formed.
+fn upstream_stream_url_for_suite(
+    target: &tiygate_core::RoutingTarget,
+    suite: tiygate_core::ProtocolSuite,
+) -> Option<String> {
+    match suite {
+        tiygate_core::ProtocolSuite::GoogleGemini => Some(format!(
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            target.effective_api_base().trim_end_matches('/'),
+            target.model_id
+        )),
+        _ => upstream_url_for_suite(target, suite),
     }
 }
 
@@ -2681,16 +2756,35 @@ async fn handle_responses(
     scope.set_egress(target.api_protocol.clone());
     scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
 
-    let (mut upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
-        Ok(b) => b,
-        Err(e) => {
-            let app_err = AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Encode error: {e}"),
-            );
-            let http_status = app_err.http_status().as_u16();
-            scope.emit_error("encode_error", Some(http_status));
-            return Err(app_err);
+    let egress_protocol = target.api_protocol.clone();
+    let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
+
+    // Encode for the upstream. Same-protocol → use the ingress codec
+    // directly; cross-protocol → convert IR into the egress protocol's
+    // wire format (with the field-level lossy-conversion check), so a
+    // /v1/responses request can be routed to an OpenAI / Anthropic /
+    // Gemini upstream.
+    let (mut upstream_body, mut upstream_headers) = if is_same_protocol {
+        match codec.encode_request(&ir_request) {
+            Ok(b) => b,
+            Err(e) => {
+                let app_err = AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Encode error: {e}"),
+                );
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("encode_error", Some(http_status));
+                return Err(app_err);
+            }
+        }
+    } else {
+        match encode_cross_protocol(&codec, &egress_protocol, &ir_request) {
+            Ok(b) => b,
+            Err(app_err) => {
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("encode_error", Some(http_status));
+                return Err(app_err);
+            }
         }
     };
 
@@ -2711,7 +2805,30 @@ async fn handle_responses(
     let egress_body_capture = serde_json::to_string(&upstream_body).ok();
     let req_id_capture = scope.request_id().to_string();
 
-    let upstream_url = format!("{}/responses", target.effective_api_base());
+    // Address the upstream by the egress protocol suite. Same-protocol
+    // Responses stays on `/responses`; cross-protocol routing targets the
+    // egress protocol's endpoint (chat-completions, messages, or Gemini's
+    // model-embedded URL).
+    let upstream_url = if is_stream {
+        upstream_stream_url_for_suite(target, egress_protocol.suite)
+    } else {
+        gemini_aware_upstream_url(target, egress_protocol.suite)
+    };
+    let upstream_url = match upstream_url {
+        Some(u) => u,
+        None => {
+            let app_err = AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "No upstream path for egress protocol suite: {:?}",
+                    egress_protocol.suite
+                ),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("encode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
     if is_stream {
         // Streaming path: tell the upstream we accept SSE and drive the
@@ -2813,6 +2930,9 @@ async fn handle_responses(
                 ),
                 max_bytes: state.raw_envelope_max_bytes as usize,
             }),
+            // Cross-protocol streaming: decode the egress SSE and re-encode
+            // into the Responses client format. Same-protocol → None (verbatim).
+            build_stream_transcode(&ingress_protocol, &egress_protocol),
         );
         // Forward upstream response headers to the client (denylist).
         forward_upstream_resp_headers(
@@ -2913,6 +3033,50 @@ async fn handle_responses(
         scope.emit_error("upstream_error", Some(http_status));
         return Err(app_err);
     }
+    // Cross-protocol response re-encode: when the upstream spoke a
+    // different protocol than the Responses client, decode the upstream
+    // body via the egress codec and re-encode it into the Responses
+    // format so the client sees what it expects. Same-protocol → verbatim.
+    let response_body = if is_same_protocol {
+        response_body
+    } else {
+        let egress_codec = match get_egress_codec(&egress_protocol) {
+            Some(c) => c,
+            None => {
+                let app_err = AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("No egress codec found: {:?}", egress_protocol),
+                );
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("decode_error", Some(http_status));
+                return Err(app_err);
+            }
+        };
+        let ir_response = match egress_codec.decode_response(response_body) {
+            Ok(ir) => ir,
+            Err(e) => {
+                let app_err = AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Decode response error: {e}"),
+                );
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("decode_error", Some(http_status));
+                return Err(app_err);
+            }
+        };
+        match codec.encode_response(&ir_response) {
+            Ok(v) => v,
+            Err(e) => {
+                let app_err = AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Encode response error: {e}"),
+                );
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("encode_error", Some(http_status));
+                return Err(app_err);
+            }
+        }
+    };
     let body_str_capture = serde_json::to_string(&response_body).ok();
     let mut resp = Json(response_body).into_response();
     // Forward upstream response headers to the client (denylist).
@@ -3055,16 +3219,35 @@ async fn handle_gemini_generate(
     scope.set_egress(target.api_protocol.clone());
     scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
 
-    let (mut upstream_body, mut upstream_headers) = match codec.encode_request(&ir_request) {
-        Ok(b) => b,
-        Err(e) => {
-            let app_err = AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Encode error: {e}"),
-            );
-            let http_status = app_err.http_status().as_u16();
-            scope.emit_error("encode_error", Some(http_status));
-            return Err(app_err);
+    let egress_protocol = target.api_protocol.clone();
+    let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
+
+    // Encode for the upstream. Same-protocol Gemini → use the Gemini
+    // codec directly; cross-protocol → convert IR into the egress
+    // protocol's wire format (with the lossy-conversion check) so a
+    // Gemini generateContent request can be routed to an OpenAI /
+    // Anthropic / Responses upstream.
+    let (mut upstream_body, mut upstream_headers) = if is_same_protocol {
+        match codec.encode_request(&ir_request) {
+            Ok(b) => b,
+            Err(e) => {
+                let app_err = AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Encode error: {e}"),
+                );
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("encode_error", Some(http_status));
+                return Err(app_err);
+            }
+        }
+    } else {
+        match encode_cross_protocol(&codec, &egress_protocol, &ir_request) {
+            Ok(b) => b,
+            Err(app_err) => {
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("encode_error", Some(http_status));
+                return Err(app_err);
+            }
         }
     };
 
@@ -3085,24 +3268,51 @@ async fn handle_gemini_generate(
     let egress_body_capture = serde_json::to_string(&upstream_body).ok();
     let req_id_capture = scope.request_id().to_string();
 
-    // Gemini uses `?alt=sse` on the query string to switch the same
-    // POST endpoint into Server-Sent Events mode. The body shape is
-    // identical to the non-streaming call, so we share `upstream_body`.
-    let base_stream_url = format!(
-        "{}/v1beta/models/{}:generateContent",
-        target.effective_api_base(),
-        target.model_id
-    );
+    // Resolve the streaming and non-streaming upstream URLs by the egress
+    // protocol suite. Same-protocol Gemini uses `:streamGenerateContent`
+    // / `:generateContent`; cross-protocol routing targets the egress
+    // protocol's endpoint (chat-completions, messages, responses).
+    let stream_upstream_url = match upstream_stream_url_for_suite(target, egress_protocol.suite) {
+        Some(u) => u,
+        None => {
+            let app_err = AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "No upstream path for egress protocol suite: {:?}",
+                    egress_protocol.suite
+                ),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("encode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
+    let nonstream_upstream_url = match gemini_aware_upstream_url(target, egress_protocol.suite) {
+        Some(u) => u,
+        None => {
+            let app_err = AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "No upstream path for egress protocol suite: {:?}",
+                    egress_protocol.suite
+                ),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("encode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
 
     if is_stream {
-        // Streaming path: append `?alt=sse` and run the body through
-        // `drive_upstream_stream` so the client sees the same idle /
-        // total / keepalive / protocol-native end-frame semantics as
-        // the other streaming ingress paths.
+        // Streaming path: the egress URL already carries `?alt=sse` for
+        // Gemini; for cross-protocol egress it is the target protocol's
+        // streaming endpoint. Run the body through `drive_upstream_stream`
+        // so the client sees the same idle / total / keepalive /
+        // protocol-native end-frame semantics as the other ingress paths.
         let stream_builder = crate::ingress_phase4::inject_trace(
             state
                 .http_client
-                .post(format!("{base_stream_url}?alt=sse"))
+                .post(&stream_upstream_url)
                 .headers(upstream_headers),
             &trace_ctx,
         )
@@ -3194,6 +3404,9 @@ async fn handle_gemini_generate(
                 ),
                 max_bytes: state.raw_envelope_max_bytes as usize,
             }),
+            // Cross-protocol streaming: decode the egress SSE and re-encode
+            // into the Gemini client format. Same-protocol → None (verbatim).
+            build_stream_transcode(&ingress_protocol, &egress_protocol),
         );
         // Forward upstream response headers to the client (denylist).
         forward_upstream_resp_headers(
@@ -3223,7 +3436,7 @@ async fn handle_gemini_generate(
     }
 
     // Non-streaming path: read the full body and forward as JSON.
-    let upstream_url = base_stream_url;
+    let upstream_url = nonstream_upstream_url;
     let nonstream_builder = crate::ingress_phase4::inject_trace(
         state
             .http_client
@@ -3295,6 +3508,50 @@ async fn handle_gemini_generate(
         scope.emit_error("upstream_error", Some(http_status));
         return Err(app_err);
     }
+    // Cross-protocol response re-encode: when the upstream spoke a
+    // different protocol than the Gemini client, decode the upstream body
+    // via the egress codec and re-encode it into the Gemini format so the
+    // client sees what it expects. Same-protocol → verbatim.
+    let response_body = if is_same_protocol {
+        response_body
+    } else {
+        let egress_codec = match get_egress_codec(&egress_protocol) {
+            Some(c) => c,
+            None => {
+                let app_err = AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("No egress codec found: {:?}", egress_protocol),
+                );
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("decode_error", Some(http_status));
+                return Err(app_err);
+            }
+        };
+        let ir_response = match egress_codec.decode_response(response_body) {
+            Ok(ir) => ir,
+            Err(e) => {
+                let app_err = AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Decode response error: {e}"),
+                );
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("decode_error", Some(http_status));
+                return Err(app_err);
+            }
+        };
+        match codec.encode_response(&ir_response) {
+            Ok(v) => v,
+            Err(e) => {
+                let app_err = AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Encode response error: {e}"),
+                );
+                let http_status = app_err.http_status().as_u16();
+                scope.emit_error("encode_error", Some(http_status));
+                return Err(app_err);
+            }
+        }
+    };
     let body_str_capture = serde_json::to_string(&response_body).ok();
     let mut resp = Json(response_body).into_response();
     // Forward upstream response headers to the client (denylist).
@@ -3329,7 +3586,6 @@ async fn handle_gemini_generate(
             is_stream: false,
         },
     );
-    let _ = ingress_protocol;
     let http_status = resp.status().as_u16();
     scope.emit_ok(Some(http_status));
     Ok(resp)
@@ -3521,6 +3777,48 @@ pub struct StreamCapture {
     pub max_bytes: usize,
 }
 
+/// Cross-protocol streaming re-encode plan for [`drive_upstream_stream`].
+///
+/// When the ingress entrypoint protocol differs from the egress (upstream
+/// provider) protocol, the upstream SSE bytes cannot be forwarded verbatim —
+/// the client expects its own protocol's wire format. This carries the IR
+/// hub-spoke pair: the egress protocol's [`StreamDecoder`] (parses the
+/// upstream SSE into canonical [`tiygate_core::StreamPart`]s) and the ingress
+/// protocol's [`StreamEncoder`] (re-encodes those parts into the client's
+/// native SSE frames). When `None`, the stream is forwarded verbatim (the
+/// same-protocol fast path with zero information loss).
+///
+/// [`StreamDecoder`]: tiygate_core::StreamDecoder
+/// [`StreamEncoder`]: tiygate_core::StreamEncoder
+pub struct StreamTranscode {
+    /// Egress (upstream) protocol decoder: upstream SSE → IR stream parts.
+    pub decoder: Box<dyn tiygate_core::StreamDecoder>,
+    /// Ingress (client) protocol encoder: IR stream parts → client SSE.
+    pub encoder: Box<dyn tiygate_core::StreamEncoder>,
+}
+
+/// Split a UTF-8 SSE buffer into complete lines, returning the parsed lines
+/// and any trailing partial line (no terminating `\n` yet) that must be
+/// carried over to the next chunk. SSE events are delimited by blank lines
+/// and each protocol decoder parses a single `data:` line at a time while
+/// ignoring `event:` / blank lines, so line-granular feeding is sufficient
+/// and robust to TCP packet boundaries that split a frame mid-line.
+fn split_sse_lines(buf: &str) -> (Vec<String>, String) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut remainder = String::new();
+    let mut last_end = 0usize;
+    for (idx, ch) in buf.char_indices() {
+        if ch == '\n' {
+            lines.push(buf[last_end..idx].to_string());
+            last_end = idx + 1;
+        }
+    }
+    if last_end < buf.len() {
+        remainder.push_str(&buf[last_end..]);
+    }
+    (lines, remainder)
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::let_underscore_must_use,
@@ -3543,6 +3841,7 @@ pub fn drive_upstream_stream(
     total_timeout: Duration,
     keepalive_interval: Duration,
     capture: Option<StreamCapture>,
+    transcode: Option<StreamTranscode>,
 ) -> Response {
     use async_stream::stream;
 
@@ -3563,6 +3862,14 @@ pub fn drive_upstream_stream(
     // hold the biggest terminal frame.
     let mut tail_buf: Vec<u8> = Vec::new();
     const TAIL_CAP: usize = 512;
+    // Cross-protocol transcode state. When `Some`, upstream SSE bytes are
+    // decoded into IR stream parts (egress decoder) and re-encoded into the
+    // client's protocol (ingress encoder) instead of being forwarded
+    // verbatim. `frame_buf` carries any partial trailing line across chunk
+    // boundaries so a frame split by a TCP packet boundary is parsed once
+    // complete.
+    let mut transcode = transcode;
+    let mut frame_buf = String::new();
     let idle_timeout = if idle_timeout.is_zero() {
         // 0 means "use the keepalive cadence as a no-progress signal"
         // — but to be safe we still need *some* upper bound so a hung
@@ -3620,18 +3927,63 @@ pub fn drive_upstream_stream(
                                 capture_buf.extend_from_slice(&bytes[..take]);
                             }
                             // Maintain a small rolling tail for terminal-
-                            // frame dedup on natural close.
-                            tail_buf.extend_from_slice(&bytes);
-                            if tail_buf.len() > TAIL_CAP {
-                                let cut = tail_buf.len() - TAIL_CAP;
-                                tail_buf.drain(..cut);
+                            // frame dedup on natural close. Only needed for the
+                            // verbatim path; transcode dedups on its own
+                            // re-encoded output instead.
+                            if transcode.is_none() {
+                                tail_buf.extend_from_slice(&bytes);
+                                if tail_buf.len() > TAIL_CAP {
+                                    let cut = tail_buf.len() - TAIL_CAP;
+                                    tail_buf.drain(..cut);
+                                }
                             }
-                            // Forward upstream bytes VERBATIM. The upstream
-                            // chunk is already a complete SSE frame
-                            // (`data: ...\n\n`); wrapping it in an axum
-                            // `Event` would double-prefix `data:` and
-                            // corrupt the stream. Pass the raw bytes.
-                            yield Ok(bytes);
+                            if let Some(tc) = transcode.as_mut() {
+                                // Cross-protocol mode: decode upstream SSE
+                                // into IR stream parts and re-encode into the
+                                // client's protocol. Append to the line buffer
+                                // and feed each *complete* line to the egress
+                                // decoder; the trailing partial line (if any)
+                                // is held over to the next chunk.
+                                frame_buf.push_str(&String::from_utf8_lossy(&bytes));
+                                let (lines, remainder) = split_sse_lines(&frame_buf);
+                                frame_buf = remainder;
+                                let mut out: Vec<u8> = Vec::new();
+                                for line in lines {
+                                    match tc.decoder.feed(&line) {
+                                        Ok(parts) => {
+                                            for part in &parts {
+                                                match tc.encoder.encode_part(part) {
+                                                    Ok(b) => out.extend_from_slice(&b),
+                                                    Err(e) => {
+                                                        let ef = tc.encoder.encode_error(
+                                                            &format!("transcode encode error: {e}"),
+                                                            Some("transcode_error"),
+                                                        );
+                                                        out.extend_from_slice(&ef);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let ef = tc.encoder.encode_error(
+                                                &format!("transcode decode error: {e}"),
+                                                Some("transcode_error"),
+                                            );
+                                            out.extend_from_slice(&ef);
+                                        }
+                                    }
+                                }
+                                if !out.is_empty() {
+                                    yield Ok(Bytes::from(out));
+                                }
+                            } else {
+                                // Forward upstream bytes VERBATIM. The upstream
+                                // chunk is already a complete SSE frame
+                                // (`data: ...\n\n`); wrapping it in an axum
+                                // `Event` would double-prefix `data:` and
+                                // corrupt the stream. Pass the raw bytes.
+                                yield Ok(bytes);
+                            }
                         }
                         Some(Err(_e)) => {
                             last_reason = Some(TruncationReason::UpstreamError);
@@ -3643,8 +3995,18 @@ pub fn drive_upstream_stream(
                             }
                             // Emit the protocol-native error frame so
                             // the client can tell the upstream failed,
-                            // then close. Bytes are forwarded verbatim.
-                            if !error_marker.is_empty() {
+                            // then close. In transcode mode the frame is
+                            // generated by the *ingress* encoder so the
+                            // client sees its own protocol's error shape.
+                            if let Some(tc) = transcode.as_mut() {
+                                let ef = tc.encoder.encode_error(
+                                    "upstream stream truncated by gateway",
+                                    Some("upstream_error"),
+                                );
+                                if !ef.is_empty() {
+                                    yield Ok(Bytes::from(ef));
+                                }
+                            } else if !error_marker.is_empty() {
                                 yield Ok(Bytes::from(error_marker.clone()));
                             }
                             break;
@@ -3656,13 +4018,45 @@ pub fn drive_upstream_stream(
                             if let Ok(mut a) = accum.lock() {
                                 a.mark_completed();
                             }
-                            // Only append our own end frame if the upstream
-                            // did NOT already send an identical terminal
-                            // frame (avoids the duplicate `[DONE]` the old
-                            // code produced). Bytes forwarded verbatim.
-                            if !end_marker.is_empty()
+                            if let Some(tc) = transcode.as_mut() {
+                                // Transcode mode: flush any buffered partial
+                                // line, drain decoder.finish() parts, then
+                                // emit the ingress encoder's done frame so the
+                                // client sees its own protocol terminator.
+                                let mut out: Vec<u8> = Vec::new();
+                                if !frame_buf.trim().is_empty() {
+                                    if let Ok(parts) = tc.decoder.feed(&frame_buf) {
+                                        for part in &parts {
+                                            if let Ok(b) = tc.encoder.encode_part(part) {
+                                                out.extend_from_slice(&b);
+                                            }
+                                        }
+                                    }
+                                }
+                                frame_buf.clear();
+                                if let Ok(parts) = tc.decoder.finish() {
+                                    for part in &parts {
+                                        if let Ok(b) = tc.encoder.encode_part(part) {
+                                            out.extend_from_slice(&b);
+                                        }
+                                    }
+                                }
+                                let done = tc.encoder.encode_done();
+                                if !done.is_empty()
+                                    && !tail_ends_with_marker(&out, &done)
+                                {
+                                    out.extend_from_slice(&done);
+                                }
+                                if !out.is_empty() {
+                                    yield Ok(Bytes::from(out));
+                                }
+                            } else if !end_marker.is_empty()
                                 && !tail_ends_with_marker(&tail_buf, &end_marker)
                             {
+                                // Only append our own end frame if the upstream
+                                // did NOT already send an identical terminal
+                                // frame (avoids the duplicate `[DONE]` the old
+                                // code produced). Bytes forwarded verbatim.
                                 yield Ok(Bytes::from(end_marker.clone()));
                             }
                             break;
@@ -3678,7 +4072,12 @@ pub fn drive_upstream_stream(
                     // frame and close — already-received bytes are
                     // still billable. Dedup against an upstream
                     // terminal frame just like the natural-close path.
-                    if !end_marker.is_empty()
+                    if let Some(tc) = transcode.as_mut() {
+                        let done = tc.encoder.encode_done();
+                        if !done.is_empty() {
+                            yield Ok(Bytes::from(done));
+                        }
+                    } else if !end_marker.is_empty()
                         && !tail_ends_with_marker(&tail_buf, &end_marker)
                     {
                         yield Ok(Bytes::from(end_marker.clone()));
@@ -3699,8 +4098,17 @@ pub fn drive_upstream_stream(
                     }
                     // Total budget elapsed. Emit the protocol-native
                     // error frame so the client can tell this was a
-                    // gateway-side cap, not a natural end. Verbatim bytes.
-                    if !error_marker.is_empty() {
+                    // gateway-side cap, not a natural end. In transcode
+                    // mode the frame is built by the ingress encoder.
+                    if let Some(tc) = transcode.as_mut() {
+                        let ef = tc.encoder.encode_error(
+                            "upstream stream exceeded gateway total budget",
+                            Some("upstream_timeout"),
+                        );
+                        if !ef.is_empty() {
+                            yield Ok(Bytes::from(ef));
+                        }
+                    } else if !error_marker.is_empty() {
                         yield Ok(Bytes::from(error_marker.clone()));
                     }
                     break;

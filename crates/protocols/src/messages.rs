@@ -831,9 +831,14 @@ impl StreamDecoder for MessagesStreamDecoder {
                     }
                     Some("input_json_delta") => {
                         if let Some(json) = delta["partial_json"].as_str() {
+                            // Argument fragment: emit `name: None` so
+                            // cross-protocol encoders that key on the opener
+                            // (name present) vs. fragments (name absent) route
+                            // this to their argument-delta event rather than
+                            // re-opening the tool-call block.
                             parts.push(StreamPart::ToolCallDelta {
                                 id: self.tool_use_id.clone().unwrap_or_default(),
-                                name: self.tool_use_name.clone(),
+                                name: None,
                                 arguments: json.to_string(),
                             });
                         }

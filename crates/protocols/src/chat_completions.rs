@@ -944,15 +944,42 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                 if let Some(tc_id) = tc["id"].as_str() {
                                     self.tool_call_id = Some(tc_id.to_string());
                                 }
-                                if let Some(tc_name) = tc["function"]["name"].as_str() {
-                                    self.tool_call_name = Some(tc_name.to_string());
+                                let tc_name = tc["function"]["name"].as_str().map(String::from);
+                                if tc_name.is_some() {
+                                    self.tool_call_name = tc_name.clone();
                                 }
-                                if let Some(args) = tc["function"]["arguments"].as_str() {
-                                    parts.push(StreamPart::ToolCallDelta {
-                                        id: self.tool_call_id.clone().unwrap_or_default(),
-                                        name: self.tool_call_name.clone(),
-                                        arguments: args.to_string(),
-                                    });
+                                let tc_args = tc["function"]["arguments"].as_str();
+                                // Emit the opener (name present) and argument
+                                // fragments (name absent) as DISTINCT deltas so
+                                // cross-protocol encoders that key on
+                                // `name == None` (Anthropic `input_json_delta`,
+                                // Responses `function_call_arguments.delta`)
+                                // receive the argument stream. The retained
+                                // `tool_call_name` must NOT leak onto arg-only
+                                // deltas — that suppresses the argument frames.
+                                match (tc_name, tc_args) {
+                                    (Some(n), Some(args)) => {
+                                        parts.push(StreamPart::ToolCallDelta {
+                                            id: self.tool_call_id.clone().unwrap_or_default(),
+                                            name: Some(n),
+                                            arguments: args.to_string(),
+                                        });
+                                    }
+                                    (Some(n), None) => {
+                                        parts.push(StreamPart::ToolCallDelta {
+                                            id: self.tool_call_id.clone().unwrap_or_default(),
+                                            name: Some(n),
+                                            arguments: String::new(),
+                                        });
+                                    }
+                                    (None, Some(args)) => {
+                                        parts.push(StreamPart::ToolCallDelta {
+                                            id: self.tool_call_id.clone().unwrap_or_default(),
+                                            name: None,
+                                            arguments: args.to_string(),
+                                        });
+                                    }
+                                    (None, None) => {}
                                 }
                             }
                         }

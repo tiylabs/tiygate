@@ -840,3 +840,579 @@ async fn test_streaming_appends_done_when_upstream_omits_it() {
     );
 }
 
+/// Build a test app whose ingress entrypoint is OpenAI chat-completions but
+/// whose single route targets an Anthropic Messages upstream (cross-protocol).
+fn build_chat_ingress_anthropic_egress_app(upstream_url: String, model: &str) -> axum::Router {
+    let mut routing_table = RoutingTable::new();
+    routing_table.routes.insert(
+        model.to_string(),
+        vec![tiygate_core::RoutingTarget {
+            provider_id: "anthropic".to_string(),
+            model_id: "claude-3-5-sonnet-20241022".to_string(),
+            api_base: upstream_url,
+            api_key: "sk-ant-test".to_string(),
+            api_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::AnthropicMessages,
+                "messages",
+                "2023-06-01",
+            ),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+        }],
+    );
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    ingress::router(config_store, health, &ServerConfig::default())
+}
+
+/// Build a test app whose ingress entrypoint is Anthropic Messages but whose
+/// single route targets an OpenAI chat-completions upstream (cross-protocol).
+fn build_messages_ingress_openai_egress_app(upstream_url: String, model: &str) -> axum::Router {
+    let mut routing_table = RoutingTable::new();
+    routing_table.routes.insert(
+        model.to_string(),
+        vec![tiygate_core::RoutingTarget {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o".to_string(),
+            api_base: upstream_url,
+            api_key: "sk-test".to_string(),
+            api_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+        }],
+    );
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    ingress::router(config_store, health, &ServerConfig::default())
+}
+
+#[tokio::test]
+async fn test_streaming_chat_ingress_anthropic_egress_transcodes_to_openai() {
+    // A /v1/chat/completions (stream) request routed to an Anthropic upstream
+    // must be re-encoded: the client speaks OpenAI, so the gateway must decode
+    // the Anthropic SSE and emit OpenAI `chat.completion.chunk` + `[DONE]`.
+    let mock_server = wiremock::MockServer::start().await;
+
+    // Anthropic-native upstream SSE stream.
+    let upstream_sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"content\":[]}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/messages"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(upstream_sse),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_chat_ingress_anthropic_egress_app(mock_server.uri(), "gpt-4o");
+    let body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // Client must see OpenAI wire format, not Anthropic events.
+    assert!(
+        body_str.contains("chat.completion.chunk"),
+        "expected OpenAI chunks, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("Hello") && body_str.contains(" there"),
+        "expected text deltas, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("data: [DONE]"),
+        "expected OpenAI terminator, got: {body_str}"
+    );
+    assert!(
+        !body_str.contains("event: message_start"),
+        "Anthropic event frames leaked to OpenAI client: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_messages_ingress_openai_egress_transcodes_to_anthropic() {
+    // A /v1/messages (stream) request routed to an OpenAI upstream must be
+    // re-encoded into Anthropic SSE events for the client.
+    let mock_server = wiremock::MockServer::start().await;
+
+    let upstream_sse = concat!(
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(upstream_sse),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_messages_ingress_openai_egress_app(mock_server.uri(), "claude-3-5-sonnet");
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // Client must see Anthropic wire format.
+    assert!(
+        body_str.contains("event: content_block_delta") && body_str.contains("text_delta"),
+        "expected Anthropic content_block_delta, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("Hi") && body_str.contains(" world"),
+        "expected text deltas, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("message_stop"),
+        "expected Anthropic terminator, got: {body_str}"
+    );
+    assert!(
+        !body_str.contains("chat.completion.chunk"),
+        "OpenAI chunk format leaked to Anthropic client: {body_str}"
+    );
+    assert!(
+        !body_str.contains("data: [DONE]"),
+        "OpenAI [DONE] terminator leaked to Anthropic client: {body_str}"
+    );
+}
+
+/// Build an app whose ingress is OpenAI Responses but whose route targets an
+/// OpenAI chat-completions upstream (cross-protocol).
+fn build_responses_ingress_openai_egress_app(upstream_url: String, model: &str) -> axum::Router {
+    let mut routing_table = RoutingTable::new();
+    routing_table.routes.insert(
+        model.to_string(),
+        vec![tiygate_core::RoutingTarget {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o".to_string(),
+            api_base: upstream_url,
+            api_key: "sk-test".to_string(),
+            api_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+        }],
+    );
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    ingress::router(config_store, health, &ServerConfig::default())
+}
+
+/// Build an app whose ingress is Google Gemini but whose route targets an
+/// OpenAI chat-completions upstream (cross-protocol).
+fn build_gemini_ingress_openai_egress_app(upstream_url: String, model: &str) -> axum::Router {
+    let mut routing_table = RoutingTable::new();
+    routing_table.routes.insert(
+        model.to_string(),
+        vec![tiygate_core::RoutingTarget {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o".to_string(),
+            api_base: upstream_url,
+            api_key: "sk-test".to_string(),
+            api_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+        }],
+    );
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    ingress::router(config_store, health, &ServerConfig::default())
+}
+
+#[tokio::test]
+async fn test_streaming_responses_ingress_openai_egress_transcodes_to_responses() {
+    // A /v1/responses (stream) request routed to an OpenAI chat-completions
+    // upstream must be re-encoded into Responses SSE events for the client.
+    let mock_server = wiremock::MockServer::start().await;
+    let upstream_sse = concat!(
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(upstream_sse),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_responses_ingress_openai_egress_app(mock_server.uri(), "gpt-4o");
+    let body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "input": "Hi"
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // Client must see Responses wire format, not OpenAI chunks.
+    assert!(
+        body_str.contains("response.output_text.delta"),
+        "expected Responses text delta events, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("Hi") && body_str.contains(" there"),
+        "expected text deltas, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("data: [DONE]"),
+        "expected Responses terminator, got: {body_str}"
+    );
+    assert!(
+        !body_str.contains("chat.completion.chunk"),
+        "OpenAI chunk format leaked to Responses client: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_nonstream_responses_ingress_openai_egress_transcodes_to_responses() {
+    // Non-streaming /v1/responses routed to an OpenAI upstream: the OpenAI
+    // chat.completion body must be re-encoded into a Responses object.
+    let mock_server = wiremock::MockServer::start().await;
+    let upstream_body = json!({
+        "id": "chatcmpl_xyz",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Hello from OpenAI"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    });
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(upstream_body))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_responses_ingress_openai_egress_app(mock_server.uri(), "gpt-4o");
+    let body = json!({"model": "gpt-4o", "input": "Hi"});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    // The client must see a Responses object, not a chat.completion.
+    assert_eq!(v["object"], "response", "expected Responses object: {v}");
+    let text = serde_json::to_string(&v).unwrap();
+    assert!(
+        text.contains("Hello from OpenAI"),
+        "expected re-encoded text in Responses body: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_gemini_ingress_openai_egress_transcodes_to_gemini() {
+    // A Gemini generateContent (stream) request routed to an OpenAI upstream
+    // must be re-encoded into Gemini SSE chunks for the client.
+    let mock_server = wiremock::MockServer::start().await;
+    let upstream_sse = concat!(
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(upstream_sse),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_gemini_ingress_openai_egress_app(mock_server.uri(), "gemini-pro");
+    let body = json!({
+        "_stream": true,
+        "contents": [{"role": "user", "parts": [{"text": "Hi"}]}]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1beta/models/gemini-pro/generateContent")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // Client must see Gemini wire format (candidates/parts), not OpenAI chunks.
+    assert!(
+        body_str.contains("candidates") && body_str.contains("\"text\""),
+        "expected Gemini candidates/parts, got: {body_str}"
+    );
+    assert!(
+        body_str.contains("Hi") && body_str.contains(" world"),
+        "expected text deltas, got: {body_str}"
+    );
+    assert!(
+        !body_str.contains("chat.completion.chunk"),
+        "OpenAI chunk format leaked to Gemini client: {body_str}"
+    );
+    assert!(
+        !body_str.contains("data: [DONE]"),
+        "OpenAI [DONE] terminator leaked to Gemini client: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_nonstream_gemini_ingress_openai_egress_transcodes_to_gemini() {
+    // Non-streaming Gemini generateContent routed to an OpenAI upstream: the
+    // OpenAI body must be re-encoded into a Gemini generateContent response.
+    let mock_server = wiremock::MockServer::start().await;
+    let upstream_body = json!({
+        "id": "chatcmpl_xyz",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Hello from OpenAI"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    });
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(upstream_body))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_gemini_ingress_openai_egress_app(mock_server.uri(), "gemini-pro");
+    let body = json!({
+        "contents": [{"role": "user", "parts": [{"text": "Hi"}]}]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1beta/models/gemini-pro/generateContent")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    // The client must see a Gemini object (candidates[].content.parts).
+    let text = serde_json::to_string(&v).unwrap();
+    assert!(
+        v["candidates"].is_array(),
+        "expected Gemini candidates array: {text}"
+    );
+    assert!(
+        text.contains("Hello from OpenAI"),
+        "expected re-encoded text in Gemini body: {text}"
+    );
+}
+
+/// Build a same-protocol Responses app (Responses ingress → Responses upstream).
+fn build_responses_same_protocol_app(upstream_url: String, model: &str) -> axum::Router {
+    let mut routing_table = RoutingTable::new();
+    routing_table.routes.insert(
+        model.to_string(),
+        vec![tiygate_core::RoutingTarget {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o".to_string(),
+            api_base: upstream_url,
+            api_key: "sk-test".to_string(),
+            api_protocol: ProtocolEndpoint::new(ProtocolSuite::OpenAiResponses, "responses", "v1"),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+        }],
+    );
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    ingress::router(config_store, health, &ServerConfig::default())
+}
+
+/// Build a same-protocol Gemini app (Gemini ingress → Gemini upstream).
+fn build_gemini_same_protocol_app(upstream_url: String, model: &str) -> axum::Router {
+    let mut routing_table = RoutingTable::new();
+    routing_table.routes.insert(
+        model.to_string(),
+        vec![tiygate_core::RoutingTarget {
+            provider_id: "google".to_string(),
+            model_id: "gemini-pro".to_string(),
+            api_base: upstream_url,
+            api_key: "sk-gemini".to_string(),
+            api_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::GoogleGemini,
+                "generateContent",
+                "v1beta",
+            ),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+        }],
+    );
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    ingress::router(config_store, health, &ServerConfig::default())
+}
+
+#[tokio::test]
+async fn test_nonstream_responses_same_protocol_passthrough() {
+    // Same-protocol Responses→Responses: the upstream body is forwarded
+    // verbatim (no cross-protocol re-encode) after the refactor.
+    let mock_server = wiremock::MockServer::start().await;
+    let upstream_body = json!({
+        "id": "resp_abc",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Same protocol ok"}]
+        }]
+    });
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/responses"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(upstream_body))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_responses_same_protocol_app(mock_server.uri(), "gpt-4o");
+    let body = json!({"model": "gpt-4o", "input": "Hi"});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(v["id"], "resp_abc", "same-protocol body should pass through: {v}");
+    assert!(serde_json::to_string(&v).unwrap().contains("Same protocol ok"));
+}
+
+#[tokio::test]
+async fn test_nonstream_gemini_same_protocol_passthrough() {
+    // Same-protocol Gemini→Gemini: the upstream body is forwarded verbatim.
+    let mock_server = wiremock::MockServer::start().await;
+    let upstream_body = json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": [{"text": "Gemini same protocol"}]},
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3, "totalTokenCount": 5}
+    });
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1beta/models/gemini-pro:generateContent"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(upstream_body))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_gemini_same_protocol_app(mock_server.uri(), "gemini-pro");
+    let body = json!({"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1beta/models/gemini-pro/generateContent")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(v["candidates"].is_array(), "same-protocol Gemini body should pass through: {v}");
+    assert!(serde_json::to_string(&v).unwrap().contains("Gemini same protocol"));
+}
+
+
+
