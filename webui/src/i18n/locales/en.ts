@@ -283,6 +283,13 @@ const en = {
     empty: "No audit entries yet.",
     viewDetails: "View details",
     detailsTitle: "Audit details",
+    snapshot: "Snapshot",
+    changes: "Changes",
+    fieldName: "Field",
+    before: "Before",
+    after: "After",
+    noChanges: "No field changes recorded.",
+    rawDetails: "Raw details",
   },
   integration: {
     title: "Integration Guide",

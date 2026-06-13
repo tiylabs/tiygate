@@ -280,6 +280,13 @@ const zh: Translation = {
     empty: "暂无审计记录。",
     viewDetails: "查看详情",
     detailsTitle: "审计详情",
+    snapshot: "快照",
+    changes: "变更",
+    fieldName: "字段",
+    before: "变更前",
+    after: "变更后",
+    noChanges: "未记录字段变更。",
+    rawDetails: "原始详情",
   },
   integration: {
     title: "接入指引",

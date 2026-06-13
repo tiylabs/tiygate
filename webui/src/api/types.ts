@@ -109,6 +109,17 @@ export interface StatsResponse {
   buckets: StatBucket[];
 }
 
+export interface AuditChange {
+  field: string;
+  before: unknown;
+  after: unknown;
+}
+
+export interface AuditDetails {
+  snapshot?: Record<string, unknown>;
+  changes?: AuditChange[];
+}
+
 export interface AuditEntry {
   id: number;
   actor: string;
