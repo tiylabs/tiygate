@@ -19,7 +19,7 @@ use std::collections::HashSet;
 /// - credentials the client uses against the *gateway* (must never
 ///   leak to the provider, and the gateway injects its own):
 ///   `authorization`, `proxy-authorization`, `x-api-key`,
-///   `anthropic-version`, `cookie`
+///   `x-goog-api-key`, `anthropic-version`, `cookie`
 /// - headers the gateway recomputes because it rewrites the body or
 ///   controls the connection: `host`, `content-length`,
 ///   `content-type`, `content-encoding`, `accept-encoding`, `expect`
@@ -32,6 +32,7 @@ const DEFAULT_REQUEST_DENY: &[&str] = &[
     "authorization",
     "proxy-authorization",
     "x-api-key",
+    "x-goog-api-key",
     "anthropic-version",
     "cookie",
     "host",

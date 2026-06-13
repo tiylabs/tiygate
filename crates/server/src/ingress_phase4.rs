@@ -140,7 +140,13 @@ pub async fn resolve_api_key(state: &AppState, headers: &axum::http::HeaderMap) 
 }
 
 /// Pull the cleartext credential out of the inbound headers.
-/// Recognises `Authorization: Bearer …` and `x-api-key: …`.
+/// Recognises `Authorization: Bearer …`, `x-api-key: …`, and the
+/// Google Gemini-native `x-goog-api-key: …` header. Gemini SDKs
+/// (and curl users following the official docs) send the key in
+/// the `x-goog-api-key` header rather than `Authorization: Bearer`,
+/// so without this branch every `…/v1beta/models/…:generateContent`
+/// request would be treated as anonymous and the upstream would
+/// reject the rewritten `x-goog-api-key: ` header with 403.
 ///
 /// Returns `Some(secret)` when the header is well-formed and
 /// non-empty. Returns `None` when no credential is present (the
@@ -164,6 +170,15 @@ fn extract_credential(headers: &axum::http::HeaderMap) -> Option<String> {
     }
     if let Some(v) = headers
         .get(http::header::HeaderName::from_static("x-api-key"))
+        .and_then(|v| v.to_str().ok())
+    {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(v) = headers
+        .get(http::header::HeaderName::from_static("x-goog-api-key"))
         .and_then(|v| v.to_str().ok())
     {
         let trimmed = v.trim();
@@ -985,6 +1000,63 @@ mod api_key_resolution_tests {
     #[test]
     fn extract_missing_credential_returns_none() {
         let h = HeaderMap::new();
+        assert_eq!(extract_credential(&h), None);
+    }
+
+    /// Google Gemini's official auth header is `x-goog-api-key`. A
+    /// client that follows the Google AI for Developers docs (e.g.
+    /// the official `google-generative-ai` SDK or a hand-rolled
+    /// `curl`) sends the key in this header rather than
+    /// `Authorization: Bearer …`. Without this branch the
+    /// `…/v1beta/models/…:generateContent` path would treat every
+    /// such request as anonymous and the upstream would reject the
+    /// empty `x-goog-api-key` header with 403.
+    #[test]
+    fn extract_x_goog_api_key() {
+        let h = headers_from(&[("x-goog-api-key", "AIza-from-curl")]);
+        assert_eq!(extract_credential(&h).as_deref(), Some("AIza-from-curl"));
+    }
+
+    /// `x-goog-api-key` is case-insensitive (HTTP headers are).
+    /// The header-name parser preserves the canonical lower-case
+    /// form, but a client that sends `X-Goog-Api-Key` should still
+    /// be recognised.
+    #[test]
+    fn extract_x_goog_api_key_canonical() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static("x-goog-api-key"),
+            HeaderValue::from_static("AIza-456"),
+        );
+        assert_eq!(extract_credential(&h).as_deref(), Some("AIza-456"));
+    }
+
+    /// When a client sends `Authorization: Bearer …` AND
+    /// `x-goog-api-key: …` (a common pattern with mixed SDK
+    /// interop), the Authorization header still wins, mirroring
+    /// the existing `Authorization` vs `x-api-key` priority. The
+    /// resolved secret is used solely to authenticate the caller
+    /// against TiyGate's `api_keys` table (quota, audit); the
+    /// upstream provider always authenticates with the key
+    /// configured on the routing target — the client-supplied
+    /// value is **never** forwarded to the upstream.
+    #[test]
+    fn extract_prefers_authorization_over_x_goog_api_key() {
+        let h = headers_from(&[
+            ("authorization", "Bearer sk-priority"),
+            ("x-goog-api-key", "AIza-fallback"),
+        ]);
+        assert_eq!(
+            extract_credential(&h).as_deref(),
+            Some("sk-priority")
+        );
+    }
+
+    /// Empty `x-goog-api-key` (e.g. from a misconfigured SDK) must
+    /// be ignored, not treated as the literal empty string.
+    #[test]
+    fn extract_empty_x_goog_api_key_returns_none() {
+        let h = headers_from(&[("x-goog-api-key", "   ")]);
         assert_eq!(extract_credential(&h), None);
     }
 }

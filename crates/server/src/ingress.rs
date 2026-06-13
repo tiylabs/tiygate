@@ -352,6 +352,17 @@ pub fn compute_pass_through<C: tiygate_core::EndpointCodec>(
 /// invoke its `AuthApplier::apply` to populate the upstream headers.
 /// Falls back to a protocol-aware default applier if no registered
 /// provider is found (e.g., test fixtures).
+///
+/// The client-supplied credential (`Authorization: Bearer …` /
+/// `x-api-key: …` / `x-goog-api-key: …`) is **only** used to
+/// authenticate the caller against TiyGate's own `api_keys` table
+/// (for quota enforcement, audit, and per-key rate limiting). It is
+/// **not** forwarded to the upstream provider — the upstream
+/// always authenticates with the key configured on the routing
+/// target (`target.effective_api_key()`). Mixing the two would let
+/// a caller substitute a different upstream key than the one
+/// TiyGate routes traffic to, breaking per-account model routing
+/// and the audit trail.
 pub async fn apply_provider_auth(
     target: &tiygate_core::RoutingTarget,
     upstream_headers: &mut http::HeaderMap,
@@ -375,6 +386,10 @@ pub async fn apply_provider_auth(
     //     official endpoint; the URL builders do not append it by default
     //     because the header is the recommended form.)
     //   - Everything else: `Authorization: Bearer <KEY>`.
+    //
+    // In all three cases the key written to the upstream is the
+    // routing target's `effective_api_key()` — the static key
+    // configured on the target row, never the caller's credential.
     use tiygate_core::ProtocolSuite;
     if matches!(target.api_protocol.suite, ProtocolSuite::AnthropicMessages) {
         let api_key = target.effective_api_key();
@@ -390,14 +405,22 @@ pub async fn apply_provider_auth(
             http::HeaderValue::from_static("2023-06-01"),
         );
     } else if matches!(target.api_protocol.suite, ProtocolSuite::GoogleGemini) {
-        tiygate_providers::gemini::apply_gemini_default_auth(target, upstream_headers).map_err(
-            |e| {
-                AppError::new(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Invalid x-goog-api-key header value: {e}"),
-                )
-            },
-        )?;
+        // The registered-provider branch above runs first; this
+        // fallback only fires when the routing target has no
+        // provider registered. We re-use the upstream `effective_api_key()`
+        // — the static key configured on the target row — and
+        // write it as `x-goog-api-key`.
+        let api_key = target.effective_api_key();
+        let hv = http::HeaderValue::from_str(api_key).map_err(|e| {
+            AppError::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid x-goog-api-key header value: {e}"),
+            )
+        })?;
+        upstream_headers.insert(
+            http::HeaderName::from_static(tiygate_providers::gemini::GEMINI_API_KEY_HEADER),
+            hv,
+        );
     } else {
         let api_key = target.effective_api_key();
         let hv = http::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
