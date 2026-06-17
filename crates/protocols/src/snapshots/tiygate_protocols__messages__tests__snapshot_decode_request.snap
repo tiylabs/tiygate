@@ -1,0 +1,39 @@
+---
+source: crates/protocols/src/messages.rs
+expression: ir
+---
+IrRequest {
+    model: "claude-sonnet-4-20250514",
+    system: None,
+    messages: [
+        Message {
+            role: User,
+            content: [
+                Text {
+                    text: "Hello",
+                },
+            ],
+        },
+    ],
+    tools: [],
+    params: GenerationParams {
+        max_tokens: Some(
+            100,
+        ),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop: [],
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+    },
+    response_format: None,
+    stream: false,
+    ingress_protocol: ProtocolEndpoint {
+        suite: AnthropicMessages,
+        name: "messages",
+        version: "2023-06-01",
+    },
+    extensions: {},
+}

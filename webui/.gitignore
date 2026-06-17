@@ -1,0 +1,11 @@
+node_modules
+dist
+.vite
+*.local
+.DS_Store
+
+# TypeScript incremental build cache. The tsc -b run in `npm run
+# build` emits these next to each tsconfig; we never want them in
+# the repo, and the `git add webui/` form below can otherwise pick
+# them up.
+*.tsbuildinfo

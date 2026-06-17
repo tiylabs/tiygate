@@ -1,0 +1,2058 @@
+//! OpenAI Responses API protocol codec.
+//! Implements bidirectional conversion for OpenAI's Responses API.
+
+use http::HeaderMap;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use tiygate_core::{
+    Content, EndpointCapabilities, EndpointCodec, FinishReason, IrRequest, IrResponse, Message,
+    ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder, StreamPart,
+    Tool, Usage,
+};
+
+pub struct ResponsesCodec {
+    id: ProtocolEndpoint,
+    capabilities: EndpointCapabilities,
+}
+
+impl Default for ResponsesCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn responses_call_id(item: &Value) -> Option<&str> {
+    item["call_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| item["id"].as_str().filter(|s| !s.is_empty()))
+}
+
+fn unique_responses_call_id(
+    raw_id: &str,
+    occurrence: usize,
+    used_ids: &mut HashSet<String>,
+) -> String {
+    let base = if raw_id.is_empty() {
+        format!("call_tiygate_{occurrence}")
+    } else if occurrence == 0 {
+        raw_id.to_string()
+    } else {
+        format!("{raw_id}_{occurrence}")
+    };
+
+    let mut candidate = base.clone();
+    let mut collision = 1usize;
+    while used_ids.contains(&candidate) {
+        candidate = format!("{base}_{collision}");
+        collision += 1;
+    }
+    used_ids.insert(candidate.clone());
+    candidate
+}
+
+fn responses_function_call_output(tool_call_id: &str, content: &str) -> Value {
+    json!({"type": "function_call_output", "call_id": tool_call_id, "output": content})
+}
+
+impl ResponsesCodec {
+    pub fn new() -> Self {
+        Self {
+            id: ProtocolEndpoint::new(ProtocolSuite::OpenAiResponses, "responses", "v1"),
+            capabilities: EndpointCapabilities {
+                streaming: true,
+                tools: true,
+                reasoning: true,
+                embeddings: false,
+                force_upstream_stream: false,
+                override_model_in_body: false,
+                ingress_routes: &[("POST", "/v1/responses")],
+                multimodal: true,
+                structured_output: true,
+                function_calling: true,
+                parallel_tool_calls: true,
+                extended_reasoning: true,
+                deterministic_seed: false,
+                tool_choice_required: true,
+                stream: tiygate_core::StreamCaps {
+                    server_sent_events: true,
+                    usage_in_stream: true,
+                    requires_stream_flag: true,
+                },
+                unknown_field_policy: tiygate_core::protocol::UnknownFieldPolicy::Drop,
+                lossy_default_reject: true,
+            },
+        }
+    }
+}
+
+impl EndpointCodec for ResponsesCodec {
+    fn id(&self) -> &ProtocolEndpoint {
+        &self.id
+    }
+    fn capabilities(&self) -> &EndpointCapabilities {
+        &self.capabilities
+    }
+
+    fn decode_request(
+        &self,
+        body: Value,
+        _env: &RawEnvelope,
+    ) -> Result<IrRequest, tiygate_core::Error> {
+        let model = body["model"].as_str().unwrap_or("unknown").to_string();
+        let stream = body["stream"].as_bool().unwrap_or(false);
+        let system = body["instructions"].as_str().map(String::from);
+        let mut messages: Vec<Message> = Vec::new();
+
+        if let Some(arr) = body["input"].as_array() {
+            let mut call_id_counts: HashMap<String, usize> = HashMap::new();
+            let mut call_id_remap: HashMap<String, VecDeque<String>> = HashMap::new();
+            let mut used_call_ids: HashSet<String> = HashSet::new();
+
+            for item in arr {
+                // Responses typed items (function_call, function_call_output,
+                // reasoning) do NOT carry a `role` field — their semantic role
+                // is implied by the item type. Determine role from `type` first
+                // so these items map to the correct IR roles for cross-protocol
+                // conversion (e.g. function_call → Assistant, which Anthropic
+                // requires for tool_use blocks).
+                let role = match item["type"].as_str() {
+                    Some("function_call") | Some("reasoning") => Role::Assistant,
+                    Some("function_call_output") => Role::Tool,
+                    _ => match item["role"].as_str().unwrap_or("user") {
+                        "system" | "developer" => Role::System,
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "tool" => Role::Tool,
+                        _ => Role::User,
+                    },
+                };
+                let content = if let Some(text) = item["content"].as_str() {
+                    vec![Content::Text {
+                        text: text.to_string(),
+                    }]
+                } else if let Some(content_arr) = item["content"].as_array() {
+                    let mut parts = Vec::new();
+                    for part in content_arr {
+                        match part["type"].as_str() {
+                            Some("input_text") | Some("output_text") => {
+                                parts.push(Content::Text {
+                                    text: part["text"].as_str().unwrap_or("").to_string(),
+                                });
+                            }
+                            Some("input_image") => {
+                                if let Some(raw_url) = part["image_url"].as_str() {
+                                    let (source, mime_type) =
+                                        tiygate_core::ir::MediaSource::from_data_url(
+                                            raw_url, "image/*",
+                                        );
+                                    parts.push(Content::Media {
+                                        source,
+                                        mime_type,
+                                        metadata: Default::default(),
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    parts
+                } else if item["type"] == "function_call" {
+                    // Responses uses `call_id`; fall back to `id` for proxies
+                    // that only emit the item id. Some clients emit duplicated
+                    // ids (including `call_e3b0...`, a hash of empty input).
+                    // Downstream protocols such as Anthropic require unique
+                    // `tool_use.id` values, so normalize duplicates while
+                    // recording an occurrence-ordered remap for following
+                    // `function_call_output` items.
+                    let raw_id = responses_call_id(item).unwrap_or("");
+                    let occurrence = call_id_counts.entry(raw_id.to_string()).or_insert(0);
+                    let id = unique_responses_call_id(raw_id, *occurrence, &mut used_call_ids);
+                    *occurrence += 1;
+                    call_id_remap
+                        .entry(raw_id.to_string())
+                        .or_default()
+                        .push_back(id.clone());
+
+                    vec![Content::ToolCall {
+                        id,
+                        name: item["name"].as_str().unwrap_or("").to_string(),
+                        arguments: serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
+                            .unwrap_or(json!({})),
+                    }]
+                } else if item["type"] == "function_call_output" {
+                    // `output` is usually a string but some clients send a
+                    // structured object/array; serialize non-string outputs so
+                    // the tool result content is not silently dropped.
+                    let output = match &item["output"] {
+                        Value::String(s) => s.clone(),
+                        Value::Null => String::new(),
+                        other => serde_json::to_string(other).unwrap_or_default(),
+                    };
+                    let raw_id = responses_call_id(item).unwrap_or("");
+                    let tool_call_id = call_id_remap
+                        .get_mut(raw_id)
+                        .and_then(VecDeque::pop_front)
+                        .unwrap_or_else(|| raw_id.to_string());
+                    vec![Content::ToolResult {
+                        tool_call_id,
+                        name: String::new(),
+                        content: output,
+                    }]
+                } else if item["type"] == "reasoning" {
+                    // Reasoning input item (replayed assistant chain-of-thought).
+                    // Pull the text out of the `summary` array (or a plain
+                    // `text` field) so the thinking survives a round-trip.
+                    let text = item["summary"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|s| s["text"].as_str())
+                                .collect::<Vec<_>>()
+                                .join("")
+                        })
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| item["text"].as_str().map(String::from))
+                        .unwrap_or_default();
+                    vec![Content::Reasoning {
+                        text,
+                        signature: None,
+                        id: item["id"].as_str().map(|s| s.to_string()),
+                    }]
+                } else {
+                    vec![Content::Text {
+                        text: String::new(),
+                    }]
+                };
+                // Merge consecutive items with the same role into one Message
+                // so that e.g. a reasoning item followed by function_call items
+                // end up in the same IR assistant turn. This is critical for
+                // cross-protocol conversion: the Chat Completions encoder gates
+                // reasoning_content on the presence of tool_calls *within the
+                // same message*, so splitting them would silently drop reasoning.
+                if let Some(last) = messages.last_mut() {
+                    if last.role == role {
+                        last.content.extend(content);
+                    } else {
+                        messages.push(Message { role, content });
+                    }
+                } else {
+                    messages.push(Message { role, content });
+                }
+            }
+        }
+
+        let tools: Vec<Tool> = body["tools"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| Tool {
+                        name: t["name"].as_str().unwrap_or("").to_string(),
+                        description: t["description"].as_str().map(String::from),
+                        parameters: t["parameters"].as_object().map(|p| json!(p)),
+                        required: false,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let params = tiygate_core::GenerationParams {
+            max_tokens: body["max_output_tokens"].as_u64().map(|v| v as u32),
+            temperature: body["temperature"].as_f64().map(|v| v as f32),
+            top_p: body["top_p"].as_f64().map(|v| v as f32),
+            stop: body["stop"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+
+        // Preserve protocol-specific fields in extensions for round-trip fidelity:
+        // - tool_choice: "auto" | "required" | {"type":"function","name":"x"}
+        // - text.format: structured output configuration
+        // - reasoning.effort: reasoning depth control
+        let mut extensions = std::collections::HashMap::new();
+        if let Some(tc) = body.get("tool_choice") {
+            extensions.insert("tool_choice".to_string(), tc.clone());
+        }
+        if let Some(tf) = body.get("text") {
+            extensions.insert("text".to_string(), tf.clone());
+        }
+        if let Some(re) = body.get("reasoning") {
+            if let Some(effort) = re.get("effort").and_then(|v| v.as_str()) {
+                extensions.insert("reasoning_effort".to_string(), json!(effort));
+            }
+        }
+
+        // Preserve Responses-specific top-level fields the IR does not model so
+        // a same-protocol re-encode is lossless. Stored under a prefixed key.
+        {
+            let mut extra = serde_json::Map::new();
+            for key in [
+                "metadata",
+                "previous_response_id",
+                "store",
+                "parallel_tool_calls",
+                "service_tier",
+                "user",
+                "truncation",
+                "include",
+                "prompt_cache_key",
+                "prompt_cache_retention",
+            ] {
+                if let Some(v) = body.get(key) {
+                    extra.insert(key.to_string(), v.clone());
+                }
+            }
+            if !extra.is_empty() {
+                extensions.insert("responses_extra".to_string(), json!(extra));
+            }
+        }
+
+        Ok(IrRequest {
+            model,
+            system,
+            messages,
+            tools,
+            params,
+            response_format: None,
+            stream,
+            ingress_protocol: self.id.clone(),
+            extensions,
+        })
+    }
+
+    fn encode_response(&self, ir: &IrResponse) -> Result<Value, tiygate_core::Error> {
+        let mut response = json!({"object": "response", "model": ""});
+        if let Some(id) = &ir.response_id {
+            response["id"] = json!(id);
+        }
+        let mut output_items = Vec::new();
+        let mut message_text = String::new();
+        let mut tool_calls = Vec::new();
+        for c in &ir.content {
+            match c {
+                Content::Text { text } => {
+                    message_text.push_str(text);
+                }
+                Content::Reasoning { text, id, .. } => {
+                    let mut item = json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": text}]});
+                    if let Some(rid) = id {
+                        item["id"] = json!(rid);
+                    }
+                    output_items.push(item);
+                }
+                Content::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    tool_calls.push(json!({"call_id": id, "type": "function_call", "name": name, "arguments": serde_json::to_string(arguments).unwrap_or_default(), "status": "completed"}));
+                }
+                _ => {}
+            }
+        }
+        if !message_text.is_empty() {
+            output_items.push(json!({"id": ir.response_id.as_deref().unwrap_or("msg_0"), "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": message_text}]}));
+        }
+        for tc in &tool_calls {
+            output_items.push(tc.clone());
+        }
+        response["output"] = json!(output_items);
+        if let Some(fr) = &ir.finish_reason {
+            response["status"] = json!(match fr {
+                FinishReason::Stop => "completed",
+                FinishReason::Length => "incomplete",
+                FinishReason::ContentFilter => "incomplete",
+                FinishReason::ToolCalls => "incomplete",
+                _ => "completed",
+            });
+        }
+        if let Some(usage) = &ir.usage {
+            // OpenAI Responses 规范：input_tokens 必须含 cache 命中，所以从其他协议流入时
+            // codec 内部把 cache_* 累加进 input_tokens
+            let cache_read = usage.cache_read_tokens.unwrap_or(0);
+            let cache_write = usage.cache_write_tokens.unwrap_or(0);
+            let prompt_for_responses = usage.prompt_tokens + cache_read + cache_write;
+            let total_for_responses = prompt_for_responses + usage.completion_tokens;
+            response["usage"] = json!({
+                "input_tokens": prompt_for_responses,
+                "output_tokens": usage.completion_tokens,
+                "total_tokens": total_for_responses,
+            });
+            if cache_read > 0 {
+                response["usage"]["input_tokens_details"] = json!({"cached_tokens": cache_read});
+            }
+            if let Some(rt) = usage.reasoning_tokens {
+                response["usage"]["output_tokens_details"] = json!({"reasoning_tokens": rt});
+            }
+        }
+        Ok(response)
+    }
+
+    fn stream_encoder(&self) -> Box<dyn StreamEncoder> {
+        Box::new(ResponsesStreamEncoder::new())
+    }
+    fn stream_decoder(&self) -> Box<dyn StreamDecoder> {
+        Box::new(ResponsesStreamDecoder::new())
+    }
+
+    fn encode_request(&self, ir: &IrRequest) -> Result<(Value, HeaderMap), tiygate_core::Error> {
+        let mut body = json!({"model": ir.model, "stream": ir.stream});
+        if let Some(sys) = &ir.system {
+            body["instructions"] = json!(sys);
+        }
+        let mut input_items = Vec::new();
+        for msg in &ir.messages {
+            match msg.role {
+                Role::System => {
+                    for c in &msg.content {
+                        if let Content::Text { text } = c {
+                            let existing = body["instructions"].as_str().unwrap_or("");
+                            body["instructions"] = json!(format!("{existing}\n{text}"));
+                        }
+                    }
+                }
+                Role::User | Role::Assistant => {
+                    let role_str = match msg.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        _ => "user",
+                    };
+                    let mut text_parts: Vec<Value> = Vec::new();
+                    let mut reasoning_items: Vec<Value> = Vec::new();
+                    let mut tool_calls_json: Vec<Value> = Vec::new();
+                    let mut tool_outputs_json: Vec<Value> = Vec::new();
+
+                    for c in &msg.content {
+                        match c {
+                            Content::Text { text } => {
+                                text_parts.push(json!({"type": "input_text", "text": text}));
+                            }
+                            Content::Media {
+                                source, mime_type, ..
+                            } => match source {
+                                tiygate_core::ir::MediaSource::Url { url } => {
+                                    text_parts
+                                        .push(json!({"type": "input_image", "image_url": url}));
+                                }
+                                tiygate_core::ir::MediaSource::Inline { data } => {
+                                    text_parts.push(json!({
+                                        "type": "input_image",
+                                        "image_url": format!("data:{};base64,{}", mime_type, data)
+                                    }));
+                                }
+                                _ => {}
+                            },
+                            Content::Reasoning { text, id, .. } => {
+                                // Responses API treats reasoning as a sibling
+                                // output/input item, NOT as a content sub-part
+                                // of the message. The OpenAI Responses spec
+                                // (and the Deepseek thinking-mode spec it
+                                // mirrors) requires that the reasoning item be
+                                // echoed back alongside any function_call
+                                // item the same turn produced — otherwise
+                                // the request is rejected.
+                                //
+                                // Each reasoning block is emitted as its own
+                                // item so a Responses-issued `id` (`rs_...`)
+                                // can be replayed verbatim. The Responses API
+                                // pairs each reasoning item with the following
+                                // item by id; replaying the original id keeps
+                                // same-protocol multi-turn from 400ing with
+                                // "Item provided without its required preceding
+                                // item of type reasoning". Cross-protocol
+                                // reasoning has no Responses id (id == None),
+                                // so we emit it idless rather than fabricate
+                                // one.
+                                let mut item = json!({
+                                    "type": "reasoning",
+                                    "summary": [{"type": "summary_text", "text": text}],
+                                });
+                                if let Some(rid) = id {
+                                    item["id"] = json!(rid);
+                                }
+                                reasoning_items.push(item);
+                            }
+                            Content::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            } => {
+                                let args_str = match arguments {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                tool_calls_json.push(json!({
+                                    "type": "function_call",
+                                    "call_id": id,
+                                    "name": name,
+                                    "arguments": args_str,
+                                }));
+                            }
+                            Content::ToolResult {
+                                tool_call_id,
+                                name: _,
+                                content,
+                            } => {
+                                // Cross-protocol Anthropic Messages carries
+                                // `tool_result` blocks inside a user message,
+                                // while Responses requires a sibling
+                                // `function_call_output` input item. Preserve
+                                // them regardless of the IR message role so
+                                // prior function calls have matching outputs.
+                                tool_outputs_json
+                                    .push(responses_function_call_output(tool_call_id, content));
+                            }
+                        }
+                    }
+
+                    for item in reasoning_items {
+                        input_items.push(item);
+                    }
+
+                    for tc in tool_calls_json {
+                        input_items.push(tc);
+                    }
+
+                    // Only emit a message item if there is text/image content.
+                    // A turn that is purely reasoning + function_call (the
+                    // shape Responses actually returns) is fully represented
+                    // by the items above.
+                    if !text_parts.is_empty() {
+                        let mut item = json!({"role": role_str});
+                        if text_parts.len() == 1
+                            && text_parts[0]
+                                .get("type")
+                                .map(|v| v == "input_text")
+                                .unwrap_or(false)
+                        {
+                            item["content"] = text_parts[0]["text"].clone();
+                        } else {
+                            item["content"] = json!(text_parts);
+                        }
+                        input_items.push(item);
+                    }
+
+                    for output in tool_outputs_json {
+                        input_items.push(output);
+                    }
+                }
+                Role::Tool => {
+                    for c in &msg.content {
+                        if let Content::ToolResult {
+                            tool_call_id,
+                            name: _,
+                            content,
+                        } = c
+                        {
+                            input_items.push(responses_function_call_output(tool_call_id, content));
+                        }
+                    }
+                }
+            }
+        }
+        body["input"] = json!(input_items);
+        if !ir.tools.is_empty() {
+            let tools: Vec<Value> = ir.tools.iter().map(|t| json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.parameters})).collect();
+            body["tools"] = json!(tools);
+        }
+        if let Some(mt) = ir.params.max_tokens {
+            body["max_output_tokens"] = json!(mt);
+        }
+        if let Some(t) = ir.params.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(p) = ir.params.top_p {
+            body["top_p"] = json!(p);
+        }
+        if !ir.params.stop.is_empty() {
+            body["stop"] = json!(ir.params.stop);
+        }
+
+        // Replay modeled Responses extensions captured at decode time.
+        if let Some(tc) = ir.extensions.get("tool_choice") {
+            body["tool_choice"] = tc.clone();
+        }
+        if let Some(tf) = ir.extensions.get("text") {
+            body["text"] = tf.clone();
+        }
+        if let Some(effort) = ir
+            .extensions
+            .get("reasoning_effort")
+            .and_then(|v| v.as_str())
+        {
+            body["reasoning"] = json!({"effort": effort});
+        }
+        // Replay Responses-specific top-level passthrough fields.
+        if let Some(extra) = ir
+            .extensions
+            .get("responses_extra")
+            .and_then(|v| v.as_object())
+        {
+            for (k, v) in extra {
+                if body.get(k).is_none() {
+                    body[k] = v.clone();
+                }
+            }
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        Ok((body, headers))
+    }
+
+    fn decode_response(&self, body: Value) -> Result<IrResponse, tiygate_core::Error> {
+        let response_id = body["id"].as_str().map(String::from);
+        let mut content = Vec::new();
+        if let Some(output) = body["output"].as_array() {
+            for item in output {
+                match item["type"].as_str() {
+                    Some("message") => {
+                        if let Some(content_arr) = item["content"].as_array() {
+                            for part in content_arr {
+                                if part["type"] == "output_text" {
+                                    if let Some(text) = part["text"].as_str() {
+                                        content.push(Content::Text {
+                                            text: text.to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("function_call") => {
+                        let args: Value =
+                            serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
+                                .unwrap_or(json!({}));
+                        content.push(Content::ToolCall {
+                            id: item["id"].as_str().unwrap_or("").to_string(),
+                            name: item["name"].as_str().unwrap_or("").to_string(),
+                            arguments: args,
+                        });
+                    }
+                    Some("reasoning") => {
+                        // Join the summary parts into a single reasoning block
+                        // so the Responses `id` maps to exactly one IR
+                        // Reasoning content (and re-encodes to exactly one
+                        // reasoning item, avoiding duplicate-id orphans).
+                        if let Some(summary) = item["summary"].as_array() {
+                            let text = summary
+                                .iter()
+                                .filter_map(|s| s["text"].as_str())
+                                .collect::<Vec<_>>()
+                                .join("");
+                            if !text.is_empty() {
+                                content.push(Content::Reasoning {
+                                    text,
+                                    signature: None,
+                                    id: item["id"].as_str().map(|s| s.to_string()),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let finish_reason = body["status"].as_str().map(|s| match s {
+            "completed" => FinishReason::Stop,
+            "incomplete" => {
+                if content
+                    .iter()
+                    .any(|c| matches!(c, Content::ToolCall { .. }))
+                {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Length
+                }
+            }
+            other => FinishReason::Other(other.to_string()),
+        });
+        let usage = body.get("usage").map(|u| {
+            let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
+            // Responses' `input_tokens` includes the cached portion; the IR
+            // convention keeps prompt_tokens cache-free. Subtract to avoid
+            // double-counting when re-encoded downstream.
+            let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
+            Usage {
+                prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
+                completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+                total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+                reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
+                cache_read_tokens: cache_read,
+                ..Default::default()
+            }
+        });
+        Ok(IrResponse {
+            content,
+            usage,
+            finish_reason,
+            response_id,
+            stop_details: None,
+            extensions: Default::default(),
+        })
+    }
+
+    fn pass_through_policy(
+        &self,
+        ingress: &tiygate_core::ProtocolEndpoint,
+        egress: &tiygate_core::ProtocolEndpoint,
+    ) -> tiygate_core::PassThroughPolicy {
+        if ingress.suite == egress.suite {
+            tiygate_core::PassThroughPolicy::Passthrough
+        } else {
+            tiygate_core::PassThroughPolicy::Convert
+        }
+    }
+}
+
+pub struct ResponsesStreamEncoder {
+    response_id: Option<String>,
+    /// Next output item index to allocate. The text message and each function
+    /// call occupy distinct output_index slots so a Responses client can
+    /// reassemble them independently.
+    next_output_index: u32,
+    /// output_index assigned to the assistant text message (lazily allocated
+    /// on the first TextDelta), so all text fragments share one index.
+    text_output_index: Option<u32>,
+    /// Maps a function-call id to its allocated output_index, so argument
+    /// fragments target the correct call.
+    tool_output_indices: std::collections::HashMap<String, u32>,
+    /// Function-call ids in allocation order, used to emit deterministic
+    /// terminal output items.
+    tool_output_order: Vec<String>,
+    /// Function names by call id for terminal `output_item.done` and
+    /// `response.completed.response.output` reconstruction.
+    tool_names: std::collections::HashMap<String, String>,
+    /// Accumulated function-call argument JSON fragments by call id.
+    tool_arguments: std::collections::HashMap<String, String>,
+    /// Function-call ids whose terminal done events were already emitted.
+    tool_done: std::collections::HashSet<String>,
+    /// Monotonic sequence_number stamped on every emitted event, per the
+    /// Responses streaming contract.
+    sequence_number: u64,
+    /// Whether `response.in_progress` has been emitted yet.
+    in_progress_sent: bool,
+    /// Usage stashed from a `StreamPart::Usage`, emitted inside the terminal
+    /// `response.completed`. Emitting `response.completed` early (on Usage)
+    /// terminated the stream prematurely for strict clients; we now defer it
+    /// to the real `Finish`/`ResponseCompleted`.
+    pending_usage: Option<Usage>,
+    /// Whether a terminal `response.completed` has already been emitted, so we
+    /// do not emit it twice when both `Finish` and `ResponseCompleted` arrive.
+    completed_sent: bool,
+    /// Status stashed from `Finish` when `pending_usage` was not yet available.
+    /// When the upstream sends `finish_reason` and `usage` as separate SSE
+    /// chunks (OpenAI-compatible: finish chunk → usage chunk → [DONE]), the
+    /// `Finish` part arrives before `Usage`. If we emitted `response.completed`
+    /// immediately on `Finish`, the usage would be lost. Instead we stash the
+    /// status here and defer `completed_event` to `ResponseCompleted` (which
+    /// arrives when the upstream sends `[DONE]`), by which point `Usage` has
+    /// been stashed too.
+    pending_finish_status: Option<String>,
+    /// output_index assigned to the reasoning item (lazily allocated on the
+    /// first ReasoningDelta), mirroring text_output_index.
+    reasoning_output_index: Option<u32>,
+    /// Accumulated reasoning text for `output_item.done` and `completed_event`.
+    reasoning_text: String,
+}
+impl Default for ResponsesStreamEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResponsesStreamEncoder {
+    pub fn new() -> Self {
+        Self {
+            response_id: None,
+            next_output_index: 0,
+            text_output_index: None,
+            tool_output_indices: std::collections::HashMap::new(),
+            tool_output_order: Vec::new(),
+            tool_names: std::collections::HashMap::new(),
+            tool_arguments: std::collections::HashMap::new(),
+            tool_done: std::collections::HashSet::new(),
+            sequence_number: 0,
+            in_progress_sent: false,
+            pending_usage: None,
+            completed_sent: false,
+            pending_finish_status: None,
+            reasoning_output_index: None,
+            reasoning_text: String::new(),
+        }
+    }
+
+    /// Allocate the next sequence number for an emitted event.
+    fn next_seq(&mut self) -> u64 {
+        let s = self.sequence_number;
+        self.sequence_number += 1;
+        s
+    }
+
+    /// Format a Responses SSE event, injecting the `sequence_number`.
+    fn event(&mut self, mut value: Value) -> String {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("sequence_number".to_string(), json!(self.next_seq()));
+        }
+        format!("data: {}\n\n", value)
+    }
+
+    fn open_tool_call(&mut self, id: &str, name: &str) -> String {
+        let already_open = self.tool_output_indices.contains_key(id);
+        let idx = if let Some(idx) = self.tool_output_indices.get(id).copied() {
+            idx
+        } else {
+            let idx = self.next_output_index;
+            self.next_output_index += 1;
+            self.tool_output_indices.insert(id.to_string(), idx);
+            self.tool_output_order.push(id.to_string());
+            idx
+        };
+        self.tool_names
+            .entry(id.to_string())
+            .or_insert_with(|| name.to_string());
+        self.tool_arguments.entry(id.to_string()).or_default();
+        if already_open {
+            return String::new();
+        }
+        self.event(json!({"type": "response.output_item.added", "output_index": idx, "item": {"id": id, "call_id": id, "type": "function_call", "name": name, "arguments": "", "status": "in_progress"}}))
+    }
+
+    fn append_tool_arguments(&mut self, id: &str, arguments: &str) -> String {
+        let idx = self.tool_output_indices.get(id).copied().unwrap_or(0);
+        self.tool_arguments
+            .entry(id.to_string())
+            .or_default()
+            .push_str(arguments);
+        self.event(json!({"type": "response.function_call_arguments.delta", "item_id": id, "output_index": idx, "delta": arguments}))
+    }
+
+    fn close_tool_calls(&mut self, status: &str) -> String {
+        let mut out = String::new();
+        for call_id in self.tool_output_order.clone() {
+            if self.tool_done.contains(&call_id) {
+                continue;
+            }
+            let idx = self.tool_output_indices.get(&call_id).copied().unwrap_or(0);
+            let name = self.tool_names.get(&call_id).cloned().unwrap_or_default();
+            let arguments = self
+                .tool_arguments
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_default();
+            out.push_str(&self.event(json!({"type": "response.function_call_arguments.done", "item_id": call_id, "output_index": idx, "arguments": arguments})));
+            out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": call_id, "call_id": call_id, "type": "function_call", "name": name, "arguments": arguments, "status": status}})));
+            self.tool_done.insert(call_id);
+        }
+        out
+    }
+
+    /// Build the terminal `response.completed` event (once), folding in any
+    /// stashed usage and the given status.
+    fn completed_event(&mut self, status: &str) -> String {
+        let id = self.response_id.clone().unwrap_or_default();
+        let mut response = json!({"id": id, "status": status});
+        if let Some(usage) = self.pending_usage.take() {
+            // IR prompt_tokens is cache-free; Responses requires input_tokens
+            // to include cache. Re-add so streamed usage stays consistent.
+            let cache_read = usage.cache_read_tokens.unwrap_or(0);
+            let cache_write = usage.cache_write_tokens.unwrap_or(0);
+            let input = usage.prompt_tokens + cache_read + cache_write;
+            response["usage"] = json!({
+                "input_tokens": input,
+                "output_tokens": usage.completion_tokens,
+                "total_tokens": input + usage.completion_tokens,
+            });
+            if cache_read > 0 {
+                response["usage"]["input_tokens_details"] = json!({"cached_tokens": cache_read});
+            }
+            if let Some(rt) = usage.reasoning_tokens {
+                if rt > 0 {
+                    response["usage"]["output_tokens_details"] = json!({"reasoning_tokens": rt});
+                }
+            }
+        }
+        // Build the output array so clients can reconstruct items from
+        // response.completed even when incremental events were missed.
+        let mut output = Vec::<Value>::new();
+        if self.reasoning_output_index.is_some() {
+            let item_id = format!("{}_rs", id);
+            output.push(json!({
+                "id": item_id,
+                "type": "reasoning",
+                "status": status,
+                "summary": [{"type": "summary_text", "text": &self.reasoning_text}]
+            }));
+        }
+        if self.text_output_index.is_some() {
+            let item_id = format!("{}_msg", id);
+            output.push(json!({
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": status,
+                "content": []
+            }));
+        }
+        for call_id in self.tool_output_order.clone() {
+            let name = self.tool_names.get(&call_id).cloned().unwrap_or_default();
+            let arguments = self
+                .tool_arguments
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_default();
+            output.push(json!({
+                "type": "function_call",
+                "id": call_id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "status": status,
+            }));
+        }
+        if !output.is_empty() {
+            response["output"] = json!(output);
+        }
+        self.completed_sent = true;
+        self.event(json!({"type": "response.completed", "response": response}))
+    }
+}
+
+impl StreamEncoder for ResponsesStreamEncoder {
+    fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
+        let chunk = match part {
+            StreamPart::ResponseStarted { id } => {
+                self.response_id = Some(id.clone());
+                let created = self.event(json!({"type": "response.created", "response": {"id": id, "object": "response", "status": "in_progress"}}));
+                // Emit response.in_progress right after created so strict
+                // clients see the lifecycle transition.
+                self.in_progress_sent = true;
+                let in_progress = self.event(json!({"type": "response.in_progress", "response": {"id": id, "object": "response", "status": "in_progress"}}));
+                format!("{created}{in_progress}")
+            }
+            StreamPart::TextDelta { text } => {
+                // All text fragments belong to one assistant message item;
+                // allocate its output_index once and emit the item.added +
+                // content_part.added lifecycle on first use.
+                let item_id = format!("{}_msg", self.response_id.as_deref().unwrap_or(""));
+                let mut out = String::new();
+                let idx = if let Some(i) = self.text_output_index {
+                    i
+                } else {
+                    let i = self.next_output_index;
+                    self.next_output_index += 1;
+                    self.text_output_index = Some(i);
+                    out.push_str(&self.event(json!({"type": "response.output_item.added", "output_index": i, "item": {"id": item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []}})));
+                    out.push_str(&self.event(json!({"type": "response.content_part.added", "output_index": i, "item_id": item_id, "content_index": 0, "part": {"type": "output_text", "text": ""}})));
+                    i
+                };
+                out.push_str(&self.event(json!({"type": "response.output_text.delta", "item_id": item_id, "output_index": idx, "content_index": 0, "delta": text})));
+                out
+            }
+            StreamPart::ReasoningDelta { text } => {
+                let item_id = format!("{}_rs", self.response_id.as_deref().unwrap_or(""));
+                let mut out = String::new();
+                let idx = if let Some(i) = self.reasoning_output_index {
+                    i
+                } else {
+                    let i = self.next_output_index;
+                    self.next_output_index += 1;
+                    self.reasoning_output_index = Some(i);
+                    out.push_str(&self.event(json!({"type": "response.output_item.added", "output_index": i, "item": {"id": item_id, "type": "reasoning", "status": "in_progress", "summary": []}})));
+                    out.push_str(&self.event(json!({"type": "response.reasoning_summary_part.added", "output_index": i, "item_id": item_id, "summary_index": 0, "part": {"type": "summary_text", "text": ""}})));
+                    i
+                };
+                self.reasoning_text.push_str(text);
+                out.push_str(&self.event(json!({"type": "response.reasoning_summary_text.delta", "item_id": item_id, "output_index": idx, "summary_index": 0, "delta": text})));
+                out
+            }
+            StreamPart::ToolCallDelta {
+                id,
+                name,
+                arguments,
+            } => {
+                if let Some(n) = name {
+                    // Opener: allocate a distinct output_index for this call.
+                    let mut out = self.open_tool_call(id, n);
+                    if !arguments.is_empty() {
+                        out.push_str(&self.append_tool_arguments(id, arguments));
+                    }
+                    out
+                } else {
+                    self.append_tool_arguments(id, arguments)
+                }
+            }
+            StreamPart::Usage { usage } => {
+                // Stash usage for the terminal response.completed instead of
+                // emitting it now — emitting response.completed early would
+                // terminate the stream before the model finished.
+                self.pending_usage = Some(usage.clone());
+                String::new()
+            }
+            StreamPart::Finish { reason } => {
+                if self.completed_sent || self.pending_finish_status.is_some() {
+                    String::new()
+                } else {
+                    let status = match reason {
+                        FinishReason::Stop => "completed",
+                        FinishReason::Length => "incomplete",
+                        FinishReason::ContentFilter => "incomplete",
+                        FinishReason::ToolCalls => "completed",
+                        _ => "completed",
+                    };
+                    // Close the open text item's lifecycle before completing.
+                    let mut out = String::new();
+                    // Close reasoning item lifecycle first (reasoning precedes
+                    // text in the output sequence).
+                    if let Some(idx) = self.reasoning_output_index {
+                        let item_id = format!("{}_rs", self.response_id.as_deref().unwrap_or(""));
+                        out.push_str(&self.event(json!({"type": "response.reasoning_summary_text.done", "output_index": idx, "item_id": item_id, "summary_index": 0})));
+                        out.push_str(&self.event(json!({"type": "response.reasoning_summary_part.done", "output_index": idx, "item_id": item_id, "summary_index": 0})));
+                        out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": item_id, "type": "reasoning", "status": status, "summary": [{"type": "summary_text", "text": &self.reasoning_text}]}})));
+                    }
+                    if let Some(idx) = self.text_output_index {
+                        let item_id = format!("{}_msg", self.response_id.as_deref().unwrap_or(""));
+                        out.push_str(&self.event(json!({"type": "response.output_text.done", "output_index": idx, "item_id": item_id, "content_index": 0})));
+                        out.push_str(&self.event(json!({"type": "response.content_part.done", "output_index": idx, "item_id": item_id, "content_index": 0})));
+                        out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": item_id, "type": "message", "role": "assistant", "status": "completed"}})));
+                    }
+                    out.push_str(&self.close_tool_calls(status));
+                    // When usage is already stashed (same-chunk finish+usage),
+                    // emit response.completed immediately. Otherwise defer to
+                    // ResponseCompleted so a late-arriving Usage is included.
+                    if self.pending_usage.is_some() {
+                        out.push_str(&self.completed_event(status));
+                    } else {
+                        self.pending_finish_status = Some(status.to_string());
+                    }
+                    out
+                }
+            }
+            StreamPart::ResponseCompleted { .. } => {
+                // If no Finish arrived, emit the terminal completed now so the
+                // usage is not lost; then end the stream.
+                let mut out = String::new();
+                if !self.completed_sent {
+                    let status = self
+                        .pending_finish_status
+                        .take()
+                        .unwrap_or_else(|| "completed".to_string());
+                    out.push_str(&self.close_tool_calls(&status));
+                    out.push_str(&self.completed_event(&status));
+                }
+                out.push_str("data: [DONE]\n\n");
+                out
+            }
+            StreamPart::Error { message, .. } => self.event(
+                json!({"type": "error", "error": {"message": message, "type": "gateway_error"}}),
+            ),
+        };
+        Ok(chunk.into_bytes())
+    }
+    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"type": "error", "error": {"message": message, "type": "gateway_error"}})
+        )
+        .into_bytes()
+    }
+    fn encode_done(&mut self) -> Vec<u8> {
+        "data: [DONE]\n\n".to_string().into_bytes()
+    }
+}
+
+pub struct ResponsesStreamDecoder {
+    response_id: Option<String>,
+    in_function_call: bool,
+    current_call_id: Option<String>,
+    current_call_name: Option<String>,
+    /// Whether ANY `function_call` output item appeared during this response.
+    /// Unlike `in_function_call` (which is reset on `response.output_item.done`),
+    /// this latches for the whole stream so the terminal `response.completed`
+    /// can be mapped to `FinishReason::ToolCalls`. OpenAI Responses reports
+    /// `status: "completed"` even for tool-call turns — the only reliable
+    /// signal that the turn ended to call a tool is the presence of a
+    /// `function_call` output item, NOT the status.
+    saw_function_call: bool,
+}
+impl Default for ResponsesStreamDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResponsesStreamDecoder {
+    pub fn new() -> Self {
+        Self {
+            response_id: None,
+            in_function_call: false,
+            current_call_id: None,
+            current_call_name: None,
+            saw_function_call: false,
+        }
+    }
+}
+
+impl StreamDecoder for ResponsesStreamDecoder {
+    fn feed(&mut self, line: &str) -> Result<Vec<StreamPart>, tiygate_core::Error> {
+        let line = line.trim();
+        if line.is_empty() || line == "data: [DONE]" {
+            if line == "data: [DONE]" {
+                return Ok(vec![StreamPart::ResponseCompleted {
+                    id: self.response_id.clone().unwrap_or_default(),
+                    status: "completed".to_string(),
+                    usage: None,
+                }]);
+            }
+            return Ok(vec![]);
+        }
+        let data = if let Some(s) = line.strip_prefix("data: ") {
+            s
+        } else {
+            return Ok(vec![]);
+        };
+        let event: Value = serde_json::from_str(data)
+            .map_err(|e| tiygate_core::Error::Codec(format!("Responses SSE: {}", e)))?;
+        let mut parts = Vec::new();
+
+        match event["type"].as_str() {
+            Some("response.created") => {
+                if let Some(id) = event["response"]["id"].as_str() {
+                    self.response_id = Some(id.to_string());
+                    parts.push(StreamPart::ResponseStarted { id: id.to_string() });
+                }
+            }
+            Some("response.output_text.delta") => {
+                if let Some(text) = event["delta"].as_str() {
+                    parts.push(StreamPart::TextDelta {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            Some("response.reasoning_text.delta")
+            | Some("response.reasoning_summary_text.delta") => {
+                if let Some(text) = event["delta"].as_str() {
+                    parts.push(StreamPart::ReasoningDelta {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            Some("response.output_item.added") => {
+                let item = &event["item"];
+                if item["type"] == "function_call" {
+                    self.in_function_call = true;
+                    self.saw_function_call = true;
+                    self.current_call_id = item["id"].as_str().map(String::from);
+                    self.current_call_name = item["name"].as_str().map(String::from);
+                    parts.push(StreamPart::ToolCallDelta {
+                        id: self.current_call_id.clone().unwrap_or_default(),
+                        name: self.current_call_name.clone(),
+                        arguments: String::new(),
+                    });
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let Some(args) = event["delta"].as_str() {
+                    // Argument fragment: `name: None` so cross-protocol
+                    // encoders route this to their argument-delta event
+                    // instead of re-opening the tool-call block.
+                    parts.push(StreamPart::ToolCallDelta {
+                        id: self.current_call_id.clone().unwrap_or_default(),
+                        name: None,
+                        arguments: args.to_string(),
+                    });
+                }
+            }
+            Some("response.output_item.done") => {
+                self.in_function_call = false;
+                self.current_call_id = None;
+                self.current_call_name = None;
+            }
+            // Lifecycle / bookkeeping events that carry no IR-relevant payload.
+            // OpenAI Responses streams interleave many of these; they must be
+            // consumed silently (NOT turned into error frames) so the stream
+            // is not corrupted. See the Responses streaming event reference.
+            Some("response.in_progress")
+            | Some("response.content_part.added")
+            | Some("response.content_part.done")
+            | Some("response.output_text.done")
+            | Some("response.output_text.annotation.added")
+            | Some("response.function_call_arguments.done")
+            | Some("response.reasoning_text.done")
+            | Some("response.reasoning_summary_text.done")
+            | Some("response.reasoning_summary_part.added")
+            | Some("response.reasoning_summary_part.done")
+            | Some("response.queued") => {
+                // no-op: lifecycle marker
+            }
+            Some("response.completed") | Some("response.done") => {
+                if let Some(usage) = event["response"]["usage"].as_object() {
+                    let cache_read = usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d["cached_tokens"].as_u64());
+                    let raw_input = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    parts.push(StreamPart::Usage {
+                        usage: Usage {
+                            // input_tokens includes cache; IR keeps it cache-free.
+                            prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
+                            completion_tokens: usage
+                                .get("output_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            total_tokens: usage
+                                .get("total_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            reasoning_tokens: usage
+                                .get("output_tokens_details")
+                                .and_then(|d| d["reasoning_tokens"].as_u64()),
+                            cache_read_tokens: cache_read,
+                            ..Default::default()
+                        },
+                    });
+                }
+                let status = event["response"]["status"].as_str().unwrap_or("completed");
+                let reason = match status {
+                    // OpenAI Responses reports `status: "completed"` even when
+                    // the turn stopped to call a tool. A `function_call` output
+                    // item is the authoritative signal, so prefer ToolCalls
+                    // when one was seen — otherwise the cross-protocol encoder
+                    // emits `finish_reason: "stop"` and the client never runs
+                    // the tool.
+                    "completed" => {
+                        if self.saw_function_call {
+                            FinishReason::ToolCalls
+                        } else {
+                            FinishReason::Stop
+                        }
+                    }
+                    "incomplete" => {
+                        if self.saw_function_call {
+                            FinishReason::ToolCalls
+                        } else {
+                            FinishReason::Length
+                        }
+                    }
+                    other => FinishReason::Other(other.to_string()),
+                };
+                parts.push(StreamPart::Finish { reason });
+                // The Responses protocol terminates with `response.completed`
+                // (it does NOT send a trailing `data: [DONE]`). Emit the IR
+                // terminal `ResponseCompleted` so cross-protocol ingress
+                // encoders (e.g. ChatCompletions -> `data: [DONE]`, Anthropic
+                // -> `event: message_stop`) produce their protocol-native end
+                // frame. Without this the client stream ends after the final
+                // chunk with no terminator. Mirrors the Anthropic decoder,
+                // which pushes `ResponseCompleted` on `message_stop`.
+                parts.push(StreamPart::ResponseCompleted {
+                    id: self.response_id.clone().unwrap_or_default(),
+                    status: "completed".to_string(),
+                    usage: None,
+                });
+            }
+            Some("error") | Some("response.failed") => {
+                let err = if event.get("error").is_some() {
+                    &event["error"]
+                } else {
+                    &event["response"]["error"]
+                };
+                parts.push(StreamPart::Error {
+                    message: err["message"].as_str().unwrap_or("Unknown").to_string(),
+                    code: err["type"].as_str().map(String::from),
+                });
+            }
+            Some("response.incomplete") => {
+                let reason = if self.saw_function_call {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Length
+                };
+                parts.push(StreamPart::Finish { reason });
+                // Same terminator rule as `response.completed`: this is a real
+                // end-of-stream signal, so emit `ResponseCompleted` to drive
+                // the ingress encoder's protocol-native end frame.
+                parts.push(StreamPart::ResponseCompleted {
+                    id: self.response_id.clone().unwrap_or_default(),
+                    status: "incomplete".to_string(),
+                    usage: None,
+                });
+            }
+            Some(_other) => {
+                // Unknown / future Responses event types must NOT abort the
+                // stream. Ignore per UnknownFieldPolicy::Drop.
+            }
+            None => {
+                // SSE comment/keepalive lines without a `type` field are ignored.
+            }
+        }
+        Ok(parts)
+    }
+    fn finish(&mut self) -> Result<Vec<StreamPart>, tiygate_core::Error> {
+        Ok(vec![])
+    }
+}
+
+inventory::submit! { tiygate_core::CodecRegistration { make: || Box::new(ResponsesCodec::new()) }
+
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn make_raw_env() -> RawEnvelope {
+        RawEnvelope {
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            headers: std::collections::HashMap::new(),
+            body: None,
+            truncated: false,
+            original_body_size: 0,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_decode_basic_request() {
+        let _codec = ResponsesCodec::new();
+    }
+
+    #[test]
+    fn test_decode_request_reasoning_input_item() {
+        // 高影响回归:reasoning input item 必须解析为 Content::Reasoning。
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "let me think"}]}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let has_reasoning = ir.messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|c| matches!(c, Content::Reasoning { text, .. } if text == "let me think"))
+        });
+        assert!(
+            has_reasoning,
+            "reasoning input item should decode to Reasoning"
+        );
+    }
+
+    #[test]
+    fn test_stream_encoder_usage_deferred_to_completed() {
+        // 高影响回归:Usage 不再提前发 response.completed;只在 Finish 发一次。
+        let mut enc = ResponsesStreamEncoder::new();
+        let usage_bytes = enc
+            .encode_part(&StreamPart::Usage {
+                usage: Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        // Usage alone must NOT emit response.completed.
+        assert!(usage_bytes.is_empty());
+        let finish_bytes = enc
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::Stop,
+            })
+            .unwrap();
+        let s = String::from_utf8_lossy(&finish_bytes);
+        assert!(s.contains("response.completed"));
+        assert!(s.contains("\"input_tokens\":10"));
+        assert!(s.contains("sequence_number"));
+    }
+
+    #[test]
+    fn test_stream_encoder_function_call_item_includes_call_id() {
+        let mut enc = ResponsesStreamEncoder::new();
+        let bytes = enc
+            .encode_part(&StreamPart::ToolCallDelta {
+                id: "call_123".to_string(),
+                name: Some("lookup".to_string()),
+                arguments: String::new(),
+            })
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\"type\":\"response.output_item.added\""));
+        assert!(s.contains("\"type\":\"function_call\""));
+        assert!(
+            s.contains("\"call_id\":\"call_123\""),
+            "Responses stream function_call item must expose call_id for clients: {s}"
+        );
+    }
+
+    #[test]
+    fn test_stream_encoder_repeated_function_call_opener_is_deduped() {
+        let mut enc = ResponsesStreamEncoder::new();
+        let first = enc
+            .encode_part(&StreamPart::ToolCallDelta {
+                id: "call_123".to_string(),
+                name: Some("lookup".to_string()),
+                arguments: String::new(),
+            })
+            .unwrap();
+        let second = enc
+            .encode_part(&StreamPart::ToolCallDelta {
+                id: "call_123".to_string(),
+                name: Some("lookup".to_string()),
+                arguments: String::new(),
+            })
+            .unwrap();
+
+        assert!(String::from_utf8_lossy(&first).contains("response.output_item.added"));
+        assert!(
+            !String::from_utf8_lossy(&second).contains("response.output_item.added"),
+            "repeated opener for the same call id must not emit duplicate output_item.added: {}",
+            String::from_utf8_lossy(&second)
+        );
+    }
+
+    #[test]
+    fn test_stream_encoder_reasoning_lifecycle() {
+        let mut enc = ResponsesStreamEncoder::new();
+        // ResponseStarted
+        let _ = enc
+            .encode_part(&StreamPart::ResponseStarted {
+                id: "resp_r1".to_string(),
+            })
+            .unwrap();
+        // First ReasoningDelta — should emit output_item.added + summary_part.added + delta
+        let bytes1 = enc
+            .encode_part(&StreamPart::ReasoningDelta {
+                text: "thinking".to_string(),
+            })
+            .unwrap();
+        let s1 = String::from_utf8_lossy(&bytes1);
+        assert!(
+            s1.contains("\"type\":\"response.output_item.added\""),
+            "first reasoning delta must emit output_item.added: {s1}"
+        );
+        assert!(
+            s1.contains("\"type\":\"reasoning\""),
+            "output_item.added item must have type=reasoning: {s1}"
+        );
+        assert!(
+            s1.contains("\"type\":\"response.reasoning_summary_part.added\""),
+            "first reasoning delta must emit reasoning_summary_part.added: {s1}"
+        );
+        assert!(
+            s1.contains("\"type\":\"response.reasoning_summary_text.delta\""),
+            "reasoning delta must emit reasoning_summary_text.delta: {s1}"
+        );
+        assert!(
+            s1.contains("\"delta\":\"thinking\""),
+            "delta must contain the reasoning text: {s1}"
+        );
+
+        // Second ReasoningDelta — should NOT re-emit output_item.added
+        let bytes2 = enc
+            .encode_part(&StreamPart::ReasoningDelta {
+                text: " harder".to_string(),
+            })
+            .unwrap();
+        let s2 = String::from_utf8_lossy(&bytes2);
+        assert!(
+            !s2.contains("response.output_item.added"),
+            "subsequent reasoning delta must not re-emit output_item.added: {s2}"
+        );
+        assert!(
+            s2.contains("\"delta\":\" harder\""),
+            "second delta must contain text: {s2}"
+        );
+
+        // Usage with reasoning_tokens
+        let _ = enc
+            .encode_part(&StreamPart::Usage {
+                usage: Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    reasoning_tokens: Some(15),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        // Finish
+        let finish_bytes = enc
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::Stop,
+            })
+            .unwrap();
+        let sf = String::from_utf8_lossy(&finish_bytes);
+
+        // Reasoning done events
+        assert!(
+            sf.contains("\"type\":\"response.reasoning_summary_text.done\""),
+            "finish must emit reasoning_summary_text.done: {sf}"
+        );
+        assert!(
+            sf.contains("\"type\":\"response.reasoning_summary_part.done\""),
+            "finish must emit reasoning_summary_part.done: {sf}"
+        );
+        // output_item.done with accumulated summary
+        assert!(
+            sf.contains("\"type\":\"response.output_item.done\""),
+            "finish must emit output_item.done for reasoning: {sf}"
+        );
+        assert!(
+            sf.contains("thinking harder"),
+            "output_item.done must contain accumulated reasoning text: {sf}"
+        );
+
+        // response.completed with output array and reasoning_tokens
+        assert!(
+            sf.contains("\"type\":\"response.completed\""),
+            "finish must emit response.completed: {sf}"
+        );
+        assert!(
+            sf.contains("\"type\":\"reasoning\""),
+            "completed output must contain reasoning item: {sf}"
+        );
+        assert!(
+            sf.contains("\"reasoning_tokens\":15"),
+            "completed usage must include reasoning_tokens: {sf}"
+        );
+    }
+
+    #[test]
+    fn test_encode_response_text() {
+        let codec = ResponsesCodec::new();
+        let ir = IrResponse {
+            content: vec![Content::Text {
+                text: "Hi!".to_string(),
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                ..Default::default()
+            }),
+            finish_reason: Some(FinishReason::Stop),
+            response_id: Some("resp_1".to_string()),
+            stop_details: None,
+            extensions: Default::default(),
+        };
+        let encoded = codec.encode_response(&ir).unwrap();
+        assert_eq!(encoded["id"], "resp_1");
+        assert_eq!(encoded["output"][0]["content"][0]["text"], "Hi!");
+        assert_eq!(encoded["usage"]["input_tokens"], 10);
+    }
+
+    #[test]
+    fn test_stream_encoder_error_frame() {
+        let mut encoder = ResponsesStreamEncoder::new();
+        let err = encoder.encode_error("overloaded", Some("529"));
+        let s = String::from_utf8_lossy(&err);
+        assert!(s.contains("error"));
+        assert!(s.contains("overloaded"));
+    }
+
+    #[test]
+    fn test_codec_capabilities() {
+        let codec = ResponsesCodec::new();
+        assert!(codec.capabilities().streaming);
+        assert!(codec.capabilities().tools);
+        assert!(codec.capabilities().structured_output);
+        assert!(codec.capabilities().lossy_default_reject);
+    }
+
+    #[test]
+    fn test_encode_response_includes_cached_tokens() {
+        // IR 带 cache → Responses 输出 input_tokens_details.cached_tokens
+        let codec = ResponsesCodec::new();
+        let ir = IrResponse {
+            content: vec![Content::Text {
+                text: "ok".to_string(),
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                reasoning_tokens: Some(10),
+                cache_read_tokens: Some(80),
+                cache_write_tokens: None,
+            }),
+            finish_reason: Some(FinishReason::Stop),
+            response_id: Some("r1".to_string()),
+            stop_details: None,
+            extensions: std::collections::HashMap::new(),
+        };
+        let encoded = codec.encode_response(&ir).unwrap();
+        // OpenAI Responses 规范：input_tokens 含 cache
+        assert_eq!(encoded["usage"]["input_tokens"], 180);
+        assert_eq!(encoded["usage"]["total_tokens"], 230);
+        assert_eq!(
+            encoded["usage"]["input_tokens_details"]["cached_tokens"],
+            80
+        );
+        assert_eq!(
+            encoded["usage"]["output_tokens_details"]["reasoning_tokens"],
+            10
+        );
+    }
+
+    /// Anthropic Messages represents tool results as `tool_result` content
+    /// blocks inside a user message. When routing that history to the OpenAI
+    /// Responses API, those blocks must become sibling `function_call_output`
+    /// input items; otherwise Responses rejects the request with 400
+    /// `No tool output found for function call ...`.
+    #[test]
+    fn test_encode_request_preserves_anthropic_tool_results_for_responses() {
+        let anthropic = crate::messages::MessagesCodec::new();
+        let responses = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "openai/gpt-5.5",
+            "stream": true,
+            "max_tokens": 128000,
+            "messages": [
+                {"role": "user", "content": "请搜索并总结。"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "我先查询资料。"},
+                        {"type": "tool_use", "id": "fc_1", "name": "web_search", "input": {"query": "a"}},
+                        {"type": "tool_use", "id": "fc_2", "name": "web_search", "input": {"query": "b"}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "下面是搜索结果。"},
+                        {"type": "tool_result", "tool_use_id": "fc_1", "content": "result-a"},
+                        {"type": "tool_result", "tool_use_id": "fc_2", "content": [{"type": "text", "text": "result-b"}]}
+                    ]
+                }
+            ],
+            "tools": [
+                {"name": "web_search", "description": "search", "input_schema": {"type": "object"}}
+            ]
+        });
+
+        let ir = anthropic.decode_request(body, &env).unwrap();
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        let input = encoded["input"]
+            .as_array()
+            .expect("Responses input[] present");
+
+        let function_calls: Vec<&Value> = input
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .collect();
+        let function_outputs: Vec<&Value> = input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect();
+
+        assert_eq!(function_calls.len(), 2, "both tool_use blocks survive");
+        assert_eq!(function_outputs.len(), 2, "both tool_result blocks survive");
+        assert_eq!(function_outputs[0]["call_id"], "fc_1");
+        assert_eq!(function_outputs[0]["output"], "result-a");
+        assert_eq!(function_outputs[1]["call_id"], "fc_2");
+        assert_eq!(function_outputs[1]["output"], "result-b");
+
+        let first_call_idx = input
+            .iter()
+            .position(|item| item["type"] == "function_call")
+            .expect("function_call present");
+        let mixed_user_text_idx = input
+            .iter()
+            .position(|item| item["role"] == "user" && item["content"] == "下面是搜索结果。")
+            .expect("mixed user text message present");
+        let first_output_idx = input
+            .iter()
+            .position(|item| item["type"] == "function_call_output")
+            .expect("function_call_output present");
+        assert!(
+            first_output_idx > first_call_idx,
+            "tool outputs must follow the tool calls they answer"
+        );
+        assert!(
+            mixed_user_text_idx < first_output_idx,
+            "text that shares an Anthropic user message with tool_result must keep natural order"
+        );
+    }
+
+    /// Reasoning + function_call on a single assistant turn must round-trip
+    /// through `encode_request` as siblings in the `input[]` array, so the
+    /// Responses API receives the reasoning item it requires to continue the
+    /// chain-of-thought. Regression test for the gap where Reasoning content
+    /// was silently dropped during request encoding.
+    #[test]
+    fn test_encode_request_echoes_reasoning_alongside_tool_call() {
+        let codec = ResponsesCodec::new();
+        let ir = tiygate_core::IrRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: vec![Content::Text {
+                        text: "杭州明天天气？".to_string(),
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        Content::Reasoning {
+                            text: "我需要先查日期再查天气。".to_string(),
+                            signature: None,
+                            id: None,
+                        },
+                        Content::ToolCall {
+                            id: "call_1".to_string(),
+                            name: "get_weather".to_string(),
+                            arguments: serde_json::json!({"location": "杭州"}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![Content::ToolResult {
+                        tool_call_id: "call_1".to_string(),
+                        name: "get_weather".to_string(),
+                        content: "cloudy".to_string(),
+                    }],
+                },
+            ],
+            tools: vec![],
+            params: tiygate_core::GenerationParams::default(),
+            stream: false,
+            response_format: None,
+            extensions: Default::default(),
+        };
+        let (body, _) = codec.encode_request(&ir).unwrap();
+        let input = body["input"].as_array().expect("input[] present");
+
+        // Must contain, in order: user message, reasoning item, function_call
+        // item, function_call_output item. The reasoning item MUST sit
+        // *before* the function_call it justifies, matching the wire format
+        // Responses returns.
+        // (User/assistant message items have no `type` discriminator —
+        // they're identified by `role`. Reasoning/function_call items are
+        // identified by `type`.)
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input.len(), 4, "no extra items beyond the four above");
+
+        let reasoning = &input[1];
+        assert_eq!(reasoning["type"], "reasoning");
+        assert_eq!(reasoning["summary"][0]["type"], "summary_text");
+        assert_eq!(reasoning["summary"][0]["text"], "我需要先查日期再查天气。");
+
+        let fc = &input[2];
+        assert_eq!(fc["type"], "function_call");
+        assert_eq!(fc["call_id"], "call_1");
+        assert_eq!(fc["name"], "get_weather");
+    }
+
+    /// When an assistant turn is purely reasoning (no text, no tool call) the
+    /// encoder must still emit the reasoning item, and must NOT emit an empty
+    /// message item in its place.
+    #[test]
+    fn test_encode_request_emits_reasoning_only_turn() {
+        let codec = ResponsesCodec::new();
+        let ir = tiygate_core::IrRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![Content::Reasoning {
+                    text: "thinking...".to_string(),
+                    signature: None,
+                    id: None,
+                }],
+            }],
+            tools: vec![],
+            params: tiygate_core::GenerationParams::default(),
+            stream: false,
+            response_format: None,
+            extensions: Default::default(),
+        };
+        let (body, _) = codec.encode_request(&ir).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "reasoning");
+    }
+
+    /// Same-protocol (Responses → Responses) round-trip must preserve the
+    /// reasoning item `id` (`rs_...`). The Responses API pairs each reasoning
+    /// item with the following item by id; losing the id causes a 400
+    /// "Item provided without its required preceding item of type reasoning"
+    /// on the next turn. Cross-protocol reasoning (id == None) must be emitted
+    /// without a fabricated id.
+    #[test]
+    fn test_responses_reasoning_id_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        // A request replaying a prior Responses turn: reasoning item carries
+        // its original `rs_...` id, followed by a function_call.
+        let body = json!({
+            "model": "gpt-5",
+            "input": [
+                {"role": "user", "content": "weather?"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_abc123",
+                    "summary": [{"type": "summary_text", "text": "check the tool"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{}"
+                }
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        // The reasoning id must survive into the IR.
+        let captured_id = ir.messages.iter().find_map(|m| {
+            m.content.iter().find_map(|c| match c {
+                Content::Reasoning { id, .. } => id.clone(),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            captured_id.as_deref(),
+            Some("rs_abc123"),
+            "reasoning id 应被解析进 IR"
+        );
+
+        // Re-encode: the reasoning item must replay the exact id.
+        let (re, _) = codec.encode_request(&ir).unwrap();
+        let input = re["input"].as_array().unwrap();
+        let reasoning = input
+            .iter()
+            .find(|i| i["type"] == "reasoning")
+            .expect("reasoning item present");
+        assert_eq!(reasoning["id"], "rs_abc123", "reasoning id 必须原样回传");
+        assert_eq!(reasoning["summary"][0]["text"], "check the tool");
+    }
+
+    #[test]
+    fn test_responses_duplicate_call_ids_are_normalized_for_tool_results() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let duplicate = "call_e3b0c44298fc1c149afbf4c8996fb92427a";
+        let body = json!({
+            "model": "minimax/minimax-m3",
+            "input": [
+                {"type": "message", "role": "user", "content": "review this"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I'll inspect it."}]},
+                {"type": "function_call", "call_id": duplicate, "name": "git_status", "arguments": "{}"},
+                {"type": "function_call", "call_id": duplicate, "name": "git_diff", "arguments": "{\"path\":\"crates/store/src/log_sink/oltp.rs\"}"},
+                {"type": "function_call_output", "call_id": duplicate, "output": "status output"},
+                {"type": "function_call_output", "call_id": duplicate, "output": "diff output"}
+            ]
+        });
+
+        let ir = codec.decode_request(body, &env).unwrap();
+
+        let tool_call_ids: Vec<String> = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                Content::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_call_ids,
+            vec![duplicate.to_string(), format!("{duplicate}_1")]
+        );
+
+        let tool_result_ids: Vec<String> = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                Content::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_result_ids, tool_call_ids);
+
+        let anthropic = crate::messages::MessagesCodec::new();
+        let (encoded, _) = anthropic.encode_request(&ir).unwrap();
+        let messages = encoded["messages"].as_array().unwrap();
+        let assistant_tool_ids: Vec<String> = messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter(|block| block["type"] == "tool_use")
+            .filter_map(|block| block["id"].as_str().map(String::from))
+            .collect();
+        assert_eq!(assistant_tool_ids, tool_call_ids);
+    }
+
+    /// Cross-protocol reasoning (no Responses id) must be emitted WITHOUT an
+    /// `id` field — fabricating one would be rejected by the Responses API.
+    #[test]
+    fn test_responses_cross_protocol_reasoning_has_no_id() {
+        let codec = ResponsesCodec::new();
+        let ir = tiygate_core::IrRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::AnthropicMessages,
+                "messages",
+                "2023-06-01",
+            ),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![Content::Reasoning {
+                    text: "from anthropic".to_string(),
+                    signature: Some("sig_anthropic".to_string()),
+                    id: None,
+                }],
+            }],
+            tools: vec![],
+            params: tiygate_core::GenerationParams::default(),
+            stream: false,
+            response_format: None,
+            extensions: Default::default(),
+        };
+        let (body, _) = codec.encode_request(&ir).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let reasoning = input
+            .iter()
+            .find(|i| i["type"] == "reasoning")
+            .expect("reasoning item present");
+        assert!(
+            reasoning.get("id").is_none(),
+            "跨协议 reasoning 不应带 id(避免伪造 id 被 400)"
+        );
+        // Anthropic 的 signature 不得泄漏到 Responses 的 reasoning item。
+        assert!(reasoning.get("signature").is_none());
+    }
+
+    /// Responses decode_request 必须将连续的同 role input items 合并到
+    /// 同一个 IR Message 中。如果 reasoning 和 function_call 被拆分为
+    /// 独立的 Message,Chat Completions encode_request 的门控逻辑
+    /// `!reasoning_text.is_empty() && !tool_calls_json.is_empty()`
+    /// 无法在同一个 message 中同时看到两者,导致 reasoning_content
+    /// 被丢弃,DeepSeek 400。
+    #[test]
+    fn test_decode_request_merges_consecutive_same_role_items() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        // 模拟客户端回传: reasoning + 2个 function_call + 2个 function_call_output
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "input": [
+                {"role": "user", "content": "天气?"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "需要查天气"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"杭州\"}"},
+                {"type": "function_call", "call_id": "call_2", "name": "get_weather", "arguments": "{\"city\":\"北京\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "晴天"},
+                {"type": "function_call_output", "call_id": "call_2", "output": "多云"}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+
+        // reasoning(Assistant) + function_call(Assistant) + function_call(Assistant)
+        // 应合并为一个 Assistant message
+        let assistant_msgs: Vec<_> = ir
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(
+            assistant_msgs.len(),
+            1,
+            "连续的 reasoning + function_call items 必须合并为一个 assistant message, 实际: {}",
+            assistant_msgs.len()
+        );
+
+        let content = &assistant_msgs[0].content;
+        let has_reasoning = content
+            .iter()
+            .any(|c| matches!(c, Content::Reasoning { .. }));
+        let tool_call_count = content
+            .iter()
+            .filter(|c| matches!(c, Content::ToolCall { .. }))
+            .count();
+        assert!(
+            has_reasoning,
+            "合并后的 assistant message 必须包含 Reasoning"
+        );
+        assert_eq!(
+            tool_call_count, 2,
+            "合并后的 assistant message 必须包含 2 个 ToolCall"
+        );
+
+        // function_call_output(Tool) + function_call_output(Tool)
+        // 也应合并为一个 Tool message
+        let tool_msgs: Vec<_> = ir
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(
+            tool_msgs.len(),
+            1,
+            "连续的 function_call_output items 必须合并为一个 tool message, 实际: {}",
+            tool_msgs.len()
+        );
+        assert_eq!(tool_msgs[0].content.len(), 2, "tool message 应含 2 个结果");
+    }
+
+    /// 不同 role 的 items 不应被合并:user → assistant → tool 保持分离。
+    #[test]
+    fn test_decode_request_does_not_merge_different_roles() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+                {"role": "user", "content": "thanks"}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(
+            ir.messages.len(),
+            4,
+            "不同 role 的 items 不应合并: user(1) + assistant(1) + tool(1) + user(1) = 4"
+        );
+        assert_eq!(ir.messages[0].role, Role::User);
+        assert_eq!(ir.messages[1].role, Role::Assistant);
+        assert_eq!(ir.messages[2].role, Role::Tool);
+        assert_eq!(ir.messages[3].role, Role::User);
+    }
+}

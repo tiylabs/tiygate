@@ -1,0 +1,43 @@
+---
+source: crates/protocols/src/chat_completions.rs
+expression: ir
+---
+IrRequest {
+    model: "gpt-4o",
+    system: Some(
+        "You are helpful.",
+    ),
+    messages: [
+        Message {
+            role: User,
+            content: [
+                Text {
+                    text: "Hello",
+                },
+            ],
+        },
+    ],
+    tools: [],
+    params: GenerationParams {
+        max_tokens: Some(
+            100,
+        ),
+        temperature: Some(
+            0.7,
+        ),
+        top_p: None,
+        top_k: None,
+        stop: [],
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+    },
+    response_format: None,
+    stream: false,
+    ingress_protocol: ProtocolEndpoint {
+        suite: OpenAiCompatible,
+        name: "chat-completions",
+        version: "v1",
+    },
+    extensions: {},
+}

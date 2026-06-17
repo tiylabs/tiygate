@@ -1,0 +1,121 @@
+services:
+  tiygate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVER_FEATURES: "webui tiygate-core/redis-quota"
+    image: tiylabs/tiygate:local
+    container_name: tiygate
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      TIYGATE_LISTEN_ADDR: 0.0.0.0:3000
+      TIYGATE_MODE: all
+      # PostgreSQL backend — connects to the Postgres service defined below.
+      TIYGATE_DATABASE_URL: postgres://tiygate:${POSTGRES_PASSWORD:-tiygate}@postgres:5432/tiygate
+      TIYGATE_REDIS_URL: redis://redis:6379/0
+      TIYGATE_ADMIN_TOKEN: ${TIYGATE_ADMIN_TOKEN:-dev-admin-token-change-me}
+      TIYGATE_MASTER_KEY: ${TIYGATE_MASTER_KEY:-}
+      TIYGATE_MAX_BODY_BYTES: ${TIYGATE_MAX_BODY_BYTES:-10485760}
+      TIYGATE_MAX_INFLIGHT: ${TIYGATE_MAX_INFLIGHT:-2048}
+      TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS: ${TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS:-120}
+      TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS: ${TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS:-0}
+      TIYGATE_EPOCH_POLL_INTERVAL_SECS: ${TIYGATE_EPOCH_POLL_INTERVAL_SECS:-3}
+      RUST_LOG: ${RUST_LOG:-info}
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/readyz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tiygate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tiygate
+      POSTGRES_USER: tiygate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tiygate}
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - wal_compression=on
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tiygate -d tiygate"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: tiygate-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --tcp-keepalive
+      - "60"
+      - --timeout
+      - "0"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+  redis_data:

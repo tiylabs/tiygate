@@ -1,0 +1,333 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TiyGate N×N Protocol Conversion</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f8fafc;
+    --fg: #172033;
+    --muted: #5b6475;
+    --line: #94a3b8;
+    --neutral: #e2e8f0;
+    --input: #bfdbfe;
+    --process: #c7d2fe;
+    --storage: #a5f3fc;
+    --external: #fde68a;
+    --risk: #fecaca;
+    --success: #bbf7d0;
+    --codec: #ddd6fe;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f172a;
+      --fg: #e5e7eb;
+      --muted: #a3adbd;
+      --line: #64748b;
+      --neutral: #1e293b;
+      --input: #1e3a5f;
+      --process: #312e81;
+      --storage: #164e63;
+      --external: #713f12;
+      --risk: #7f1d1d;
+      --success: #14532d;
+      --codec: #2e1065;
+    }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  main {
+    max-width: 1100px;
+    margin: 32px auto;
+    padding: 0 20px;
+  }
+  svg {
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+  .title { font-size: 20px; font-weight: 700; fill: var(--fg); }
+  .subtitle { font-size: 13px; fill: var(--muted); }
+  .label { font-size: 13px; font-weight: 600; fill: var(--fg); }
+  .small { font-size: 11px; fill: var(--muted); }
+  .tiny { font-size: 10px; fill: var(--muted); }
+  .node { stroke: var(--line); stroke-width: 1.2; }
+  .neutral { fill: var(--neutral); }
+  .input { fill: var(--input); }
+  .process { fill: var(--process); }
+  .storage { fill: var(--storage); }
+  .external { fill: var(--external); }
+  .risk { fill: var(--risk); }
+  .success { fill: var(--success); }
+  .codec { fill: var(--codec); }
+  .edge { stroke: var(--line); stroke-width: 1.5; fill: none; }
+  .edge-thick { stroke: var(--line); stroke-width: 2.5; fill: none; }
+  .edge-dash { stroke: var(--line); stroke-width: 1.5; fill: none; stroke-dasharray: 6 4; }
+  .zone { fill: none; stroke: var(--line); stroke-width: 1; stroke-dasharray: 6 4; opacity: 0.7; }
+  .zone-label { font-size: 12px; fill: var(--muted); font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+  .badge { font-size: 10px; font-weight: 600; }
+  .highlight { stroke: #6366f1; stroke-width: 2; }
+  .highlight-fill { fill: #eef2ff; }
+  .ir-node { fill: var(--storage); stroke: #06b6d4; stroke-width: 2; }
+  .lossy-node { fill: var(--risk); stroke: #ef4444; stroke-width: 1.5; }
+  .passthrough { stroke: #10b981; stroke-width: 2; fill: none; stroke-dasharray: 8 4; }
+</style>
+<main>
+<svg viewBox="0 0 1060 720" xmlns="http://www.w3.org/2000/svg">
+
+  <!-- ===== TITLE ===== -->
+  <text x="530" y="28" text-anchor="middle" class="title">TiyGate N×N 协议转换架构</text>
+  <text x="530" y="50" text-anchor="middle" class="subtitle">Canonical IR 将 N×N 协议转换降维为 2N 个 Codec</text>
+
+  <!-- ===== ZONES ===== -->
+  <!-- Client Zone -->
+  <rect x="15" y="70" width="195" height="460" rx="6" class="zone" />
+  <text x="112" y="92" text-anchor="middle" class="zone-label">客户端协议</text>
+
+  <!-- Gateway Zone -->
+  <rect x="225" y="70" width="610" height="460" rx="6" class="zone" />
+  <text x="530" y="92" text-anchor="middle" class="zone-label">TiyGate 网关</text>
+
+  <!-- Provider Zone -->
+  <rect x="850" y="70" width="195" height="460" rx="6" class="zone" />
+  <text x="947" y="92" text-anchor="middle" class="zone-label">上游服务</text>
+
+  <!-- ===== CLIENT PROTOCOLS (left) ===== -->
+  <!-- Chat Completions -->
+  <rect x="30" y="115" width="165" height="52" rx="6" class="node input" />
+  <text x="112" y="138" text-anchor="middle" class="label">Chat Completions</text>
+  <text x="112" y="155" text-anchor="middle" class="tiny">OpenAI 兼容系列</text>
+
+  <!-- Messages -->
+  <rect x="30" y="195" width="165" height="52" rx="6" class="node input" />
+  <text x="112" y="218" text-anchor="middle" class="label">Messages</text>
+  <text x="112" y="235" text-anchor="middle" class="tiny">Anthropic 系列</text>
+
+  <!-- Responses -->
+  <rect x="30" y="275" width="165" height="52" rx="6" class="node input" />
+  <text x="112" y="298" text-anchor="middle" class="label">Responses</text>
+  <text x="112" y="315" text-anchor="middle" class="tiny">OpenAI Responses API</text>
+
+  <!-- Gemini -->
+  <rect x="30" y="355" width="165" height="52" rx="6" class="node input" />
+  <text x="112" y="378" text-anchor="middle" class="label">Generate Content</text>
+  <text x="112" y="395" text-anchor="middle" class="tiny">Google Gemini 系列</text>
+
+  <!-- ===== N×N PROBLEM CALLOUT (top-right of client zone) ===== -->
+  <rect x="20" y="435" width="185" height="85" rx="6" class="node risk" opacity="0.5" />
+  <text x="112" y="453" text-anchor="middle" class="small" font-weight="700" fill="#dc2626">❌ 无 IR 时的问题</text>
+  <text x="112" y="472" text-anchor="middle" class="tiny">4 协议需要 4×4 = 16 个</text>
+  <text x="112" y="488" text-anchor="middle" class="tiny">点对点适配器 (N²)</text>
+  <text x="112" y="508" text-anchor="middle" class="tiny" fill="#dc2626">每增加一个协议 +2N+1 适配器</text>
+
+  <!-- ===== INGRESS CODECS (decode) ===== -->
+  <!-- CC decode -->
+  <rect x="240" y="115" width="120" height="52" rx="6" class="node codec" />
+  <text x="300" y="136" text-anchor="middle" class="label">decode →</text>
+  <text x="300" y="155" text-anchor="middle" class="tiny">Chat Completions Codec</text>
+
+  <!-- Messages decode -->
+  <rect x="240" y="195" width="120" height="52" rx="6" class="node codec" />
+  <text x="300" y="216" text-anchor="middle" class="label">decode →</text>
+  <text x="300" y="235" text-anchor="middle" class="tiny">Messages Codec</text>
+
+  <!-- Responses decode -->
+  <rect x="240" y="275" width="120" height="52" rx="6" class="node codec" />
+  <text x="300" y="296" text-anchor="middle" class="label">decode →</text>
+  <text x="300" y="315" text-anchor="middle" class="tiny">Responses Codec</text>
+
+  <!-- Gemini decode -->
+  <rect x="240" y="355" width="120" height="52" rx="6" class="node codec" />
+  <text x="300" y="376" text-anchor="middle" class="label">decode →</text>
+  <text x="300" y="395" text-anchor="middle" class="tiny">Gemini Codec</text>
+
+  <!-- ===== ARROWS: Client → Ingress Codec ===== -->
+  <line x1="195" y1="141" x2="240" y2="141" class="edge" marker-end="url(#arrow)" />
+  <line x1="195" y1="221" x2="240" y2="221" class="edge" marker-end="url(#arrow)" />
+  <line x1="195" y1="301" x2="240" y2="301" class="edge" marker-end="url(#arrow)" />
+  <line x1="195" y1="381" x2="240" y2="381" class="edge" marker-end="url(#arrow)" />
+
+  <!-- ===== CONVERGENCE ARROWS → IR ===== -->
+  <!-- Each ingress codec output converges to the IR input -->
+  <line x1="360" y1="141" x2="395" y2="200" class="edge" marker-end="url(#arrow)" />
+  <line x1="360" y1="221" x2="395" y2="250" class="edge" marker-end="url(#arrow)" />
+  <line x1="360" y1="301" x2="395" y2="300" class="edge" marker-end="url(#arrow)" />
+  <line x1="360" y1="381" x2="395" y2="350" class="edge" marker-end="url(#arrow)" />
+
+  <!-- ===== CANONICAL IR (center) ===== -->
+  <rect x="395" y="130" width="170" height="290" rx="10" class="node ir-node" />
+  <text x="480" y="158" text-anchor="middle" class="label" fill="#0e7490">Canonical IR</text>
+  <text x="480" y="178" text-anchor="middle" class="tiny" fill="#155e75">规范中间表示</text>
+
+  <!-- IR internal structure -->
+  <rect x="408" y="192" width="144" height="22" rx="4" fill="#cffafe" stroke="#06b6d4" stroke-width="0.8" />
+  <text x="480" y="207" text-anchor="middle" class="tiny" fill="#155e75">IrRequest</text>
+
+  <rect x="408" y="220" width="144" height="22" rx="4" fill="#cffafe" stroke="#06b6d4" stroke-width="0.8" />
+  <text x="480" y="235" text-anchor="middle" class="tiny" fill="#155e75">IrResponse</text>
+
+  <rect x="408" y="248" width="144" height="22" rx="4" fill="#cffafe" stroke="#06b6d4" stroke-width="0.8" />
+  <text x="480" y="263" text-anchor="middle" class="tiny" fill="#155e75">Message / Content</text>
+
+  <rect x="408" y="276" width="144" height="22" rx="4" fill="#cffafe" stroke="#06b6d4" stroke-width="0.8" />
+  <text x="480" y="291" text-anchor="middle" class="tiny" fill="#155e75">StreamPart</text>
+
+  <rect x="408" y="304" width="144" height="22" rx="4" fill="#cffafe" stroke="#06b6d4" stroke-width="0.8" />
+  <text x="480" y="319" text-anchor="middle" class="tiny" fill="#155e75">Usage / Extensions</text>
+
+  <!-- IR key insight label -->
+  <text x="480" y="347" text-anchor="middle" class="small" fill="#0e7490" font-style="italic">承载所有协议的</text>
+  <text x="480" y="363" text-anchor="middle" class="small" fill="#0e7490" font-style="italic">字段并集，无信息丢失</text>
+
+  <!-- N×N Solution Callout -->
+  <rect x="408" y="378" width="144" height="34" rx="6" class="node success" opacity="0.6" />
+  <text x="480" y="395" text-anchor="middle" class="small" fill="#166534" font-weight="700">✅ 4+4 = 8 个 Codec</text>
+  <text x="480" y="408" text-anchor="middle" class="tiny" fill="#166534">仅需 2N，每增协议 +2</text>
+
+  <!-- ===== DIVERGENCE ARROWS IR → Lossy Check ===== -->
+  <line x1="565" y1="200" x2="600" y2="141" class="edge" marker-end="url(#arrow)" />
+  <line x1="565" y1="250" x2="600" y2="221" class="edge" marker-end="url(#arrow)" />
+  <line x1="565" y1="300" x2="600" y2="301" class="edge" marker-end="url(#arrow)" />
+  <line x1="565" y1="350" x2="600" y2="381" class="edge" marker-end="url(#arrow)" />
+
+  <!-- ===== LOSSY CHECK GATE ===== -->
+  <rect x="600" y="130" width="105" height="290" rx="6" class="node lossy-node" />
+  <text x="652" y="155" text-anchor="middle" class="label" fill="#991b1b">Lossy Check</text>
+  <text x="652" y="172" text-anchor="middle" class="tiny" fill="#7f1d1d">协议能力校验</text>
+
+  <!-- Lossy dimensions -->
+  <rect x="610" y="185" width="85" height="18" rx="3" fill="#fee2e2" stroke="#fca5a5" stroke-width="0.5" />
+  <text x="652" y="198" text-anchor="middle" class="tiny" fill="#991b1b">Tool Calling</text>
+
+  <rect x="610" y="208" width="85" height="18" rx="3" fill="#fee2e2" stroke="#fca5a5" stroke-width="0.5" />
+  <text x="652" y="221" text-anchor="middle" class="tiny" fill="#991b1b">Parallel Tools</text>
+
+  <rect x="610" y="231" width="85" height="18" rx="3" fill="#fee2e2" stroke="#fca5a5" stroke-width="0.5" />
+  <text x="652" y="244" text-anchor="middle" class="tiny" fill="#991b1b">Media Source</text>
+
+  <rect x="610" y="254" width="85" height="18" rx="3" fill="#fee2e2" stroke="#fca5a5" stroke-width="0.5" />
+  <text x="652" y="267" text-anchor="middle" class="tiny" fill="#991b1b">Struct Output</text>
+
+  <rect x="610" y="277" width="85" height="18" rx="3" fill="#fee2e2" stroke="#fca5a5" stroke-width="0.5" />
+  <text x="652" y="290" text-anchor="middle" class="tiny" fill="#991b1b">Ext Reasoning</text>
+
+  <rect x="610" y="300" width="85" height="18" rx="3" fill="#fee2e2" stroke="#fca5a5" stroke-width="0.5" />
+  <text x="652" y="313" text-anchor="middle" class="tiny" fill="#991b1b">Tool Choice</text>
+
+  <rect x="610" y="323" width="85" height="18" rx="3" fill="#fee2e2" stroke="#fca5a5" stroke-width="0.5" />
+  <text x="652" y="336" text-anchor="middle" class="tiny" fill="#991b1b">Seed (drop)</text>
+
+  <!-- Reject label -->
+  <rect x="610" y="355" width="85" height="28" rx="4" fill="#dc2626" />
+  <text x="652" y="369" text-anchor="middle" class="small" fill="#fff" font-weight="700">不可转换 → 拒绝</text>
+  <text x="652" y="405" text-anchor="middle" class="tiny" fill="#7f1d1d">lossy_default_reject</text>
+  <text x="652" y="416" text-anchor="middle" class="tiny" fill="#7f1d1d">无 allow_lossy 逃生舱</text>
+
+  <!-- ===== ARROWS: Lossy → Egress Codec ===== -->
+  <line x1="705" y1="141" x2="740" y2="141" class="edge" marker-end="url(#arrow)" />
+  <line x1="705" y1="221" x2="740" y2="221" class="edge" marker-end="url(#arrow)" />
+  <line x1="705" y1="301" x2="740" y2="301" class="edge" marker-end="url(#arrow)" />
+  <line x1="705" y1="381" x2="740" y2="381" class="edge" marker-end="url(#arrow)" />
+
+  <!-- Small pass indicator on arrows -->
+  <text x="720" y="135" text-anchor="middle" class="tiny" fill="#16a34a">✓</text>
+  <text x="720" y="215" text-anchor="middle" class="tiny" fill="#16a34a">✓</text>
+  <text x="720" y="295" text-anchor="middle" class="tiny" fill="#16a34a">✓</text>
+  <text x="720" y="375" text-anchor="middle" class="tiny" fill="#16a34a">✓</text>
+
+  <!-- ===== EGRESS CODECS (encode) ===== -->
+  <!-- CC encode -->
+  <rect x="740" y="115" width="95" height="52" rx="6" class="node codec" />
+  <text x="787" y="136" text-anchor="middle" class="label">→ encode</text>
+  <text x="787" y="155" text-anchor="middle" class="tiny">Chat Codec</text>
+
+  <!-- Messages encode -->
+  <rect x="740" y="195" width="95" height="52" rx="6" class="node codec" />
+  <text x="787" y="216" text-anchor="middle" class="label">→ encode</text>
+  <text x="787" y="235" text-anchor="middle" class="tiny">Messages Codec</text>
+
+  <!-- Responses encode -->
+  <rect x="740" y="275" width="95" height="52" rx="6" class="node codec" />
+  <text x="787" y="296" text-anchor="middle" class="label">→ encode</text>
+  <text x="787" y="315" text-anchor="middle" class="tiny">Responses Codec</text>
+
+  <!-- Gemini encode -->
+  <rect x="740" y="355" width="95" height="52" rx="6" class="node codec" />
+  <text x="787" y="376" text-anchor="middle" class="label">→ encode</text>
+  <text x="787" y="395" text-anchor="middle" class="tiny">Gemini Codec</text>
+
+  <!-- ===== PROVIDERS (right) ===== -->
+  <!-- OpenAI -->
+  <rect x="865" y="115" width="165" height="52" rx="6" class="node external" />
+  <text x="947" y="138" text-anchor="middle" class="label">OpenAI</text>
+  <text x="947" y="155" text-anchor="middle" class="tiny">+ DeepSeek, Moonshot, xAI…</text>
+
+  <!-- Anthropic -->
+  <rect x="865" y="195" width="165" height="52" rx="6" class="node external" />
+  <text x="947" y="218" text-anchor="middle" class="label">Anthropic</text>
+  <text x="947" y="235" text-anchor="middle" class="tiny">Claude 系列</text>
+
+  <!-- OpenAI Responses -->
+  <rect x="865" y="275" width="165" height="52" rx="6" class="node external" />
+  <text x="947" y="298" text-anchor="middle" class="label">OpenAI Responses</text>
+  <text x="947" y="315" text-anchor="middle" class="tiny">Responses API</text>
+
+  <!-- Google / Bedrock -->
+  <rect x="865" y="355" width="165" height="52" rx="6" class="node external" />
+  <text x="947" y="378" text-anchor="middle" class="label">Google / Bedrock</text>
+  <text x="947" y="395" text-anchor="middle" class="tiny">Gemini + AWS Bedrock</text>
+
+  <!-- ===== ARROWS: Egress → Providers ===== -->
+  <line x1="835" y1="141" x2="865" y2="141" class="edge" marker-end="url(#arrow)" />
+  <line x1="835" y1="221" x2="865" y2="221" class="edge" marker-end="url(#arrow)" />
+  <line x1="835" y1="301" x2="865" y2="301" class="edge" marker-end="url(#arrow)" />
+  <line x1="835" y1="381" x2="865" y2="381" class="edge" marker-end="url(#arrow)" />
+
+  <!-- ===== PASSTHROUGH FAST PATH (bottom) ===== -->
+  <rect x="15" y="555" width="1030" height="145" rx="6" class="zone" />
+  <text x="530" y="577" text-anchor="middle" class="zone-label">PassThrough 快速路径 (同协议，绕过 IR)</text>
+
+  <!-- PassThrough flow boxes -->
+  <rect x="30" y="595" width="165" height="40" rx="6" class="node input" />
+  <text x="112" y="613" text-anchor="middle" class="label">Chat Completions</text>
+  <text x="112" y="629" text-anchor="middle" class="tiny">客户端请求 (原始 JSON)</text>
+
+  <!-- PassThrough arrow straight across -->
+  <line x1="195" y1="615" x2="865" y2="615" class="passthrough" marker-end="url(#arrow-green)" />
+
+  <!-- PassThrough label on arrow -->
+  <rect x="400" y="600" width="260" height="30" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="1" />
+  <text x="530" y="615" text-anchor="middle" class="label" fill="#065f46">PassThrough — 原始字节直接转发</text>
+  <text x="530" y="628" text-anchor="middle" class="tiny" fill="#047857">同一协议族 (suite match)，零序列化开销，零字段丢失</text>
+
+  <!-- PassThrough target -->
+  <rect x="865" y="595" width="165" height="40" rx="6" class="node external" />
+  <text x="947" y="613" text-anchor="middle" class="label">OpenAI / 兼容服务</text>
+  <text x="947" y="629" text-anchor="middle" class="tiny">上游 Provider</text>
+
+  <!-- Decision box -->
+  <rect x="370" y="660" width="320" height="32" rx="6" class="node process" />
+  <text x="530" y="675" text-anchor="middle" class="label">pass_through_policy(ingress, egress) → Passthrough | Convert</text>
+  <text x="530" y="688" text-anchor="middle" class="tiny">同 suite → 原始转发；不同 suite → 走 IR 转换路径</text>
+
+  <!-- ===== LEGEND ===== -->
+  <text x="530" y="713" text-anchor="middle" class="small" fill="var(--muted)">
+    Codec 注册: inventory::submit! { CodecRegistration { make: || Box::new(...) } } ｜ 5 个 Codec 实现文件 ｜ 16 个 N×N 集成测试
+  </text>
+
+  <!-- ===== MARKER DEFINITIONS ===== -->
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="var(--line)" />
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#10b981" />
+    </marker>
+  </defs>
+
+</svg>
+</main>

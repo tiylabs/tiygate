@@ -1,0 +1,23 @@
+[package]
+name = "tiygate-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tiygate-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+moka.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true

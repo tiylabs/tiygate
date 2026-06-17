@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TiyGate 请求时间指标示意图</title>
+<style>
+  body { margin: 0; padding: 24px; background: #f8fafc; color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1220px; margin: 0 auto; background: #fff; border: 1px solid #e2e8f0; border-radius: 18px; padding: 18px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  p { margin: 0 0 16px; color: #475569; font-size: 14px; }
+  svg { width: 100%; height: auto; display: block; }
+  .node { fill: #fff; stroke: #94a3b8; stroke-width: 1.4; rx: 12; }
+  .client { fill: #eff6ff; stroke: #60a5fa; }
+  .gateway { fill: #f8fafc; stroke: #64748b; }
+  .upstream { fill: #fff7ed; stroke: #fb923c; }
+  .stream { fill: #ecfdf5; stroke: #34d399; }
+  .store { fill: #f5f3ff; stroke: #a78bfa; }
+  .label { font-size: 14px; fill: #0f172a; font-weight: 600; }
+  .small { font-size: 12px; fill: #475569; font-weight: 400; }
+  .tiny { font-size: 11px; fill: #64748b; }
+  .axis { stroke: #334155; stroke-width: 2; marker-end: url(#arrow); }
+  .conn { stroke: #94a3b8; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+  .metric-total { stroke: #2563eb; stroke-width: 10; stroke-linecap: round; }
+  .metric-ttfb { stroke: #f97316; stroke-width: 10; stroke-linecap: round; }
+  .metric-stream { stroke: #10b981; stroke-width: 10; stroke-linecap: round; }
+  .metric-queue { stroke: #94a3b8; stroke-width: 10; stroke-linecap: round; stroke-dasharray: 6 6; }
+  .tick { stroke: #64748b; stroke-width: 1.2; }
+  .note { fill: #fff; stroke: #cbd5e1; rx: 10; }
+  .warning { fill: #fff7ed; stroke: #fdba74; rx: 10; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>请求从开始到结束：当前记录的时间点/时间段</h1>
+<p>基于当前代码：流式请求下，主请求日志先在返回 Response 时写入，流结束后再异步补写 stream_duration_ms。</p>
+<svg viewBox="0 0 1200 760" role="img" aria-label="TiyGate request timing diagram">
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L8,3 z" fill="#334155" />
+    </marker>
+  </defs>
+
+  <!-- main time axis -->
+  <line x1="70" y1="94" x2="1135" y2="94" class="axis" />
+  <text x="70" y="64" class="label">时间线</text>
+  <text x="1085" y="64" class="small">向右推进</text>
+
+  <!-- ticks -->
+  <g>
+    <line x1="90" y1="82" x2="90" y2="110" class="tick" />
+    <text x="60" y="130" class="tiny">T0</text>
+    <text x="38" y="146" class="tiny">请求进入</text>
+
+    <line x1="260" y1="82" x2="260" y2="110" class="tick" />
+    <text x="232" y="130" class="tiny">T1</text>
+    <text x="202" y="146" class="tiny">开始上游请求</text>
+
+    <line x1="430" y1="82" x2="430" y2="110" class="tick" />
+    <text x="402" y="130" class="tiny">T2</text>
+    <text x="368" y="146" class="tiny">上游响应头到达</text>
+
+    <line x1="610" y1="82" x2="610" y2="110" class="tick" />
+    <text x="582" y="130" class="tiny">T3</text>
+    <text x="568" y="146" class="tiny">首个 SSE chunk</text>
+
+    <line x1="760" y1="82" x2="760" y2="110" class="tick" />
+    <text x="732" y="130" class="tiny">T4</text>
+    <text x="710" y="146" class="tiny">Response 返回客户端</text>
+
+    <line x1="1010" y1="82" x2="1010" y2="110" class="tick" />
+    <text x="982" y="130" class="tiny">T5</text>
+    <text x="946" y="146" class="tiny">EOF / 错误 / timeout</text>
+
+    <line x1="1110" y1="82" x2="1110" y2="110" class="tick" />
+    <text x="1082" y="130" class="tiny">T6</text>
+    <text x="1054" y="146" class="tiny">telemetry 落库补写</text>
+  </g>
+
+  <!-- lifecycle nodes -->
+  <rect x="35" y="185" width="135" height="74" class="node client" />
+  <text x="58" y="214" class="label">客户端请求</text>
+  <text x="58" y="236" class="small">进入网关 handler</text>
+
+  <rect x="205" y="185" width="170" height="74" class="node gateway" />
+  <text x="230" y="214" class="label">网关前置处理</text>
+  <text x="230" y="236" class="small">解析 / 鉴权 / 路由 / 转换</text>
+
+  <rect x="410" y="185" width="165" height="74" class="node upstream" />
+  <text x="435" y="214" class="label">上游响应头到达</text>
+  <text x="435" y="236" class="small">client.execute 返回</text>
+
+  <rect x="610" y="185" width="175" height="74" class="node gateway" />
+  <text x="634" y="214" class="label">构造下游 Response</text>
+  <text x="634" y="236" class="small">emit_ok 写主请求行</text>
+
+  <rect x="820" y="185" width="185" height="74" class="node stream" />
+  <text x="846" y="214" class="label">持续转发 SSE body</text>
+  <text x="846" y="236" class="small">chunk / keepalive / transcode</text>
+
+  <rect x="1035" y="185" width="135" height="74" class="node store" />
+  <text x="1056" y="214" class="label">流结束后捕获</text>
+  <text x="1056" y="236" class="small">补写 stream_duration</text>
+
+  <line x1="170" y1="222" x2="205" y2="222" class="conn" />
+  <line x1="375" y1="222" x2="410" y2="222" class="conn" />
+  <line x1="575" y1="222" x2="610" y2="222" class="conn" />
+  <line x1="785" y1="222" x2="820" y2="222" class="conn" />
+  <line x1="1005" y1="222" x2="1035" y2="222" class="conn" />
+
+  <!-- metric bars -->
+  <text x="55" y="335" class="label">当前记录的时间段</text>
+
+  <line x1="90" y1="370" x2="760" y2="370" class="metric-total" />
+  <circle cx="90" cy="370" r="5" fill="#2563eb" />
+  <circle cx="760" cy="370" r="5" fill="#2563eb" />
+  <text x="100" y="357" class="label">total_latency_ms</text>
+  <text x="100" y="392" class="small">RequestScope.started → scope.emit_ok / emit_error；流式场景通常到“Response 被构造并返回”，不等 body 完全结束。</text>
+
+  <line x1="90" y1="425" x2="760" y2="425" class="metric-total" />
+  <circle cx="90" cy="425" r="5" fill="#2563eb" />
+  <circle cx="760" cy="425" r="5" fill="#2563eb" />
+  <text x="100" y="412" class="label">upstream_latency_ms</text>
+  <text x="100" y="447" class="small">当前 RequestScope 中与 total_latency_ms 同源：started.elapsed()；queue_latency_ms 固定为 0。</text>
+
+  <line x1="260" y1="480" x2="430" y2="480" class="metric-ttfb" />
+  <circle cx="260" cy="480" r="5" fill="#f97316" />
+  <circle cx="430" cy="480" r="5" fill="#f97316" />
+  <text x="270" y="467" class="label">ttfb_ms</text>
+  <text x="270" y="502" class="small">exec_started → client.execute(...) 返回；即“向上游发起请求”到“上游响应头到达”。</text>
+
+  <line x1="430" y1="535" x2="1010" y2="535" class="metric-stream" />
+  <circle cx="430" cy="535" r="5" fill="#10b981" />
+  <circle cx="1010" cy="535" r="5" fill="#10b981" />
+  <text x="440" y="522" class="label">stream_duration_ms</text>
+  <text x="440" y="557" class="small">drive_upstream_stream 入口 → 上游 EOF / 上游错误 / idle timeout / total timeout；包含首 chunk 前等待。</text>
+
+  <line x1="90" y1="590" x2="90" y2="590" class="metric-queue" />
+  <text x="100" y="595" class="label">queue_latency_ms = 0</text>
+  <text x="260" y="595" class="small">当前代码未拆出排队耗时，落库值固定为 0。</text>
+
+  <!-- notes -->
+  <rect x="60" y="635" width="500" height="78" class="note" />
+  <text x="84" y="662" class="label">关键边界</text>
+  <text x="84" y="686" class="small">T2 是分界点：T1→T2 归入 ttfb_ms；T2→T5 归入 stream_duration_ms。</text>
+  <text x="84" y="706" class="small">T3 不是 stream_duration_ms 的起点，首 token 前等待也被计入。</text>
+
+  <rect x="620" y="635" width="500" height="78" class="warning" />
+  <text x="644" y="662" class="label">流式请求的特殊点</text>
+  <text x="644" y="686" class="small">主请求日志的 total_latency_ms 可能早于流 body 结束写入。</text>
+  <text x="644" y="706" class="small">stream_duration_ms 是后续 capture 阶段异步 upsert 到 request_logs 的。</text>
+</svg>
+</div>
+</body>
+</html>

@@ -1,0 +1,21 @@
+-- finish_reason
+--
+-- Upstream model finish / stop reason mirrored onto the aggregated
+-- request_logs row so list views and detail drawers can surface it
+-- without a payload join.
+--
+-- Populated by the OLTP sink's `write_capture` background task via an
+-- order-independent upsert (`update_request_finish_reason`).
+--
+-- Typical values (normalised to snake_case):
+--   "stop"           – natural end of generation
+--   "length"         – hit max_tokens / output limit
+--   "content_filter" – blocked by safety filter
+--   "tool_calls"     – model wants to invoke a tool
+--   "error"          – upstream signalled failure (Responses API)
+--   other strings    – protocol-specific values passed through
+--
+-- NULL means the finish reason could not be extracted (e.g. pre-existing
+-- row, non-chat endpoint, or unparseable response body).
+
+ALTER TABLE request_logs ADD COLUMN finish_reason TEXT;
