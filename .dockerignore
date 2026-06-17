@@ -1,0 +1,16 @@
+target
+.git
+.gitignore
+.DS_Store
+.env
+.env.*
+!/.env.example
+webui/node_modules
+webui/dist
+node_modules
+npm-debug.log*
+Dockerfile*
+docker-compose*.yml
+README*.md
+docs
+scripts

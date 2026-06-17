@@ -1,0 +1,54 @@
+# Rust / Cargo
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Build artifacts
+*.pdb
+*.dll
+*.so
+*.dylib
+
+# IDE / Editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+.fleet/
+.zed/
+
+# Local env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+config/local*.toml
+config/local*.yaml
+config/local*.yml
+
+# Runtime / data
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# Coverage / profiling
+coverage/
+*.profraw
+*.profdata
+.tarpaulin-info/
+
+# OS
+Thumbs.db

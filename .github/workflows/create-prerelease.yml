@@ -1,0 +1,57 @@
+name: Create prerelease
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release tag (e.g. 1.0.0)"
+        required: true
+        default: "1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find previous stable tag
+        id: prev_tag
+        run: |
+          CURRENT_TAG="${{ github.ref_name }}"
+          # List all tags matching X.Y.Z (no suffix), sorted by version descending
+          # Exclude the current tag, then take the first match as the previous stable tag
+          PREV_TAG=$(git tag -l --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${CURRENT_TAG}$" | head -n 1)
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Current tag: ${CURRENT_TAG}, Previous stable tag: ${PREV_TAG}"
+
+      - name: Generate changelog
+        id: changelog
+        uses: requarks/changelog-action@v1.10.3
+        with:
+          token: ${{ github.token }}
+          fromTag: ${{ github.ref_name }}
+          toTag: ${{ steps.prev_tag.outputs.prev_tag }}
+          writeToFile: false
+
+      - name: Create Prerelease
+        uses: ncipollo/release-action@v1.12.0
+        with:
+          allowUpdates: true
+          draft: false
+          prerelease: true
+          makeLatest: false
+          name: ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.changes }}
+          # Use a PAT so the release event triggers downstream workflows
+          # (events from the default GITHUB_TOKEN do not start new workflow runs).
+          token: ${{ secrets.PAT_TOKEN }}

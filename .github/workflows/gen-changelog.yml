@@ -1,0 +1,57 @@
+name: Update changelog
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release tag (e.g. 1.0.0)"
+        required: true
+        default: "1.0.0"
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Find previous stable tag
+        id: prev_tag
+        run: |
+          CURRENT_TAG="${{ github.ref_name }}"
+          # List all tags matching X.Y.Z (no suffix), sorted by version descending
+          # Exclude the current tag, then take the first match as the previous stable tag
+          PREV_TAG=$(git tag -l --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${CURRENT_TAG}$" | head -n 1)
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Current tag: ${CURRENT_TAG}, Previous stable tag: ${PREV_TAG}"
+
+      - name: Update CHANGELOG
+        id: changelog
+        uses: requarks/changelog-action@v1.10.3
+        with:
+          token: ${{ github.token }}
+          fromTag: ${{ github.ref_name }}
+          toTag: ${{ steps.prev_tag.outputs.prev_tag }}
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          commit-message: "docs:📝 update CHANGELOG.md for ${{ github.ref_name }}"
+          title: "docs:📝 update CHANGELOG.md for ${{ github.ref_name }}"
+          body: |
+            Auto-generated changelog update for release ${{ github.ref_name }}.
+            Comparing changes from `${{ steps.prev_tag.outputs.prev_tag }}` to `${{ github.ref_name }}`.
+
+            This PR was automatically created by the changelog workflow.
+          branch: changelog/${{ github.ref_name }}
+          base: master
+          add-paths: CHANGELOG.md
+          labels: documentation,automated
+          delete-branch: true
