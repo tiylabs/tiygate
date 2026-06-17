@@ -37,7 +37,7 @@ Most gateways optimize for one dimension. TiyGate is engineered to hold three at
 | **Extensibility** | Trait + `inventory` decentralized registration (adding a provider = new file + one `submit!`); hook pipeline; `Executor` escape hatch for SDK-style providers; three-segment protocol identity; pluggable strategies, cache, and log sinks |
 | **Maintainability** | `core` has zero dependencies on concrete providers/protocols/DB; canonical IR collapses N×N protocol translation to N; field-level capability matrix makes lossiness explicit; heavy dependencies isolated in dedicated crates |
 
-The full design rationale lives in [`docs/ai-gateway-architecture-design.md`](docs/ai-gateway-architecture-design.md). The field-level lossiness matrix used by `lossy_default_reject` lives in [`docs/protocol-capability-matrix.md`](docs/protocol-capability-matrix.md).
+The field-level lossiness matrix used by `lossy_default_reject` lives in [`docs/protocol-capability-matrix.md`](docs/protocol-capability-matrix.md).
 
 ## Workspace Layout
 
@@ -260,7 +260,7 @@ cargo tree -p tiygate-server -e features --depth 1
 
 ## Contributing
 
-Issues and pull requests are welcome. For non-trivial changes, please read the architecture doc first — the design is opinionated, and contributions that fight the layering (e.g. adding a concrete provider dependency to `core`, or introducing `allow_lossy`) will be declined.
+Issues and pull requests are welcome. The design is opinionated, and contributions that fight the layering (e.g. adding a concrete provider dependency to `core`, or introducing `allow_lossy`) will be declined.
 
 ## License
 
@@ -269,5 +269,5 @@ Issues and pull requests are welcome. For non-trivial changes, please read the a
 ---
 
 <div align="center">
-<sub>Built by <a href="https://github.com/tiylabs">tiylabs</a> · <a href="docs/ai-gateway-architecture-design.md">Architecture</a> · <a href="docs/protocol-capability-matrix.md">Capability Matrix</a></sub>
+<sub>Built by <a href="https://github.com/tiylabs">tiylabs</a> · <a href="docs/protocol-capability-matrix.md">Capability Matrix</a></sub>
 </div>

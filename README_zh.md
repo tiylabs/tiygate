@@ -37,7 +37,7 @@ TiyGate 是一款用 **Rust** 编写的**独立 AI 网关产品**。它位于应
 | **可扩展** | trait + `inventory` 去中心注册(加 provider = 加文件 + 一行 `submit!`)、hook pipeline、`Executor` 逃生舱(SDK 型 provider)、三段式协议身份、可插拔路由策略/缓存/日志 sink |
 | **易维护** | `core` 对具体 provider/协议/DB 零依赖;canonical IR 把 N² 协议转换降为 N;**字段级能力矩阵**显式判定有损;重依赖关进独立 crate |
 
-完整设计论证见 [`docs/ai-gateway-architecture-design.md`](docs/ai-gateway-architecture-design.md)。`lossy_default_reject` 所用的字段级有损判定表见 [`docs/protocol-capability-matrix.md`](docs/protocol-capability-matrix.md)。
+`lossy_default_reject` 所用的字段级有损判定表见 [`docs/protocol-capability-matrix.md`](docs/protocol-capability-matrix.md)。
 
 ## Workspace 结构
 
@@ -260,7 +260,7 @@ cargo tree -p tiygate-server -e features --depth 1
 
 ## 贡献
 
-欢迎 Issue 与 PR。涉及非平凡变更前请先阅读架构设计文档 —— 设计是有立场的,与分层对抗的贡献(例如给 `core` 加具体 provider 依赖、引入 `allow_lossy`)会被拒。
+欢迎 Issue 与 PR。设计是有立场的,与分层对抗的贡献(例如给 `core` 加具体 provider 依赖、引入 `allow_lossy`)会被拒。
 
 ## 许可证
 
@@ -269,5 +269,5 @@ cargo tree -p tiygate-server -e features --depth 1
 ---
 
 <div align="center">
-<sub>由 <a href="https://github.com/tiylabs">tiylabs</a> 构建 · <a href="docs/ai-gateway-architecture-design.md">架构设计</a> · <a href="docs/protocol-capability-matrix.md">能力矩阵</a></sub>
+<sub>由 <a href="https://github.com/tiylabs">tiylabs</a> 构建 · <a href="docs/protocol-capability-matrix.md">能力矩阵</a></sub>
 </div>
