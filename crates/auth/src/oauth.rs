@@ -428,7 +428,7 @@ fn _ensure_send_sync() {
 // `apply` on `OAuthAuthApplier` is the hot path: it must be infallible on
 // the fast path and must not call into the network unless the token is
 // expiring. The `debug!` line is a no-op trace that helps when running
-// with `RUST_LOG=tiygate::providers::oauth=debug`.
+// with `RUST_LOG=tiygate::auth::oauth=debug`.
 #[allow(dead_code)]
 fn _trace_helper() {
     debug!("oauth trace helper loaded");

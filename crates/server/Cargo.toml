@@ -57,6 +57,7 @@ dotenv = ["dep:dotenvy"]
 [dependencies]
 # Internal crates — most are opt-in via features above.
 tiygate-core.workspace = true
+tiygate-auth.workspace = true
 tiygate-protocols.workspace = true
 tiygate-store.workspace = true
 tiygate-admin = { workspace = true, optional = true }

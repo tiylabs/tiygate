@@ -11,6 +11,7 @@ path = "src/lib.rs"
 tiygate-core.workspace = true
 tiygate-store.workspace = true
 tiygate-providers.workspace = true
+tiygate-auth.workspace = true
 oauth2.workspace = true
 axum.workspace = true
 serde.workspace = true

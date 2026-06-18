@@ -3078,6 +3078,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
+ "tiygate-auth",
  "tiygate-core",
  "tiygate-providers",
  "tiygate-store",
@@ -3085,6 +3086,23 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "tiygate-auth"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "http 1.4.2",
+ "oauth2",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tiygate-core",
+ "tokio",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -3185,17 +3203,15 @@ dependencies = [
  "async-trait",
  "http 1.4.2",
  "inventory",
- "oauth2",
- "parking_lot",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tiygate-auth",
  "tiygate-core",
  "tokio",
  "tracing",
  "wiremock",
- "zeroize",
 ]
 
 [[package]]
@@ -3224,6 +3240,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tiygate-admin",
+ "tiygate-auth",
  "tiygate-cache",
  "tiygate-core",
  "tiygate-protocols",

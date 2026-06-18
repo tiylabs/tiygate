@@ -8,6 +8,7 @@ members = [
     "crates/store",
     "crates/cache",
     "crates/admin",
+    "crates/auth",
     "crates/server",
 ]
 
@@ -27,6 +28,7 @@ tiygate-provider-bedrock = { path = "crates/provider-bedrock" }
 tiygate-store = { path = "crates/store" }
 tiygate-cache = { path = "crates/cache" }
 tiygate-admin = { path = "crates/admin" }
+tiygate-auth = { path = "crates/auth" }
 
 # Core
 tokio = { version = "1", features = ["full"] }

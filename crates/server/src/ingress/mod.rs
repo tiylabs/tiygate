@@ -405,16 +405,18 @@ pub async fn apply_provider_auth(
     // In all three cases the key written to the upstream is the
     // routing target's `effective_api_key()` — the static key
     // configured on the target row, never the caller's credential.
-    use tiygate_core::ProtocolSuite;
+    use tiygate_auth::{api_key::HeaderApiKeyAuthApplier, bearer::BearerAuthApplier};
+    use tiygate_core::{AuthApplier, ProtocolSuite};
     if matches!(target.api_protocol.suite, ProtocolSuite::AnthropicMessages) {
-        let api_key = target.effective_api_key();
-        let hv = http::HeaderValue::from_str(api_key).map_err(|e| {
-            AppError::new(
+        let applier = HeaderApiKeyAuthApplier {
+            header_name: "x-api-key".to_string(),
+        };
+        if let Err(e) = applier.apply(upstream_headers, target).await {
+            return Err(AppError::new(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Invalid header value: {e}"),
-            )
-        })?;
-        upstream_headers.insert(http::HeaderName::from_static("x-api-key"), hv);
+                format!("Provider auth applier failed: {e}"),
+            ));
+        }
         upstream_headers.insert(
             http::HeaderName::from_static("anthropic-version"),
             http::HeaderValue::from_static("2023-06-01"),
@@ -425,26 +427,23 @@ pub async fn apply_provider_auth(
         // provider registered. We re-use the upstream `effective_api_key()`
         // — the static key configured on the target row — and
         // write it as `x-goog-api-key`.
-        let api_key = target.effective_api_key();
-        let hv = http::HeaderValue::from_str(api_key).map_err(|e| {
-            AppError::new(
+        let applier = HeaderApiKeyAuthApplier {
+            header_name: "x-goog-api-key".to_string(),
+        };
+        if let Err(e) = applier.apply(upstream_headers, target).await {
+            return Err(AppError::new(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Invalid x-goog-api-key header value: {e}"),
-            )
-        })?;
-        upstream_headers.insert(
-            http::HeaderName::from_static(tiygate_providers::gemini::GEMINI_API_KEY_HEADER),
-            hv,
-        );
+                format!("Provider auth applier failed: {e}"),
+            ));
+        }
     } else {
-        let api_key = target.effective_api_key();
-        let hv = http::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-            AppError::new(
+        let applier = BearerAuthApplier;
+        if let Err(e) = applier.apply(upstream_headers, target).await {
+            return Err(AppError::new(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Invalid header: {e}"),
-            )
-        })?;
-        upstream_headers.insert(http::header::AUTHORIZATION, hv);
+                format!("Provider auth applier failed: {e}"),
+            ));
+        }
     }
     Ok(())
 }

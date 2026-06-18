@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use tiygate_providers::oauth::{OAuthAuthApplier, OAuthConfig, OAuthOutcome};
+use tiygate_auth::oauth::{OAuthAuthApplier, OAuthConfig, OAuthOutcome};
 use tiygate_store::models::AuthMode;
 
 use crate::state::{AdminState, OAuthPendingFlow};

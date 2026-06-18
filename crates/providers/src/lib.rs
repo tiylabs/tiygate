@@ -7,7 +7,6 @@ pub mod anthropic;
 pub mod deepseek;
 pub mod gemini;
 pub mod moonshot;
-pub mod oauth;
 pub mod ollama;
 pub mod openai;
 pub mod openai_compatible;

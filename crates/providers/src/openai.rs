@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use tiygate_auth::bearer::BearerAuthApplier;
 use tiygate_core::{
     AuthApplier, AuthMode, ProtocolEndpoint, ProtocolSuite, Provider, ProviderMetadata,
 };
@@ -46,24 +47,6 @@ impl Provider for OpenAiProvider {
 
     fn auth(&self) -> Arc<dyn AuthApplier> {
         Arc::new(BearerAuthApplier)
-    }
-}
-
-/// Bearer token authentication applier.
-pub struct BearerAuthApplier;
-
-#[async_trait::async_trait]
-impl AuthApplier for BearerAuthApplier {
-    async fn apply(
-        &self,
-        headers: &mut http::HeaderMap,
-        target: &tiygate_core::RoutingTarget,
-    ) -> Result<(), tiygate_core::Error> {
-        let key = target.effective_api_key();
-        let header_value = http::HeaderValue::from_str(&format!("Bearer {}", key))
-            .map_err(|e| tiygate_core::Error::Auth(format!("Invalid header value: {}", e)))?;
-        headers.insert(http::header::AUTHORIZATION, header_value);
-        Ok(())
     }
 }
 

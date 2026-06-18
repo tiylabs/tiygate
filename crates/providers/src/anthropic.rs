@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use tiygate_auth::api_key::HeaderApiKeyAuthApplier;
 use tiygate_core::{
     AuthApplier, AuthMode, ProtocolEndpoint, ProtocolSuite, Provider, ProviderMetadata,
 };
@@ -53,33 +54,9 @@ impl Provider for AnthropicProvider {
     }
 
     fn auth(&self) -> Arc<dyn AuthApplier> {
-        Arc::new(ApiKeyAuthApplier {
+        Arc::new(HeaderApiKeyAuthApplier {
             header_name: "x-api-key".to_string(),
         })
-    }
-}
-
-/// API key authentication applier (custom header).
-pub struct ApiKeyAuthApplier {
-    pub header_name: String,
-}
-
-#[async_trait::async_trait]
-impl AuthApplier for ApiKeyAuthApplier {
-    async fn apply(
-        &self,
-        headers: &mut http::HeaderMap,
-        target: &tiygate_core::RoutingTarget,
-    ) -> Result<(), tiygate_core::Error> {
-        let key = target.effective_api_key();
-        let header_value = http::HeaderValue::from_str(key)
-            .map_err(|e| tiygate_core::Error::Auth(format!("Invalid header value: {}", e)))?;
-        headers.insert(
-            http::HeaderName::from_bytes(self.header_name.as_bytes())
-                .map_err(|e| tiygate_core::Error::Auth(format!("Invalid header name: {}", e)))?,
-            header_value,
-        );
-        Ok(())
     }
 }
 

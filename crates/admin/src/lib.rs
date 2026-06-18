@@ -9,6 +9,12 @@ use axum::{middleware, Router};
 
 pub use state::AdminState;
 
+// Anchor the `tiygate_providers` crate so its `inventory::submit!`
+// provider registrations are not dead-code-eliminated. Without this
+// reference the linker drops the provider registrations and the
+// provider-catalog endpoint returns an empty list.
+extern crate tiygate_providers;
+
 /// Build the Admin REST router. The router is *unauthenticated* at
 /// this level — the [`auth::require_admin_token`] middleware is
 /// applied by [`build_router_with_auth`]. Callers that want a

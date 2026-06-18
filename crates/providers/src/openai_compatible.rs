@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use tiygate_auth::bearer::BearerAuthApplier;
 use tiygate_core::{
     AuthApplier, AuthMode, ProtocolEndpoint, ProtocolSuite, Provider, ProviderMetadata,
 };
@@ -57,7 +58,7 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     fn auth(&self) -> Arc<dyn AuthApplier> {
-        Arc::new(super::openai::BearerAuthApplier)
+        Arc::new(BearerAuthApplier)
     }
 
     fn egress_protocol_for_model(&self, _model_id: &str) -> ProtocolEndpoint {

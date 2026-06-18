@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use tiygate_auth::bearer::BearerAuthApplier;
 use tiygate_core::{
     AuthApplier, AuthMode, ProtocolEndpoint, ProtocolSuite, Provider, ProviderMetadata,
 };
@@ -45,7 +46,7 @@ impl Provider for OpenRouterProvider {
     }
 
     fn auth(&self) -> Arc<dyn AuthApplier> {
-        Arc::new(super::openai::BearerAuthApplier)
+        Arc::new(BearerAuthApplier)
     }
 }
 
@@ -65,10 +66,7 @@ mod tests {
         let provider = OpenRouterProvider::new();
         assert_eq!(provider.id(), "openrouter");
         assert_eq!(provider.metadata().display_name, "OpenRouter");
-        assert_eq!(
-            provider.metadata().base_url,
-            "https://openrouter.ai/api/v1"
-        );
+        assert_eq!(provider.metadata().base_url, "https://openrouter.ai/api/v1");
         assert!(matches!(provider.metadata().auth_mode, AuthMode::Bearer));
         assert_eq!(provider.metadata().channels.len(), 1);
         assert_eq!(provider.metadata().channels[0], "default");

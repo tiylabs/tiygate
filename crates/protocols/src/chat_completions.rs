@@ -1962,10 +1962,7 @@ mod tests {
         let openers1: Vec<_> = p1
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ToolCallDelta {
-                    name: Some(n),
-                    ..
-                } => Some(n.clone()),
+                StreamPart::ToolCallDelta { name: Some(n), .. } => Some(n.clone()),
                 _ => None,
             })
             .collect();
@@ -1979,10 +1976,7 @@ mod tests {
         let openers2: Vec<_> = p2
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ToolCallDelta {
-                    name: Some(n),
-                    ..
-                } => Some(n.clone()),
+                StreamPart::ToolCallDelta { name: Some(n), .. } => Some(n.clone()),
                 _ => None,
             })
             .collect();

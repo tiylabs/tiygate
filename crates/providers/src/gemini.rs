@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use http::HeaderName;
+use tiygate_auth::api_key::HeaderApiKeyAuthApplier;
 use tiygate_core::{
     AuthApplier, AuthMode, ProtocolEndpoint, ProtocolSuite, Provider, ProviderMetadata,
     RoutingTarget,
@@ -86,31 +86,6 @@ impl Provider for GeminiProvider {
 
     fn egress_protocol_for_model(&self, _model_id: &str) -> ProtocolEndpoint {
         ProtocolEndpoint::new(ProtocolSuite::GoogleGemini, "generate_content", "v1beta")
-    }
-}
-
-/// `AuthApplier` that writes the API key into a custom header. Used as the
-/// default auth for the public Gemini endpoint. Mirrors the shape of
-/// `anthropic::ApiKeyAuthApplier` so the rest of the pipeline needs no
-/// changes.
-pub struct HeaderApiKeyAuthApplier {
-    pub header_name: String,
-}
-
-#[async_trait::async_trait]
-impl AuthApplier for HeaderApiKeyAuthApplier {
-    async fn apply(
-        &self,
-        headers: &mut http::HeaderMap,
-        target: &RoutingTarget,
-    ) -> Result<(), tiygate_core::Error> {
-        let key = target.effective_api_key();
-        let header_name = HeaderName::from_bytes(self.header_name.as_bytes())
-            .map_err(|e| tiygate_core::Error::Auth(format!("Invalid header name: {e}")))?;
-        let header_value = http::HeaderValue::from_str(key)
-            .map_err(|e| tiygate_core::Error::Auth(format!("Invalid header value: {e}")))?;
-        headers.insert(header_name, header_value);
-        Ok(())
     }
 }
 
