@@ -826,7 +826,7 @@ pub(super) async fn handle_gemini_generate(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(capture): axum::extract::Path<String>,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Result<Response, AppError> {
     // The router registers two path shapes for Gemini ingress:
     //   * colon shape  — `/v1beta/models/:capture`  (the `:capture`
@@ -847,7 +847,7 @@ pub(super) async fn handle_gemini_generate(
             ));
         }
     };
-    let _ = method; // We currently route all methods to one handler.
+    let is_gemini_stream = method == "streamGenerateContent";
     let model = model.to_string();
     let _permit = acquire_permit(&state).await?;
     let codec = GeminiCodec::new();
@@ -900,6 +900,14 @@ pub(super) async fn handle_gemini_generate(
             scope.emit_error("quota_exceeded", Some(http_status));
             return Err(app_err);
         }
+    }
+
+    // Inject the streaming flag from the URL method into the body so the
+    // Gemini codec's `decode_request` (which reads `body["_stream"]`) can
+    // pick it up. Standard Gemini clients do not send a `_stream` field —
+    // streaming is encoded in the URL method (`:streamGenerateContent`).
+    if is_gemini_stream {
+        body["_stream"] = Value::Bool(true);
     }
 
     let ir_request = match codec.decode_request(body, &raw_env) {

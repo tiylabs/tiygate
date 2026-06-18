@@ -38,6 +38,7 @@ impl ZenMuxProvider {
                     ),
                     ProtocolEndpoint::new(ProtocolSuite::OpenAiResponses, "responses", "v1"),
                     ProtocolEndpoint::new(ProtocolSuite::AnthropicMessages, "messages", "v1"),
+                    ProtocolEndpoint::new(ProtocolSuite::GoogleGemini, "generateContent", "v1beta"),
                 ],
                 defaults: serde_json::json!({}),
             },
@@ -83,6 +84,8 @@ fn suite_for_model(model_id: &str) -> ProtocolSuite {
         ProtocolSuite::OpenAiResponses
     } else if body.contains("claude") || body.contains("minimax") {
         ProtocolSuite::AnthropicMessages
+    } else if body.contains("gemini") {
+        ProtocolSuite::GoogleGemini
     } else {
         ProtocolSuite::OpenAiCompatible
     }
@@ -98,10 +101,19 @@ fn api_base_for_suite(raw_base: &str, suite: ProtocolSuite) -> String {
         base = stripped.trim_end_matches('/');
     } else if let Some(stripped) = base.strip_suffix("/v1") {
         base = stripped.trim_end_matches('/');
+    } else if let Some(stripped) = base.strip_suffix("/v1beta") {
+        base = stripped.trim_end_matches('/');
     }
 
     match suite {
         ProtocolSuite::AnthropicMessages => format!("{}/anthropic/v1", base),
+        // Google Gemini embeds the model and method in the URL path
+        // (`/v1beta/models/{model}:generateContent`), which is appended by
+        // `gemini_aware_upstream_url` in the egress layer. ZenMux exposes
+        // Gemini via its `vertex-ai` sub-path, so we return
+        // `{base}/vertex-ai` to produce the final
+        // `{base}/vertex-ai/v1beta/models/{model}:generateContent`.
+        ProtocolSuite::GoogleGemini => format!("{}/vertex-ai", base),
         _ => format!("{}/v1", base),
     }
 }
@@ -153,6 +165,16 @@ mod tests {
         );
         assert_eq!(
             provider
+                .egress_protocol_for_model("google/gemini-2.5-flash:zenmux")
+                .suite,
+            ProtocolSuite::GoogleGemini
+        );
+        assert_eq!(
+            provider.egress_protocol_for_model("gemini-1.5-pro").suite,
+            ProtocolSuite::GoogleGemini
+        );
+        assert_eq!(
+            provider
                 .egress_protocol_for_model("text-embedding-3-large")
                 .suite,
             ProtocolSuite::OpenAiCompatible
@@ -184,6 +206,20 @@ mod tests {
         assert_eq!(
             provider.egress_api_base("https://example.test/api/anthropic/v1", &messages),
             "https://example.test/api/anthropic/v1"
+        );
+
+        let gemini = ProtocolSuite::GoogleGemini.default_endpoint();
+        assert_eq!(
+            provider.egress_api_base("https://example.test/api", &gemini),
+            "https://example.test/api/vertex-ai"
+        );
+        assert_eq!(
+            provider.egress_api_base("https://example.test/api/v1beta", &gemini),
+            "https://example.test/api/vertex-ai"
+        );
+        assert_eq!(
+            provider.egress_api_base("https://example.test/api/v1beta/", &gemini),
+            "https://example.test/api/vertex-ai"
         );
     }
 }

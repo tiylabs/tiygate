@@ -1249,6 +1249,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                     id: self.response_id.clone().unwrap_or_default(),
                     status: "completed".to_string(),
                     usage: None,
+                    extensions: std::collections::HashMap::new(),
                 });
                 return Ok(parts);
             }
@@ -1870,6 +1871,7 @@ mod tests {
                 id: "r1".to_string(),
                 status: "completed".to_string(),
                 usage: None,
+                extensions: std::collections::HashMap::new(),
             },
         ];
 

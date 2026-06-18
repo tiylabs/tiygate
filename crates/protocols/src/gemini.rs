@@ -27,6 +27,241 @@ fn synth_gemini_call_id(name: &str) -> String {
     }
 }
 
+/// Recover the Gemini function name for a tool result.
+///
+/// Chat Completions, Anthropic Messages, and OpenAI Responses usually carry
+/// the function name on the assistant tool call, not on the tool result. Gemini
+/// requires `functionResponse.name`, so recover it from the prior matching IR
+/// `ToolCall` before encoding.
+fn lookup_tool_call_name(messages: &[Message], tool_call_id: &str) -> Option<String> {
+    if !tool_call_id.is_empty() {
+        for msg in messages.iter().rev() {
+            if !matches!(msg.role, Role::Assistant) {
+                continue;
+            }
+            for content in &msg.content {
+                if let Content::ToolCall { id, name, .. } = content {
+                    if id == tool_call_id && !name.is_empty() {
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    tool_call_id
+        .strip_prefix("gemini_call_")
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+}
+
+/// Sentinel value injected as `thoughtSignature` when a Gemini 3 model
+/// response is replayed but the real signature was lost (e.g. cross-protocol
+/// ingress that does not carry Gemini extensions). Matches the
+/// `skip_thought_signature_validator` constant used by @ai-sdk/google.
+const SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
+
+/// Heuristic check for Gemini 3 models, which require `thoughtSignature` on
+/// `functionCall` parts. Model IDs like `gemini-3-*` or `gemini-3.*` trigger
+/// sentinel injection when a real signature is unavailable.
+fn is_gemini3_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("gemini-3")
+}
+
+/// Heuristic check for Gemini models that support `thinkingLevel`.
+///
+/// Official Gemini docs use `thinkingBudget` for Gemini 2.5 models and
+/// `thinkingLevel` for Gemini 3+ models. The two fields must not be sent
+/// together in one request.
+fn supports_gemini_thinking_level(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let Some(start) = lower.find("gemini-") else {
+        return false;
+    };
+    let version = &lower[start + "gemini-".len()..];
+    let major: String = version.chars().take_while(|c| c.is_ascii_digit()).collect();
+
+    major
+        .parse::<u32>()
+        .map(|major| major >= 3)
+        .unwrap_or(false)
+}
+
+/// Convert a JSON Schema to Gemini's OpenAPI 3.0 subset, mirroring
+/// @ai-sdk/google's `convertJSONSchemaToOpenAPISchema`.
+///
+/// Key transformations:
+/// - `type: ["x", "null"]` → `anyOf: [{type:"x"}]` + `nullable: true`
+/// - `const: v` → `enum: [v]`
+/// - Empty object schema (`{type:"object"}` with no properties) → `{type:"object"}`
+/// - `anyOf` containing a `null` type → collapse to `nullable: true` on the
+///   non-null schema (or `anyOf` of non-null schemas + `nullable: true`)
+/// - Recursive handling of `properties`, `items`, `allOf`, `anyOf`, `oneOf`
+fn convert_json_schema_to_openapi(schema: &Value) -> Value {
+    match schema {
+        Value::Null => Value::Null,
+        // JSON Schema `true` means "any value"; `false` means "never valid".
+        // Gemini's OpenAPI subset does not accept boolean schemas, so we
+        // emit an empty schema for `true` (matches @ai-sdk/google).
+        Value::Bool(true) => json!({}),
+        Value::Bool(false) => json!({"not": {}}),
+        Value::Object(obj) => {
+            // Check for empty object schema: {type:"object"} with no
+            // properties (or empty properties) and no additionalProperties.
+            let is_empty_object = obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "object")
+                .unwrap_or(false)
+                && obj
+                    .get("properties")
+                    .map(|p| p.as_object().map(|o| o.is_empty()).unwrap_or(true))
+                    .unwrap_or(true)
+                && !obj.contains_key("additionalProperties");
+            if is_empty_object {
+                if let Some(desc) = obj.get("description") {
+                    return json!({"type": "object", "description": desc});
+                }
+                return json!({"type": "object"});
+            }
+
+            let mut result = serde_json::Map::new();
+
+            // Pass through description, required, format, minLength.
+            if let Some(desc) = obj.get("description") {
+                result.insert("description".to_string(), desc.clone());
+            }
+            if let Some(req) = obj.get("required") {
+                result.insert("required".to_string(), req.clone());
+            }
+            if let Some(fmt) = obj.get("format") {
+                result.insert("format".to_string(), fmt.clone());
+            }
+            if let Some(min_len) = obj.get("minLength") {
+                result.insert("minLength".to_string(), min_len.clone());
+            }
+
+            // const → enum: [const]
+            if let Some(const_val) = obj.get("const") {
+                result.insert("enum".to_string(), json!([const_val]));
+            }
+
+            // type handling: string, array of types, or absent
+            if let Some(type_val) = obj.get("type") {
+                if let Some(type_str) = type_val.as_str() {
+                    result.insert("type".to_string(), json!(type_str));
+                } else if let Some(type_arr) = type_val.as_array() {
+                    let has_null = type_arr.iter().any(|t| t.as_str() == Some("null"));
+                    let non_null: Vec<&Value> = type_arr
+                        .iter()
+                        .filter(|t| t.as_str() != Some("null"))
+                        .collect();
+                    if non_null.is_empty() {
+                        result.insert("type".to_string(), json!("null"));
+                    } else if non_null.len() == 1 {
+                        result.insert("type".to_string(), non_null[0].clone());
+                        if has_null {
+                            result.insert("nullable".to_string(), json!(true));
+                        }
+                    } else {
+                        let any_of: Vec<Value> =
+                            non_null.iter().map(|t| json!({"type": t})).collect();
+                        result.insert("anyOf".to_string(), json!(any_of));
+                        if has_null {
+                            result.insert("nullable".to_string(), json!(true));
+                        }
+                    }
+                }
+            }
+
+            // enum (explicit)
+            if let Some(enum_vals) = obj.get("enum") {
+                result.insert("enum".to_string(), enum_vals.clone());
+            }
+
+            // properties (recursive)
+            if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
+                let converted: serde_json::Map<String, Value> = props
+                    .iter()
+                    .map(|(k, v)| (k.clone(), convert_json_schema_to_openapi(v)))
+                    .collect();
+                result.insert("properties".to_string(), json!(converted));
+            }
+
+            // items (recursive)
+            if let Some(items) = obj.get("items") {
+                if let Some(items_arr) = items.as_array() {
+                    let converted: Vec<Value> = items_arr
+                        .iter()
+                        .map(convert_json_schema_to_openapi)
+                        .collect();
+                    result.insert("items".to_string(), json!(converted));
+                } else {
+                    result.insert("items".to_string(), convert_json_schema_to_openapi(items));
+                }
+            }
+
+            // allOf (recursive)
+            if let Some(all_of) = obj.get("allOf").and_then(|v| v.as_array()) {
+                let converted: Vec<Value> =
+                    all_of.iter().map(convert_json_schema_to_openapi).collect();
+                result.insert("allOf".to_string(), json!(converted));
+            }
+
+            // anyOf (recursive, with null-collapsing)
+            if let Some(any_of) = obj.get("anyOf").and_then(|v| v.as_array()) {
+                let has_null = any_of.iter().any(|s| {
+                    s.as_object()
+                        .and_then(|o| o.get("type"))
+                        .and_then(|v| v.as_str())
+                        == Some("null")
+                });
+                if has_null {
+                    let non_null: Vec<&Value> = any_of
+                        .iter()
+                        .filter(|s| {
+                            s.as_object()
+                                .and_then(|o| o.get("type"))
+                                .and_then(|v| v.as_str())
+                                != Some("null")
+                        })
+                        .collect();
+                    if non_null.len() == 1 {
+                        let converted = convert_json_schema_to_openapi(non_null[0]);
+                        if let Some(conv_obj) = converted.as_object() {
+                            for (k, v) in conv_obj {
+                                result.insert(k.clone(), v.clone());
+                            }
+                        }
+                        result.insert("nullable".to_string(), json!(true));
+                    } else {
+                        let converted: Vec<Value> = non_null
+                            .iter()
+                            .map(|s| convert_json_schema_to_openapi(s))
+                            .collect();
+                        result.insert("anyOf".to_string(), json!(converted));
+                        result.insert("nullable".to_string(), json!(true));
+                    }
+                } else {
+                    let converted: Vec<Value> =
+                        any_of.iter().map(convert_json_schema_to_openapi).collect();
+                    result.insert("anyOf".to_string(), json!(converted));
+                }
+            }
+
+            // oneOf (recursive)
+            if let Some(one_of) = obj.get("oneOf").and_then(|v| v.as_array()) {
+                let converted: Vec<Value> =
+                    one_of.iter().map(convert_json_schema_to_openapi).collect();
+                result.insert("oneOf".to_string(), json!(converted));
+            }
+
+            json!(result)
+        }
+        other => other.clone(),
+    }
+}
+
 pub struct GeminiCodec {
     id: ProtocolEndpoint,
     capabilities: EndpointCapabilities,
@@ -61,8 +296,10 @@ impl GeminiCodec {
                 parallel_tool_calls: false,
                 extended_reasoning: true,
                 deterministic_seed: false,
-                // Gemini does not support tool_choice=required (see §1 of matrix)
-                tool_choice_required: false,
+                // Gemini supports tool_choice=required via
+                // toolConfig.functionCallingConfig.mode=ANY, and specific
+                // function via allowedFunctionNames. See §1 of matrix.
+                tool_choice_required: true,
                 stream: tiygate_core::StreamCaps {
                     server_sent_events: true,
                     usage_in_stream: true,
@@ -313,6 +550,37 @@ impl EndpointCodec for GeminiCodec {
             }
         }
 
+        // Parse toolConfig.functionCallingConfig into the normalized
+        // extensions["tool_choice"] format so cross-protocol targets can
+        // interpret it. Gemini's mode mapping:
+        //   AUTO  → "auto"
+        //   NONE  → "none"
+        //   ANY   → "required" (or specific function if allowedFunctionNames)
+        if let Some(mode) = body["toolConfig"]["functionCallingConfig"]["mode"].as_str() {
+            let allowed =
+                body["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"].as_array();
+            let normalized = match mode {
+                "AUTO" => Some(json!("auto")),
+                "NONE" => Some(json!("none")),
+                "ANY" => {
+                    if let Some(names) = allowed {
+                        // Specific function pinning: use the first name.
+                        if let Some(first) = names.first().and_then(|n| n.as_str()) {
+                            Some(json!({"type": "function", "function": {"name": first}}))
+                        } else {
+                            Some(json!("required"))
+                        }
+                    } else {
+                        Some(json!("required"))
+                    }
+                }
+                _ => None,
+            };
+            if let Some(n) = normalized {
+                extensions.insert("tool_choice".to_string(), n);
+            }
+        }
+
         Ok(IrRequest {
             model,
             system,
@@ -440,19 +708,39 @@ impl EndpointCodec for GeminiCodec {
                         if let Some(sig) = thought_signatures.get(sig_idx) {
                             part["thoughtSignature"] = sig.clone();
                             sig_idx += 1;
+                        } else if is_gemini3_model(&ir.model) {
+                            // Gemini 3 requires a thoughtSignature on every
+                            // functionCall part. When the real signature was
+                            // lost (e.g. cross-protocol ingress that does not
+                            // carry Gemini extensions), inject the sentinel so
+                            // the API does not reject with 400.
+                            part["thoughtSignature"] = json!(SKIP_THOUGHT_SIGNATURE_VALIDATOR);
+                            sig_idx += 1;
                         }
                         parts.push(part);
                     }
                     Content::ToolResult {
-                        tool_call_id: _,
+                        tool_call_id,
                         name,
                         content,
                     } => {
                         let response_obj: Value =
                             serde_json::from_str(content).unwrap_or(json!({"output": content}));
-                        parts.push(
-                            json!({"functionResponse": {"name": name, "response": response_obj}}),
-                        );
+                        let resolved_name = if name.is_empty() {
+                            lookup_tool_call_name(&ir.messages, tool_call_id).ok_or_else(|| {
+                                tiygate_core::Error::Codec(format!(
+                                    "Gemini functionResponse.name is required but missing; no prior ToolCall matched tool_call_id '{tool_call_id}'"
+                                ))
+                            })?
+                        } else {
+                            name.clone()
+                        };
+                        parts.push(json!({
+                            "functionResponse": {
+                                "name": resolved_name,
+                                "response": response_obj
+                            }
+                        }));
                     }
                     Content::Media {
                         source, mime_type, ..
@@ -503,13 +791,14 @@ impl EndpointCodec for GeminiCodec {
         // Thinking config: output thinkingConfig from params.thinking.
         //
         // Cross-protocol derivation:
-        // - effort → thinkingLevel (Gemini 3.x) + thinkingBudget (derived)
-        // - budget_tokens → thinkingBudget (when effort is absent)
+        // - Gemini 3+ uses thinkingLevel (derive from budget_tokens when needed)
+        // - Gemini 2.5 and older use thinkingBudget (derive from effort when needed)
         // - include_thoughts ← display (derived when include_thoughts is missing)
         //
-        // Gemini supports minimal/low/medium/high for thinkingLevel (4 levels);
-        // XHigh/Max clamp to "high". Gemini's thinkingBudget range is 0–24576,
-        // so derived budgets are clamped to that range.
+        // Official Gemini docs state that thinkingLevel and thinkingBudget
+        // must not be used together. Gemini supports minimal/low/medium/high
+        // for thinkingLevel; XHigh/Max clamp to "high". Gemini's
+        // thinkingBudget range is 0–24576, so derived budgets are clamped.
         if let Some(ref thinking) = ir.params.thinking {
             // Derive include_thoughts from display when not set.
             let include_thoughts = thinking.include_thoughts.or_else(|| {
@@ -529,21 +818,20 @@ impl EndpointCodec for GeminiCodec {
             if let Some(include) = include_thoughts {
                 tc["includeThoughts"] = json!(include);
             }
-            if let Some(effort) = effort {
-                // Gemini supports minimal/low/medium/high; XHigh/Max clamp to "high".
-                tc["thinkingLevel"] = json!(match effort {
-                    tiygate_core::ThinkingEffort::Minimal => "minimal",
-                    tiygate_core::ThinkingEffort::Low => "low",
-                    tiygate_core::ThinkingEffort::Medium => "medium",
-                    tiygate_core::ThinkingEffort::High => "high",
-                    tiygate_core::ThinkingEffort::XHigh => "high",
-                    tiygate_core::ThinkingEffort::Max => "high",
-                });
-            }
-            // thinkingBudget: prefer explicit budget_tokens; otherwise derive
-            // from effort (clamped to Gemini's 0–24576 range).
-            if let Some(budget) = thinking.budget_tokens {
-                tc["thinkingBudget"] = json!(budget);
+            if supports_gemini_thinking_level(&ir.model) {
+                if let Some(effort) = effort {
+                    // Gemini supports minimal/low/medium/high; XHigh/Max clamp to "high".
+                    tc["thinkingLevel"] = json!(match effort {
+                        tiygate_core::ThinkingEffort::Minimal => "minimal",
+                        tiygate_core::ThinkingEffort::Low => "low",
+                        tiygate_core::ThinkingEffort::Medium => "medium",
+                        tiygate_core::ThinkingEffort::High => "high",
+                        tiygate_core::ThinkingEffort::XHigh => "high",
+                        tiygate_core::ThinkingEffort::Max => "high",
+                    });
+                }
+            } else if let Some(budget) = thinking.budget_tokens {
+                tc["thinkingBudget"] = json!(budget.min(GEMINI_THINKING_BUDGET_MAX));
             } else if let Some(effort) = effort {
                 let derived = tiygate_core::ThinkingConfig::effort_to_budget(effort);
                 tc["thinkingBudget"] = json!(derived.min(GEMINI_THINKING_BUDGET_MAX));
@@ -557,7 +845,7 @@ impl EndpointCodec for GeminiCodec {
         // https://ai.google.dev/gemini-api/docs/structured-output
         match &ir.response_format {
             Some(tiygate_core::ResponseFormat::JsonSchema { schema, .. }) => {
-                gc["responseSchema"] = schema.clone();
+                gc["responseSchema"] = convert_json_schema_to_openapi(schema);
                 gc["responseMimeType"] = json!("application/json");
                 has_gc = true;
             }
@@ -572,8 +860,62 @@ impl EndpointCodec for GeminiCodec {
         }
 
         if !ir.tools.is_empty() {
-            let declarations: Vec<Value> = ir.tools.iter().map(|t| json!({"name": t.name, "description": t.description, "parameters": t.parameters})).collect();
+            let declarations: Vec<Value> = ir
+                .tools
+                .iter()
+                .map(|t| {
+                    let params = t
+                        .parameters
+                        .as_ref()
+                        .map(convert_json_schema_to_openapi)
+                        .unwrap_or(Value::Null);
+                    json!({"name": t.name, "description": t.description, "parameters": params})
+                })
+                .collect();
             body["tools"] = json!([{"functionDeclarations": declarations}]);
+        }
+
+        // Emit toolConfig from IR extensions["tool_choice"].
+        // Maps the normalized tool_choice forms to Gemini's
+        // toolConfig.functionCallingConfig:
+        //   "auto"     → {mode: "AUTO"}
+        //   "none"     → {mode: "NONE"}
+        //   "required" → {mode: "ANY"}
+        //   {type:"function", function:{name:"x"}} → {mode: "ANY", allowedFunctionNames: ["x"]}
+        //   {type:"function", name:"x"} (Responses variant) → same as above
+        // Guarded by body.get("toolConfig").is_none() so a same-protocol
+        // passthrough toolConfig (from gemini_top_level) takes priority.
+        if body.get("toolConfig").is_none() {
+            if let Some(tc) = ir.extensions.get("tool_choice") {
+                let fcc = if let Some(s) = tc.as_str() {
+                    match s {
+                        "auto" => Some(json!({"mode": "AUTO"})),
+                        "none" => Some(json!({"mode": "NONE"})),
+                        "required" => Some(json!({"mode": "ANY"})),
+                        _ => None,
+                    }
+                } else if let Some(obj) = tc.as_object() {
+                    if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
+                        // Try nested function.name (Chat/Anthropic) first,
+                        // then flat name (Responses).
+                        let name = obj["function"]["name"]
+                            .as_str()
+                            .or_else(|| obj["name"].as_str())
+                            .unwrap_or("");
+                        Some(json!({
+                            "mode": "ANY",
+                            "allowedFunctionNames": [name]
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(fcc) = fcc {
+                    body["toolConfig"] = json!({"functionCallingConfig": fcc});
+                }
+            }
         }
 
         // Replay Google-specific top-level fields captured at decode time.
@@ -737,6 +1079,20 @@ impl EndpointCodec for GeminiCodec {
                 "SAFETY" => FinishReason::ContentFilter,
                 other => FinishReason::Other(other.to_string()),
             });
+        // Flip STOP → ToolCalls when the response contains function calls.
+        // Gemini always returns finishReason=STOP even when the model emits
+        // tool calls; cross-protocol targets (OpenAI/Anthropic) need
+        // FinishReason::ToolCalls so the client runs the tool instead of
+        // stopping. Mirrors the streaming decoder's `saw_tool_calls` latch.
+        let finish_reason = if finish_reason == Some(FinishReason::Stop)
+            && content
+                .iter()
+                .any(|c| matches!(c, Content::ToolCall { .. }))
+        {
+            Some(FinishReason::ToolCalls)
+        } else {
+            finish_reason
+        };
         // Populate stop_details on SAFETY finish reason
         let stop_details = if body["candidates"]
             .as_array()
@@ -903,6 +1259,11 @@ pub struct GeminiStreamDecoder {
     /// cross-protocol encoder emit `finish_reason: "stop"` and the client
     /// would never run the tool.
     saw_tool_calls: bool,
+    /// Collected `thoughtSignature` values from `functionCall` parts during
+    /// streaming. Propagated via `ResponseCompleted.extensions` so the
+    /// pipeline can carry them into the next request's IR extensions for
+    /// Gemini 3 multi-turn thought-signature replay.
+    thought_signatures: Vec<Value>,
 }
 impl Default for GeminiStreamDecoder {
     fn default() -> Self {
@@ -916,6 +1277,7 @@ impl GeminiStreamDecoder {
             response_id: None,
             saw_finish: false,
             saw_tool_calls: false,
+            thought_signatures: Vec::new(),
         }
     }
 }
@@ -992,6 +1354,11 @@ impl StreamDecoder for GeminiStreamDecoder {
                         }
                         if let Some(fc) = p.get("functionCall") {
                             self.saw_tool_calls = true;
+                            // Collect thoughtSignature for Gemini 3 multi-turn
+                            // preservation (propagated via ResponseCompleted).
+                            if let Some(sig) = p.get("thoughtSignature") {
+                                self.thought_signatures.push(sig.clone());
+                            }
                             let name = fc["name"].as_str().map(String::from);
                             // Prefer Gemini's native call id when present; else
                             // synthesize a deterministic id from the name so a
@@ -1064,10 +1431,18 @@ impl StreamDecoder for GeminiStreamDecoder {
 
     fn finish(&mut self) -> Result<Vec<StreamPart>, tiygate_core::Error> {
         if let Some(id) = self.response_id.take() {
+            let mut extensions = std::collections::HashMap::new();
+            if !self.thought_signatures.is_empty() {
+                extensions.insert(
+                    "gemini_thought_signatures".to_string(),
+                    json!(std::mem::take(&mut self.thought_signatures)),
+                );
+            }
             Ok(vec![StreamPart::ResponseCompleted {
                 id,
                 status: "completed".to_string(),
                 usage: None,
+                extensions,
             }])
         } else {
             Ok(vec![])
@@ -1078,7 +1453,7 @@ impl StreamDecoder for GeminiStreamDecoder {
 inventory::submit! { tiygate_core::CodecRegistration { make: || Box::new(GeminiCodec::new()) } }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1177,6 +1552,7 @@ mod tests {
                 id: "r1".to_string(),
                 status: "ok".to_string(),
                 usage: None,
+                extensions: std::collections::HashMap::new(),
             },
         ];
         for v in variants {
@@ -1370,5 +1746,382 @@ mod tests {
         assert_eq!(tc.0, "gemini_call_lookup");
         assert_eq!(tc.1.as_deref(), Some("lookup"));
         assert!(tc.2.contains("\"q\":\"x\""));
+    }
+
+    #[test]
+    fn test_decode_response_stop_with_tool_calls_flips_to_tool_calls() {
+        // Item 1: Non-streaming STOP + tool calls → ToolCalls.
+        // Gemini always returns finishReason=STOP even when the model emits
+        // tool calls. The decoder must flip to ToolCalls so cross-protocol
+        // targets (OpenAI/Anthropic) signal the client to run the tool.
+        let codec = GeminiCodec::new();
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"functionCall": {"name": "get_weather", "args": {"city": "London"}}}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let ir = codec.decode_response(resp).unwrap();
+        assert_eq!(ir.finish_reason, Some(FinishReason::ToolCalls));
+    }
+
+    #[test]
+    fn test_decode_response_stop_without_tool_calls_stays_stop() {
+        // Non-streaming STOP without tool calls must remain STOP.
+        let codec = GeminiCodec::new();
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "Hello!"}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let ir = codec.decode_response(resp).unwrap();
+        assert_eq!(ir.finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn test_stream_thought_signature_propagation() {
+        // Item 2: Streaming thoughtSignature propagation.
+        // The stream decoder must collect thoughtSignature values from
+        // functionCall parts and emit them via ResponseCompleted.extensions.
+        let mut dec = GeminiStreamDecoder::new();
+        let line = r#"data: {"responseId":"resp_1","candidates":[{"content":{"parts":[{"functionCall":{"name":"f","args":{}},"thoughtSignature":"sig_123"}]}}]}"#;
+        let _ = dec.feed(line).unwrap();
+        let parts = dec.finish().unwrap();
+        let ext = parts
+            .iter()
+            .find_map(|p| match p {
+                StreamPart::ResponseCompleted { extensions, .. } => Some(extensions.clone()),
+                _ => None,
+            })
+            .expect("ResponseCompleted");
+        assert_eq!(
+            ext.get("gemini_thought_signatures"),
+            Some(&json!(["sig_123"]))
+        );
+    }
+
+    #[test]
+    fn test_thought_signature_sentinel_injection() {
+        // Item 3: Sentinel injection for Gemini 3 models.
+        // When a ToolCall is replayed without a real thoughtSignature on a
+        // Gemini 3 model, the sentinel "skip_thought_signature_validator"
+        // must be injected.
+        let codec = GeminiCodec::new();
+        let req = IrRequest {
+            model: "gemini-3-pro".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: json!({"city": "London"}),
+                }],
+            }],
+            tools: vec![],
+            params: Default::default(),
+            response_format: None,
+            stream: false,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::GoogleGemini,
+                "generateContent",
+                "v1beta",
+            ),
+            metadata: None,
+            extensions: std::collections::HashMap::new(),
+        };
+        let (body, _h) = codec.encode_request(&req).unwrap();
+        let part = &body["contents"][0]["parts"][0];
+        assert_eq!(part["functionCall"]["name"], "get_weather");
+        assert_eq!(part["thoughtSignature"], SKIP_THOUGHT_SIGNATURE_VALIDATOR);
+    }
+
+    #[test]
+    fn test_thought_signature_no_sentinel_for_non_gemini3() {
+        // Non-Gemini-3 models must NOT get the sentinel.
+        let codec = GeminiCodec::new();
+        let req = IrRequest {
+            model: "gemini-2.0-flash".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: json!({}),
+                }],
+            }],
+            tools: vec![],
+            params: Default::default(),
+            response_format: None,
+            stream: false,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::GoogleGemini,
+                "generateContent",
+                "v1beta",
+            ),
+            metadata: None,
+            extensions: std::collections::HashMap::new(),
+        };
+        let (body, _h) = codec.encode_request(&req).unwrap();
+        let part = &body["contents"][0]["parts"][0];
+        assert!(part.get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn test_json_schema_to_openapi_conversion() {
+        // Item 4: JSON Schema → OpenAPI Schema conversion.
+        // Verify key transformations match @ai-sdk/google's behavior.
+        // const → enum
+        let schema = json!({"const": "hello"});
+        let result = convert_json_schema_to_openapi(&schema);
+        assert_eq!(result["enum"], json!(["hello"]));
+        // type: ["string", "null"] → type: "string" + nullable: true
+        let schema = json!({"type": ["string", "null"]});
+        let result = convert_json_schema_to_openapi(&schema);
+        assert_eq!(result["type"], "string");
+        assert_eq!(result["nullable"], true);
+        // anyOf with null → nullable + merged schema
+        let schema = json!({"anyOf": [{"type": "string"}, {"type": "null"}]});
+        let result = convert_json_schema_to_openapi(&schema);
+        assert_eq!(result["type"], "string");
+        assert_eq!(result["nullable"], true);
+        // Empty object schema
+        let schema = json!({"type": "object"});
+        let result = convert_json_schema_to_openapi(&schema);
+        assert_eq!(result["type"], "object");
+        // Properties recursion
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "const": "abc"},
+                "age": {"type": ["integer", "null"]}
+            },
+            "required": ["name"]
+        });
+        let result = convert_json_schema_to_openapi(&schema);
+        assert_eq!(result["type"], "object");
+        assert_eq!(result["required"], json!(["name"]));
+        assert_eq!(result["properties"]["name"]["enum"], json!(["abc"]));
+        assert_eq!(result["properties"]["age"]["type"], "integer");
+        assert_eq!(result["properties"]["age"]["nullable"], true);
+    }
+
+    #[test]
+    fn test_encode_request_applies_schema_conversion_to_response_schema() {
+        // Verify that encode_request applies convert_json_schema_to_openapi
+        // to responseSchema.
+        let codec = GeminiCodec::new();
+        let req = IrRequest {
+            model: "gemini-2.0-flash".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: "hi".to_string(),
+                    annotations: None,
+                }],
+            }],
+            tools: vec![],
+            params: Default::default(),
+            response_format: Some(tiygate_core::ResponseFormat::JsonSchema {
+                name: "response".to_string(),
+                schema: json!({"type": "object", "properties": {"x": {"const": 42}}}),
+                strict: None,
+            }),
+            stream: false,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::GoogleGemini,
+                "generateContent",
+                "v1beta",
+            ),
+            metadata: None,
+            extensions: std::collections::HashMap::new(),
+        };
+        let (body, _h) = codec.encode_request(&req).unwrap();
+        // The const should have been converted to enum.
+        assert_eq!(
+            body["generationConfig"]["responseSchema"]["properties"]["x"]["enum"],
+            json!([42])
+        );
+    }
+
+    #[test]
+    fn test_encode_request_applies_schema_conversion_to_tool_parameters() {
+        // Verify that encode_request applies convert_json_schema_to_openapi
+        // to functionDeclarations parameters.
+        let codec = GeminiCodec::new();
+        let req = IrRequest {
+            model: "gemini-2.0-flash".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: "hi".to_string(),
+                    annotations: None,
+                }],
+            }],
+            tools: vec![Tool {
+                name: "get_weather".to_string(),
+                description: Some("Get weather".to_string()),
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "const": "London"}
+                    }
+                })),
+                required: false,
+            }],
+            params: Default::default(),
+            response_format: None,
+            stream: false,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::GoogleGemini,
+                "generateContent",
+                "v1beta",
+            ),
+            metadata: None,
+            extensions: std::collections::HashMap::new(),
+        };
+        let (body, _h) = codec.encode_request(&req).unwrap();
+        let params = &body["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(params["properties"]["city"]["enum"], json!(["London"]));
+    }
+
+    #[test]
+    fn test_tool_config_from_ir_extensions_auto() {
+        // Item 5: toolConfig from IR extensions["tool_choice"].
+        let codec = GeminiCodec::new();
+        let mut extensions = std::collections::HashMap::new();
+        extensions.insert("tool_choice".to_string(), json!("auto"));
+        let req = IrRequest {
+            model: "gemini-2.0-flash".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: "hi".to_string(),
+                    annotations: None,
+                }],
+            }],
+            tools: vec![Tool {
+                name: "f".to_string(),
+                description: None,
+                parameters: None,
+                required: false,
+            }],
+            params: Default::default(),
+            response_format: None,
+            stream: false,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::GoogleGemini,
+                "generateContent",
+                "v1beta",
+            ),
+            metadata: None,
+            extensions,
+        };
+        let (body, _h) = codec.encode_request(&req).unwrap();
+        assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+    }
+
+    #[test]
+    fn test_tool_config_from_ir_extensions_required() {
+        let codec = GeminiCodec::new();
+        let mut extensions = std::collections::HashMap::new();
+        extensions.insert("tool_choice".to_string(), json!("required"));
+        let req = IrRequest {
+            model: "gemini-2.0-flash".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: "hi".to_string(),
+                    annotations: None,
+                }],
+            }],
+            tools: vec![Tool {
+                name: "f".to_string(),
+                description: None,
+                parameters: None,
+                required: false,
+            }],
+            params: Default::default(),
+            response_format: None,
+            stream: false,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::GoogleGemini,
+                "generateContent",
+                "v1beta",
+            ),
+            metadata: None,
+            extensions,
+        };
+        let (body, _h) = codec.encode_request(&req).unwrap();
+        assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+    }
+
+    #[test]
+    fn test_tool_config_from_ir_extensions_specific_function() {
+        let codec = GeminiCodec::new();
+        let mut extensions = std::collections::HashMap::new();
+        extensions.insert(
+            "tool_choice".to_string(),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+        );
+        let req = IrRequest {
+            model: "gemini-2.0-flash".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: "hi".to_string(),
+                    annotations: None,
+                }],
+            }],
+            tools: vec![Tool {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: None,
+                required: false,
+            }],
+            params: Default::default(),
+            response_format: None,
+            stream: false,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::GoogleGemini,
+                "generateContent",
+                "v1beta",
+            ),
+            metadata: None,
+            extensions,
+        };
+        let (body, _h) = codec.encode_request(&req).unwrap();
+        assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
+            "get_weather"
+        );
+    }
+
+    #[test]
+    fn test_decode_request_parses_tool_config_to_extensions() {
+        // Verify that decode_request parses Gemini's toolConfig into
+        // the normalized extensions["tool_choice"] format.
+        let codec = GeminiCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gemini-2.0-flash",
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["f"]}}
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(
+            ir.extensions.get("tool_choice"),
+            Some(&json!({"type": "function", "function": {"name": "f"}}))
+        );
     }
 }

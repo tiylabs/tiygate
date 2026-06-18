@@ -245,6 +245,17 @@ impl EndpointCodec for ResponsesCodec {
                     messages.push(Message { role, content });
                 }
             }
+        } else if let Some(text) = body["input"].as_str() {
+            // OpenAI Responses API allows `input` to be a plain string
+            // (shorthand for a single user message). Normalize it into the
+            // same IR structure as the array form.
+            messages.push(Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: text.to_string(),
+                    annotations: None,
+                }],
+            });
         }
 
         let tools: Vec<Tool> = body["tools"]
@@ -1245,6 +1256,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     id: self.response_id.clone().unwrap_or_default(),
                     status: "completed".to_string(),
                     usage: None,
+                    extensions: HashMap::new(),
                 }]);
             }
             return Ok(vec![]);
@@ -1394,6 +1406,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     id: self.response_id.clone().unwrap_or_default(),
                     status: "completed".to_string(),
                     usage: None,
+                    extensions: HashMap::new(),
                 });
             }
             Some("error") | Some("response.failed") => {
@@ -1421,6 +1434,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     id: self.response_id.clone().unwrap_or_default(),
                     status: "incomplete".to_string(),
                     usage: None,
+                    extensions: HashMap::new(),
                 });
             }
             Some(_other) => {
@@ -1462,6 +1476,25 @@ mod tests {
     #[test]
     fn test_decode_basic_request() {
         let _codec = ResponsesCodec::new();
+    }
+
+    #[test]
+    fn test_decode_string_input() {
+        // OpenAI Responses API allows `input` to be a plain string.
+        // The decoder must normalize it into a user message.
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-4o",
+            "input": "Hello, who are you?",
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(ir.messages.len(), 1);
+        assert!(matches!(ir.messages[0].role, Role::User));
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            Content::Text { text, .. } if text == "Hello, who are you?"
+        ));
     }
 
     #[test]

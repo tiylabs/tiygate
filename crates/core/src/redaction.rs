@@ -7,7 +7,8 @@
 //! covering all of the common cases:
 //!
 //! * `Authorization: Bearer …`, `x-api-key: …`,
-//!   `anthropic-api-key: …`, `openai-organization`, etc.
+//!   `x-goog-api-key: …`, `anthropic-api-key: …`,
+//!   `openai-organization`, etc.
 //! * `Cookie`, `Set-Cookie` headers.
 //! * `proxy-authorization`
 //! * Any header containing `key`, `token`, `secret`, or `password`
@@ -34,6 +35,7 @@ const DEFAULT_HEADER_PATTERNS: &[&str] = &[
     "cookie",
     "set-cookie",
     "x-api-key",
+    "x-goog-api-key",
     "anthropic-api-key",
     "openai-organization",
     "openai-project",
@@ -205,6 +207,17 @@ mod tests {
         assert!(r.should_redact_header("X-Refresh-Token"));
         assert!(r.should_redact_header("client_secret"));
         assert!(!r.should_redact_header("Content-Type"));
+    }
+
+    #[test]
+    fn default_redacts_x_goog_api_key() {
+        let r = Redactor::with_defaults();
+        assert!(
+            r.should_redact_header("x-goog-api-key"),
+            "x-goog-api-key must be in the default redaction set"
+        );
+        // Case-insensitive
+        assert!(r.should_redact_header("X-GOOG-API-KEY"));
     }
 
     #[test]

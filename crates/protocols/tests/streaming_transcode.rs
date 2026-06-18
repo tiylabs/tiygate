@@ -366,6 +366,7 @@ fn matrix_finish_present_all_pairs() {
             id: "resp_f".to_string(),
             status: "completed".to_string(),
             usage: None,
+            extensions: std::collections::HashMap::new(),
         },
     ];
 

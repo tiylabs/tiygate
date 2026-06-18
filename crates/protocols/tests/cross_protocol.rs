@@ -93,6 +93,18 @@ fn response() -> IrResponse {
     }
 }
 
+fn first_gemini_function_response_name(encoded: &serde_json::Value) -> String {
+    encoded["contents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|content| content["parts"].as_array().unwrap().iter())
+        .find_map(|part| part.get("functionResponse"))
+        .and_then(|fr| fr["name"].as_str())
+        .unwrap()
+        .to_string()
+}
+
 // ============================================================================
 // N×N Cross-Protocol Conversion Matrix
 // ============================================================================
@@ -298,17 +310,15 @@ fn lossy_extended_reasoning_chat_to_anthropic() {
 
 #[test]
 fn lossy_tool_choice_specific_chat_to_gemini() {
-    // OpenAI supports tool_choice=function(specific_name). Gemini does not.
-    // This should be rejected when lossy_default_reject is true.
+    // OpenAI supports tool_choice=function(specific_name). Gemini now supports
+    // this via toolConfig.functionCallingConfig.mode=ANY + allowedFunctionNames.
     let ingress = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
 
     assert!(ingress.capabilities().function_calling);
     assert!(gemini.capabilities().function_calling);
-    // Both must declare lossy_default_reject so the gateway can reject
-    // the specific_function combination at runtime.
-    assert!(ingress.capabilities().lossy_default_reject);
-    assert!(gemini.capabilities().lossy_default_reject);
+    // Gemini now declares tool_choice_required so the lossy check passes.
+    assert!(gemini.capabilities().tool_choice_required);
 }
 
 // ============================================================================
@@ -583,6 +593,114 @@ fn nxn_gemini_to_gemini() {
     );
 }
 
+#[test]
+fn chat_tool_result_to_gemini_recovers_function_name() {
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_abc",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"London\"}"
+                }
+            }]},
+            {"role": "tool", "tool_call_id": "call_abc", "content": "{\"temp\":18}"}
+        ]
+    });
+    let ir = chat.decode_request(body, &make_env()).unwrap();
+    let tool_result_name = ir
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .find_map(|content| match content {
+            Content::ToolResult { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(tool_result_name, "");
+
+    let (encoded, _) = gemini.encode_request(&ir).unwrap();
+    assert_eq!(first_gemini_function_response_name(&encoded), "get_weather");
+}
+
+#[test]
+fn anthropic_tool_result_to_gemini_recovers_function_name() {
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let body = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "get_weather",
+                "input": {"city": "London"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [{"type": "text", "text": "18°C"}]
+            }]}
+        ]
+    });
+    let ir = anthropic.decode_request(body, &make_env()).unwrap();
+    let (encoded, _) = gemini.encode_request(&ir).unwrap();
+    assert_eq!(first_gemini_function_response_name(&encoded), "get_weather");
+}
+
+#[test]
+fn responses_tool_output_to_gemini_recovers_function_name() {
+    let responses = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let body = json!({
+        "model": "gpt-5",
+        "input": [
+            {"role": "user", "content": "weather?"},
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"London\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "18°C"
+            }
+        ]
+    });
+    let ir = responses.decode_request(body, &make_env()).unwrap();
+    let (encoded, _) = gemini.encode_request(&ir).unwrap();
+    assert_eq!(first_gemini_function_response_name(&encoded), "get_weather");
+}
+
+#[test]
+fn orphan_tool_result_to_gemini_returns_codec_error() {
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let mut ir = basic_request();
+    ir.messages.push(Message {
+        role: Role::Tool,
+        content: vec![Content::ToolResult {
+            tool_call_id: "missing_call".to_string(),
+            name: String::new(),
+            content: "{}".to_string(),
+        }],
+    });
+
+    let err = gemini.encode_request(&ir).unwrap_err().to_string();
+    assert!(
+        err.contains("functionResponse.name is required") && err.contains("missing_call"),
+        "unexpected error: {err}"
+    );
+}
+
 // ============================================================================
 // Runtime lossy_default_reject: when tool_choice=required is sent to a
 // target that cannot express it, the conversion layer must surface a
@@ -590,12 +708,10 @@ fn nxn_gemini_to_gemini() {
 // ============================================================================
 
 #[test]
-fn runtime_lossy_reject_tool_choice_to_gemini() {
+fn runtime_tool_choice_to_gemini_accepted() {
     // OpenAI chat completions → Gemini generateContent. The OpenAI
-    // request uses `tool_choice: "required"` and a tool. Gemini's
-    // functionCalling mode is implicit; there is no direct equivalent
-    // of `tool_choice=required` (it can only force-enable via
-    // tool_config). The gateway must surface a lossy rejection here.
+    // request uses `tool_choice: "required"` and a tool. Gemini now
+    // supports this via toolConfig.functionCallingConfig.mode=ANY.
     let ingress = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let body = json!({
         "model": "m",
@@ -611,26 +727,18 @@ fn runtime_lossy_reject_tool_choice_to_gemini() {
         "tool_choice": "required"
     });
     let ir = ingress.decode_request(body, &make_env()).expect("decode");
-    // Sanity: lossy_default_reject flag is declared.
-    assert!(ingress.capabilities().lossy_default_reject);
-    // The IR carries the tools (we model them in the IR).
     assert_eq!(ir.tools.len(), 1);
-    // The runtime contract: the gateway's lossy check in
-    // `ingress::execute_upstream` rejects the conversion when the
-    // egress codec cannot express tool_choice=required. We assert the
-    // contract here at the codec level by checking that the egress
-    // Gemini codec does not declare an equivalent of tool_choice.
+    // The IR carries tool_choice=required in extensions.
+    assert_eq!(ir.extensions.get("tool_choice"), Some(&json!("required")));
+    // Gemini now declares tool_choice_required so the lossy check passes.
     let egress = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
     let caps = egress.capabilities();
-    // Gemini's tool_choice is implicit (the model decides). There is
-    // no explicit "force a tool call" knob in generateContent, so the
-    // runtime must reject the conversion (the gateway does this in
-    // ingress::execute_upstream's lossy check). We assert the runtime
-    // contract by simulating the lossy check inline:
-    let lossy_rejected = !caps.function_calling || caps.lossy_default_reject;
-    assert!(
-        lossy_rejected,
-        "Gemini must trigger lossy_default_reject when tool_choice=required is sent"
+    assert!(caps.tool_choice_required);
+    // Verify the encode produces toolConfig with mode=ANY.
+    let (encoded, _h) = egress.encode_request(&ir).expect("encode");
+    assert_eq!(
+        encoded["toolConfig"]["functionCallingConfig"]["mode"],
+        "ANY"
     );
 }
 
@@ -870,8 +978,12 @@ fn chat_thinking_effort_cross_to_anthropic() {
 
 /// Helper: build a minimal IR request with a given thinking config.
 fn thinking_ir(thinking: ThinkingConfig) -> IrRequest {
+    thinking_ir_for_model("test-model", thinking)
+}
+
+fn thinking_ir_for_model(model: &str, thinking: ThinkingConfig) -> IrRequest {
     IrRequest {
-        model: "test-model".to_string(),
+        model: model.to_string(),
         system: Some("You are helpful.".to_string()),
         messages: vec![Message {
             role: Role::User,
@@ -913,21 +1025,49 @@ fn cross_thinking_chat_effort_to_anthropic_adaptive() {
 
 #[test]
 fn cross_thinking_chat_effort_to_gemini_thinking_level() {
-    // Chat effort → Gemini thinkingLevel + thinkingBudget
+    // Chat effort → Gemini 3+ thinkingLevel only.
     let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
-    let ir = thinking_ir(ThinkingConfig {
-        effort: Some(ThinkingEffort::Medium),
-        ..Default::default()
-    });
+    let ir = thinking_ir_for_model(
+        "gemini-3.0-pro",
+        ThinkingConfig {
+            effort: Some(ThinkingEffort::Medium),
+            ..Default::default()
+        },
+    );
     let (out, _) = gemini.encode_request(&ir).unwrap();
     assert_eq!(
         out["generationConfig"]["thinkingConfig"]["thinkingLevel"],
         "medium"
     );
-    // thinkingBudget is derived from effort, clamped to Gemini's 0-24576 range.
+    assert!(
+        out["generationConfig"]["thinkingConfig"]
+            .get("thinkingBudget")
+            .is_none(),
+        "Gemini does not support thinkingLevel and thinkingBudget together"
+    );
+}
+
+#[test]
+fn cross_thinking_effort_to_gemini_2_5_budget() {
+    // Gemini 2.5 does not support thinkingLevel, so effort is mapped to thinkingBudget.
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = thinking_ir_for_model(
+        "gemini-2.5-flash",
+        ThinkingConfig {
+            effort: Some(ThinkingEffort::Medium),
+            ..Default::default()
+        },
+    );
+    let (out, _) = gemini.encode_request(&ir).unwrap();
     assert_eq!(
         out["generationConfig"]["thinkingConfig"]["thinkingBudget"],
         ThinkingConfig::effort_to_budget(ThinkingEffort::Medium)
+    );
+    assert!(
+        out["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none(),
+        "Gemini 2.5 models use thinkingBudget rather than thinkingLevel"
     );
 }
 
@@ -946,22 +1086,50 @@ fn cross_thinking_anthropic_budget_to_chat_effort() {
 
 #[test]
 fn cross_thinking_anthropic_budget_to_gemini_thinking_level() {
-    // Anthropic budget_tokens → Gemini thinkingLevel + thinkingBudget
+    // Anthropic budget_tokens → Gemini 3+ thinkingLevel only.
     let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
-    let ir = thinking_ir(ThinkingConfig {
-        budget_tokens: Some(10_000),
-        ..Default::default()
-    });
+    let ir = thinking_ir_for_model(
+        "gemini-3.0-pro",
+        ThinkingConfig {
+            budget_tokens: Some(10_000),
+            ..Default::default()
+        },
+    );
     let (out, _) = gemini.encode_request(&ir).unwrap();
     // 10000 falls in the Medium range (6144-16383)
     assert_eq!(
         out["generationConfig"]["thinkingConfig"]["thinkingLevel"],
         "medium"
     );
-    // thinkingBudget should be the explicit value
+    assert!(
+        out["generationConfig"]["thinkingConfig"]
+            .get("thinkingBudget")
+            .is_none(),
+        "Gemini does not support thinkingLevel and thinkingBudget together"
+    );
+}
+
+#[test]
+fn cross_thinking_budget_to_gemini_2_5_budget() {
+    // Gemini 2.5 preserves explicit thinkingBudget and does not emit thinkingLevel.
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = thinking_ir_for_model(
+        "gemini-2.5-flash",
+        ThinkingConfig {
+            budget_tokens: Some(10_000),
+            ..Default::default()
+        },
+    );
+    let (out, _) = gemini.encode_request(&ir).unwrap();
     assert_eq!(
         out["generationConfig"]["thinkingConfig"]["thinkingBudget"],
         10_000
+    );
+    assert!(
+        out["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none(),
+        "Gemini 2.5 models use thinkingBudget rather than thinkingLevel"
     );
 }
 
@@ -1036,7 +1204,7 @@ fn cross_thinking_anthropic_adaptive_decode_to_chat() {
 
 #[test]
 fn cross_thinking_anthropic_adaptive_decode_to_gemini() {
-    // Anthropic adaptive thinking → Gemini thinkingLevel (XHigh clamps to "high")
+    // Anthropic adaptive thinking → Gemini 3+ thinkingLevel (XHigh clamps to "high")
     let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
     let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
     let env = make_env();
@@ -1049,7 +1217,8 @@ fn cross_thinking_anthropic_adaptive_decode_to_gemini() {
             "output_config": {"effort": "max"}
         },
     });
-    let ir = anthropic.decode_request(body, &env).unwrap();
+    let mut ir = anthropic.decode_request(body, &env).unwrap();
+    ir.model = "gemini-3.0-pro".to_string();
     assert_eq!(
         ir.params.thinking.as_ref().unwrap().effort,
         Some(ThinkingEffort::Max)
@@ -1101,10 +1270,13 @@ fn cross_thinking_minimal_effort_clamping() {
     // Minimal effort: Anthropic clamps to "low", Gemini supports "minimal"
     let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
     let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
-    let ir = thinking_ir(ThinkingConfig {
-        effort: Some(ThinkingEffort::Minimal),
-        ..Default::default()
-    });
+    let ir = thinking_ir_for_model(
+        "gemini-3.0-pro",
+        ThinkingConfig {
+            effort: Some(ThinkingEffort::Minimal),
+            ..Default::default()
+        },
+    );
     let (anth_out, _) = anthropic.encode_request(&ir).unwrap();
     // Anthropic doesn't support "minimal", clamps to "low"
     assert_eq!(anth_out["thinking"]["output_config"]["effort"], "low");
@@ -1122,10 +1294,13 @@ fn cross_thinking_max_effort_clamping() {
     // Max effort: OpenAI clamps to "xhigh", Gemini clamps to "high"
     let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
-    let ir = thinking_ir(ThinkingConfig {
-        effort: Some(ThinkingEffort::Max),
-        ..Default::default()
-    });
+    let ir = thinking_ir_for_model(
+        "gemini-3.0-pro",
+        ThinkingConfig {
+            effort: Some(ThinkingEffort::Max),
+            ..Default::default()
+        },
+    );
     let (chat_out, _) = chat.encode_request(&ir).unwrap();
     // OpenAI has no "max", clamps to "xhigh"
     assert_eq!(chat_out["reasoning_effort"], "xhigh");

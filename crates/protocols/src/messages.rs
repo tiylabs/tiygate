@@ -1419,6 +1419,7 @@ impl StreamDecoder for MessagesStreamDecoder {
                     id: self.response_id.clone().unwrap_or_default(),
                     status: "completed".to_string(),
                     usage: None,
+                    extensions: std::collections::HashMap::new(),
                 });
             }
             Some("error") => {
@@ -1787,6 +1788,7 @@ mod tests {
                 id: "r1".to_string(),
                 status: "completed".to_string(),
                 usage: None,
+                extensions: std::collections::HashMap::new(),
             },
         ];
         for variant in variants {

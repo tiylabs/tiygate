@@ -217,21 +217,21 @@ fn tool_choice_to_chat_completions_always_passes() {
 }
 
 #[test]
-fn specific_tool_choice_to_gemini_rejected() {
-    // Gemini does not support tool_choice=specific (❌ in §1 of matrix).
+fn specific_tool_choice_to_gemini_accepted() {
+    // Gemini now supports tool_choice=specific via
+    // toolConfig.functionCallingConfig.mode=ANY + allowedFunctionNames.
     let mut req = req_with_tools();
     with_specific_tool_choice(&mut req);
-    let err = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps());
-    assert_eq!(extract_dim(&err), Some(LossyDimension::ToolChoiceSpecific));
+    assert!(check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps()).is_ok());
 }
 
 #[test]
-fn tool_choice_required_to_gemini_rejected() {
-    // Gemini tool_choice_required=false → reject.
+fn tool_choice_required_to_gemini_accepted() {
+    // Gemini now supports tool_choice=required via
+    // toolConfig.functionCallingConfig.mode=ANY.
     let mut req = req_with_tools();
     with_tool_choice_str(&mut req, "required");
-    let err = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps());
-    assert_eq!(extract_dim(&err), Some(LossyDimension::ToolChoiceRequired));
+    assert!(check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps()).is_ok());
 }
 
 // --- Dimension 5: media sources ---

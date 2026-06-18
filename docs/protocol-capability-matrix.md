@@ -17,13 +17,12 @@
 |------|:---:|:---:|:---:|:---:|:---:|
 | `function_calling` | ✅ | ✅ | ✅ | ✅ | N/A |
 | `parallel_tool_calls` | ✅ | ⚠️ → chat→msg: 并行工具调用无法在 Anthropic 表达 | ✅ | ⚠️ | N/A |
-| `tool_choice=required` | ✅ | ✅ (via `{type:"any"}`) | ✅ | ⚠️ → Gemini 不支持 required | N/A |
-| `tool_choice=具体函数` | ✅ | ✅ (via `{type:"tool", name:"x"}`) | ✅ | ❌ → Gemini 不支持指定函数 | N/A |
+| `tool_choice=required` | ✅ | ✅ (via `{type:"any"}`) | ✅ | ✅ (via `toolConfig.functionCallingConfig.mode=ANY`) | N/A |
+| `tool_choice=具体函数` | ✅ | ✅ (via `{type:"tool", name:"x"}`) | ✅ | ✅ (via `mode=ANY` + `allowedFunctionNames`) | N/A |
 | `tool_result` 引用 | ✅ | ✅ | ✅ | ✅ | N/A |
 
 **有损组合（阶段 1-3 已知）**：
 - `chat_completions → messages` 且请求包含 `parallel_tool_calls=true` → **拒绝**
-- `chat_completions → gemini` 且 `tool_choice=required` → **拒绝**
 - `messages → gemini` tool_use 块结构 → **有损**（Gemini 用 `functionCall`/`functionResponse` parts，语义不完全等价）
 
 ## 2. 多模态（Multimodal）
@@ -69,7 +68,7 @@
 
 | Ingress ↓ / Egress → | chat_completions | messages | responses | gemini |
 |----------------------|:---:|:---:|:---:|:---:|
-| **chat_completions** | PassThrough ✅ | ⚠️ parallel_tc 可能拒绝 | ✅ | ⚠️ tool_choice=required 拒绝 |
+| **chat_completions** | PassThrough ✅ | ⚠️ parallel_tc 可能拒绝 | ✅ | ✅ |
 | **messages** | ✅ | PassThrough ✅ | ✅ | ⚠️ tool_use→functionCall 有损 |
 | **responses** | ⚠️ file_id 丢失 | ⚠️ file_id + structured_output 拒绝 | PassThrough ✅ | ⚠️ file_id+audio 拒绝 |
 | **gemini** | ⚠️ inline video/audio 拒绝 | ⚠️ inline video/audio 拒绝 | ⚠️ inline video/audio 拒绝 | PassThrough ✅ |
@@ -84,8 +83,8 @@
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
 |------|:---:|:---:|:---:|:---:|:---:|
-| `effort` (minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`) | ✅ (`thinking.output_config.effort`，adaptive 类型) | ✅ (`reasoning.effort`) | ✅ (`thinkingConfig.thinkingLevel`) | N/A |
-| `budget_tokens` | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinking.budget_tokens`，enabled 类型) | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinkingConfig.thinkingBudget`) | N/A |
+| `effort` (minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`) | ✅ (`thinking.output_config.effort`，adaptive 类型) | ✅ (`reasoning.effort`) | ✅ (Gemini 3+ `thinkingConfig.thinkingLevel`；2.5 → 推导 `thinkingBudget`) | N/A |
+| `budget_tokens` | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinking.budget_tokens`，enabled 类型) | ✅ → 推导 effort（`budget_to_effort`） | ✅ (Gemini 2.5 `thinkingConfig.thinkingBudget`；3+ → 推导 `thinkingLevel`) | N/A |
 | `display` (summarized/omitted) | ⚠️ → 丢弃 | ✅ (`thinking.display`) | ⚠️ → 丢弃 | ✅ → 推导 `includeThoughts` | N/A |
 | `include_thoughts` | ⚠️ → 丢弃 | ✅ → 推导 `display`（需同时有 effort 或 budget_tokens） | ⚠️ → 丢弃 | ✅ (`thinkingConfig.includeThoughts`) | N/A |
 
@@ -94,7 +93,7 @@
 **effort 级别映射**：IR 使用 6 级枚举（Minimal/Low/Medium/High/XHigh/Max）。各协议支持级别不同，超出部分 clamp：
 - OpenAI: minimal/low/medium/high/xhigh（Max → xhigh）
 - Anthropic: low/medium/high/xhigh/max（Minimal → low，使用 adaptive thinking + `output_config.effort`）
-- Gemini: minimal/low/medium/high（XHigh/Max → high，同时输出 `thinkingBudget`）
+- Gemini: 3+ 使用 minimal/low/medium/high（XHigh/Max → high）并只输出 `thinkingLevel`；2.5 使用 `thinkingBudget`。官方协议不允许同一请求同时包含 `thinkingLevel` 和 `thinkingBudget`。
 
 **effort ↔ budget_tokens 双向映射**：`ThinkingConfig::effort_to_budget` / `budget_to_effort` 提供数值映射，各协议 encode 时自动推导缺失字段。
 

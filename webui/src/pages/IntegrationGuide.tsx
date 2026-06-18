@@ -56,7 +56,7 @@ interface ProtocolSpec {
    *  themes, soft blue in dark themes). */
   brand: string;
   brandLabel: string;
-  auth: "bearer" | "x-api-key";
+  auth: "bearer" | "x-api-key" | "x-goog-api-key";
 }
 
 interface LanguageSpec {
@@ -117,7 +117,7 @@ const PROTOCOLS: ProtocolSpec[] = [
     icon: Server,
     brand: geminiBrand,
     brandLabel: "Google Gemini",
-    auth: "bearer",
+    auth: "x-goog-api-key",
   },
   {
     id: "embeddings",
@@ -198,9 +198,12 @@ function readStoredBoolean(key: string, fallback: boolean): boolean {
   return raw === "1";
 }
 
-function protocolPathFor(protocol: ProtocolId, model: string): string {
+function protocolPathFor(protocol: ProtocolId, model: string, stream: boolean): string {
   if (protocol === "gemini") {
-    return `/v1beta/models/${encodeURIComponent(model || "model")}:generateContent`;
+    const encodedModel = encodeURIComponent(model || "model");
+    return stream
+      ? `/v1beta/models/${encodedModel}:streamGenerateContent?alt=sse`
+      : `/v1beta/models/${encodedModel}:generateContent`;
   }
   const p = PROTOCOLS.find((it) => it.id === protocol);
   return p ? p.path : "";
@@ -368,11 +371,13 @@ function buildPython(
   apiKey: string,
   stream: boolean,
 ): string {
-  const url = `${trimTrailingSlash(baseUrl)}${protocolPathFor(protocol, model)}`;
+  const url = `${trimTrailingSlash(baseUrl)}${protocolPathFor(protocol, model, stream)}`;
   const authValue =
     protocol === "anthropic"
       ? `{"x-api-key": "${escapeForPythonString(apiKey)}", "anthropic-version": "2023-06-01"}`
-      : `{"Authorization": f"Bearer ${apiKey || "<YOUR_API_KEY>"}"}`;
+      : protocol === "gemini"
+        ? `{"x-goog-api-key": "${escapeForPythonString(apiKey || "<YOUR_API_KEY>")}"}`
+        : `{"Authorization": f"Bearer ${apiKey || "<YOUR_API_KEY>"}"}`;
   const body = pythonBodyFor(protocol, model, stream);
   const streamSnippet = stream
     ? `\n\ndef _print_stream(events):\n    for event in events:\n        sys.stdout.write(event)\n        sys.stdout.flush()\n\n\ndef main() -> None:\n    if STREAM:\n        with httpx.stream("POST", URL, headers=HEADERS, json=BODY, timeout=60.0) as response:\n            response.raise_for_status()\n            _print_stream(response.iter_text())\n        return\n    response = httpx.post(URL, headers=HEADERS, json=BODY, timeout=60.0)\n    response.raise_for_status()\n    print(response.text)\n\n\nif __name__ == "__main__":\n    main()\n`
@@ -393,8 +398,9 @@ function buildTypeScript(
   apiKey: string,
   stream: boolean,
 ): string {
-  const url = `${trimTrailingSlash(baseUrl)}${protocolPathFor(protocol, model)}`;
+  const url = `${trimTrailingSlash(baseUrl)}${protocolPathFor(protocol, model, stream)}`;
   const isAnthropic = protocol === "anthropic";
+  const isGemini = protocol === "gemini";
   const body = typescriptBodyFor(protocol, model, stream);
   const requestSnippet = stream
     ? `const response = await fetch(URL, {
@@ -432,7 +438,12 @@ console.log(data);`;
   "anthropic-version": "2023-06-01",
   "Content-Type": "application/json",
 }`
-    : `{
+    : isGemini
+      ? `{
+  "x-goog-api-key": ${apiKey || "<YOUR_API_KEY>"},
+  "Content-Type": "application/json",
+}`
+      : `{
   Authorization: \`Bearer ${apiKey || "<YOUR_API_KEY>"}\`,
   "Content-Type": "application/json",
 }`;
@@ -452,12 +463,15 @@ function buildCurl(
   apiKey: string,
   stream: boolean,
 ): string {
-  const url = `${trimTrailingSlash(baseUrl)}${protocolPathFor(protocol, model)}`;
+  const url = `${trimTrailingSlash(baseUrl)}${protocolPathFor(protocol, model, stream)}`;
   const isAnthropic = protocol === "anthropic";
+  const isGemini = protocol === "gemini";
   const keyPlaceholder = apiKey || "<YOUR_API_KEY>";
   const authLine = isAnthropic
     ? `-H "x-api-key: ${escapeForCurl(keyPlaceholder)}" \\\n  -H "anthropic-version: 2023-06-01" \\`
-    : `-H "Authorization: Bearer ${escapeForCurl(keyPlaceholder)}" \\`;
+    : isGemini
+      ? `-H "x-goog-api-key: ${escapeForCurl(keyPlaceholder)}" \\`
+      : `-H "Authorization: Bearer ${escapeForCurl(keyPlaceholder)}" \\`;
   const streamLine = stream ? " \\\n  -N" : "";
   const body = curlBodyFor(protocol, model, stream);
   return `# ${protocol} — cURL
@@ -917,6 +931,8 @@ export default function IntegrationGuide() {
                   <code className="block break-all font-mono text-[12px] leading-relaxed text-text">
                     {activeProtocolSpec.auth === "x-api-key"
                       ? t("integration.authAnthropic")
+                      : activeProtocolSpec.auth === "x-goog-api-key"
+                        ? "x-goog-api-key: <YOUR_API_KEY>"
                       : t("integration.authBearer")}
                   </code>
                 </div>

@@ -83,6 +83,10 @@ pub enum StreamPart {
         id: String,
         status: String,
         usage: Option<Usage>,
+        /// Protocol-specific metadata collected during streaming that needs
+        /// to survive the stream boundary (e.g. Gemini thought signatures).
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        extensions: HashMap<String, serde_json::Value>,
     },
     /// An error occurred during streaming.
     Error {
@@ -274,7 +278,8 @@ pub struct GenerationParams {
 /// - **Anthropic**: `thinking.output_config.effort` (low/medium/high/xhigh/max;
 ///   Minimal clamps to low) or `thinking.budget_tokens` (numeric)
 /// - **Gemini**: `thinkingConfig.thinkingLevel` (minimal/low/medium/high;
-///   XHigh/Max clamp to high) and `thinkingConfig.thinkingBudget` (numeric)
+///   XHigh/Max clamp to high) or `thinkingConfig.thinkingBudget` (numeric;
+///   Gemini docs require the two fields not to be sent together)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingEffort {
@@ -300,8 +305,9 @@ pub enum ThinkingDisplay {
 /// - **OpenAI Responses**: `reasoning.effort` ↔ `effort`
 /// - **Anthropic**: `thinking: {type, budget_tokens, display}` ↔
 ///   `budget_tokens` / `display`
-/// - **Gemini**: `thinkingConfig: {includeThoughts, thinkingBudget}` ↔
-///   `include_thoughts` / `budget_tokens`
+/// - **Gemini**: `thinkingConfig: {includeThoughts, thinkingLevel}` or
+///   `thinkingConfig: {includeThoughts, thinkingBudget}` ↔
+///   `include_thoughts` / `effort` / `budget_tokens`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThinkingConfig {
     /// Effort level (maps to `reasoning_effort` / `reasoning.effort`).

@@ -56,7 +56,7 @@ impl GeminiProvider {
                 channels: vec!["default".to_string()],
                 protocols: vec![ProtocolEndpoint::new(
                     ProtocolSuite::GoogleGemini,
-                    "generate_content",
+                    "generateContent",
                     "v1beta",
                 )],
                 defaults: serde_json::json!({}),
@@ -85,7 +85,7 @@ impl Provider for GeminiProvider {
     }
 
     fn egress_protocol_for_model(&self, _model_id: &str) -> ProtocolEndpoint {
-        ProtocolEndpoint::new(ProtocolSuite::GoogleGemini, "generate_content", "v1beta")
+        ProtocolEndpoint::new(ProtocolSuite::GoogleGemini, "generateContent", "v1beta")
     }
 }
 
@@ -155,7 +155,7 @@ mod tests {
             api_key: key.to_string(),
             api_protocol: ProtocolEndpoint::new(
                 ProtocolSuite::GoogleGemini,
-                "generate_content",
+                "generateContent",
                 "v1beta",
             ),
             account_label: None,
