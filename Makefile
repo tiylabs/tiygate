@@ -51,9 +51,18 @@ help: ## 显示所有可用目标
 # =========================
 # 前端(WebUI)
 # =========================
+# `webui/node_modules/.package-lock.json` 是 npm install 成功后写入的标志文件,
+# 用来幂等判断"依赖是否就绪",避免每次都跑 install。
+WEBUI_INSTALLED := $(WEBUI_DIR)/node_modules/.package-lock.json
+
 .PHONY: webui-install
-webui-install: ## 安装 webui 依赖(npm install)
-	cd $(WEBUI_DIR) && $(NPM) install
+webui-install: ## 安装 webui 依赖(若已安装则跳过,支持首次 make dev/build 一次成功)
+	@if [ ! -f "$(WEBUI_INSTALLED)" ]; then \
+		echo ">> webui 依赖未就绪,执行: $(NPM) install"; \
+		cd $(WEBUI_DIR) && $(NPM) install; \
+	else \
+		echo ">> webui 依赖已就绪($(WEBUI_INSTALLED)),跳过 install"; \
+	fi
 
 .PHONY: webui-lint
 webui-lint: ## 前端类型检查(tsc --noEmit)
@@ -84,11 +93,11 @@ lint: webui-lint ## 静态检查:cargo fmt --check + clippy + 前端类型检查
 	$(CARGO_CLIPPY)
 
 .PHONY: build
-build: webui-build ## 构建 Rust release 版本(会先构建前端以供 rust-embed 嵌入)
+build: webui-install webui-build ## 构建 Rust release 版本(会先安装前端依赖并构建产物以供 rust-embed 嵌入)
 	$(CARGO_BUILD) --release
 
 .PHONY: build-debug
-build-debug: webui-build ## 构建 Rust debug 版本
+build-debug: webui-install webui-build ## 构建 Rust debug 版本
 	$(CARGO_BUILD)
 
 .PHONY: test
@@ -108,7 +117,7 @@ clean: webui-clean ## 清理 Rust + 前端构建产物
 # 开发体验
 # =========================
 .PHONY: dev
-dev: webui-build ## 本地开发:先构建 webui 供 Rust 嵌入,再 cargo run 启动服务(带 $(SERVER_FEATURES) feature)
+dev: webui-install webui-build ## 本地开发:先安装/校验前端依赖,再构建 webui 供 Rust 嵌入,然后 cargo run 启动服务(带 $(SERVER_FEATURES) feature)
 	$(CARGO_RUN) -p $(SERVER_CRATE) --features "$(SERVER_FEATURES)"
 
 .PHONY: dev-server
