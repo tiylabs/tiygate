@@ -1210,7 +1210,7 @@ impl StreamEncoder for GeminiStreamEncoder {
                     FinishReason::Stop => "STOP",
                     FinishReason::Length => "MAX_TOKENS",
                     FinishReason::ContentFilter => "SAFETY",
-                    FinishReason::ToolCalls => "TOOL_CALLS",
+                    FinishReason::ToolCalls => "STOP",
                     FinishReason::Other(_) => "STOP",
                 };
                 format!(
@@ -1382,7 +1382,13 @@ impl StreamDecoder for GeminiStreamDecoder {
                 }
                 if let Some(fr) = c["finishReason"].as_str() {
                     let reason = match fr {
-                        "STOP" => FinishReason::Stop,
+                        "STOP" => {
+                            if self.saw_tool_calls {
+                                FinishReason::ToolCalls
+                            } else {
+                                FinishReason::Stop
+                            }
+                        }
                         "MAX_TOKENS" => FinishReason::Length,
                         "SAFETY" => FinishReason::ContentFilter,
                         o => FinishReason::Other(o.to_string()),
@@ -1393,6 +1399,14 @@ impl StreamDecoder for GeminiStreamDecoder {
             }
         }
         if let Some(usage) = event.get("usageMetadata") {
+            let has_token_usage = usage.get("promptTokenCount").is_some()
+                || usage.get("candidatesTokenCount").is_some()
+                || usage.get("totalTokenCount").is_some()
+                || usage.get("cachedContentTokenCount").is_some()
+                || usage.get("thoughtsTokenCount").is_some();
+            if !has_token_usage {
+                return Ok(parts);
+            }
             let cache_read = usage["cachedContentTokenCount"].as_u64();
             let raw_prompt = usage["promptTokenCount"].as_u64().unwrap_or(0);
             parts.push(StreamPart::Usage {

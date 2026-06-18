@@ -14,7 +14,7 @@ use tiygate_core::{EndpointCodec, StreamDecoder, StreamEncoder, StreamPart};
 use tiygate_protocols::chat_completions::{
     ChatCompletionsCodec, ChatCompletionsStreamDecoder, ChatCompletionsStreamEncoder,
 };
-use tiygate_protocols::gemini::{GeminiCodec, GeminiStreamDecoder};
+use tiygate_protocols::gemini::{GeminiCodec, GeminiStreamDecoder, GeminiStreamEncoder};
 use tiygate_protocols::messages::{MessagesCodec, MessagesStreamDecoder, MessagesStreamEncoder};
 use tiygate_protocols::responses::{ResponsesCodec, ResponsesStreamDecoder};
 
@@ -461,6 +461,26 @@ fn count_completed(parts: &[StreamPart]) -> usize {
 }
 
 #[test]
+fn gemini_decoder_ignores_traffic_type_only_usage_metadata() {
+    // Gemini can include usageMetadata on every chunk with only trafficType.
+    // That is not a terminal usage frame and must not synthesize Finish(Stop)
+    // before a later functionCall arrives.
+    let mut dec = GeminiStreamDecoder::new();
+    let parts = dec
+        .feed(r#"data: {"responseId":"r1","candidates":[{"content":{"parts":[{"text":"hi"}]}}],"usageMetadata":{"trafficType":"ON_DEMAND"}}"#)
+        .unwrap();
+    assert_eq!(
+        count_finish(&parts),
+        0,
+        "trafficType-only usageMetadata must not synthesize Finish, got: {parts:?}"
+    );
+    assert!(
+        parts.iter().all(|p| !matches!(p, StreamPart::Usage { .. })),
+        "trafficType-only usageMetadata must not emit zero Usage, got: {parts:?}"
+    );
+}
+
+#[test]
 fn gemini_decoder_synthesizes_finish_on_usage_only() {
     // Proxy stripped `finishReason`; only `usageMetadata` arrives. The decoder
     // must synthesize exactly one Finish(Stop) so the cross-protocol ingress
@@ -510,6 +530,67 @@ fn gemini_decoder_usage_only_fallback_maps_tool_call_to_tool_calls() {
         ),
         "usage-only fallback after functionCall must map to ToolCalls, got: {parts:?}"
     );
+}
+
+#[test]
+fn gemini_decoder_stop_with_function_call_maps_to_tool_calls() {
+    // Native Gemini streams use finishReason=STOP even when the candidate
+    // contains a functionCall. Cross-protocol clients need ToolCalls, not Stop,
+    // otherwise they will not execute the tool.
+    let mut dec = GeminiStreamDecoder::new();
+    let parts = dec
+        .feed(r#"data: {"responseId":"r1","candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"cmd":"ls"}}}]},"finishReason":"STOP"}]}"#)
+        .unwrap();
+    assert!(
+        matches!(
+            parts
+                .iter()
+                .find(|p| matches!(p, StreamPart::Finish { .. })),
+            Some(StreamPart::Finish {
+                reason: FinishReason::ToolCalls
+            })
+        ),
+        "STOP with functionCall must map to ToolCalls, got: {parts:?}"
+    );
+}
+
+#[test]
+fn gemini_decoder_stop_after_prior_function_call_maps_to_tool_calls() {
+    // The functionCall and finishReason may arrive in separate SSE events; the
+    // decoder must latch that a tool call occurred before mapping STOP.
+    let mut dec = GeminiStreamDecoder::new();
+    let _ = dec
+        .feed(r#"data: {"responseId":"r1","candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"cmd":"ls"}}}]}}]}"#)
+        .unwrap();
+    let parts = dec
+        .feed(r#"data: {"candidates":[{"finishReason":"STOP"}]}"#)
+        .unwrap();
+    assert!(
+        matches!(
+            parts
+                .iter()
+                .find(|p| matches!(p, StreamPart::Finish { .. })),
+            Some(StreamPart::Finish {
+                reason: FinishReason::ToolCalls
+            })
+        ),
+        "STOP after a prior functionCall must map to ToolCalls, got: {parts:?}"
+    );
+}
+
+#[test]
+fn gemini_stream_encoder_tool_calls_finish_emits_stop() {
+    // Gemini has no TOOL_CALLS finishReason; tool-call turns are represented as
+    // functionCall parts plus STOP on the wire.
+    let mut enc = GeminiStreamEncoder;
+    let bytes = enc
+        .encode_part(&StreamPart::Finish {
+            reason: FinishReason::ToolCalls,
+        })
+        .unwrap();
+    let s = String::from_utf8_lossy(&bytes);
+    assert!(s.contains("\"finishReason\":\"STOP\""), "{s}");
+    assert!(!s.contains("TOOL_CALLS"), "{s}");
 }
 
 #[test]

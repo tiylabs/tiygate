@@ -173,6 +173,62 @@ fn output_item_done_for<'a>(events: &'a [Value], call_id: &str) -> Option<&'a Va
     })
 }
 
+fn finish_reasons(parts: &[StreamPart]) -> Vec<FinishReason> {
+    parts
+        .iter()
+        .filter_map(|p| match p {
+            StreamPart::Finish { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn gemini_function_call_stop_transcodes_to_responses_tool_calls() {
+    let upstream = br#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"I will check"}]}}],"usageMetadata":{"trafficType":"ON_DEMAND"},"modelVersion":"google/gemini-3.5-flash","responseId":"r1"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":" status."}]}}],"usageMetadata":{"trafficType":"ON_DEMAND"},"modelVersion":"google/gemini-3.5-flash","responseId":"r1"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"shell","args":{"cwd":"/tmp","timeout":30000,"command":"git status"}},"thoughtSignature":"sig"}]}}],"usageMetadata":{"trafficType":"ON_DEMAND"},"modelVersion":"google/gemini-3.5-flash","responseId":"r1"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":70648,"candidatesTokenCount":72,"totalTokenCount":71152,"trafficType":"ON_DEMAND","thoughtsTokenCount":432},"modelVersion":"google/gemini-3.5-flash","responseId":"r1"}
+
+"#;
+
+    let client = transcode(
+        ProtocolSuite::GoogleGemini,
+        ProtocolSuite::OpenAiResponses,
+        upstream,
+    );
+    let recovered = decode_client(ProtocolSuite::OpenAiResponses, &client);
+    assert!(
+        finish_reasons(&recovered).contains(&FinishReason::ToolCalls),
+        "Gemini functionCall + STOP must reach Responses client as ToolCalls; recovered: {recovered:?}; client: {}",
+        String::from_utf8_lossy(&client)
+    );
+    assert!(
+        !finish_reasons(&recovered).contains(&FinishReason::Stop),
+        "Responses client must not see Stop for tool-call turn; recovered: {recovered:?}; client: {}",
+        String::from_utf8_lossy(&client)
+    );
+
+    let events = sse_json_events(&client);
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .expect("response.completed event");
+    assert_eq!(completed["response"]["status"], "completed");
+    assert!(
+        completed["response"]["output"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .any(|item| item["type"] == "function_call"),
+        "completed output must include function_call so log parsers infer tool_calls: {}",
+        String::from_utf8_lossy(&client)
+    );
+}
+
 #[test]
 fn openai_chat_single_frame_tool_args_survive_responses_transcode() {
     let upstream = br#"data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"z-ai/glm-5.2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b61a7d12078444ebb0e1d7c8","type":"function","function":{"name":"search","arguments":"{\"query\":\"ttfb\"}"}},{"index":1,"id":"call_985eec250ff44649a8e4c98a","type":"function","function":{"name":"search","arguments":"{\"query\":\"latency\"}"}},{"index":2,"id":"call_1a4878db943a4d65a01baf3f","type":"function","function":{"name":"search","arguments":"{\"query\":\"upstream\"}"}}]},"finish_reason":null}]}
