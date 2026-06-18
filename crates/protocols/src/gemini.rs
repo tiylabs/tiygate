@@ -1372,10 +1372,15 @@ impl StreamDecoder for GeminiStreamDecoder {
                                         .map(synth_gemini_call_id)
                                         .unwrap_or_default()
                                 });
+                            let arguments = if fc.get("args").is_some_and(|args| !args.is_null()) {
+                                serde_json::to_string(&fc["args"]).unwrap_or_default()
+                            } else {
+                                "{}".to_string()
+                            };
                             parts.push(StreamPart::ToolCallDelta {
                                 id,
                                 name,
-                                arguments: serde_json::to_string(&fc["args"]).unwrap_or_default(),
+                                arguments,
                             });
                         }
                     }

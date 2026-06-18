@@ -230,6 +230,37 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishRe
 }
 
 #[test]
+fn gemini_function_call_args_transcode_to_messages_tool_use_input() {
+    let upstream = r#"data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"shell","args":{"command":"git commit -m \"fix(webui): 🐛 align pagination colors with active theme properties\""}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":31016,"cachedContentTokenCount":29849,"candidatesTokenCount":33,"totalTokenCount":31049},"modelVersion":"google/gemini-3.5-flash","responseId":"r1"}
+
+"#
+    .as_bytes();
+
+    let client = transcode(
+        ProtocolSuite::GoogleGemini,
+        ProtocolSuite::AnthropicMessages,
+        upstream,
+    );
+    let recovered = decode_client(ProtocolSuite::AnthropicMessages, &client);
+    let args = tool_args(&recovered);
+    assert!(
+        args.contains("git commit")
+            && args.contains("fix(webui)")
+            && args.contains("active theme properties"),
+        "Gemini functionCall args must survive Messages transcode; recovered: {recovered:?}; client: {}",
+        String::from_utf8_lossy(&client)
+    );
+    assert!(
+        finish_reasons(&recovered).contains(&FinishReason::ToolCalls),
+        "Messages client must see tool_use finish; recovered: {recovered:?}; client: {}",
+        String::from_utf8_lossy(&client)
+    );
+    let s = String::from_utf8_lossy(&client);
+    assert!(s.contains("input_json_delta"), "{s}");
+    assert!(s.contains("git commit"), "{s}");
+}
+
+#[test]
 fn openai_chat_single_frame_tool_args_survive_responses_transcode() {
     let upstream = br#"data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"z-ai/glm-5.2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b61a7d12078444ebb0e1d7c8","type":"function","function":{"name":"search","arguments":"{\"query\":\"ttfb\"}"}},{"index":1,"id":"call_985eec250ff44649a8e4c98a","type":"function","function":{"name":"search","arguments":"{\"query\":\"latency\"}"}},{"index":2,"id":"call_1a4878db943a4d65a01baf3f","type":"function","function":{"name":"search","arguments":"{\"query\":\"upstream\"}"}}]},"finish_reason":null}]}
 

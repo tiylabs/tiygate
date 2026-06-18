@@ -1058,6 +1058,18 @@ impl StreamEncoder for MessagesStreamEncoder {
                         "tool_use",
                         json!({"type": "tool_use", "id": id, "name": n, "input": {}}),
                     ));
+                    if !arguments.is_empty() {
+                        let idx = self.current_index.unwrap_or(0);
+                        let data = json!({
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {"type": "input_json_delta", "partial_json": arguments},
+                        });
+                        out.push_str(&format!(
+                            "event: content_block_delta\ndata: {}\n\n",
+                            serde_json::to_string(&data).unwrap_or_default()
+                        ));
+                    }
                     out
                 } else {
                     let idx = self.current_index.unwrap_or(0);
@@ -2030,6 +2042,63 @@ mod tests {
         assert!(all.contains("\"index\":0"));
         assert!(all.contains("\"index\":1"));
         assert!(all.contains("content_block_stop"));
+    }
+
+    #[test]
+    fn test_stream_encoder_tool_call_opener_preserves_arguments() {
+        let mut enc = MessagesStreamEncoder::new();
+        let part = StreamPart::ToolCallDelta {
+            id: "gemini_call_shell".to_string(),
+            name: Some("shell".to_string()),
+            arguments: r#"{"command":"git status"}"#.to_string(),
+        };
+        let out = String::from_utf8(enc.encode_part(&part).unwrap()).unwrap();
+        assert!(out.contains("content_block_start"));
+        assert!(out.contains("\"type\":\"tool_use\""));
+        assert!(out.contains("\"name\":\"shell\""));
+        assert!(out.contains("content_block_delta"));
+        assert!(out.contains("input_json_delta"));
+        let delta = out
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .find(|event| event["type"] == "content_block_delta")
+            .expect("content_block_delta");
+        assert_eq!(
+            delta["delta"]["partial_json"],
+            r#"{"command":"git status"}"#
+        );
+    }
+
+    #[test]
+    fn test_stream_encoder_parallel_tool_use_preserves_opener_arguments() {
+        let mut enc = MessagesStreamEncoder::new();
+        let mut all = String::new();
+        for part in [
+            StreamPart::ToolCallDelta {
+                id: "a".to_string(),
+                name: Some("fa".to_string()),
+                arguments: r#"{"x":1}"#.to_string(),
+            },
+            StreamPart::ToolCallDelta {
+                id: "b".to_string(),
+                name: Some("fb".to_string()),
+                arguments: r#"{"y":2}"#.to_string(),
+            },
+        ] {
+            all.push_str(&String::from_utf8(enc.encode_part(&part).unwrap()).unwrap());
+        }
+        let deltas: Vec<Value> = all
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .filter(|event| event["type"] == "content_block_delta")
+            .collect();
+        assert_eq!(deltas.len(), 2, "expected two argument deltas: {all}");
+        assert_eq!(deltas[0]["index"], 0);
+        assert_eq!(deltas[0]["delta"]["partial_json"], r#"{"x":1}"#);
+        assert_eq!(deltas[1]["index"], 1);
+        assert_eq!(deltas[1]["delta"]["partial_json"], r#"{"y":2}"#);
     }
 
     #[test]
