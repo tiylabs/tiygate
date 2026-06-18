@@ -17,7 +17,7 @@ import { cn } from "@/lib/cn";
 
 export interface JsonViewerProps {
   /** A JSON-serialised string (or arbitrary text that falls back to `<pre>`). */
-  value: string;
+  value: string | null | undefined;
   className?: string;
 }
 
@@ -27,10 +27,15 @@ const COLLAPSE_ALL = Symbol("collapse-all");
 type ExpandCommand = typeof EXPAND_ALL | typeof COLLAPSE_ALL | null;
 
 export function JsonViewer({ value, className }: JsonViewerProps) {
+  // Empty / null / undefined — nothing to render.
+  if (value == null || value === "") return null;
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(value);
   } catch {
+    // Non-JSON content — fall back to a plain `<pre>` so the raw text is
+    // still visible (matches the previous behaviour before JsonViewer).
     return (
       <pre
         className={cn(
