@@ -13,6 +13,7 @@ import {
   EmptyState,
   ErrorBox,
   Input,
+  JsonViewer,
   Spinner,
   Switch,
   Table,
@@ -1259,9 +1260,7 @@ function MessageBlock({
             ) : null}
             <CopyButton value={prettyJson(body)} ariaLabel={copyAllLabel} />
           </summary>
-          <pre className="mt-1 max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
-            {prettyJson(body)}
-          </pre>
+          <JsonViewer value={body} className="mt-1" />
         </details>
       ) : null}
     </div>
@@ -1342,11 +1341,9 @@ function SseParsedBlock({
             </button>
           </Tooltip>
         ) : null}
-        <CopyButton value={value} />
+        <CopyButton value={prettyJson(value)} />
       </summary>
-      <pre className="mt-1 max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
-        {value}
-      </pre>
+      <JsonViewer value={value} className="mt-1" />
     </details>
   );
 }
