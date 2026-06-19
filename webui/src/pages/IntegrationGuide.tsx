@@ -686,9 +686,15 @@ export default function IntegrationGuide() {
   const { t } = useTranslation();
   const toast = useToast();
 
-  const [baseUrl, setBaseUrl] = useState<string>(() =>
-    readStoredString(STORAGE.baseUrl, resolveDefaultBaseUrl()),
-  );
+  const [baseUrl, setBaseUrl] = useState<string>(() => {
+    const stored = readStoredString(STORAGE.baseUrl, "");
+    const resolved = resolveDefaultBaseUrl();
+    // 线上环境自动迁移旧缓存的 localhost 默认值
+    if (stored === DEFAULT_API_BASE && stored !== resolved) {
+      return resolved;
+    }
+    return stored || resolved;
+  });
   const [model, setModel] = useState<string>(() =>
     readStoredString(STORAGE.model, DEFAULT_VIRTUAL_MODEL),
   );
@@ -721,15 +727,25 @@ export default function IntegrationGuide() {
     window.localStorage.setItem(STORAGE.language, activeLanguage);
   }, [activeLanguage]);
 
+  const effectiveBaseUrl = baseUrl.trim() || resolveDefaultBaseUrl();
+
   const sample = useMemo(
-    () => buildSample(activeLanguage, activeProtocol, baseUrl, model, apiKey, stream),
-    [activeLanguage, activeProtocol, baseUrl, model, apiKey, stream],
+    () =>
+      buildSample(
+        activeLanguage,
+        activeProtocol,
+        effectiveBaseUrl,
+        model,
+        apiKey,
+        stream,
+      ),
+    [activeLanguage, activeProtocol, effectiveBaseUrl, model, apiKey, stream],
   );
 
   const activeProtocolSpec = PROTOCOLS.find((p) => p.id === activeProtocol)!;
   const activeLanguageSpec = LANGUAGES.find((l) => l.id === activeLanguage)!;
 
-  const isValidBase = /^https?:\/\/[^\s]+$/i.test(baseUrl.trim());
+  const isValidBase = /^https?:\/\/[^\s]+$/i.test(effectiveBaseUrl.trim());
   const isValidModel = model.trim().length > 0;
 
   async function copySample() {
@@ -771,7 +787,7 @@ export default function IntegrationGuide() {
                 </span>
                 <code className="truncate font-mono text-xs text-text">
                   <span className="text-text-subtle">GET </span>
-                  {trimTrailingSlash(baseUrl || DEFAULT_API_BASE)}
+                  {trimTrailingSlash(effectiveBaseUrl)}
                   <span className="text-text-subtle">/healthz</span>
                 </code>
               </div>
