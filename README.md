@@ -63,7 +63,7 @@ tiygate/
 
 - **Rust 1.88+** (`rustup update stable`)
 - **Node.js 20+** (for building the embedded WebUI)
-- An upstream provider key, e.g. `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`
+- No upstream provider key needed to start — providers are configured in the Admin Console after launch
 
 ### Build and run
 
@@ -78,7 +78,7 @@ Configure environment variables by copying the template, then fill in the requir
 cp .env.example .env
 ```
 
-Edit `.env` — the two variables you must set for a working WebUI:
+Edit `.env` — the three variables you must set for a working WebUI:
 
 ```bash
 # SQLite is the easiest local backend (file is created on first run)
@@ -86,9 +86,13 @@ TIYGATE_DATABASE_URL=sqlite://./tiygate.db?mode=rwc
 
 # Admin API token — the WebUI login screen asks for this exact value
 TIYGATE_ADMIN_TOKEN=dev-admin-token-change-me
+
+# (Optional but recommended) AES-GCM master key to encrypt provider keys
+# / OAuth tokens / S3 credentials at rest. See the Security section below.
+# TIYGATE_MASTER_KEY=4f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8
 ```
 
-See `.env.example` for the full list of knobs (listen address, mode, logging, streaming timeouts, etc.). The server loads `.env` automatically at startup when the `dotenv` feature is on.
+Everything else — listen address, deployment mode, logging level — is covered in `.env.example`. **Runtime-tunable parameters** (routing strategy, ingress limits, upstream streaming timeouts, connection-pool tuning, header-forwarding deny-lists, payload-archive to S3, background-task intervals, etc.) are **managed through the Admin Console** at `/admin/ui/settings`. On first start the env values are seeded into the `settings` table as initial defaults; after that the settings table is the single source of truth and changes apply without a restart. The server loads `.env` automatically at startup when the `dotenv` feature is on.
 
 Start the gateway with the embedded WebUI:
 
@@ -100,7 +104,7 @@ make dev
 
 ### Open the Admin Console
 
-Once the server is running, open **`http://localhost:3000/admin/ui`** in your browser. Paste your `TIYGATE_ADMIN_TOKEN` on the login screen to enter the console. From there you can manage providers, routes, API keys, and view analytics.
+Once the server is running, open **`http://localhost:3000/admin/ui`** in your browser. Paste your `TIYGATE_ADMIN_TOKEN` on the login screen to enter the console. From there you can manage providers, routes, API keys, runtime settings, and view analytics.
 
 ### Smoke test
 
@@ -136,7 +140,7 @@ Health probes are wired by default:
 
 ### Admin console (WebUI)
 
-In `all` / `admin` modes the binary serves an embedded React console at **`/admin/ui`** (e.g. `http://localhost:8080/admin/ui`). It covers the full control plane — providers, routes, API keys (with one-time secret + quota editing and live usage), the OAuth authorization-code flow — plus analytics: per-model / provider / API-key stats, circuit-breaker status, request-log drill-down with replay, and the audit trail. It is bilingual (English / 简体中文).
+In `all` / `admin` modes the binary serves an embedded React console at **`/admin/ui`** (e.g. `http://localhost:8080/admin/ui`). It covers the full control plane — providers, routes, API keys (with one-time secret + quota editing and live usage), the OAuth authorization-code flow, runtime settings (routing, ingress, upstream, header forwarding, payload archive, background tasks) — plus analytics: per-model / provider / API-key stats, circuit-breaker status, request-log drill-down with replay, and the audit trail. It is bilingual (English / 简体中文).
 
 Authentication reuses the single `TIYGATE_ADMIN_TOKEN`: paste it on the login screen (validated against the Admin API, stored in the browser). The UI is compiled into the binary via `rust-embed` (the opt-in `webui` feature), so the frontend must be built before the Rust crate — run `scripts/build-with-webui.sh`, or `cd webui && npm install && npm run build` followed by `cargo build -p tiygate-server --features webui`. See `webui/README.md` for development details.
 
@@ -149,48 +153,41 @@ Send `SIGTERM` (or K8s `preStop`) and the gateway:
 1. Flips `/readyz` to `503` so the load balancer removes it from the pool
 2. Refuses new requests with `503 + Retry-After`
 3. Lets in-flight requests (including long SSE streams) finish naturally
-4. On `drain_timeout` (default 30s, must be ≥ single-request `deadline`), sends a **protocol-native error frame** to any still-open streams and runs `UsageAccumulator` to prevent billing drift. The streaming path is implemented in `crates/server/src/ingress.rs::drive_upstream_stream` — it also adds a 120s idle timer (configurable via `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`), an opt-in total wall-clock budget (`TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS`, default disabled), and a 30s SSE keepalive (`SseKeepaliveStream`) so middleboxes do not silently drop long-quiet streams
+4. On `drain_timeout` (default 30s, must be ≥ single-request `deadline`), sends a **protocol-native error frame** to any still-open streams and runs `UsageAccumulator` to prevent billing drift. The streaming path is implemented in `crates/server/src/ingress.rs::drive_upstream_stream` — it also adds a 120s idle timer (tunable via the Admin Console's Upstream settings), an opt-in total wall-clock budget (default disabled), and a 30s SSE keepalive (`SseKeepaliveStream`) so middleboxes do not silently drop long-quiet streams
 5. Flushes the telemetry channel, releases resources, exits
 
-### Environment variables
+### Configuration
 
-All TiyGate knobs are read from environment variables. Unknown keys are ignored. The gateway also loads `.env` from the working directory at startup (when the `dotenv` feature is on).
+TiyGate configuration is split into two layers:
 
-#### Server core
+**1. Startup-only environment variables** — read once at process start, require a restart to change:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `TIYGATE_LISTEN_ADDR` | `0.0.0.0:3000` | Listen address for the HTTP server. |
 | `TIYGATE_MODE` | `all` | Deployment mode. `all` (data + control in one process), `proxy` (data plane only), `admin` (control plane only). |
-| `TIYGATE_MAX_BODY_BYTES` | `10485760` (10 MiB) | Per-request body size limit for plain text / JSON. |
-| `TIYGATE_MAX_INFLIGHT` | `1024` | Maximum concurrent in-flight requests. Beyond this, additional requests queue and are eventually rejected with `503 + Retry-After`. |
-| `TIYGATE_ROUTING_STRATEGY` | `weighted` | Routing strategy across targets. `weighted` (default), `priority`, `cooldown`, `latency`. |
-
-#### Streaming lifecycle (see `crates/server/src/ingress.rs::drive_upstream_stream`)
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` | `120` | Idle window for upstream streaming responses. If no chunk arrives for this long, the stream is closed with a protocol-native end frame. |
-| `TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS` | `0` (disabled) | Wall-clock budget for upstream streaming responses. When it elapses, the stream is closed with a protocol-native error frame. Set to `0` to opt out. |
-
-#### Security
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
+| `TIYGATE_DATABASE_URL` | unset | Database connection string (SQLite or Postgres). When unset, the server falls back to a legacy in-memory config store with no Admin API. |
 | `TIYGATE_ADMIN_TOKEN` | unset | Bearer token required by the Admin API. When unset, Admin API requests are rejected. |
-| `TIYGATE_MASTER_KEY` | unset | Master key used to AES-GCM-encrypt provider keys/tokens at rest. **Planned for the DB-backed phase; the in-memory config store does not yet read it.** Treat unset as "not encrypted" today. |
-
-#### Observability
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
+| `TIYGATE_MASTER_KEY` | unset | AES-256-GCM master key used to encrypt provider keys, OAuth tokens, and S3 credentials at rest. Accepts 64 hex chars or standard base64. When unset, secrets are stored in cleartext (the server logs a warning; acceptable for local dev only). |
+| `TIYGATE_REDIS_URL` | unset | When set (and built with the `redis-quota` feature), quota counters are shared across replicas via Redis instead of per-replica in-memory. |
 | `RUST_LOG` | `info` | `tracing` / `tracing-subscriber` filter. Examples: `info`, `tiygate=debug`, `tiygate_server::ingress=trace`. |
 
-### Configuration
+**2. Runtime-tunable settings** — managed through the Admin Console at **`/admin/ui/settings`** (backed by the `settings` table, exposed via `GET/PUT /admin/v1/settings`). These are hot-reloaded: the data plane polls for changes and atomically switches to the new snapshot without a restart.
 
-- **DB-driven config** (OLTP): provider / route / API key CRUD via Admin API, no restart required
-- **Epoch versioning**: data plane polls for config changes, atomically switches to the new snapshot; in-flight requests keep the old epoch until they finish — no half-old, half-new state mid-request
-- **Secret encryption**: provider keys/tokens are AES-GCM encrypted at rest; the master key is read from `TIYGATE_MASTER_KEY`
+On first start, the env values below are seeded into the `settings` table as initial defaults; after that, **the settings table is the single source of truth** — editing `.env` again has no effect unless the `settings` table is cleared.
+
+The Settings page is organized into five cards:
+
+| Card | What it controls | Seeded from env |
+| --- | --- | --- |
+| **Routing & Ingress** | Default routing strategy, max body bytes, max in-flight, max queue depth, acquire timeout, raw-envelope capture media types | `TIYGATE_ROUTING_STRATEGY`, `TIYGATE_MAX_BODY_BYTES`, `TIYGATE_MAX_INFLIGHT`, `TIYGATE_RAW_ENVELOPE_CAPTURE_MEDIA` |
+| **Upstream** | Stream idle / total timeouts, TCP keepalive, pool idle timeout, TCP nodelay | `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`, `TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS`, `TIYGATE_UPSTREAM_TCP_KEEPALIVE_SECS`, `TIYGATE_UPSTREAM_POOL_IDLE_TIMEOUT_SECS`, `TIYGATE_UPSTREAM_TCP_NODELAY` |
+| **Header Forwarding** | Request / response header deny-lists (comma-separated) | `TIYGATE_FORWARD_REQUEST_HEADER_DENY`, `TIYGATE_FORWARD_RESPONSE_HEADER_DENY` |
+| **Payload Archive** | S3-compatible object-storage archiving of full request/response payloads (enabled flag, endpoint, region, bucket, credentials, prefix, force-path-style, scan interval, batch size, concurrency, timeout, max retries) | `TIYGATE_PAYLOAD_ARCHIVE_*` family |
+| **Background Tasks** | Log retention interval & days, epoch poll interval, token-stats interval & lookback days | `TIYGATE_LOG_RETENTION_*`, `TIYGATE_EPOCH_POLL_INTERVAL_SECS`, `TIYGATE_TOKEN_STATS_*` |
+
+- **Epoch versioning**: the data plane polls for config changes and atomically switches to the new snapshot; in-flight requests keep the old epoch until they finish — no half-old, half-new state mid-request.
+- **Secret encryption**: provider keys / OAuth tokens / encrypted S3 settings are AES-GCM encrypted at rest using `TIYGATE_MASTER_KEY`. Encrypted settings are redacted on `GET /admin/v1/settings`.
 
 ### Caching
 
@@ -204,7 +201,7 @@ The Admin Console's request replay feature transparently hydrates archived objec
 
 Object lifecycle is decoupled from DB retention — the worker never deletes from S3; use bucket lifecycle policies for expiry.
 
-Set `TIYGATE_PAYLOAD_ARCHIVE_ENABLED=true` and configure the S3 endpoint / credentials in `.env`. Full variable list in `.env.example` (`TIYGATE_PAYLOAD_ARCHIVE_*`).
+Enable and configure payload archiving in the Admin Console under **Settings → Payload Archive**. The env variables (`TIYGATE_PAYLOAD_ARCHIVE_*`) only seed the initial defaults on first start; after that the settings table is authoritative and changes apply without a restart. See `.env.example` for the full variable list.
 
 ### Distributed tracing
 

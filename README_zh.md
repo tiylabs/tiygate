@@ -63,7 +63,7 @@ tiygate/
 
 - **Rust 1.88+**(`rustup update stable`)
 - **Node.js 20+**(用于构建内嵌 WebUI)
-- 至少一个上游服务商 Key,如 `OPENAI_API_KEY` 或 `ANTHROPIC_API_KEY`
+- 无需提前准备上游服务商 Key —— 启动后在管理控制台配置供应商
 
 ### 编译并启动
 
@@ -78,7 +78,7 @@ cd tiygate
 cp .env.example .env
 ```
 
-编辑 `.env`,WebUI 可用的两个必填项:
+编辑 `.env`,WebUI 可用的三个必填项:
 
 ```bash
 # SQLite 是最简单的本地后端(文件不存在时自动创建)
@@ -86,9 +86,13 @@ TIYGATE_DATABASE_URL=sqlite://./tiygate.db?mode=rwc
 
 # Admin API token —— WebUI 登录页需粘贴此值
 TIYGATE_ADMIN_TOKEN=dev-admin-token-change-me
+
+# (可选但推荐)AES-GCM 主密钥,用于静态加密 provider key / OAuth token / S3 凭证。
+# 详见下方"安全"小节。
+# TIYGATE_MASTER_KEY=4f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8
 ```
 
-完整可调参数(监听地址、模式、日志、流式超时等)见 `.env.example`。服务启动时会自动加载 `.env`(dotenv feature 开启时)。
+其余项(监听地址、部署模式、日志级别等)见 `.env.example`。**运行时可调参数**(路由策略、入口限制、上游流式超时、连接池调优、header 转发黑名单、payload 归档到 S3、后台任务间隔等)均**通过管理控制台** `/admin/ui/settings` 管理。首次启动时,env 值作为初始默认值写入 `settings` 表;此后以 settings 表为唯一权威来源,修改即时生效、无需重启。服务启动时会自动加载 `.env`(dotenv feature 开启时)。
 
 以内嵌 WebUI 启动网关:
 
@@ -100,7 +104,7 @@ make dev
 
 ### 进入管理控制台
 
-服务启动后,在浏览器打开 **`http://localhost:3000/admin/ui`**,在登录页粘贴 `TIYGATE_ADMIN_TOKEN` 即可进入控制台。在控制台中可管理供应商、路由、API 密钥,并查看分析数据。
+服务启动后,在浏览器打开 **`http://localhost:3000/admin/ui`**,在登录页粘贴 `TIYGATE_ADMIN_TOKEN` 即可进入控制台。在控制台中可管理供应商、路由、API 密钥、运行时设置,并查看分析数据。
 
 ### 冒烟测试
 
@@ -136,7 +140,7 @@ curl -sS http://localhost:3000/v1/chat/completions \
 
 ### 管理控制台(WebUI)
 
-在 `all` / `admin` 模式下,二进制会在 **`/admin/ui`** 提供内嵌的 React 控制台(如 `http://localhost:8080/admin/ui`)。它覆盖完整控制面 —— 供应商、路由、API 密钥(一次性 secret + 配额编辑与实时用量)、OAuth 授权码流程 —— 以及分析:按模型 / 供应商 / API 密钥的统计、熔断器状态、请求日志下钻与回放、审计记录,支持中英文双语。
+在 `all` / `admin` 模式下,二进制会在 **`/admin/ui`** 提供内嵌的 React 控制台(如 `http://localhost:8080/admin/ui`)。它覆盖完整控制面 —— 供应商、路由、API 密钥(一次性 secret + 配额编辑与实时用量)、OAuth 授权码流程、运行时设置(路由、入口、上游、header 转发、payload 归档、后台任务)—— 以及分析:按模型 / 供应商 / API 密钥的统计、熔断器状态、请求日志下钻与回放、审计记录,支持中英文双语。
 
 鉴权复用单一的 `TIYGATE_ADMIN_TOKEN`:在登录页粘贴(经 Admin API 校验后存于浏览器)。UI 通过 `rust-embed`(opt-in 的 `webui` feature)编译进二进制,因此前端必须先于 Rust crate 构建 —— 运行 `scripts/build-with-webui.sh`,或先 `cd webui && npm install && npm run build` 再 `cargo build -p tiygate-server --features webui`。开发细节见 `webui/README.md`。
 
@@ -149,48 +153,41 @@ curl -sS http://localhost:3000/v1/chat/completions \
 1. 将 `/readyz` 翻转为 `503`,让负载均衡摘除该副本
 2. 对**新请求**返回 `503 + Retry-After`
 3. **放行存量请求**(含长 SSE 流式)自然结束
-4. 超过 `drain_timeout`(默认 30s,应 ≥ 单请求 `deadline`)时,对仍未结束的流发送**协议原生 error 帧**,并跑 `UsageAccumulator` 兜底计费,防止账单漂移。流式路径实现在 `crates/server/src/ingress.rs::drive_upstream_stream` —— 它同时叠加 120s idle 计时(可通过 `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` 调节)、可选用 total 总时长预算(`TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS`,默认关闭)以及 30s 周期 SSE keepalive(`SseKeepaliveStream`),防止中间代理对长时间静默的流做隐式断连
+4. 超过 `drain_timeout`(默认 30s,应 ≥ 单请求 `deadline`)时,对仍未结束的流发送**协议原生 error 帧**,并跑 `UsageAccumulator` 兜底计费,防止账单漂移。流式路径实现在 `crates/server/src/ingress.rs::drive_upstream_stream` —— 它同时叠加 120s idle 计时(可在管理控制台 Upstream 设置中调节)、可选用 total 总时长预算(默认关闭)以及 30s 周期 SSE keepalive(`SseKeepaliveStream`),防止中间代理对长时间静默的流做隐式断连
 5. flush 日志 channel、归还资源、退出
 
-### 环境变量
+### 配置
 
-TiyGate 全部可调参数均通过环境变量读取,未识别的键会被忽略。网关启动时还会从工作目录加载 `.env`(在 `dotenv` feature 开启时)。
+TiyGate 配置分为两层:
 
-#### Server 核心
+**1. 启动时环境变量** —— 进程启动时读取一次,修改需重启:
 
 | 变量 | 默认 | 用途 |
 | --- | --- | --- |
 | `TIYGATE_LISTEN_ADDR` | `0.0.0.0:3000` | HTTP server 监听地址。 |
 | `TIYGATE_MODE` | `all` | 部署模式。`all`(数据面+控制面同进程)、`proxy`(纯数据面)、`admin`(纯控制面)。 |
-| `TIYGATE_MAX_BODY_BYTES` | `10485760`(10 MiB) | 普通文本 / JSON 请求体大小上限。 |
-| `TIYGATE_MAX_INFLIGHT` | `1024` | 最大并发在途请求数。超过后新请求排队,排满后被 `503 + Retry-After` 拒绝。 |
-| `TIYGATE_ROUTING_STRATEGY` | `weighted` | 跨 target 的路由策略。`weighted`(默认)、`priority`、`cooldown`、`latency`。 |
-
-#### 流式生命周期(实现见 `crates/server/src/ingress.rs::drive_upstream_stream`)
-
-| 变量 | 默认 | 用途 |
-| --- | --- | --- |
-| `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` | `120` | 上游流式响应的 idle 窗口。若该时长内无 chunk 到达,以协议原生 end 帧关闭流。 |
-| `TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS` | `0`(关闭) | 上游流式响应的总时长预算。到期后以协议原生 error 帧关闭流。设为 `0` 表示不启用。 |
-
-#### 安全
-
-| 变量 | 默认 | 用途 |
-| --- | --- | --- |
+| `TIYGATE_DATABASE_URL` | 未设置 | 数据库连接串(SQLite 或 Postgres)。未设置时回退到内存 ConfigStore(无 Admin API)。 |
 | `TIYGATE_ADMIN_TOKEN` | 未设置 | Admin API 要求的 bearer 鉴权 token。未设置时 Admin API 请求会被拒绝。 |
-| `TIYGATE_MASTER_KEY` | 未设置 | 用于 AES-GCM 静态加密 provider key / token 的主密钥。**计划在 DB 持久化阶段引入,当前内存 ConfigStore 暂未读取**——目前未设置等同于"不加密"。 |
-
-#### 可观测性
-
-| 变量 | 默认 | 用途 |
-| --- | --- | --- |
+| `TIYGATE_MASTER_KEY` | 未设置 | AES-256-GCM 主密钥,用于静态加密 provider key、OAuth token、S3 凭证。接受 64 位 hex 或标准 base64。未设置时 secret 明文存储(服务会打印 warning,仅适合本地开发)。 |
+| `TIYGATE_REDIS_URL` | 未设置 | 设置后(且以 `redis-quota` feature 编译),配额计数器通过 Redis 跨副本共享,替代单副本内存计数。 |
 | `RUST_LOG` | `info` | `tracing` / `tracing-subscriber` 过滤器。示例:`info`、`tiygate=debug`、`tiygate_server::ingress=trace`。 |
 
-### 配置
+**2. 运行时可调设置** —— 通过管理控制台 **`/admin/ui/settings`** 管理(底层为 `settings` 表,API 为 `GET/PUT /admin/v1/settings`)。这些参数热加载:数据面轮询变更并原子切换到新快照,无需重启。
 
-- **DB 动态配置**(OLTP):通过 Admin API 增删改 provider / route / API key,无需重启
-- **epoch 版本号**:数据面轮询配置变更,原子切换到新快照;**在途请求保持旧 epoch 直到结束**——不会看到半新半旧配置
-- **密钥加密**:provider key / token 在数据库中 AES-GCM 静态加密;主密钥来自 `TIYGATE_MASTER_KEY`
+首次启动时,下列 env 值作为初始默认值写入 `settings` 表;此后 **settings 表为唯一权威来源** —— 再次编辑 `.env` 不再生效(除非清空 settings 表)。
+
+Settings 页面分为五个卡片:
+
+| 卡片 | 控制内容 | 种子 env |
+| --- | --- | --- |
+| **路由与入口** | 默认路由策略、请求体上限、最大并发、队列深度、获取超时、raw-envelope 捕获媒体类型 | `TIYGATE_ROUTING_STRATEGY`、`TIYGATE_MAX_BODY_BYTES`、`TIYGATE_MAX_INFLIGHT`、`TIYGATE_RAW_ENVELOPE_CAPTURE_MEDIA` |
+| **上游** | 流式 idle / total 超时、TCP keepalive、连接池 idle 超时、TCP nodelay | `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_TCP_KEEPALIVE_SECS`、`TIYGATE_UPSTREAM_POOL_IDLE_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_TCP_NODELAY` |
+| **Header 转发** | 请求 / 响应 header 黑名单(逗号分隔) | `TIYGATE_FORWARD_REQUEST_HEADER_DENY`、`TIYGATE_FORWARD_RESPONSE_HEADER_DENY` |
+| **Payload 归档** | S3 兼容对象存储归档完整请求/响应 payload(开关、端点、region、bucket、凭证、prefix、force-path-style、扫描间隔、批次大小、并发、超时、最大重试) | `TIYGATE_PAYLOAD_ARCHIVE_*` 系列 |
+| **后台任务** | 日志保留间隔与天数、epoch 轮询间隔、token 统计间隔与回看天数 | `TIYGATE_LOG_RETENTION_*`、`TIYGATE_EPOCH_POLL_INTERVAL_SECS`、`TIYGATE_TOKEN_STATS_*` |
+
+- **epoch 版本号**:数据面轮询配置变更,原子切换到新快照;**在途请求保持旧 epoch 直到结束**——不会看到半新半旧配置。
+- **密钥加密**:provider key / OAuth token / 加密的 S3 设置在数据库中 AES-GCM 静态加密,主密钥来自 `TIYGATE_MASTER_KEY`。加密设置在 `GET /admin/v1/settings` 时脱敏返回。
 
 ### 缓存
 
@@ -204,7 +201,7 @@ Admin 控制台的请求回放功能会按需从 S3 透明水合已归档对象(
 
 对象生命周期与 DB 保留策略解耦——worker 不会删除 S3 中的对象,请通过 bucket lifecycle policy 管理过期。
 
-在 `.env` 中设置 `TIYGATE_PAYLOAD_ARCHIVE_ENABLED=true` 并配置 S3 端点 / 凭证。完整变量列表见 `.env.example`(`TIYGATE_PAYLOAD_ARCHIVE_*`)。
+在管理控制台 **Settings → Payload Archive** 中启用并配置 payload 归档。env 变量(`TIYGATE_PAYLOAD_ARCHIVE_*`)仅在首次启动时作为初始默认值;此后以 settings 表为准,修改即时生效、无需重启。完整变量列表见 `.env.example`。
 
 ### 分布式追踪
 
