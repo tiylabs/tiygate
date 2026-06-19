@@ -186,6 +186,16 @@ function escapeForCurl(s: string): string {
   return s.replace(/'/g, "'\\''");
 }
 
+function resolveDefaultBaseUrl(): string {
+  if (typeof window === "undefined" || !window.location) return DEFAULT_API_BASE;
+  const { hostname, origin } = window.location;
+  // 本地开发环境仍使用固定默认值，线上部署自动取当前域名
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]") {
+    return DEFAULT_API_BASE;
+  }
+  return origin;
+}
+
 function readStoredString(key: string, fallback: string): string {
   if (typeof window === "undefined") return fallback;
   return window.localStorage.getItem(key) ?? fallback;
@@ -677,7 +687,7 @@ export default function IntegrationGuide() {
   const toast = useToast();
 
   const [baseUrl, setBaseUrl] = useState<string>(() =>
-    readStoredString(STORAGE.baseUrl, DEFAULT_API_BASE),
+    readStoredString(STORAGE.baseUrl, resolveDefaultBaseUrl()),
   );
   const [model, setModel] = useState<string>(() =>
     readStoredString(STORAGE.model, DEFAULT_VIRTUAL_MODEL),
@@ -847,7 +857,7 @@ export default function IntegrationGuide() {
                   <Input
                     value={baseUrl}
                     onChange={(e) => setBaseUrl(e.target.value)}
-                    placeholder={DEFAULT_API_BASE}
+                    placeholder={resolveDefaultBaseUrl()}
                     spellCheck={false}
                     autoCapitalize="off"
                     autoCorrect="off"
