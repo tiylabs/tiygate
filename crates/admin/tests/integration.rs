@@ -1119,3 +1119,132 @@ async fn config_import_overwrites_when_selected() {
         .expect("exists");
     assert_eq!(p.name, "Overwritten");
 }
+
+#[tokio::test]
+async fn settings_audit_records_snapshot_and_changes_on_create() {
+    let (router, store, pool) = boot_no_auth().await;
+
+    // No prior setting exists — this is a create operation.
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/admin/v1/settings",
+            json!({ "settings": { "gateway.test.key": "v1" } }),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let details_json: String = sqlx::query_scalar(
+        "SELECT details_json FROM audit_log \
+         WHERE target_type = 'settings' AND action = 'upsert' \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(pool.any())
+    .await
+    .expect("audit row");
+    let details: serde_json::Value = serde_json::from_str(&details_json).expect("json");
+
+    // snapshot must contain the new value.
+    assert_eq!(details["snapshot"]["gateway.test.key"], json!("v1"));
+    // changes must show before=null, after=v1 (field-level diff).
+    let changes = details["changes"].as_array().expect("changes array");
+    let entry = changes
+        .iter()
+        .find(|c| c["field"] == "gateway.test.key")
+        .expect("found change for key");
+    assert_eq!(entry["before"], serde_json::Value::Null);
+    assert_eq!(entry["after"], json!("v1"));
+
+    // Confirm the value was actually persisted.
+    let val = store.get_setting("gateway.test.key").await.expect("get");
+    assert_eq!(val.as_deref(), Some("v1"));
+}
+
+#[tokio::test]
+async fn settings_audit_records_before_after_on_update() {
+    let (router, store, pool) = boot_no_auth().await;
+
+    // Seed an initial value.
+    store
+        .set_setting("gateway.test.key", "old")
+        .await
+        .expect("seed");
+
+    // Update it via the API.
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/admin/v1/settings",
+            json!({ "settings": { "gateway.test.key": "new" } }),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let details_json: String = sqlx::query_scalar(
+        "SELECT details_json FROM audit_log \
+         WHERE target_type = 'settings' AND action = 'upsert' \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(pool.any())
+    .await
+    .expect("audit row");
+    let details: serde_json::Value = serde_json::from_str(&details_json).expect("json");
+
+    // snapshot carries the post-write value.
+    assert_eq!(details["snapshot"]["gateway.test.key"], json!("new"));
+
+    // changes carries field-level before/after.
+    let changes = details["changes"].as_array().expect("changes array");
+    let entry = changes
+        .iter()
+        .find(|c| c["field"] == "gateway.test.key")
+        .expect("found change for key");
+    assert_eq!(entry["before"], json!("old"));
+    assert_eq!(entry["after"], json!("new"));
+}
+
+#[tokio::test]
+async fn settings_audit_redacts_encrypted_keys() {
+    let (router, _store, pool) = boot_no_auth().await;
+
+    // Write an encrypted key — the audit entry must not store the
+    // cleartext value, only a redacted placeholder.
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/admin/v1/settings",
+            json!({ "settings": { "gateway.archive.s3_secret_access_key": "super-secret" } }),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let details_json: String = sqlx::query_scalar(
+        "SELECT details_json FROM audit_log \
+         WHERE target_type = 'settings' AND action = 'upsert' \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(pool.any())
+    .await
+    .expect("audit row");
+    let details: serde_json::Value = serde_json::from_str(&details_json).expect("json");
+
+    // The cleartext secret must never appear in the audit row.
+    let raw = details_json.as_str();
+    assert!(
+        !raw.contains("super-secret"),
+        "cleartext secret leaked into audit log: {raw}"
+    );
+    // The redacted snapshot must contain a redaction marker.
+    let snap = &details["snapshot"]["gateway.archive.s3_secret_access_key"];
+    let snap_str = snap.as_str().expect("string");
+    assert!(
+        snap_str.starts_with("[encrypted:"),
+        "expected redaction marker, got {snap_str}"
+    );
+}

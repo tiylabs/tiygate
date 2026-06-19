@@ -1416,39 +1416,68 @@ async fn update_settings(
     State(state): State<AdminState>,
     Json(req): Json<UpdateSettingsRequest>,
 ) -> Result<Response, AdminError> {
-    let mut changed_keys: Vec<String> = Vec::new();
+    use tiygate_store::encryption::KeyEncryption;
+    use tiygate_store::settings_keys::is_encrypted_key;
+
+    /// Redact a setting value for safe inclusion in an audit snapshot.
+    /// Encrypted keys carry ciphertext on disk; we pass it through
+    /// [`KeyEncryption::redact`] so the audit table never stores the
+    /// full blob. Non-encrypted keys are recorded as-is.
+    fn redact_setting(key: &str, value: &str) -> serde_json::Value {
+        if is_encrypted_key(key) {
+            serde_json::Value::String(KeyEncryption::redact(value))
+        } else {
+            serde_json::Value::String(value.to_string())
+        }
+    }
+
+    let mut before_map = serde_json::Map::new();
+    let mut after_map = serde_json::Map::new();
+
     for (key, val) in &req.settings {
         let s = match val {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        let is_encrypted = tiygate_store::settings_keys::is_encrypted_key(key);
-        if is_encrypted && s.trim().is_empty() {
+        if is_encrypted_key(key) && s.trim().is_empty() {
             // Leave the stored secret untouched.
             continue;
         }
-        if is_encrypted {
+        // Read the previous value (if any) before overwriting, so the
+        // audit entry carries a field-level before/after diff.
+        let old = state.store.get_setting(key).await?;
+        if let Some(prev) = &old {
+            before_map.insert(key.clone(), redact_setting(key, prev));
+        } else {
+            before_map.insert(key.clone(), serde_json::Value::Null);
+        }
+        after_map.insert(key.clone(), redact_setting(key, &s));
+
+        if is_encrypted_key(key) {
             state.store.set_setting_encrypted(key, &s).await?;
         } else {
             state.store.set_setting(key, &s).await?;
         }
-        changed_keys.push(key.clone());
     }
+
+    let before_val = serde_json::Value::Object(before_map);
+    let after_val = serde_json::Value::Object(after_map);
+    let details = audit_details(Some(&before_val), Some(&after_val));
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
         "admin",
         "upsert",
         "settings",
         "bulk",
-        &json!({ "changed_keys": changed_keys }),
+        &details,
     )
     .await;
     // Return the fresh redacted view.
     let rows = state.store.list_settings().await?;
     let mut map = serde_json::Map::new();
     for (k, v) in rows {
-        let value = if tiygate_store::settings_keys::is_encrypted_key(&k) {
-            serde_json::Value::String(tiygate_store::encryption::KeyEncryption::redact(&v))
+        let value = if is_encrypted_key(&k) {
+            serde_json::Value::String(KeyEncryption::redact(&v))
         } else {
             serde_json::Value::String(v)
         };
