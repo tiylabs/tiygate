@@ -9,6 +9,8 @@ use tiygate_store::archive::PayloadArchiveClient;
 use tiygate_store::config_store::DbConfigStore;
 use tiygate_store::db::DbPool;
 
+use crate::brute_force::{BruteForceConfig, BruteForceLimiter, InMemoryBruteForceLimiter};
+
 /// Application state passed to every Admin API handler.
 #[derive(Clone)]
 pub struct AdminState {
@@ -38,6 +40,11 @@ pub struct AdminState {
     /// because the admin handlers are async and the lock must
     /// be `Send + Sync` across `.await` points.
     pub oauth_pending: Arc<Mutex<HashMap<String, OAuthPendingFlow>>>,
+    /// Brute-force protection limiter. Defaults to an in-memory
+    /// limiter; the server binary may inject a Redis-backed one via
+    /// [`AdminState::with_bf_limiter`] when `TIYGATE_REDIS_URL` is
+    /// set.
+    pub bf_limiter: Arc<dyn BruteForceLimiter>,
 }
 
 /// A pending OAuth 2.0 authorization-code flow awaiting the
@@ -70,6 +77,7 @@ impl AdminState {
             quota: None,
             payload_archive: None,
             oauth_pending: Arc::new(Mutex::new(HashMap::new())),
+            bf_limiter: Arc::new(InMemoryBruteForceLimiter::new(BruteForceConfig::default())),
         }
     }
 
@@ -83,6 +91,15 @@ impl AdminState {
     /// Attach a payload archive client for replay reads.
     pub fn with_payload_archive(mut self, archive: Option<Arc<dyn PayloadArchiveClient>>) -> Self {
         self.payload_archive = archive;
+        self
+    }
+
+    /// Attach a brute-force protection limiter. The server binary
+    /// calls this with a Redis-backed limiter when
+    /// `TIYGATE_REDIS_URL` is configured; the default is the
+    /// in-memory limiter created in [`AdminState::new`].
+    pub fn with_bf_limiter(mut self, limiter: Arc<dyn BruteForceLimiter>) -> Self {
+        self.bf_limiter = limiter;
         self
     }
 }

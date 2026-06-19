@@ -38,6 +38,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           provenance: false
+          build-args: |
+            APP_VERSION=${{ steps.get-tag.outputs.tag }}
           cache-from: type=gha,scope=${{ matrix.suffix }}
           cache-to: type=gha,scope=${{ matrix.suffix }},mode=max
           tags: |

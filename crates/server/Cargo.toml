@@ -43,6 +43,12 @@ bedrock = ["dep:tiygate-provider-bedrock"]
 # library build so the data plane can run without a DB.
 control-plane = []
 
+# Redis-backed backends. Enables both the Redis quota counter in
+# `tiygate-core` and the Redis brute-force limiter in
+# `tiygate-admin`. Operators set `TIYGATE_REDIS_URL` and build with
+# `--features redis-quota` to share state across replicas.
+redis-quota = ["tiygate-core/redis-quota", "tiygate-admin?/redis"]
+
 # ---------------------------------------------------------------------------
 # Runtime features — used by the default binary entry point (`main.rs`).
 # `lib.rs` (and downstream binaries) can opt out of any of these.

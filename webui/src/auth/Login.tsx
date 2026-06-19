@@ -1,6 +1,6 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useTranslation } from "react-i18next";
-import { probeToken, ApiError } from "@/api/client";
+import { probeToken, fetchServerInfo, ApiError } from "@/api/client";
 import { useAuth } from "./AuthContext";
 import { Button, Card, ErrorBox, Field, PasswordInput, Switch } from "@/components/ui";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
@@ -13,6 +13,13 @@ export default function Login() {
   const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchServerInfo().then((info) => {
+      if (info) setVersion(info.version);
+    });
+  }, []);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -101,6 +108,10 @@ export default function Login() {
             </Button>
           </form>
         </Card>
+
+        {version ? (
+          <p className="mt-6 text-center text-xs text-text-muted">v{version}</p>
+        ) : null}
       </div>
     </div>
   );

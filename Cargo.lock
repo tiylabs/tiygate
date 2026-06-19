@@ -3070,6 +3070,7 @@ dependencies = [
  "http-body-util",
  "oauth2",
  "rand 0.8.6",
+ "redis",
  "serde",
  "serde_json",
  "serial_test",

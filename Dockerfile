@@ -17,9 +17,20 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY --from=webui-builder /app/webui/dist ./webui/dist
 
+# Inject the release tag (e.g. v0.2.0) as the workspace version so
+# `env!("CARGO_PKG_VERSION")` and the `/admin/v1/info` endpoint
+# report the actual build version instead of the hardcoded default.
+# The leading `v` (if present) is stripped because Cargo semver
+# does not allow it.
+ARG APP_VERSION=""
+RUN if [ -n "$APP_VERSION" ]; then \
+      VER=$(echo "$APP_VERSION" | sed 's/^v//'); \
+      sed -i.bak "s/^version = \".*\"/version = \"$VER\"/" Cargo.toml && rm Cargo.toml.bak; \
+    fi
+
 # Build a production all-in-one gateway with embedded WebUI and Redis-backed quota support.
-# Bedrock remains opt-in to keep the image smaller; pass --build-arg SERVER_FEATURES="webui tiygate-core/redis-quota bedrock" if needed.
-ARG SERVER_FEATURES="webui tiygate-core/redis-quota"
+# Bedrock remains opt-in to keep the image smaller; pass --build-arg SERVER_FEATURES="webui tiygate-core/redis-quota tiygate-admin/redis bedrock" if needed.
+ARG SERVER_FEATURES="webui redis-quota"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \

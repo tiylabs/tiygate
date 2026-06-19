@@ -16,12 +16,13 @@
 //! var is the source of truth.
 
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
+use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 
 use crate::state::AdminState;
@@ -94,7 +95,7 @@ pub fn set_test_admin_token_for_current_thread(token: Option<&str>) {
 /// handler's response (or 404) and never leaks the
 /// `admin_auth` error envelope.
 pub async fn require_admin_token(
-    State(_state): State<AdminState>,
+    State(state): State<AdminState>,
     req: Request,
     next: Next,
 ) -> Response {
@@ -106,6 +107,28 @@ pub async fn require_admin_token(
         // never accidentally gate a non-admin route.
         return next.run(req).await;
     }
+
+    // Public admin routes that do not require authentication.
+    // `/admin/v1/info` exposes the server name + version so the
+    // login page can display it before the user has a token.
+    if is_public_admin_path(path) {
+        return next.run(req).await;
+    }
+
+    // Brute-force protection: extract the client IP and check
+    // whether it is currently locked out. A locked client gets 403
+    // regardless of the token it presents — the lockout takes
+    // priority over authentication so an attacker cannot probe
+    // tokens during the lockout window.
+    let client_id = extract_client_ip(&req);
+    if state.bf_limiter.is_locked(&client_id).await {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "too many failed attempts; try again later",
+            "admin_auth",
+        );
+    }
+
     let header_value = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -114,11 +137,17 @@ pub async fn require_admin_token(
     let token = match header_value {
         Some(v) if v.starts_with("Bearer ") => &v[7..],
         _ => {
+            // Missing/malformed Authorization header counts as a
+            // failed attempt.
+            state.bf_limiter.record_failure(&client_id).await;
             return error_response(StatusCode::UNAUTHORIZED, "missing bearer token", "gateway");
         }
     };
 
     if explicit_token().is_none() {
+        // Admin auth not configured — do not penalise the caller
+        // with brute-force tracking (503 is a server-side config
+        // issue, not an auth failure).
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "admin token not configured (set TIYGATE_ADMIN_TOKEN)",
@@ -127,9 +156,12 @@ pub async fn require_admin_token(
     }
 
     if !verify_admin_token(token) {
+        state.bf_limiter.record_failure(&client_id).await;
         return error_response(StatusCode::UNAUTHORIZED, "invalid admin token", "gateway");
     }
 
+    // Successful authentication — reset the failure counters.
+    state.bf_limiter.record_success(&client_id).await;
     next.run(req).await
 }
 
@@ -142,6 +174,42 @@ fn error_response(status: StatusCode, message: &str, source: &str) -> Response {
         }
     }));
     (status, body).into_response()
+}
+
+/// Extract the client IP from a request for brute-force tracking.
+///
+/// Priority:
+/// 1. `X-Forwarded-For` — first IP (leftmost), the standard
+///    header set by Caddy / nginx / cloud LBs.
+/// 2. `X-Real-IP` — single-IP variant used by some proxies.
+/// 3. `ConnectInfo<SocketAddr>` — the raw TCP peer address, only
+///    available when the server was started with
+///    `into_make_service_with_connect_info`.
+/// 4. `"unknown"` — fallback so the limiter still provides basic
+///    protection when no IP source is available.
+fn extract_client_ip(req: &Request) -> String {
+    if let Some(xff) = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(first) = xff.split(',').next() {
+            let trimmed = first.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    if let Some(xrip) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let trimmed = xrip.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Some(addr) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return addr.0.ip().to_string();
+    }
+    "unknown".to_string()
 }
 
 /// Returns `true` when `path` is an admin route that
@@ -161,10 +229,55 @@ fn is_admin_path(path: &str) -> bool {
     path == "/admin" || path.starts_with("/admin/")
 }
 
+/// Returns `true` for admin routes that are intentionally public
+/// (no bearer token required). Currently only `/admin/v1/info`,
+/// which the login page calls to display the server version before
+/// the user has authenticated.
+fn is_public_admin_path(path: &str) -> bool {
+    path == "/admin/v1/info"
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_ip_prefers_x_forwarded_for() {
+        let builder = Request::builder().header("x-forwarded-for", "203.0.113.1, 10.0.0.1");
+        let req = builder.body(axum::body::Body::empty()).unwrap();
+        assert_eq!(extract_client_ip(&req), "203.0.113.1");
+    }
+
+    #[test]
+    fn extract_ip_uses_x_real_ip_when_no_xff() {
+        let builder = Request::builder().header("x-real-ip", "198.51.100.7");
+        let req = builder.body(axum::body::Body::empty()).unwrap();
+        assert_eq!(extract_client_ip(&req), "198.51.100.7");
+    }
+
+    #[test]
+    fn extract_ip_uses_connect_info_fallback() {
+        let addr: SocketAddr = "192.0.2.42:1234".parse().unwrap();
+        let req = Request::builder()
+            .extension(ConnectInfo(addr))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_client_ip(&req), "192.0.2.42");
+    }
+
+    #[test]
+    fn extract_ip_returns_unknown_when_nothing_available() {
+        let req = Request::builder().body(axum::body::Body::empty()).unwrap();
+        assert_eq!(extract_client_ip(&req), "unknown");
+    }
+
+    #[test]
+    fn extract_ip_ignores_empty_xff() {
+        let builder = Request::builder().header("x-forwarded-for", "  , ");
+        let req = builder.body(axum::body::Body::empty()).unwrap();
+        assert_eq!(extract_client_ip(&req), "unknown");
+    }
 
     #[test]
     fn verify_returns_false_when_unconfigured() {
@@ -225,5 +338,15 @@ mod tests {
         assert!(!is_admin_path("/v1/admin-tools"));
         assert!(!is_admin_path("/foo/admin"));
         assert!(!is_admin_path("/administrator"));
+    }
+
+    #[test]
+    fn is_public_admin_path_only_matches_info() {
+        assert!(is_public_admin_path("/admin/v1/info"));
+        // Other admin routes are NOT public.
+        assert!(!is_public_admin_path("/admin/v1/health"));
+        assert!(!is_public_admin_path("/admin/v1/providers"));
+        assert!(!is_public_admin_path("/admin/v1/settings"));
+        assert!(!is_public_admin_path("/admin/v1/info/extra"));
     }
 }

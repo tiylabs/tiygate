@@ -218,13 +218,16 @@ impl App {
                 crate::config::DeployMode::All | crate::config::DeployMode::Admin => {
                     #[cfg(feature = "admin")]
                     {
+                        let bf_config = tiygate_admin::BruteForceConfig::from_env();
+                        let bf_limiter = tiygate_admin::build_limiter(&bf_config);
                         let admin_state = tiygate_admin::AdminState::new(
                             cp.store.clone(),
                             cp.pool.clone(),
                             Some(self.health.clone()),
                         )
                         .with_quota(self.quota.clone())
-                        .with_payload_archive(self.payload_archive_client.clone());
+                        .with_payload_archive(self.payload_archive_client.clone())
+                        .with_bf_limiter(bf_limiter);
                         let admin = tiygate_admin::build_router(admin_state);
                         router = router.merge(admin);
                     }

@@ -35,6 +35,7 @@ mod webui;
 use tiygate_provider_bedrock as _;
 
 use bytes::Bytes;
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 use tiygate_store::archive::PayloadArchiveClient;
@@ -220,7 +221,15 @@ async fn run(_args: cli::RunArgs) -> anyhow::Result<()> {
 
     let app_router = app.router();
     let drain_for_server = drain_state.clone();
-    let server = axum::serve(listener, app_router).with_graceful_shutdown(async move {
+    // `into_make_service_with_connect_info` makes
+    // `ConnectInfo<SocketAddr>` available in request extensions,
+    // which the admin brute-force middleware uses to extract the
+    // client IP when `X-Forwarded-For` is absent.
+    let server = axum::serve(
+        listener,
+        app_router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         drain_for_server.wait_for_signal().await;
         tracing::info!("graceful shutdown: in-flight requests will be allowed to finish");
     });

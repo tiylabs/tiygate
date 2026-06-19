@@ -7,6 +7,13 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# `redis` enables the Redis-backed `RedisBruteForceLimiter`. When
+# this feature is *off* (the default) the `build_limiter` factory
+# always returns the in-memory limiter, even when
+# `TIYGATE_REDIS_URL` is set.
+redis = ["dep:redis"]
+
 [dependencies]
 tiygate-core.workspace = true
 tiygate-store.workspace = true
@@ -28,6 +35,10 @@ sqlx.workspace = true
 sha2.workspace = true
 hex.workspace = true
 rand.workspace = true
+# Optional Redis client. Pulled in only when the `redis` feature is
+# enabled so the admin crate builds without a Redis dependency by
+# default. Mirrors the `redis` definition in `crates/core/Cargo.toml`.
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "script"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

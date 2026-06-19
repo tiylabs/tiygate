@@ -1,12 +1,16 @@
 //! TiyGate Admin — REST API for managing providers, routes, and API keys.
 
 pub mod auth;
+pub mod brute_force;
 pub mod handlers;
 pub mod oauth;
 pub mod state;
 
 use axum::{middleware, Router};
 
+pub use brute_force::{
+    build_limiter, BruteForceConfig, BruteForceLimiter, InMemoryBruteForceLimiter,
+};
 pub use state::AdminState;
 
 // Anchor the `tiygate_providers` crate so its `inventory::submit!`

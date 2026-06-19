@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        SERVER_FEATURES: "webui tiygate-core/redis-quota"
+        SERVER_FEATURES: "webui redis-quota"
     image: tiylabs/tiygate:local
     container_name: tiygate
     restart: unless-stopped

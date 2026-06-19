@@ -109,6 +109,22 @@ export async function apiRequest<T>(
 }
 
 /**
+ * Fetch server info (name + version) from the public `/admin/v1/info`
+ * endpoint. This endpoint is exempt from bearer-token auth so the
+ * login page can display the version before the user has a token.
+ * Returns `null` on any error so callers can degrade gracefully.
+ */
+export async function fetchServerInfo(): Promise<{ name: string; version: string } | null> {
+  try {
+    const res = await fetch(buildUrl("/info"));
+    if (!res.ok) return null;
+    return (await res.json()) as { name: string; version: string };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Probe the admin token by hitting a cheap protected endpoint.
  * Returns true on 2xx, false on 401, and rethrows other errors
  * (e.g. 503 when TIYGATE_ADMIN_TOKEN is not configured server-side).
