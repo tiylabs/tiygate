@@ -1,0 +1,36 @@
+---
+source: crates/protocols/src/images.rs
+assertion_line: 669
+expression: ir
+---
+IrRequest {
+    model: "gpt-image-1",
+    system: None,
+    messages: [],
+    tools: [],
+    params: GenerationParams {
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop: [],
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        thinking: None,
+    },
+    response_format: None,
+    stream: false,
+    ingress_protocol: ProtocolEndpoint {
+        suite: OpenAiCompatible,
+        name: "images-generations",
+        version: "v1",
+    },
+    metadata: None,
+    extensions: {
+        "prompt": String("A cute sea otter"),
+        "images_extra": Object {
+            "size": String("1024x1024"),
+        },
+    },
+}
