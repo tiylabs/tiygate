@@ -22,6 +22,9 @@ interface AuthState {
    * non-Tauri environments this is always `false`.
    */
   isInitializing: boolean;
+  /** Whether the user is in passwordless mode (no logout button). */
+  isPasswordless: boolean;
+  setPasswordless: (v: boolean) => void;
   login: (token: string, remember: boolean) => void;
   logout: () => void;
 }
@@ -32,6 +35,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
   const tauri = isTauri();
   const [token, setTokenState] = useState<string | null>(() => getToken());
   const [isInitializing, setIsInitializing] = useState(tauri);
+  const [isPasswordless, setIsPasswordless] = useState(false);
   const queryClient = useQueryClient();
 
   const logout = useCallback(() => {
@@ -51,6 +55,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
   // In Tauri environments, attempt to auto-login on mount:
   // - If first-run is not complete, do nothing (the Setup page handles it).
   // - If first-run is complete, fetch the stored token and auto-login.
+  //   This is the passwordless flow — mark it so the logout button is hidden.
   useEffect(() => {
     if (!tauri) {
       setIsInitializing(false);
@@ -65,6 +70,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
           if (storedToken && !cancelled) {
             setToken(storedToken, true);
             setTokenState(storedToken);
+            setIsPasswordless(true);
           }
         }
       } catch {
@@ -88,16 +94,20 @@ export function AuthProvider({ children }: PropsWithChildren) {
     return () => setUnauthorizedHandler(null);
   }, [queryClient]);
 
+  const setPasswordless = useCallback((v: boolean) => setIsPasswordless(v), []);
+
   const value = useMemo<AuthState>(
     () => ({
       token,
       isAuthenticated: token !== null,
       isTauri: tauri,
       isInitializing,
+      isPasswordless,
+      setPasswordless,
       login,
       logout,
     }),
-    [token, tauri, isInitializing, login, logout],
+    [token, tauri, isInitializing, isPasswordless, setPasswordless, login, logout],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

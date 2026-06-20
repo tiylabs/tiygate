@@ -65,7 +65,7 @@ function SidebarContent({
   onToggleCollapse?: () => void;
 }) {
   const { t } = useTranslation();
-  const { logout } = useAuth();
+  const { logout, isPasswordless } = useAuth();
   const [version, setVersion] = useState<string | null>(null);
 
   useEffect(() => {
@@ -180,15 +180,17 @@ function SidebarContent({
         {collapsed ? (
           <div className="flex flex-col items-center gap-2">
             <ThemeSwitcher />
-            <button
-              type="button"
-              aria-label={t("app.logout")}
-              title={t("app.logout")}
-              className="inline-flex h-8 w-8 items-center justify-center rounded-md text-danger transition-colors hover:bg-danger-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              onClick={logout}
-            >
-              <LogOut size={16} aria-hidden />
-            </button>
+            {!isPasswordless && (
+              <button
+                type="button"
+                aria-label={t("app.logout")}
+                title={t("app.logout")}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md text-danger transition-colors hover:bg-danger-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={logout}
+              >
+                <LogOut size={16} aria-hidden />
+              </button>
+            )}
           </div>
         ) : (
           <>
@@ -196,21 +198,23 @@ function SidebarContent({
               <LanguageSwitcher />
               <ThemeSwitcher />
             </div>
-            <div className="flex items-center">
-              <button
-                type="button"
-                className="flex items-center gap-2 rounded-md px-3 py-2 text-sm text-danger transition-colors hover:bg-danger-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                onClick={logout}
-              >
-                <LogOut size={16} aria-hidden />
-                {t("app.logout")}
-              </button>
-              {version && (
-                <span className="ml-auto select-none px-1 text-xs text-text-subtle">
-                  v{version}
-                </span>
-              )}
-            </div>
+            {!isPasswordless && (
+              <div className="flex items-center">
+                <button
+                  type="button"
+                  className="flex items-center gap-2 rounded-md px-3 py-2 text-sm text-danger transition-colors hover:bg-danger-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={logout}
+                >
+                  <LogOut size={16} aria-hidden />
+                  {t("app.logout")}
+                </button>
+                {version && (
+                  <span className="ml-auto select-none px-1 text-xs text-text-subtle">
+                    v{version}
+                  </span>
+                )}
+              </div>
+            )}
           </>
         )}
       </div>
@@ -283,7 +287,16 @@ export default function Layout() {
           </span>
         </header>
 
-        <main className="min-w-0 flex-1 overflow-y-auto p-4 sm:p-6">
+        <main
+          className={cn(
+            "min-w-0 flex-1 overflow-y-auto p-4 sm:p-6",
+            // In Tauri the title bar blends with the content background,
+            // so remove the top padding to avoid visual emptiness.
+            typeof window !== "undefined" &&
+              "__TAURI_INTERNALS__" in window &&
+              "pt-0 sm:pt-0",
+          )}
+        >
           <Outlet />
         </main>
       </div>

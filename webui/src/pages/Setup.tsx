@@ -25,7 +25,7 @@ type Mode = "choose" | "set-token" | "busy" | "show-master-key";
 export default function Setup() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { login } = useAuth();
+  const { login, setPasswordless } = useAuth();
   const [mode, setMode] = useState<Mode>("choose");
   const [token, setToken] = useState("");
   const [confirmToken, setConfirmToken] = useState("");
@@ -107,6 +107,7 @@ export default function Setup() {
       if (passwordlessToken) {
         // Passwordless flow: wait for sidecar, then auto-login.
         await waitForSidecar(passwordlessToken);
+        setPasswordless(true);
         login(passwordlessToken, true);
         navigate("/", { replace: true });
       } else {
