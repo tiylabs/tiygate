@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Run as a menu-bar (accessory) app: no Dock icon, no Cmd+Tab entry.
+       The window is still shown on launch and can be toggled from the
+       system-tray icon. Tauri merges this file with its generated Info.plist. -->
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>

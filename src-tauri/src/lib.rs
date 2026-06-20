@@ -30,6 +30,21 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
+            // Run as a menu-bar (accessory) app on macOS: no Dock icon
+            // and no Cmd+Tab entry. The window is still shown on launch
+            // and can be toggled from the system-tray icon. This works
+            // in both `cargo tauri dev` and bundled `.app` builds (the
+            // static Info.plist LSUIElement key only takes effect in the
+            // latter, so we set it at runtime as well).
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(e) =
+                    handle.set_activation_policy(tauri::ActivationPolicy::Accessory)
+                {
+                    tracing::warn!("failed to set activation policy to Accessory: {e}");
+                }
+            }
+
             // Resolve the data directory and load (or create) the local
             // client configuration before spawning the sidecar.
             // Use app_local_data_dir (~/Library/Application Support/ on

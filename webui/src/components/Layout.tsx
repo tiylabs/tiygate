@@ -291,10 +291,10 @@ export default function Layout() {
           className={cn(
             "min-w-0 flex-1 overflow-y-auto p-4 sm:p-6",
             // In Tauri the title bar blends with the content background,
-            // so remove the top padding to avoid visual emptiness.
+            // so halve the top padding to avoid visual emptiness.
             typeof window !== "undefined" &&
               "__TAURI_INTERNALS__" in window &&
-              "pt-0 sm:pt-0",
+              "pt-2 sm:pt-3",
           )}
         >
           <Outlet />
