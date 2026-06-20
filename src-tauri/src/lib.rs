@@ -98,8 +98,21 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "quit", "退出 TiyGate", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
 
+            // Load the dedicated tray icon (a monochrome template PNG
+            // derived from webui/public/icon-round.svg). On macOS it is
+            // registered as a *template image* so the system automatically
+            // adapts it to dark/light menu-bar appearance. Template images
+            // must be pure-black pixels with an alpha channel; the system
+            // handles inversion. The PNG is embedded at compile time via
+            // `include_bytes!` so no filesystem access is needed at runtime.
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!(
+                "../icons/tray-icon-template.png"
+            ))
+            .map_err(|e| anyhow::anyhow!("failed to load tray icon: {e}"))?;
+
             TrayIconBuilder::with_id("main-tray")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon)
+                .icon_as_template(true)
                 .tooltip("TiyGate")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
