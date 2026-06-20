@@ -10,6 +10,41 @@
     <meta name="theme-color" content="#1f2937" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TiyGate Admin</title>
+    <script>
+      (() => {
+        const storageKey = "tiygate.theme";
+        const lightBg = "#f7f8fa";
+        const darkBg = "#0a0c14";
+
+        let saved = null;
+        try {
+          saved = window.localStorage.getItem(storageKey);
+        } catch {
+          saved = null;
+        }
+
+        // Determine the resolved theme mode (light/dark) before React mounts
+        // so the window background — and the macOS titlebar overlay — matches
+        // the user's theme preference immediately on launch.
+        let isDark = false;
+        if (saved === "dark" || saved === "dark-dim" || saved === "dark-oled" ||
+            saved === "dark-lime" || saved === "dark-fuchsia" || saved === "dark-mauve") {
+          isDark = true;
+        } else if (saved === "light" || saved === "light-warm" || saved === "light-slate" ||
+                   saved === "light-lime" || saved === "light-fuchsia" || saved === "light-mauve") {
+          isDark = false;
+        } else {
+          isDark = typeof window.matchMedia === "function" &&
+                   window.matchMedia("(prefers-color-scheme: dark)").matches;
+        }
+
+        const root = document.documentElement;
+        const theme = isDark ? "dark" : "light";
+        root.setAttribute("data-theme", theme);
+        root.style.colorScheme = theme;
+        root.style.backgroundColor = isDark ? darkBg : lightBg;
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
