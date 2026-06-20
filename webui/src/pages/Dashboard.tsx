@@ -390,8 +390,8 @@ export default function Dashboard() {
               [
                 { key: "model" as const, label: t("dashboard.byModel") },
                 { key: "provider" as const, label: t("dashboard.byProvider") },
-                { key: "apiKey" as const, label: t("dashboard.byApiKey") },
                 { key: "target" as const, label: t("dashboard.byTarget") },
+                { key: "apiKey" as const, label: t("dashboard.byApiKey") },
               ] as const
             ).map((tab) => (
               <button
