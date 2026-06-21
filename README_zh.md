@@ -45,22 +45,13 @@ TiyGate 是一款用 **Rust** 编写的**开源 AI 网关**，适合同时使用
 | **备份恢复** | 配置支持加密导出与导入，便于实例迁移、备份与恢复。 |
 | **数据统计** | 汇聚多服务商数据，支持按服务商、模型、API Key 等维度查看统计。 |
 
-## 选择你的版本
-
-| 版本 | 适用场景 | 获取方式 |
-|---|---|---|
-| 🖥️ **桌面版**(个人使用推荐) | 想要一键安装、原生 UI 的本地网关,无需 Docker、无需服务器配置的个人用户。macOS(Apple Silicon / Intel)和 Windows 安装包发布在 [Releases](https://github.com/tiylabs/tiygate/releases) 页面。 | 从最新的 [Release](https://github.com/tiylabs/tiygate/releases) 下载对应平台的安装包并运行。 |
-| 🐳 **Docker 版**(企业级 / 生产环境推荐) | 需要水平扩展、多节点数据面/控制面分离、容器编排(K8s、Swarm 等)的团队和生产部署。 | `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest` —— 详见 [Docker 镜像](https://hub.docker.com/r/jorbenzhu/tiygate)和[部署与运维文档](docs/deployment-operations_zh.md)。 |
-
-> 两个版本共享同一套核心引擎和管理控制台 —— 你可以先用桌面版本地探索,准备好扩展时再切换到 Docker。
-
 ## 快速开始
 
 按使用场景选择入口：
 
-- **桌面版：**从 [Releases](https://github.com/tiylabs/tiygate/releases) 下载最新 macOS 或 Windows 安装包，启动后在管理控制台配置服务商与虚拟模型。
-- **Docker：**运行 `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest`，生产配置参考[部署与运维文档](docs/deployment-operations_zh.md)。
-- **源码启动：**需要 Rust 1.88+ 和 Node.js 20+。
+- **桌面版：** 🖥️ 从 [Releases](https://github.com/tiylabs/tiygate/releases) 下载最新 macOS 或 Windows 安装包，启动后在管理控制台配置服务商与虚拟模型。
+- **Docker：** 🐳 运行 `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest`，生产配置参考[部署与运维文档](docs/deployment-operations_zh.md)。
+- **源码启动：** 🦀 需要 Rust 1.88+ 和 Node.js 20+。
 
 ```bash
 git clone https://github.com/tiylabs/tiygate.git

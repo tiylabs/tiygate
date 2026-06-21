@@ -45,22 +45,13 @@ Use TiyGate when you want to:
 | **Backup & restore** | Configuration can be exported and imported with encryption support, making instance migration, backup, and recovery straightforward. |
 | **Usage analytics** | Usage statistics are aggregated across providers, models, and API keys for operational visibility. |
 
-## Choose Your Edition
-
-| Edition | Best for | How to get it |
-|---|---|---|
-| 🖥️ **Desktop** (recommended for personal use) | Individual users who want a one-click local gateway with a native UI — no Docker, no server setup. macOS (Apple Silicon / Intel) and Windows installers are published on the [Releases](https://github.com/tiylabs/tiygate/releases) page. | Download the installer for your platform from the latest [Release](https://github.com/tiylabs/tiygate/releases) and run it. |
-| 🐳 **Docker** (recommended for enterprise / production) | Teams and production deployments that need horizontal scaling, multi-node data/control plane separation, and container orchestration (K8s, Swarm, etc.). | `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest` — see the [Docker image](https://hub.docker.com/r/jorbenzhu/tiygate) and [Deployment and Operations](docs/deployment-operations.md). |
-
-> Don't want to choose? Both editions share the same core engine and Admin Console — you can start with Desktop for local exploration and switch to Docker when you're ready to scale.
-
 ## Quick Start
 
 Choose the path that matches your use case:
 
-- **Desktop:** download the latest macOS or Windows installer from [Releases](https://github.com/tiylabs/tiygate/releases), launch TiyGate, then configure providers and virtual models in the Admin Console.
-- **Docker:** run `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest`, then follow [Deployment and Operations](docs/deployment-operations.md) for production configuration.
-- **From source:** use Rust 1.88+ and Node.js 20+.
+- **Desktop:** 🖥️  download the latest macOS or Windows installer from [Releases](https://github.com/tiylabs/tiygate/releases), launch TiyGate, then configure providers and virtual models in the Admin Console.
+- **Docker:** 🐳 run `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest`, then follow [Deployment and Operations](docs/deployment-operations.md) for production configuration.
+- **From source:** 🦀 use Rust 1.88+ and Node.js 20+.
 
 ```bash
 git clone https://github.com/tiylabs/tiygate.git
