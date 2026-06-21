@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-06-21
+### :sparkles: New Features
+- [`db91200`](https://github.com/tiylabs/tiygate/commit/db9120082502897fb79e24dc5c0b56530a1aabdd) - **store**: ✨ add SQLite local database maintenance *(commit by [@jorben](https://github.com/jorben))*
+
+
 ## [0.1.0] - 2026-06-20
 ### :boom: BREAKING CHANGES
 - due to [`9ffb875`](https://github.com/tiylabs/tiygate/commit/9ffb875a921c64485af0b4d45fac4dc0a1361758) - 🐛 correct admin UI routing basename and login redirect *(commit by [@jorben](https://github.com/jorben))*:
@@ -89,3 +94,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [`7301840`](https://github.com/tiylabs/tiygate/commit/73018405abd6004ac3f5a19d610937ac0553b472) - **ci**: 🔧 bump macOS runner to macos-26 *(commit by [@jorben](https://github.com/jorben))*
 
 [0.1.0]: https://github.com/tiylabs/tiygate/compare/0.0.1...0.1.0
+[0.1.1]: https://github.com/tiylabs/tiygate/compare/0.1.0...0.1.1
