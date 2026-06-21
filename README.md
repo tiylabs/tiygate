@@ -2,9 +2,9 @@
 
 # TiyGate
 
-**An open-source AI Gateway built for stability, extensibility, and operability.**
+**A lightweight gateway for highly available LLM services.**
 
-Multi-provider / multi-model access with first-class observability, dynamic configuration, and graceful operations.
+Connect OpenAI-compatible, Responses, Messages, and Gemini protocols through one control plane. Route virtual models across providers by policy, capture detailed request/response logs, and run locally as a zero-config desktop app or at scale in containers.
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
@@ -24,16 +24,30 @@ English | [简体中文](README_zh.md)
 
 ## What is TiyGate?
 
-TiyGate is an **independent AI Gateway product** written in Rust. It sits between your applications and upstream LLM providers (OpenAI, Anthropic, Bedrock, and any OpenAI-compatible service) and gives you a single, stable control point for routing, observability, and policy.
+TiyGate is an **open-source AI gateway written in Rust** for individuals and teams that use more than one LLM provider, subscription, protocol, or API key. It sits between your applications and upstream providers such as OpenAI, Anthropic, Bedrock, Gemini, and OpenAI-compatible services, turning fragmented provider access into one stable control plane.
 
-The two things it does best:
+Use TiyGate when you want to:
 
-1. **Multi-backend / multi-model access** — one canonical entry, many providers. Cross-protocol translation (e.g. OpenAI `chat_completions` → Anthropic `messages`) is a first-class capability, not a hack.
-2. **Logs and analytics** — every request is captured, structured, and routed to a hot-path-safe async pipeline. No blocking the request path. No silent drops.
+1. **Stop switching between provider subscriptions manually** — connect multiple providers once, then route requests by policy.
+2. **Recover automatically from unstable upstream models** — virtual models can fail over and recover across providers / models by priority, weight, throughput, and latency.
+3. **Debug unexplained request failures quickly** — every request can be captured with detailed client ↔ gateway ↔ provider request/response logs.
+4. **Understand usage across providers, models, and API keys** — analytics aggregate multi-dimensional usage instead of leaving data scattered across dashboards.
 
 ## Why TiyGate?
 
-Most gateways optimize for one dimension. TiyGate is engineered to hold three at once.
+| Capability | What you get |
+|---|---|
+| **Unified access** | One gateway for OpenAI-compatible, Responses, Messages, Gemini, and embeddings protocols, with extensible N×N protocol translation through a canonical IR. |
+| **Policy failover** | Virtual model routing across multiple providers / backend models with priority, weight, throughput, and latency-aware strategies, plus automatic failover and recovery. |
+| **Data capture** | Real-time request/response detail capture across the client → gateway → provider path, with retention policy cleanup and optional S3-compatible payload archive. |
+| **Lightweight deployment** | A zero-config desktop app for personal macOS / Windows use, and containerized deployment modes for enterprise-scale data plane / control plane separation. The desktop app can manage local and cloud instances. |
+| **Security** | Provider API keys are encrypted at rest with `TIYGATE_MASTER_KEY`, and sensitive request/response log fields are redacted. |
+| **Backup & restore** | Configuration can be exported and imported with encryption support, making instance migration, backup, and recovery straightforward. |
+| **Usage analytics** | Usage statistics are aggregated across providers, models, and API keys for operational visibility. |
+
+## Engineering Principles
+
+TiyGate is designed to keep the hot path reliable while preserving extensibility and maintainability.
 
 | Quality goal | What carries it |
 |---|---|
