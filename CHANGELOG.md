@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-06-22
+### :bug: Bug Fixes
+- [`8979b0b`](https://github.com/tiylabs/tiygate/commit/8979b0b3a3eec1bb673eacd0e39c4195cbc25442) - **auth**: 🐛 allow remote instances to bypass local first-run setup *(commit by [@jorben](https://github.com/jorben))*
+
+
 ## [0.1.1] - 2026-06-21
 ### :sparkles: New Features
 - [`db91200`](https://github.com/tiylabs/tiygate/commit/db9120082502897fb79e24dc5c0b56530a1aabdd) - **store**: ✨ add SQLite local database maintenance *(commit by [@jorben](https://github.com/jorben))*
@@ -95,3 +100,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [0.1.0]: https://github.com/tiylabs/tiygate/compare/0.0.1...0.1.0
 [0.1.1]: https://github.com/tiylabs/tiygate/compare/0.1.0...0.1.1
+[0.1.2]: https://github.com/tiylabs/tiygate/compare/0.1.1...0.1.2
