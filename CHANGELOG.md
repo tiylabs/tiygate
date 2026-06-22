@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-06-22
+### :sparkles: New Features
+- [`b4d06e4`](https://github.com/tiylabs/tiygate/commit/b4d06e4b265f0286c92190bcecdd8ddd51739c02) - **ingress**: ✨ detect and log downstream client disconnects during SSE streaming *(commit by [@jorben](https://github.com/jorben))*
+- [`84c3874`](https://github.com/tiylabs/tiygate/commit/84c387418f04721fc597a5d89d6f49839014f375) - **webui**: ✨ add cache hit ratio display and conditionally hide fields in request logs *(commit by [@jorben](https://github.com/jorben))*
+
+### :recycle: Refactors
+- [`58a2912`](https://github.com/tiylabs/tiygate/commit/58a29123143b1e7f5ff9a417705e27d7c64f6164) - **telemetry**: ♻️ normalise request log status and error_class into typed enums *(commit by [@jorben](https://github.com/jorben))*
+
+
 ## [0.1.3] - 2026-06-22
 ### :sparkles: New Features
 - [`aaeb050`](https://github.com/tiylabs/tiygate/commit/aaeb050d1ccfe4f5e2619a7fcbb731fb4c0a6f7e) - **routes**: ✨ enhance target reorder with pointer and keyboard support *(commit by [@jorben](https://github.com/jorben))*
@@ -110,3 +119,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.1]: https://github.com/tiylabs/tiygate/compare/0.1.0...0.1.1
 [0.1.2]: https://github.com/tiylabs/tiygate/compare/0.1.1...0.1.2
 [0.1.3]: https://github.com/tiylabs/tiygate/compare/0.1.2...0.1.3
+[0.1.4]: https://github.com/tiylabs/tiygate/compare/0.1.3...0.1.4
