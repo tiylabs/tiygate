@@ -61,13 +61,13 @@ export function AuthProvider({ children }: PropsWithChildren) {
   );
 
   // In Tauri environments, attempt to auto-login on mount:
-  // - If first-run is not complete, do nothing (the Setup page handles it).
-  // - If first-run is complete, check the active instance:
-  //   - Local sidecar → fetch the stored token and auto-login
-  //     (passwordless flow). Mark it so the logout button is hidden.
-  //   - Remote instance → check for a remembered per-instance token
-  //     in localStorage. If found, auto-login; otherwise redirect
-  //     to /login for manual entry.
+  // - Always inspect the active instance first. A remote instance may be
+  //   selected even while the local sidecar's first-run setup is still
+  //   incomplete.
+  // - Local sidecar with completed setup → fetch the stored token and
+  //   auto-login (passwordless flow). Mark it so the logout button is hidden.
+  // - Remote instance → check for a remembered per-instance token in
+  //   localStorage. If found, auto-login; otherwise show the login page.
   useEffect(() => {
     if (!tauri) {
       setIsInitializing(false);
@@ -76,40 +76,40 @@ export function AuthProvider({ children }: PropsWithChildren) {
     let cancelled = false;
     (async () => {
       try {
-        const firstRun = await checkIsFirstRun();
-        if (!firstRun) {
-          const active = await tauriGetActiveInstance();
-          const key = active?.id ?? "local";
-          setInstanceKey(key);
-          if (active?.kind === "local") {
-            // Local sidecar: use the Rust-side stored token for
-            // passwordless auto-login.
-            const storedToken = await tauriGetAdminToken();
-            if (storedToken && !cancelled) {
-              setToken(storedToken, true, key);
-              setTokenState(storedToken);
-              setIsPasswordless(true);
-            }
-          } else if (active?.kind === "remote") {
-            // Remote instance: a remembered token must be verified
-            // before entering the dashboard. This prevents stale tokens
-            // from triggering many parallel dashboard requests and
-            // freezing the remote instance due to failed attempts.
-            const remembered = getToken(key);
-            if (remembered && !cancelled) {
-              try {
-                await probeToken(remembered);
-                if (!cancelled) setTokenState(remembered);
-              } catch {
-                clearToken(key);
-                setTokenState(null);
-                queryClient.clear();
-              }
-            } else {
+        const [firstRun, active] = await Promise.all([
+          checkIsFirstRun(),
+          tauriGetActiveInstance(),
+        ]);
+        const key = active?.id ?? "local";
+        setInstanceKey(key);
+        if (active?.kind === "local" && !firstRun) {
+          // Local sidecar: use the Rust-side stored token for
+          // passwordless auto-login.
+          const storedToken = await tauriGetAdminToken();
+          if (storedToken && !cancelled) {
+            setToken(storedToken, true, key);
+            setTokenState(storedToken);
+            setIsPasswordless(true);
+          }
+        } else if (active?.kind === "remote") {
+          // Remote instance: a remembered token must be verified
+          // before entering the dashboard. This prevents stale tokens
+          // from triggering many parallel dashboard requests and
+          // freezing the remote instance due to failed attempts.
+          const remembered = getToken(key);
+          if (remembered && !cancelled) {
+            try {
+              await probeToken(remembered);
+              if (!cancelled) setTokenState(remembered);
+            } catch {
               clearToken(key);
               setTokenState(null);
               queryClient.clear();
             }
+          } else {
+            clearToken(key);
+            setTokenState(null);
+            queryClient.clear();
           }
         }
       } catch {

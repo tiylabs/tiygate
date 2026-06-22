@@ -38,10 +38,16 @@ export async function checkIsFirstRun(): Promise<boolean> {
   }
 }
 
-/**
- * Retrieve the stored admin token from the Rust backend (for auto-login).
- * Returns `null` in non-Tauri environments or when no token is stored.
- */
+export async function shouldShowLocalSetup(): Promise<boolean> {
+  if (!isTauri()) return false;
+  const [firstRun, active] = await Promise.all([
+    checkIsFirstRun(),
+    tauriGetActiveInstance(),
+  ]);
+  return firstRun && active?.kind !== "remote";
+}
+
+/** Retrieve the stored admin token from the Rust backend (for auto-login). */
 export async function tauriGetAdminToken(): Promise<string | null> {
   if (!isTauri()) return null;
   try {

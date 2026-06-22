@@ -1,25 +1,27 @@
 import type { PropsWithChildren } from "react";
 import { Navigate } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
-import { checkIsFirstRun } from "@/auth/setup";
+import { shouldShowLocalSetup } from "@/auth/setup";
 import { useEffect, useState } from "react";
 import { Spinner } from "@/components/ui";
 
 export default function ProtectedRoute({ children }: PropsWithChildren) {
   const { isAuthenticated, isTauri, isInitializing } = useAuth();
-  const [firstRun, setFirstRun] = useState<boolean | null>(null);
+  const [needsLocalSetup, setNeedsLocalSetup] = useState<boolean | null>(null);
 
-  // In Tauri mode, check if this is the first run (setup needed).
+  // In Tauri mode, check whether the local sidecar setup is still needed.
+  // A selected remote instance should go to login even if local first-run is
+  // incomplete.
   useEffect(() => {
     if (!isTauri || isInitializing) return;
     if (isAuthenticated) {
-      setFirstRun(false);
+      setNeedsLocalSetup(false);
       return;
     }
     let cancelled = false;
     (async () => {
-      const fr = await checkIsFirstRun();
-      if (!cancelled) setFirstRun(fr);
+      const needsSetup = await shouldShowLocalSetup();
+      if (!cancelled) setNeedsLocalSetup(needsSetup);
     })();
     return () => {
       cancelled = true;
@@ -27,8 +29,11 @@ export default function ProtectedRoute({ children }: PropsWithChildren) {
   }, [isTauri, isInitializing, isAuthenticated]);
 
   // In Tauri mode, show a spinner while initializing or while the
-  // first-run check is still pending (firstRun === null).
-  if (isTauri && (isInitializing || (!isAuthenticated && firstRun === null))) {
+  // setup check is still pending (needsLocalSetup === null).
+  if (
+    isTauri &&
+    (isInitializing || (!isAuthenticated && needsLocalSetup === null))
+  ) {
     return (
       <div className="flex min-h-full items-center justify-center bg-bg">
         <Spinner />
@@ -36,8 +41,8 @@ export default function ProtectedRoute({ children }: PropsWithChildren) {
     );
   }
 
-  // In Tauri mode, if not authenticated and first run, go to setup.
-  if (isTauri && !isAuthenticated && firstRun === true) {
+  // In Tauri mode, only force setup for the local sidecar.
+  if (isTauri && !isAuthenticated && needsLocalSetup === true) {
     return <Navigate to="/setup" replace />;
   }
 

@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { probeToken, fetchServerInfo, ApiError } from "@/api/client";
 import { useAuth } from "./AuthContext";
-import { checkIsFirstRun } from "./setup";
+import { shouldShowLocalSetup } from "./setup";
 import {
   Button,
   Card,
@@ -31,11 +31,13 @@ export default function Login() {
   const [tauriCheckDone, setTauriCheckDone] = useState(!isTauri);
 
   useEffect(() => {
-    // In Tauri mode, redirect to setup on first run.
+    // In Tauri mode, redirect to setup only when the local sidecar is the
+    // active instance and still needs first-run setup. Remote instances must
+    // be allowed to show the token login page.
     if (isTauri) {
-      checkIsFirstRun()
-        .then((firstRun) => {
-          if (firstRun) {
+      shouldShowLocalSetup()
+        .then((needsSetup) => {
+          if (needsSetup) {
             navigate("/setup", { replace: true });
           } else {
             setTauriCheckDone(true);
