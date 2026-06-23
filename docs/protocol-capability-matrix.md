@@ -35,12 +35,14 @@
 | file_id 引用 | ❌ | ❌ | ✅ | ❌ | N/A |
 | audio inline | ❌ | ❌ | ✅ | ✅ | N/A |
 | video inline | ❌ | ❌ | ❌ | ✅ | N/A |
+| `image_url.detail` | ✅ | ❌（lossy：字段丢弃） | ✅ | ❌（lossy：字段丢弃） | N/A |
 
 **有损组合（阶段 1-3 已知）**：
 - URL 承载 → `messages`（Anthropic 需要 inline base64，无法传递 URL）→ **拒绝**
 - inline audio → `chat_completions`/`messages` → **拒绝**
 - inline video → 任何非 Gemini → **拒绝**
 - file_id → 非 `responses` → **拒绝**
+- `image_url.detail` → `messages`/`gemini` → **有损**（该字段在 IR `Content::Media.metadata` 中保留，但 messages/gemini 编解码器不读取，静默丢弃）
 
 ## 3. Reasoning / 结构化输出
 

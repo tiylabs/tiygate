@@ -588,16 +588,32 @@ impl EndpointCodec for ChatCompletionsCodec {
                         }));
                     }
                     Content::Media {
-                        source, mime_type, ..
+                        source,
+                        mime_type,
+                        metadata,
+                        ..
                     } => match source {
-                        tiygate_core::ir::MediaSource::Url { url } => text_parts.push(json!({
-                            "type": "image_url",
-                            "image_url": {"url": url}
-                        })),
-                        tiygate_core::ir::MediaSource::Inline { data } => text_parts.push(json!({
-                            "type": "image_url",
-                            "image_url": {"url": format!("data:{};base64,{}", mime_type, data)}
-                        })),
+                        tiygate_core::ir::MediaSource::Url { url } => {
+                            let mut img = json!({"url": url});
+                            if let Some(d) = metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY) {
+                                img["detail"] = d.clone();
+                            }
+                            text_parts.push(json!({
+                                "type": "image_url",
+                                "image_url": img
+                            }));
+                        }
+                        tiygate_core::ir::MediaSource::Inline { data } => {
+                            let mut img =
+                                json!({"url": format!("data:{};base64,{}", mime_type, data)});
+                            if let Some(d) = metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY) {
+                                img["detail"] = d.clone();
+                            }
+                            text_parts.push(json!({
+                                "type": "image_url",
+                                "image_url": img
+                            }));
+                        }
                         _ => {}
                     },
                     Content::ToolResult {
@@ -1478,13 +1494,30 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
                 annotations: None,
             },
             Some("image_url") => {
-                let raw_url = item["image_url"]["url"].as_str().unwrap_or("");
+                // Accept both the standard object form
+                // `{"image_url": {"url": "...", "detail": "..."}}` and the
+                // legacy string form `{"image_url": "data:..."}`.
+                let (raw_url, detail) = if let Some(s) = item["image_url"].as_str() {
+                    (s, None)
+                } else {
+                    (
+                        item["image_url"]["url"].as_str().unwrap_or(""),
+                        item["image_url"]["detail"].as_str(),
+                    )
+                };
                 let (source, mime_type) =
                     tiygate_core::ir::MediaSource::from_data_url(raw_url, "image/*");
+                let mut metadata = std::collections::HashMap::<String, serde_json::Value>::new();
+                if let Some(d) = detail {
+                    metadata.insert(
+                        tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(),
+                        serde_json::Value::String(d.to_string()),
+                    );
+                }
                 Content::Media {
                     source,
                     mime_type,
-                    metadata: Default::default(),
+                    metadata,
                 }
             }
             Some("tool_use") | Some("tool_result") => {

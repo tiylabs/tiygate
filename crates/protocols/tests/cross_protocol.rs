@@ -1600,3 +1600,241 @@ fn chat_annotations_decode_to_content_text() {
     assert_eq!(anns[0].url.as_ref().unwrap(), "https://example.com");
     assert_eq!(anns[0].title.as_ref().unwrap(), "Example");
 }
+
+// ============================================================================
+// image_url.detail preservation tests
+// ============================================================================
+
+#[test]
+fn chat_decode_image_url_object_with_detail() {
+    let codec = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let body = json!({
+        "model": "m",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/img.png", "detail": "high"}}
+            ]
+        }]
+    });
+    let ir = codec.decode_request(body, &make_env()).expect("decode");
+    let media = ir.messages[0].content.iter().find_map(|c| match c {
+        Content::Media { metadata, .. } => Some(metadata),
+        _ => None,
+    });
+    let media = media.expect("should have a media part");
+    assert_eq!(
+        media.get(tiygate_core::ir::IMAGE_DETAIL_KEY),
+        Some(&json!("high")),
+        "detail should be preserved in metadata"
+    );
+}
+
+#[test]
+fn chat_decode_image_url_string_form() {
+    let codec = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let body = json!({
+        "model": "m",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": "https://example.com/img.png"}
+            ]
+        }]
+    });
+    let ir = codec.decode_request(body, &make_env()).expect("decode");
+    let media = ir.messages[0].content.iter().find_map(|c| match c {
+        Content::Media {
+            source, metadata, ..
+        } => Some((source, metadata)),
+        _ => None,
+    });
+    let (source, metadata) = media.expect("should have a media part");
+    assert!(
+        matches!(source, tiygate_core::ir::MediaSource::Url { ref url } if url == "https://example.com/img.png"),
+        "string-form image_url should parse as URL"
+    );
+    assert!(
+        !metadata.contains_key(tiygate_core::ir::IMAGE_DETAIL_KEY),
+        "no detail should be present for string form"
+    );
+}
+
+#[test]
+fn chat_encode_image_url_emits_detail() {
+    let codec = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let ir = IrRequest {
+        model: "m".to_string(),
+        system: None,
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![Content::Media {
+                source: tiygate_core::ir::MediaSource::Url {
+                    url: "https://example.com/img.png".to_string(),
+                },
+                mime_type: "image/png".to_string(),
+                metadata: {
+                    let mut m = HashMap::new();
+                    m.insert(tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(), json!("low"));
+                    m
+                },
+            }],
+        }],
+        tools: vec![],
+        params: GenerationParams::default(),
+        response_format: None,
+        stream: false,
+        ingress_protocol: ProtocolEndpoint::new(
+            ProtocolSuite::OpenAiCompatible,
+            "chat-completions",
+            "v1",
+        ),
+        extensions: HashMap::new(),
+        metadata: None,
+    };
+    let (out, _h) = codec.encode_request(&ir).expect("encode");
+    let image_url = &out["messages"][0]["content"][0]["image_url"];
+    assert_eq!(image_url["url"], json!("https://example.com/img.png"));
+    assert_eq!(image_url["detail"], json!("low"));
+}
+
+#[test]
+fn responses_decode_image_url_object_with_detail() {
+    let codec = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let body = json!({
+        "model": "m",
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "What is this?"},
+                {"type": "input_image", "image_url": {"url": "https://example.com/img.png", "detail": "high"}}
+            ]
+        }]
+    });
+    let ir = codec.decode_request(body, &make_env()).expect("decode");
+    let media = ir.messages[0].content.iter().find_map(|c| match c {
+        Content::Media { metadata, .. } => Some(metadata),
+        _ => None,
+    });
+    let media = media.expect("should have a media part");
+    assert_eq!(
+        media.get(tiygate_core::ir::IMAGE_DETAIL_KEY),
+        Some(&json!("high")),
+        "detail should be preserved in metadata"
+    );
+}
+
+#[test]
+fn responses_decode_image_url_string_form() {
+    let codec = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let body = json!({
+        "model": "m",
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image_url": "https://example.com/img.png"}
+            ]
+        }]
+    });
+    let ir = codec.decode_request(body, &make_env()).expect("decode");
+    let media = ir.messages[0].content.iter().find_map(|c| match c {
+        Content::Media {
+            source, metadata, ..
+        } => Some((source, metadata)),
+        _ => None,
+    });
+    let (source, metadata) = media.expect("should have a media part");
+    assert!(
+        matches!(source, tiygate_core::ir::MediaSource::Url { ref url } if url == "https://example.com/img.png"),
+        "string-form image_url should parse as URL"
+    );
+    assert!(
+        !metadata.contains_key(tiygate_core::ir::IMAGE_DETAIL_KEY),
+        "no detail should be present for string form"
+    );
+}
+
+#[test]
+fn responses_encode_image_url_emits_detail() {
+    let codec = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let ir = IrRequest {
+        model: "m".to_string(),
+        system: None,
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![Content::Media {
+                source: tiygate_core::ir::MediaSource::Url {
+                    url: "https://example.com/img.png".to_string(),
+                },
+                mime_type: "image/png".to_string(),
+                metadata: {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(),
+                        json!("auto"),
+                    );
+                    m
+                },
+            }],
+        }],
+        tools: vec![],
+        params: GenerationParams::default(),
+        response_format: None,
+        stream: false,
+        ingress_protocol: ProtocolEndpoint::new(ProtocolSuite::OpenAiResponses, "responses", "v1"),
+        extensions: HashMap::new(),
+        metadata: None,
+    };
+    let (out, _h) = codec.encode_request(&ir).expect("encode");
+    let img_part = &out["input"][0]["content"][0];
+    assert_eq!(img_part["type"], json!("input_image"));
+    assert_eq!(img_part["image_url"], json!("https://example.com/img.png"));
+    assert_eq!(img_part["detail"], json!("auto"));
+}
+
+#[test]
+fn detail_roundtrip_chat_to_responses() {
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let responses = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let body = json!({
+        "model": "m",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/img.png", "detail": "high"}}
+            ]
+        }]
+    });
+    let ir = chat.decode_request(body, &make_env()).expect("decode");
+    let (out, _h) = responses.encode_request(&ir).expect("encode");
+    let img_part = &out["input"][0]["content"][0];
+    assert_eq!(
+        img_part["detail"],
+        json!("high"),
+        "detail should survive cross-protocol"
+    );
+}
+
+#[test]
+fn detail_roundtrip_responses_to_chat() {
+    let responses = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let body = json!({
+        "model": "m",
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image_url": {"url": "https://example.com/img.png", "detail": "low"}}
+            ]
+        }]
+    });
+    let ir = responses.decode_request(body, &make_env()).expect("decode");
+    let (out, _h) = chat.encode_request(&ir).expect("encode");
+    let image_url = &out["messages"][0]["content"][0]["image_url"];
+    assert_eq!(
+        image_url["detail"],
+        json!("low"),
+        "detail should survive cross-protocol"
+    );
+}

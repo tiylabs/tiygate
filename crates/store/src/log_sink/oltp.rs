@@ -41,6 +41,24 @@ const DIMENSION_ERROR_CLASS: &str = "error_class";
 const DIMENSION_HTTP_STATUS: &str = "http_status";
 const DIMENSION_ERROR_SOURCE: &str = "error_source";
 
+/// Map a gateway-side stream truncation reason to
+/// `(error_class, error_source)` when the truncation represents a
+/// gateway-visible failure (i.e. the gateway sent an error frame to
+/// the client). Returns `None` for `client_disconnect` — the client
+/// left first, so no error frame was sent and the request should not
+/// be marked as failed.
+fn truncation_failure_info(reason: &str) -> Option<(&'static str, &'static str)> {
+    match reason {
+        "idle" => Some(("deadline_exceeded", "upstream stream idle timeout")),
+        "total" => Some((
+            "deadline_exceeded",
+            "upstream stream exceeded gateway total budget",
+        )),
+        "upstream_error" => Some(("transient", "upstream stream errored mid-stream")),
+        _ => None,
+    }
+}
+
 /// An `EventSink` backed by the `request_logs` table.
 pub struct OltpSink {
     pool: Arc<DbPool>,
@@ -106,10 +124,10 @@ impl EventSink for OltpSink {
                 egress_protocol = excluded.egress_protocol, \
                 lossy = excluded.lossy, \
                 cache_hit = excluded.cache_hit, \
-                status = excluded.status, \
-                error_class = excluded.error_class, \
+                status = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error') THEN request_logs.status ELSE excluded.status END, \
+                error_class = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error') THEN request_logs.error_class ELSE excluded.error_class END, \
                 http_status = excluded.http_status, \
-                error_source = excluded.error_source, \
+                error_source = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error') THEN request_logs.error_source ELSE excluded.error_source END, \
                 total_latency_ms = excluded.total_latency_ms, \
                 upstream_latency_ms = excluded.upstream_latency_ms, \
                 queue_latency_ms = excluded.queue_latency_ms, \
@@ -286,6 +304,23 @@ impl EventSink for OltpSink {
                     request_id = %capture.request_id,
                     "oltp sink: truncation write-back failed"
                 );
+            }
+            // When the truncation represents a gateway-visible failure
+            // (idle/total/upstream_error), the gateway already sent an
+            // error frame to the client. Mark the request as failed
+            // and record the error source so the dashboard surfaces it
+            // as an error rather than a silent success.
+            if let Some((error_class, error_source)) = truncation_failure_info(reason) {
+                if let Err(e) = self
+                    .update_request_failure(&capture.request_id, error_class, error_source)
+                    .await
+                {
+                    warn!(
+                        error = %e,
+                        request_id = %capture.request_id,
+                        "oltp sink: failure status write-back failed"
+                    );
+                }
             }
         }
 
@@ -536,6 +571,39 @@ impl OltpSink {
         .bind(request_id)
         .bind(now)
         .bind(reason)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    /// Persist a failure status (`status`, `error_class`,
+    /// `error_source`) onto the `request_logs` row when a
+    /// gateway-side stream truncation was sent to the client as an
+    /// error frame. Uses the same upsert placeholder strategy as
+    /// [`update_request_truncation`] so it is order-independent with
+    /// `write_request_event`.
+    async fn update_request_failure(
+        &self,
+        request_id: &str,
+        error_class: &str,
+        error_source: &str,
+    ) -> Result<(), sqlx::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO request_logs (\
+                request_id, ts, virtual_model, ingress_protocol, status, \
+                total_latency_ms, upstream_latency_ms, queue_latency_ms, lossy, \
+                error_class, error_source) \
+             VALUES ($1, $2, '', '', 'failed', 0, 0, 0, 0, $3, $4) \
+             ON CONFLICT(request_id) DO UPDATE SET \
+                status = excluded.status, \
+                error_class = excluded.error_class, \
+                error_source = excluded.error_source",
+        )
+        .bind(request_id)
+        .bind(now)
+        .bind(error_class)
+        .bind(error_source)
         .execute(self.pool.any())
         .await?;
         Ok(())
@@ -3831,6 +3899,152 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             prompt,
             Some(1),
             "recovered prompt_tokens must survive the upsert before RequestEvent arrives"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_capture_truncation_marks_request_failed() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        // Hot path emits a success RequestEvent (the normal flow for a
+        // streaming response whose truncation is discovered later).
+        sink.write_request_event(&dummy_request_event())
+            .await
+            .expect("write event");
+
+        let capture = ExchangeCapture {
+            request_id: "req-1".to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: None,
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: true,
+            truncation_reason: Some("idle".to_string()),
+            stream_duration_ms: None,
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        let row = sqlx::query(
+            "SELECT status, error_class, error_source, truncation_reason \
+             FROM request_logs WHERE request_id = $1",
+        )
+        .bind("req-1")
+        .fetch_one(pool.any())
+        .await
+        .expect("query");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_class"),
+            Some("deadline_exceeded".to_string())
+        );
+        assert!(row.get::<Option<String>, _>("error_source").is_some());
+        assert_eq!(
+            row.get::<Option<String>, _>("truncation_reason"),
+            Some("idle".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn write_capture_truncation_does_not_override_failed_requestevent() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        // Capture arrives first, marking the request as failed due to
+        // upstream_error truncation.
+        let capture = ExchangeCapture {
+            request_id: "req-2".to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: None,
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: true,
+            truncation_reason: Some("upstream_error".to_string()),
+            stream_duration_ms: None,
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        // The success RequestEvent arrives later (hot path). Its
+        // status/error_class/error_source must NOT override the
+        // failure already written by the capture.
+        let mut ev = dummy_request_event();
+        ev.request_id = "req-2".to_string();
+        sink.write_request_event(&ev).await.expect("write event");
+
+        let row = sqlx::query(
+            "SELECT status, error_class, error_source \
+             FROM request_logs WHERE request_id = $1",
+        )
+        .bind("req-2")
+        .fetch_one(pool.any())
+        .await
+        .expect("query");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_class"),
+            Some("transient".to_string())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("error_source"),
+            Some("upstream stream errored mid-stream".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn write_capture_client_disconnect_does_not_mark_failed() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        sink.write_request_event(&dummy_request_event())
+            .await
+            .expect("write event");
+
+        let capture = ExchangeCapture {
+            request_id: "req-1".to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: None,
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: true,
+            truncation_reason: Some("client_disconnect".to_string()),
+            stream_duration_ms: None,
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        let row = sqlx::query(
+            "SELECT status, error_class, error_source, truncation_reason \
+             FROM request_logs WHERE request_id = $1",
+        )
+        .bind("req-1")
+        .fetch_one(pool.any())
+        .await
+        .expect("query");
+        // Status stays success — client_disconnect is not a gateway
+        // failure.
+        assert_eq!(row.get::<String, _>("status"), "success");
+        assert!(row.get::<Option<String>, _>("error_class").is_none());
+        assert!(row.get::<Option<String>, _>("error_source").is_none());
+        assert_eq!(
+            row.get::<Option<String>, _>("truncation_reason"),
+            Some("client_disconnect".to_string())
         );
     }
 }

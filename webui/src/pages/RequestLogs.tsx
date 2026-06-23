@@ -85,28 +85,12 @@ function archiveStatusTitle(status: string) {
   return status;
 }
 
-function StatusBadge({
-  status,
-  truncationReason,
-}: {
-  status: string;
-  truncationReason?: string | null;
-}) {
+function StatusBadge({ status }: { status: string }) {
   const { t } = useTranslation();
   // Normalise legacy status values for backward compatibility.
   const normalized =
     status === "ok" ? "success" : status === "error" ? "failed" : status;
   if (normalized === "success") {
-    if (truncationReason) {
-      return (
-        <Badge
-          tone="warning"
-          title={t("requests.truncatedTitle", { reason: truncationReason })}
-        >
-          {t("requests.statusTruncated")}
-        </Badge>
-      );
-    }
     return <Badge tone="success">{t("requests.statusSuccess")}</Badge>;
   }
   if (normalized === "abnormal") {
@@ -341,19 +325,21 @@ export default function RequestLogs() {
   );
   const statusFilterOptions = useMemo(
     () =>
-      requestFilterOptions.statuses.map((value) => {
-        // Normalise legacy values for display.
-        const normalized =
-          value === "ok" ? "success" : value === "error" ? "failed" : value;
-        const labelKey = `requests.status${
-          normalized.charAt(0).toUpperCase() + normalized.slice(1)
-        }`;
-        const label = t(labelKey);
-        return {
-          value,
-          label: label === labelKey ? value : label,
-        };
-      }),
+      Array.from(
+        requestFilterOptions.statuses
+          .reduce<Map<string, string>>((acc, value) => {
+            // Normalise legacy values for display and dedup.
+            const normalized =
+              value === "ok" ? "success" : value === "error" ? "failed" : value;
+            const labelKey = `requests.status${
+              normalized.charAt(0).toUpperCase() + normalized.slice(1)
+            }`;
+            const label = t(labelKey);
+            acc.set(normalized, label === labelKey ? normalized : label);
+            return acc;
+          }, new Map<string, string>())
+          .entries(),
+      ).map(([value, label]) => ({ value, label })),
     [requestFilterOptions.statuses, t],
   );
   const errorClassFilterOptions = useMemo(
@@ -595,10 +581,7 @@ export default function RequestLogs() {
                       </div>
                     </Td>
                     <Td>
-                      <StatusBadge
-                        status={r.status}
-                        truncationReason={r.truncation_reason}
-                      />
+                      <StatusBadge status={r.status} />
                     </Td>
                     <Td className="text-right tabular-nums">
                       {r.http_status ?? "—"}
@@ -740,12 +723,7 @@ export default function RequestLogs() {
         <div className="space-y-5 text-sm">
           {/* ── Area 1: Summary Bar ── */}
           <div className="flex flex-wrap items-center gap-2">
-            <StatusBadge
-              status={detail?.status ?? ""}
-              truncationReason={
-                replayQuery.data?.truncation_reason ?? detail?.truncation_reason
-              }
-            />
+            <StatusBadge status={detail?.status ?? ""} />
             {detail?.http_status != null && (
               <span className="rounded bg-surface-muted px-1.5 py-0.5 font-mono text-xs tabular-nums">
                 {detail.http_status}
@@ -1092,7 +1070,12 @@ function MetricCell({
       {badge ? (
         <div className="mt-0.5">{badge}</div>
       ) : (
-        <div className={cn("text-text", mono && "font-mono tabular-nums")}>
+        <div
+          className={cn(
+            "text-text break-words",
+            mono && "font-mono tabular-nums",
+          )}
+        >
           {display}
           {unit && display !== "—" ? (
             <span className="ml-0.5 text-text-subtle">{unit}</span>

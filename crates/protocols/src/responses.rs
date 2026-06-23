@@ -144,15 +144,37 @@ impl EndpointCodec for ResponsesCodec {
                                 });
                             }
                             Some("input_image") => {
-                                if let Some(raw_url) = part["image_url"].as_str() {
+                                // Accept both the string form
+                                // `{"image_url": "data:..."}` and the object
+                                // form `{"image_url": {"url": "...",
+                                // "detail": "..."}}`.
+                                let (raw_url, detail) = if let Some(s) = part["image_url"].as_str()
+                                {
+                                    (s, None)
+                                } else if let Some(s) = part["image_url"]["url"].as_str() {
+                                    (s, part["image_url"]["detail"].as_str())
+                                } else {
+                                    ("", None)
+                                };
+                                if !raw_url.is_empty() {
                                     let (source, mime_type) =
                                         tiygate_core::ir::MediaSource::from_data_url(
                                             raw_url, "image/*",
                                         );
+                                    let mut metadata = std::collections::HashMap::<
+                                        String,
+                                        serde_json::Value,
+                                    >::new();
+                                    if let Some(d) = detail {
+                                        metadata.insert(
+                                            tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(),
+                                            serde_json::Value::String(d.to_string()),
+                                        );
+                                    }
                                     parts.push(Content::Media {
                                         source,
                                         mime_type,
-                                        metadata: Default::default(),
+                                        metadata,
                                     });
                                 }
                             }
@@ -484,17 +506,34 @@ impl EndpointCodec for ResponsesCodec {
                                 text_parts.push(json!({"type": "input_text", "text": text}));
                             }
                             Content::Media {
-                                source, mime_type, ..
+                                source,
+                                mime_type,
+                                metadata,
+                                ..
                             } => match source {
                                 tiygate_core::ir::MediaSource::Url { url } => {
-                                    text_parts
-                                        .push(json!({"type": "input_image", "image_url": url}));
+                                    let mut obj = json!({
+                                        "type": "input_image",
+                                        "image_url": url
+                                    });
+                                    if let Some(d) =
+                                        metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY)
+                                    {
+                                        obj["detail"] = d.clone();
+                                    }
+                                    text_parts.push(obj);
                                 }
                                 tiygate_core::ir::MediaSource::Inline { data } => {
-                                    text_parts.push(json!({
+                                    let mut obj = json!({
                                         "type": "input_image",
                                         "image_url": format!("data:{};base64,{}", mime_type, data)
-                                    }));
+                                    });
+                                    if let Some(d) =
+                                        metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY)
+                                    {
+                                        obj["detail"] = d.clone();
+                                    }
+                                    text_parts.push(obj);
                                 }
                                 _ => {}
                             },

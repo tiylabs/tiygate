@@ -267,7 +267,11 @@ pub(super) async fn handle_chat_completions(
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::QuotaExceeded, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::QuotaExceeded,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     }
@@ -278,7 +282,11 @@ pub(super) async fn handle_chat_completions(
         Err(e) => {
             let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::DecodeError, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::DecodeError,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -297,7 +305,11 @@ pub(super) async fn handle_chat_completions(
                 format!("No route found for model: {virtual_model}"),
             );
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::RouteNotFound, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::RouteNotFound,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -425,7 +437,11 @@ pub(super) async fn handle_messages(
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::QuotaExceeded, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::QuotaExceeded,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     }
@@ -435,7 +451,11 @@ pub(super) async fn handle_messages(
         Err(e) => {
             let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::DecodeError, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::DecodeError,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -452,7 +472,11 @@ pub(super) async fn handle_messages(
                 format!("No route found for model: {virtual_model}"),
             );
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::RouteNotFound, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::RouteNotFound,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -572,7 +596,11 @@ pub(super) async fn handle_embeddings(
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::QuotaExceeded, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::QuotaExceeded,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     }
@@ -637,7 +665,11 @@ pub(super) async fn handle_embeddings(
         Err(e) => {
             let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::DecodeError, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::DecodeError,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -652,7 +684,11 @@ pub(super) async fn handle_embeddings(
                 format!("No route found for model: {virtual_model}"),
             );
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::RouteNotFound, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::RouteNotFound,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -774,7 +810,11 @@ pub(super) async fn handle_responses(
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::QuotaExceeded, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::QuotaExceeded,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     }
@@ -784,7 +824,11 @@ pub(super) async fn handle_responses(
         Err(e) => {
             let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::DecodeError, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::DecodeError,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -800,7 +844,11 @@ pub(super) async fn handle_responses(
                 format!("No route found for model: {virtual_model}"),
             );
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::RouteNotFound, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::RouteNotFound,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -942,7 +990,11 @@ pub(super) async fn handle_gemini_generate(
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::QuotaExceeded, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::QuotaExceeded,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     }
@@ -960,7 +1012,11 @@ pub(super) async fn handle_gemini_generate(
         Err(e) => {
             let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::DecodeError, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::DecodeError,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -976,7 +1032,11 @@ pub(super) async fn handle_gemini_generate(
                 format!("No route found for model: {virtual_model}"),
             );
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::RouteNotFound, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::RouteNotFound,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -1095,7 +1155,11 @@ pub(super) async fn handle_images_generations(
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::QuotaExceeded, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::QuotaExceeded,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     }
@@ -1107,7 +1171,11 @@ pub(super) async fn handle_images_generations(
         Err(e) => {
             let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::DecodeError, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::DecodeError,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -1124,7 +1192,11 @@ pub(super) async fn handle_images_generations(
                 format!("No route found for model: {virtual_model}"),
             );
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::RouteNotFound, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::RouteNotFound,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };
@@ -1294,7 +1366,11 @@ pub(super) async fn handle_images_edits(
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::QuotaExceeded, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::QuotaExceeded,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     }
@@ -1307,7 +1383,11 @@ pub(super) async fn handle_images_edits(
                 format!("No route found for model: {virtual_model}"),
             );
             let http_status = app_err.http_status().as_u16();
-            scope.emit_error(RequestErrorClass::RouteNotFound, Some(&app_err.message), Some(http_status));
+            scope.emit_error(
+                RequestErrorClass::RouteNotFound,
+                Some(&app_err.message),
+                Some(http_status),
+            );
             return Err(app_err);
         }
     };

@@ -179,6 +179,11 @@ pub enum Content {
     },
 }
 
+/// Well-known metadata key for the OpenAI `image_url.detail` field (e.g.
+/// `"high"`, `"low"`, `"auto"`). Stored in [`Content::Media::metadata`] so the
+/// field survives protocol translation round-trips.
+pub const IMAGE_DETAIL_KEY: &str = "detail";
+
 /// How media is carried in the request/response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
