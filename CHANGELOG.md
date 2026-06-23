@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-06-23
+### :sparkles: New Features
+- [`d2accf6`](https://github.com/tiylabs/tiygate/commit/d2accf63c2d1097afe23fd815eb423e5e5ef2ece) - **ui**: ✨ show enabled state in target badges *(commit by [@jorben](https://github.com/jorben))*
+- [`982b5c0`](https://github.com/tiylabs/tiygate/commit/982b5c0eb14aad65d3b00d1d57b9d43266a63a91) - **protocol**: ✨ preserve image_url.detail across protocol translation *(commit by [@jorben](https://github.com/jorben))*
+
+### :bug: Bug Fixes
+- [`0bb6b29`](https://github.com/tiylabs/tiygate/commit/0bb6b29bda1aebce4301b247e7755e3d1c4bbb48) - **ingress**: 🐛 fix passthrough forwarding media-stripped body upstream *(commit by [@jorben](https://github.com/jorben))*
+
+
 ## [0.1.4] - 2026-06-22
 ### :sparkles: New Features
 - [`b4d06e4`](https://github.com/tiylabs/tiygate/commit/b4d06e4b265f0286c92190bcecdd8ddd51739c02) - **ingress**: ✨ detect and log downstream client disconnects during SSE streaming *(commit by [@jorben](https://github.com/jorben))*
@@ -120,3 +129,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.2]: https://github.com/tiylabs/tiygate/compare/0.1.1...0.1.2
 [0.1.3]: https://github.com/tiylabs/tiygate/compare/0.1.2...0.1.3
 [0.1.4]: https://github.com/tiylabs/tiygate/compare/0.1.3...0.1.4
+[0.1.5]: https://github.com/tiylabs/tiygate/compare/0.1.4...0.1.5
