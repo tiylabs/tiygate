@@ -234,6 +234,13 @@ export default function Layout() {
     window.localStorage.setItem("sidebar-collapsed", collapsed ? "1" : "0");
   }, [collapsed]);
 
+  // On macOS the Tauri title bar blends with the content background, so the
+  // sidebar needs a top border to avoid looking abruptly cut off.
+  const isTauriMac =
+    typeof window !== "undefined" &&
+    "__TAURI_INTERNALS__" in window &&
+    /Mac/i.test(navigator.userAgent);
+
   return (
     <div className="flex h-full overflow-hidden bg-bg">
       {/* Desktop sidebar — fixed full-height column that never scrolls
@@ -242,6 +249,10 @@ export default function Layout() {
         className={cn(
           "relative hidden h-full min-h-0 shrink-0 border-r border-border bg-surface transition-[width] duration-[var(--duration-fast)] lg:block",
           collapsed ? "w-16" : "w-56",
+          // On macOS the Tauri title bar blends with the content background,
+          // so round the top-right corner to match content tables and add a
+          // top border to avoid the sidebar looking abruptly cut off.
+          isTauriMac && "rounded-tr-md border-t",
         )}
       >
         <SidebarContent
