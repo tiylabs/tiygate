@@ -129,6 +129,40 @@ pub async fn enable_passwordless(
 }
 
 // ---------------------------------------------------------------------------
+// File save (backup export)
+// ---------------------------------------------------------------------------
+
+/// Show a native save-file dialog and write the supplied contents to
+/// the chosen path. Used by the config export page inside Tauri's
+/// macOS WKWebView, where the standard `<a download>` blob pattern
+/// does not work (WKWebView cancels the navigation with
+/// `NSURLErrorCancelled`).
+///
+/// Returns the path the file was written to, or `None` when the user
+/// cancels the dialog.
+#[tauri::command]
+pub async fn save_backup_file(
+    filename: String,
+    contents: String,
+) -> Result<Option<String>, String> {
+    let path = rfd::AsyncFileDialog::new()
+        .set_file_name(&filename)
+        .add_filter("JSON", &["json"])
+        .save_file()
+        .await;
+
+    let Some(path) = path else {
+        // User cancelled.
+        return Ok(None);
+    };
+
+    let path_str = path.path().to_string_lossy().to_string();
+    std::fs::write(&path_str, contents.into_bytes())
+        .map_err(|e| format!("failed to write file: {e}"))?;
+    Ok(Some(path_str))
+}
+
+// ---------------------------------------------------------------------------
 // Remote instance management commands
 // ---------------------------------------------------------------------------
 

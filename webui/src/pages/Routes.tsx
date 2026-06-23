@@ -20,7 +20,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { providersApi, routesApi } from "@/api/resources";
+import { providersApi, routesApi, type RouteFilter } from "@/api/resources";
 import type {
   Route,
   RouteInput,
@@ -53,6 +53,7 @@ import {
   useToast,
 } from "@/components/ui";
 import { PageHeader, fmtTime } from "@/components/PageHeader";
+import { Pagination } from "@/components/Pagination";
 import { cn } from "@/lib/cn";
 
 interface FormTarget extends RouteTarget {
@@ -66,6 +67,9 @@ interface FormState {
   routing_strategy: RoutingStrategyName | "";
   enabled: boolean;
 }
+
+const DEFAULT_PAGE_SIZE = 50;
+const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
 
 let nextTargetUiKey = 0;
 
@@ -111,9 +115,15 @@ export default function RoutesPage() {
   const qc = useQueryClient();
   const toast = useToast();
 
+  const [filter, setFilter] = useState<RouteFilter>({
+    limit: DEFAULT_PAGE_SIZE,
+    offset: 0,
+  });
+  const limit = filter.limit ?? DEFAULT_PAGE_SIZE;
+
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ["routes"],
-    queryFn: routesApi.list,
+    queryKey: ["routes", filter],
+    queryFn: () => routesApi.list(filter),
   });
   const { data: providers } = useQuery({
     queryKey: ["providers"],
@@ -121,7 +131,7 @@ export default function RoutesPage() {
   });
   const { scrollRef, scrollState } = useStickyTableScroll([
     isLoading,
-    data?.length ?? 0,
+    data?.entries.length ?? 0,
   ]);
   const providerNameById = useMemo(() => {
     const m = new Map<string, string>();
@@ -474,6 +484,22 @@ export default function RoutesPage() {
     [t],
   );
 
+  const total = data?.total ?? 0;
+  const offset = filter.offset ?? 0;
+  const page = Math.floor(offset / limit) + 1;
+  const pageCount = total === 0 ? 1 : Math.ceil(total / limit);
+
+  function changePage(next: number) {
+    const clamped = Math.max(1, Math.min(pageCount, next));
+    setFilter((f) => ({ ...f, offset: (clamped - 1) * limit }));
+  }
+
+  function setPageSize(n: number) {
+    setFilter((f) => ({ ...f, limit: n, offset: 0 }));
+  }
+
+  const routes = data?.entries ?? [];
+
   return (
     <div>
       <PageHeader
@@ -493,8 +519,12 @@ export default function RoutesPage() {
       ) : (
         <Card>
           {isLoading ? (
-            <TableSkeleton />
-          ) : (data ?? []).length === 0 ? (
+            <TableSkeleton
+              rows={12}
+              rowHeight="h-[68px]"
+              className="min-h-[calc(100vh-14rem)] lg:min-h-[calc(100vh-10rem)]"
+            />
+          ) : routes.length === 0 ? (
             <EmptyState
               title={t("common.emptyTitle")}
               description={t("routes.empty")}
@@ -510,7 +540,7 @@ export default function RoutesPage() {
             />
           ) : (
             <Table
-              maxHeight={["max-h-[calc(100vh-9.5rem)]", "lg:max-h-[calc(100vh-5.5rem)]"]}
+              maxHeight={["max-h-[calc(100vh-14rem)]", "lg:max-h-[calc(100vh-10rem)]"]}
               tableClassName="min-w-max border-separate border-spacing-0"
               containerRef={scrollRef}
             >
@@ -534,7 +564,7 @@ export default function RoutesPage() {
                   </Th>
                   <Th>{t("routes.targets")}</Th>
                   <Th className="text-center">{t("common.status")}</Th>
-                  <Th>{t("common.updatedAt")}</Th>
+                  <Th>{t("common.createdAt")}</Th>
                   <Th
                     className={cn(
                       "sticky right-0 z-30 bg-surface-muted text-right",
@@ -547,7 +577,7 @@ export default function RoutesPage() {
                 </tr>
               </Thead>
               <tbody>
-                {(data ?? []).map((r) => (
+                {routes.map((r) => (
                   <Tr key={r.id}>
                     <Td
                       className={cn(
@@ -588,7 +618,7 @@ export default function RoutesPage() {
                       )}
                     </Td>
                     <Td className="text-xs text-text-muted">
-                      {fmtTime(r.updated_at)}
+                      {fmtTime(r.created_at)}
                     </Td>
                     <Td
                       className={cn(
@@ -628,6 +658,31 @@ export default function RoutesPage() {
                 ))}
               </tbody>
             </Table>
+          )}
+          {routes.length > 0 && (
+            <Pagination
+              page={page}
+              pageCount={pageCount}
+              total={total}
+              limit={limit}
+              offset={offset}
+              pageSizeOptions={PAGE_SIZE_OPTIONS}
+              onPageChange={changePage}
+              onPageSizeChange={setPageSize}
+              labels={{
+                pageSizeLabel: t("routes.pageSizeLabel"),
+                pageSizeOption: t("routes.pageSizeOption"),
+                total: t("routes.total"),
+                range: t("routes.range"),
+                pageOf: t("routes.pageOf"),
+                first: t("routes.firstPage"),
+                prev: t("routes.prevPage"),
+                next: t("routes.nextPage"),
+                last: t("routes.lastPage"),
+                goTo: t("routes.goToPage"),
+                go: t("routes.go"),
+              }}
+            />
           )}
         </Card>
       )}

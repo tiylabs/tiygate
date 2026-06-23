@@ -29,6 +29,7 @@ hex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow = { workspace = true }
+rfd = "0.15"
 
 [features]
 # This feature is used for production builds or when a dev server is not

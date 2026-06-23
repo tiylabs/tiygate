@@ -513,7 +513,7 @@ export default function RequestLogs() {
       ) : (
         <Card>
           {isLoading ? (
-            <TableSkeleton rows={8} />
+            <TableSkeleton rows={8} rowHeight="h-14" />
           ) : entries.length === 0 ? (
             <EmptyState
               title={t("common.emptyTitle")}

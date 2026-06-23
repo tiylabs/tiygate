@@ -181,6 +181,22 @@ pub struct ExportSetting {
     pub encrypted: bool,
 }
 
+/// A single day of pre-aggregated token activity from the
+/// `token_daily_stats` table, carried in a config export/import
+/// bundle. The `updated_at` column is excluded — it is refreshed by
+/// the importing instance on merge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportTokenDailyStat {
+    pub day: String,
+    pub request_count: i64,
+    pub total_tokens: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub peak_single_request: i64,
+    pub longest_task_ms: i64,
+}
+
 /// Operator-selected subset of an import bundle. Each vec carries
 /// the ids (or setting keys) the user explicitly chose to import.
 /// Items present in the bundle but absent from the selection are
@@ -197,6 +213,12 @@ pub struct ImportSelection {
     pub api_keys: Vec<String>,
     #[serde(default)]
     pub settings: Vec<String>,
+    /// Selected `day` strings (YYYY-MM-DD) from the export bundle's
+    /// `token_daily_stats` section. Token stats use additive merge
+    /// (sum / MAX) rather than overwrite, so these are safe to
+    /// import repeatedly.
+    #[serde(default)]
+    pub token_stats: Vec<String>,
 }
 
 /// A serializable bundle of all configurable entities, used by the
@@ -223,6 +245,11 @@ pub struct ConfigExport {
     /// deserialize cleanly to an empty vec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settings: Vec<ExportSetting>,
+    /// Pre-aggregated daily token statistics. Absent on exports
+    /// produced before this field was added; `#[serde(default)]`
+    /// makes old bundles deserialize cleanly to an empty vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_daily_stats: Vec<ExportTokenDailyStat>,
 }
 
 /// Summary of an import operation, returned to the caller so the UI
@@ -238,6 +265,8 @@ pub struct ImportReport {
     pub api_keys_skipped: usize,
     pub settings_imported: usize,
     pub settings_skipped: usize,
+    pub token_stats_imported: usize,
+    pub token_stats_skipped: usize,
 }
 
 /// The full in-memory snapshot used by the data plane. Built from

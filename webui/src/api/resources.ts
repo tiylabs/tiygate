@@ -20,6 +20,7 @@ import type {
   RequestReplay,
   Route,
   RouteInput,
+  RouteListResponse,
   ServerInfo,
   Settings,
   SettingsResponse,
@@ -51,8 +52,15 @@ export const providerCatalogApi = {
 };
 
 // ---- routes ----
+export interface RouteFilter {
+  limit?: number;
+  offset?: number;
+}
 export const routesApi = {
-  list: () => apiRequest<Route[]>("/routes"),
+  list: (filter: RouteFilter = {}) =>
+    apiRequest<RouteListResponse>("/routes", {
+      query: filter as Record<string, string | number | boolean | undefined>,
+    }),
   get: (id: string) => apiRequest<Route>(`/routes/${id}`),
   create: (body: RouteInput) =>
     apiRequest<Route>("/routes", { method: "POST", body }),

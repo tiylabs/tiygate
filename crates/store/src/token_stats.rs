@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::config_store::DbConfigStore;
 use crate::db::DbPool;
+use crate::models::ExportTokenDailyStat;
 use crate::settings_keys;
 
 /// Configuration for the token-stats aggregation background task.
@@ -175,6 +176,26 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
     }
 
     // Step 3: Recompute summary from token_daily_stats.
+    recompute_summary(pool).await?;
+
+    debug!(
+        days_aggregated = rows.len(),
+        "token stats aggregation pass complete"
+    );
+
+    Ok(())
+}
+
+/// Recompute the single-row `token_summary` table from the current
+/// contents of `token_daily_stats`. Computes `lifetime_tokens`
+/// (SUM), `peak_day_tokens` (MAX), `longest_task_ms` (MAX), and
+/// streaks (via `compute_streaks`). Public so the config import
+/// path can call it after merging imported daily stats.
+pub async fn recompute_summary(pool: &DbPool) -> Result<(), sqlx::Error> {
+    let now = Utc::now();
+    let today = now.date_naive();
+    let updated_at = now.to_rfc3339();
+
     let lifetime_tokens: i64 =
         sqlx::query_scalar("SELECT COALESCE(SUM(total_tokens), 0) FROM token_daily_stats")
             .fetch_one(pool.any())
@@ -190,7 +211,6 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
             .fetch_one(pool.any())
             .await?;
 
-    // Compute streaks from the daily stats table.
     let (current_streak, longest_streak) = compute_streaks(pool, today).await?;
 
     sqlx::query(
@@ -213,8 +233,8 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
     .await?;
 
     debug!(
-        days_aggregated = rows.len(),
-        lifetime_tokens, current_streak, longest_streak, "token stats aggregation pass complete"
+        lifetime_tokens,
+        current_streak, longest_streak, "token summary recomputed"
     );
 
     Ok(())
@@ -351,6 +371,38 @@ pub async fn get_token_summary(pool: &DbPool) -> Result<TokenSummaryData, sqlx::
         longest_streak: row.get("longest_streak"),
         updated_at: row.get("updated_at"),
     })
+}
+
+/// Export all rows from `token_daily_stats` for inclusion in a config
+/// backup bundle. Rows are ordered by `day` ascending. The
+/// `updated_at` column is omitted — the importing instance refreshes
+/// it during the additive merge.
+pub async fn export_token_daily_stats(
+    pool: &DbPool,
+) -> Result<Vec<ExportTokenDailyStat>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT day, request_count, total_tokens, prompt_tokens, \
+                completion_tokens, reasoning_tokens, peak_single_request, \
+                longest_task_ms \
+         FROM token_daily_stats ORDER BY day",
+    )
+    .fetch_all(pool.any())
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(ExportTokenDailyStat {
+            day: r.get("day"),
+            request_count: r.get("request_count"),
+            total_tokens: r.get("total_tokens"),
+            prompt_tokens: r.get("prompt_tokens"),
+            completion_tokens: r.get("completion_tokens"),
+            reasoning_tokens: r.get("reasoning_tokens"),
+            peak_single_request: r.get("peak_single_request"),
+            longest_task_ms: r.get("longest_task_ms"),
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

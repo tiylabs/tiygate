@@ -175,6 +175,7 @@ pub fn run() {
             commands::get_server_port,
             commands::get_master_key,
             commands::apply_master_key,
+            commands::save_backup_file,
             commands::list_instances,
             commands::add_instance,
             commands::update_instance,

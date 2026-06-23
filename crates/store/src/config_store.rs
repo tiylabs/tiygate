@@ -752,8 +752,32 @@ impl DbConfigStore {
 
     // --- Route CRUD ---
 
-    pub async fn list_routes(&self) -> Result<Vec<Route>, StoreError> {
-        self.load_routes().await
+    /// Paginated route listing ordered by `created_at DESC`.
+    ///
+    /// Returns `(page_rows, total_count)` so the admin handler can build the
+    /// standard `{ total, limit, offset, entries }` envelope. `limit` and
+    /// `offset` are clamped by the caller before reaching this method.
+    pub async fn list_routes_paginated(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Route>, u64), StoreError> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM routes")
+            .fetch_one(self.pool.any())
+            .await?;
+        let rows = sqlx::query(
+            "SELECT id, virtual_model, targets_json, routing_strategy, enabled, created_at, updated_at \
+             FROM routes ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+        )
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(self.pool.any())
+        .await?;
+        let routes: Vec<Route> = rows
+            .into_iter()
+            .map(row_to_route)
+            .collect::<Result<_, _>>()?;
+        Ok((routes, total as u64))
     }
 
     pub async fn get_route(&self, id: &str) -> Result<Option<Route>, StoreError> {
@@ -983,6 +1007,7 @@ impl DbConfigStore {
                 value,
             })
             .collect();
+        let token_daily_stats = crate::token_stats::export_token_daily_stats(&self.pool).await?;
         Ok(ConfigExport {
             schema_version: 1,
             exported_at: chrono::Utc::now().to_rfc3339(),
@@ -991,6 +1016,7 @@ impl DbConfigStore {
             routes,
             api_keys,
             settings,
+            token_daily_stats,
         })
     }
 
@@ -1047,6 +1073,8 @@ impl DbConfigStore {
             selection.api_keys.iter().map(String::as_str).collect();
         let sel_settings: std::collections::HashSet<&str> =
             selection.settings.iter().map(String::as_str).collect();
+        let sel_token_stats: std::collections::HashSet<&str> =
+            selection.token_stats.iter().map(String::as_str).collect();
 
         let mut tx = self.pool.any().begin().await?;
         let mut report = ImportReport {
@@ -1058,6 +1086,8 @@ impl DbConfigStore {
             api_keys_skipped: 0,
             settings_imported: 0,
             settings_skipped: 0,
+            token_stats_imported: 0,
+            token_stats_skipped: 0,
         };
 
         for p in &data.providers {
@@ -1255,7 +1285,53 @@ impl DbConfigStore {
             report.settings_imported += 1;
         }
 
+        // Token daily stats: additive merge. For each selected day,
+        // sum the count/token columns and take MAX of the peak/latency
+        // columns. This is non-destructive — importing the same day
+        // twice accumulates rather than overwrites.
+        for s in &data.token_daily_stats {
+            if !sel_token_stats.contains(s.day.as_str()) {
+                report.token_stats_skipped += 1;
+                continue;
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            sqlx::query(
+                "INSERT INTO token_daily_stats \
+                    (day, request_count, total_tokens, prompt_tokens, completion_tokens, \
+                     reasoning_tokens, peak_single_request, longest_task_ms, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 ON CONFLICT(day) DO UPDATE SET \
+                    request_count = token_daily_stats.request_count + excluded.request_count, \
+                    total_tokens = token_daily_stats.total_tokens + excluded.total_tokens, \
+                    prompt_tokens = token_daily_stats.prompt_tokens + excluded.prompt_tokens, \
+                    completion_tokens = token_daily_stats.completion_tokens + excluded.completion_tokens, \
+                    reasoning_tokens = token_daily_stats.reasoning_tokens + excluded.reasoning_tokens, \
+                    peak_single_request = MAX(token_daily_stats.peak_single_request, excluded.peak_single_request), \
+                    longest_task_ms = MAX(token_daily_stats.longest_task_ms, excluded.longest_task_ms), \
+                    updated_at = excluded.updated_at",
+            )
+            .bind(&s.day)
+            .bind(s.request_count)
+            .bind(s.total_tokens)
+            .bind(s.prompt_tokens)
+            .bind(s.completion_tokens)
+            .bind(s.reasoning_tokens)
+            .bind(s.peak_single_request)
+            .bind(s.longest_task_ms)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            report.token_stats_imported += 1;
+        }
+
         tx.commit().await?;
+        // Recompute the token_summary from the merged daily stats so
+        // lifetime/peak/streaks reflect the combined data. This runs
+        // after commit because recompute_summary uses the pool
+        // directly (compute_streaks queries via pool.any()).
+        if report.token_stats_imported > 0 {
+            crate::token_stats::recompute_summary(&self.pool).await?;
+        }
         // Refresh the in-memory snapshot so the data plane picks up
         // the newly imported rows immediately.
         self.refresh().await?;
@@ -1808,6 +1884,7 @@ mod tests {
             routes: vec![],
             api_keys: vec![],
             settings: vec![],
+            token_daily_stats: vec![],
         };
 
         // Select only the new provider; the existing one stays
@@ -1915,6 +1992,7 @@ mod tests {
             routes: vec![],
             api_keys: vec![],
             settings: vec![],
+            token_daily_stats: vec![],
         };
         let err = store
             .import_config(&bundle, "", &ImportSelection::default())
@@ -1952,6 +2030,7 @@ mod tests {
                 updated_at: now,
             }],
             settings: vec![],
+            token_daily_stats: vec![],
         };
 
         let selection = ImportSelection {
@@ -2006,6 +2085,7 @@ mod tests {
             routes: vec![],
             api_keys: vec![],
             settings: vec![],
+            token_daily_stats: vec![],
         };
 
         // Explicitly select the existing id → upsert overwrites it.
@@ -2053,6 +2133,7 @@ mod tests {
             routes: vec![],
             api_keys: vec![],
             settings: vec![],
+            token_daily_stats: vec![],
         };
 
         let report = store
@@ -2233,5 +2314,233 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(val, "AKIATEST");
+    }
+
+    // --- token_stats export / import tests ---
+
+    use crate::models::ExportTokenDailyStat;
+
+    async fn insert_daily_stat(
+        pool: &DbPool,
+        day: &str,
+        request_count: i64,
+        total_tokens: i64,
+        peak: i64,
+        longest_ms: i64,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO token_daily_stats \
+                (day, request_count, total_tokens, prompt_tokens, completion_tokens, \
+                 reasoning_tokens, peak_single_request, longest_task_ms, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT(day) DO UPDATE SET \
+                request_count = excluded.request_count, \
+                total_tokens = excluded.total_tokens, \
+                prompt_tokens = excluded.prompt_tokens, \
+                completion_tokens = excluded.completion_tokens, \
+                reasoning_tokens = excluded.reasoning_tokens, \
+                peak_single_request = excluded.peak_single_request, \
+                longest_task_ms = excluded.longest_task_ms, \
+                updated_at = excluded.updated_at",
+        )
+        .bind(day)
+        .bind(request_count)
+        .bind(total_tokens)
+        .bind(total_tokens / 2)
+        .bind(total_tokens / 2)
+        .bind(0i64)
+        .bind(peak)
+        .bind(longest_ms)
+        .bind(&now)
+        .execute(pool.any())
+        .await
+        .expect("insert daily stat");
+    }
+
+    #[tokio::test]
+    async fn export_config_includes_token_daily_stats() {
+        let store = boot_store(None).await;
+        let today = chrono::Utc::now().date_naive();
+        let day_str = today.format("%Y-%m-%d").to_string();
+        insert_daily_stat(&store.pool, &day_str, 5, 500, 200, 8000).await;
+
+        let bundle = store.export_config().await.expect("export");
+        assert!(
+            !bundle.token_daily_stats.is_empty(),
+            "export must include token_daily_stats"
+        );
+        let row = bundle
+            .token_daily_stats
+            .iter()
+            .find(|s| s.day == day_str)
+            .expect("today's stat present");
+        assert_eq!(row.request_count, 5);
+        assert_eq!(row.total_tokens, 500);
+        assert_eq!(row.peak_single_request, 200);
+        assert_eq!(row.longest_task_ms, 8000);
+    }
+
+    #[tokio::test]
+    async fn import_token_stats_merges_additively() {
+        let store = boot_store(None).await;
+        let today = chrono::Utc::now().date_naive();
+        let day_str = today.format("%Y-%m-%d").to_string();
+        // Pre-populate with 100 tokens for today.
+        insert_daily_stat(&store.pool, &day_str, 1, 100, 50, 3000).await;
+
+        // Build a bundle that imports 200 more tokens for the same day.
+        let bundle = ConfigExport {
+            schema_version: 1,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            encrypted: false,
+            providers: vec![],
+            routes: vec![],
+            api_keys: vec![],
+            settings: vec![],
+            token_daily_stats: vec![ExportTokenDailyStat {
+                day: day_str.clone(),
+                request_count: 2,
+                total_tokens: 200,
+                prompt_tokens: 100,
+                completion_tokens: 100,
+                reasoning_tokens: 0,
+                peak_single_request: 150,
+                longest_task_ms: 5000,
+            }],
+        };
+        let selection = ImportSelection {
+            token_stats: vec![day_str.clone()],
+            ..Default::default()
+        };
+        let report = store
+            .import_config(&bundle, "", &selection)
+            .await
+            .expect("import");
+        assert_eq!(report.token_stats_imported, 1);
+        assert_eq!(report.token_stats_skipped, 0);
+
+        // Verify additive merge: 100 + 200 = 300 tokens, 1 + 2 = 3 requests.
+        let activity = crate::token_stats::get_token_activity(&store.pool, 365)
+            .await
+            .expect("activity");
+        let today_row = activity
+            .iter()
+            .find(|a| a.day == day_str)
+            .expect("today row");
+        assert_eq!(today_row.total_tokens, 300);
+        assert_eq!(today_row.request_count, 3);
+
+        // Verify peak and longest take MAX: max(50, 150) = 150, max(3000, 5000) = 5000.
+        let exported = crate::token_stats::export_token_daily_stats(&store.pool)
+            .await
+            .expect("export");
+        let row = exported
+            .iter()
+            .find(|s| s.day == day_str)
+            .expect("today row");
+        assert_eq!(row.peak_single_request, 150);
+        assert_eq!(row.longest_task_ms, 5000);
+    }
+
+    #[tokio::test]
+    async fn import_token_stats_recomputes_summary() {
+        let store = boot_store(None).await;
+        let today = chrono::Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let today_str = today.format("%Y-%m-%d").to_string();
+        let yesterday_str = yesterday.format("%Y-%m-%d").to_string();
+
+        // Import two days of stats.
+        let bundle = ConfigExport {
+            schema_version: 1,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            encrypted: false,
+            providers: vec![],
+            routes: vec![],
+            api_keys: vec![],
+            settings: vec![],
+            token_daily_stats: vec![
+                ExportTokenDailyStat {
+                    day: yesterday_str.clone(),
+                    request_count: 3,
+                    total_tokens: 300,
+                    prompt_tokens: 150,
+                    completion_tokens: 150,
+                    reasoning_tokens: 0,
+                    peak_single_request: 200,
+                    longest_task_ms: 4000,
+                },
+                ExportTokenDailyStat {
+                    day: today_str.clone(),
+                    request_count: 2,
+                    total_tokens: 500,
+                    prompt_tokens: 250,
+                    completion_tokens: 250,
+                    reasoning_tokens: 0,
+                    peak_single_request: 350,
+                    longest_task_ms: 6000,
+                },
+            ],
+        };
+        let selection = ImportSelection {
+            token_stats: vec![yesterday_str.clone(), today_str.clone()],
+            ..Default::default()
+        };
+        store
+            .import_config(&bundle, "", &selection)
+            .await
+            .expect("import");
+
+        // Verify summary was recomputed.
+        let summary = crate::token_stats::get_token_summary(&store.pool)
+            .await
+            .expect("summary");
+        // lifetime = 300 + 500 = 800
+        assert_eq!(summary.lifetime_tokens, 800);
+        // peak day = max(300, 500) = 500
+        assert_eq!(summary.peak_day_tokens, 500);
+        // longest task = max(4000, 6000) = 6000
+        assert_eq!(summary.longest_task_ms, 6000);
+        // current streak = 2 (yesterday + today)
+        assert_eq!(summary.current_streak, 2);
+        assert_eq!(summary.longest_streak, 2);
+    }
+
+    #[tokio::test]
+    async fn import_old_bundle_without_token_stats_still_works() {
+        let store = boot_store(None).await;
+        // A bundle with no token_daily_stats field (simulating an old export).
+        // Since the field has #[serde(default)], deserializing a JSON
+        // without it yields an empty vec. We test the struct directly.
+        let bundle = ConfigExport {
+            schema_version: 1,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            encrypted: false,
+            providers: vec![],
+            routes: vec![],
+            api_keys: vec![],
+            settings: vec![],
+            token_daily_stats: vec![],
+        };
+        let report = store
+            .import_config(&bundle, "", &ImportSelection::default())
+            .await
+            .expect("import");
+        assert_eq!(report.token_stats_imported, 0);
+        assert_eq!(report.token_stats_skipped, 0);
+
+        // Also verify JSON deserialization of an old-format export.
+        let old_json = r#"{
+            "schema_version": 1,
+            "exported_at": "2024-01-01T00:00:00Z",
+            "encrypted": false,
+            "providers": [],
+            "routes": [],
+            "api_keys": []
+        }"#;
+        let parsed: ConfigExport = serde_json::from_str(old_json).expect("deserialize old");
+        assert!(parsed.token_daily_stats.is_empty());
+        assert!(parsed.settings.is_empty());
     }
 }

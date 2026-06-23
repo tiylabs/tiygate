@@ -93,6 +93,13 @@ export interface RouteInput {
   enabled?: boolean;
 }
 
+export interface RouteListResponse {
+  total: number;
+  limit: number;
+  offset: number;
+  entries: Route[];
+}
+
 export interface QuotaSpec {
   requests_per_minute?: number | null;
   requests_per_day?: number | null;
@@ -361,6 +368,19 @@ export interface ExportSetting {
   encrypted: boolean;
 }
 
+/** One day of pre-aggregated token statistics from the export bundle.
+ *  Mirrors the Rust `ExportTokenDailyStat` model. */
+export interface ExportTokenDailyStat {
+  day: string;
+  request_count: number;
+  total_tokens: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  reasoning_tokens: number;
+  peak_single_request: number;
+  longest_task_ms: number;
+}
+
 export interface ConfigExport {
   schema_version: number;
   exported_at: string;
@@ -369,6 +389,7 @@ export interface ConfigExport {
   routes: ExportRoute[];
   api_keys: ExportApiKey[];
   settings?: ExportSetting[];
+  token_daily_stats?: ExportTokenDailyStat[];
 }
 
 export interface ImportSelection {
@@ -376,6 +397,7 @@ export interface ImportSelection {
   routes: string[];
   api_keys: string[];
   settings: string[];
+  token_stats: string[];
 }
 
 export interface ImportReport {
@@ -387,6 +409,8 @@ export interface ImportReport {
   api_keys_skipped: number;
   settings_imported: number;
   settings_skipped: number;
+  token_stats_imported: number;
+  token_stats_skipped: number;
 }
 
 // ---- Settings ----

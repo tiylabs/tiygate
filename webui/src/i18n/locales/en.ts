@@ -73,7 +73,6 @@ const en = {
     instanceSelectDesc:
       "Choose a TiyGate instance to manage. You can switch later from the dashboard.",
     localInstance: "Local instance",
-    localInstanceDesc: "Run TiyGate locally on this machine.",
     localShort: "Local",
     addRemote: "Add remote instance",
     instanceLabel: "Label",
@@ -254,6 +253,17 @@ const en = {
     virtualModelCopyFailed: "Failed to copy virtual model name.",
     empty:
       "No routes yet. Map a virtual model to one or more provider targets.",
+    total: "{{count}} total",
+    pageSizeLabel: "Per page",
+    pageSizeOption: "{{count}} / page",
+    pageOf: "Page {{page}} of {{total}}",
+    range: "{{from}}–{{to}} of {{total}}",
+    firstPage: "First page",
+    prevPage: "Previous page",
+    nextPage: "Next page",
+    lastPage: "Last page",
+    goToPage: "Go to",
+    go: "Go",
   },
   apiKeys: {
     title: "API Keys",
@@ -559,6 +569,7 @@ const en = {
       routes: "Routes",
       api_keys: "API Keys",
       settings: "Settings",
+      token_stats: "Token Statistics",
     },
     exportBtn: "Export Backup",
     exportSuccess: "Backup exported.",
@@ -571,7 +582,7 @@ const en = {
     invalidFormat:
       "Invalid file format. Please select a backup file exported by TiyGate.",
     fileSummary:
-      "Providers {{providers}} · Routes {{routes}} · API keys {{apiKeys}} · Settings {{settings}} · Encrypted: {{encrypted}}",
+      "Providers {{providers}} · Routes {{routes}} · API keys {{apiKeys}} · Settings {{settings}} · Token stats {{tokenStats}} days · Encrypted: {{encrypted}}",
     masterKey: "MASTER_KEY",
     masterKeyHint:
       "The source instance's TIYGATE_MASTER_KEY. Leave blank if the export file is not encrypted.",
@@ -582,6 +593,12 @@ const en = {
     routesResult: "Routes: imported {{imported}}, skipped {{skipped}}",
     apiKeysResult: "API keys: imported {{imported}}, skipped {{skipped}}",
     settingsResult: "Settings: imported {{imported}}, skipped {{skipped}}",
+    tokenStatsResult:
+      "Token stats: imported {{imported}} days, skipped {{skipped}} days",
+    tokenStatsMergeHint:
+      "Token statistics are merged additively (request counts and tokens are summed, peaks take MAX). Re-importing does not overwrite existing data.",
+    tokenStatsDay: "{{tokens}} tokens · {{requests}} requests",
+    mergeBadge: "Merge",
     loadingPreview: "Loading current instance data for preview…",
     previewLoadError: "Failed to load current instance data for preview.",
     previewHint:

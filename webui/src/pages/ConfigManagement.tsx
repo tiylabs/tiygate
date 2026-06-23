@@ -15,10 +15,13 @@ import {
   routesApi,
   apiKeysApi,
   settingsApi,
+  statsApi,
 } from "@/api/resources";
+import { isTauri } from "@/auth/setup";
 import type {
   ConfigExport,
   ExportSetting,
+  ExportTokenDailyStat,
   ImportReport,
   ImportSelection,
 } from "@/api/types";
@@ -36,9 +39,15 @@ import {
 } from "@/components/ui";
 import { PageHeader } from "@/components/PageHeader";
 
-type ScopeKey = "providers" | "routes" | "api_keys" | "settings";
+type ScopeKey = "providers" | "routes" | "api_keys" | "settings" | "token_stats";
 
-const ALL_SCOPES: ScopeKey[] = ["providers", "routes", "api_keys", "settings"];
+const ALL_SCOPES: ScopeKey[] = [
+  "providers",
+  "routes",
+  "api_keys",
+  "settings",
+  "token_stats",
+];
 
 /** A single item shown in the restore preview list. */
 interface PreviewItem {
@@ -64,11 +73,12 @@ export default function ConfigManagement() {
     routes: true,
     api_keys: true,
     settings: true,
+    token_stats: true,
   });
 
   const exportMutation = useMutation({
-    mutationFn: () => configApi.export(),
-    onSuccess: (bundle) => {
+    mutationFn: async () => {
+      const bundle = await configApi.export();
       // Filter the bundle by the selected scopes before downloading.
       const filtered: ConfigExport = {
         ...bundle,
@@ -76,19 +86,40 @@ export default function ConfigManagement() {
         routes: exportScope.routes ? bundle.routes : [],
         api_keys: exportScope.api_keys ? bundle.api_keys : [],
         settings: exportScope.settings ? (bundle.settings ?? []) : [],
+        token_daily_stats: exportScope.token_stats
+          ? (bundle.token_daily_stats ?? [])
+          : [],
       };
       const json = JSON.stringify(filtered, null, 2);
+      const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      const filename = `tiygate-backup-${ts}.json`;
+      if (isTauri()) {
+        // Tauri's macOS WKWebView does not support the `<a download>`
+        // + blob URL pattern (NSURLErrorCancelled). Route the save
+        // through a native file dialog via the Rust backend instead.
+        const mod = await import("@tauri-apps/api/core");
+        const saved = await mod.invoke<string | null>(
+          "save_backup_file",
+          { filename, contents: json },
+        );
+        return saved !== null;
+      }
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-      a.download = `tiygate-backup-${ts}.json`;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      toast.success(t("backup.exportSuccess"));
+      return true;
+    },
+    onSuccess: (saved) => {
+      if (saved) {
+        toast.success(t("backup.exportSuccess"));
+      }
+      // If saved is false the user cancelled the Tauri save dialog.
     },
     onError: (e: Error) => {
       toast.error(e.message);
@@ -110,17 +141,20 @@ export default function ConfigManagement() {
   const existingQuery = useQuery({
     queryKey: ["config-restore-existing"],
     queryFn: async () => {
-      const [providers, routes, apiKeys, settingsResp] = await Promise.all([
-        providersApi.list(),
-        routesApi.list(),
-        apiKeysApi.list(),
-        settingsApi.list(),
-      ]);
+      const [providers, routesResp, apiKeys, settingsResp, tokenActivity] =
+        await Promise.all([
+          providersApi.list(),
+          routesApi.list({ limit: 500 }),
+          apiKeysApi.list(),
+          settingsApi.list(),
+          statsApi.tokenActivity(730),
+        ]);
       return {
         providerIds: new Set(providers.map((p) => p.id)),
-        routeIds: new Set(routes.map((r) => r.id)),
+        routeIds: new Set(routesResp.entries.map((r) => r.id)),
         apiKeyIds: new Set(apiKeys.map((k) => k.id)),
         settingKeys: new Set(Object.keys(settingsResp.settings)),
+        tokenStatsDays: new Set(tokenActivity.days.map((d) => d.day)),
       };
     },
     enabled: parsedBackup !== null,
@@ -181,6 +215,19 @@ export default function ConfigManagement() {
         })),
         existing?.settingKeys,
       ),
+      token_stats: buildItems(
+        (parsedBackup.token_daily_stats ?? []).map(
+          (s: ExportTokenDailyStat) => ({
+            id: s.day,
+            label: s.day,
+            sub: t("backup.tokenStatsDay", {
+              tokens: s.total_tokens,
+              requests: s.request_count,
+            }),
+          }),
+        ),
+        existing?.tokenStatsDays,
+      ),
     };
   }, [parsedBackup, existingQuery.data, t]);
 
@@ -194,7 +241,15 @@ export default function ConfigManagement() {
     const next: Record<string, boolean> = {};
     for (const scope of ALL_SCOPES) {
       for (const item of preview[scope]) {
-        next[`${scope}:${item.id}`] = !item.exists;
+        // Token stats use additive merge (sum / MAX), which is
+        // non-destructive. Default-check all days, including those
+        // that already exist, since re-importing accumulates rather
+        // than overwrites.
+        if (scope === "token_stats") {
+          next[`${scope}:${item.id}`] = true;
+        } else {
+          next[`${scope}:${item.id}`] = !item.exists;
+        }
       }
     }
     setChecked(next);
@@ -249,6 +304,10 @@ export default function ConfigManagement() {
         if (!Array.isArray(parsed.settings)) {
           parsed.settings = [];
         }
+        // Normalize optional token_daily_stats to an array.
+        if (!Array.isArray(parsed.token_daily_stats)) {
+          parsed.token_daily_stats = [];
+        }
         setParsedBackup(parsed);
       } catch {
         setParseError(t("backup.invalidFormat"));
@@ -264,13 +323,20 @@ export default function ConfigManagement() {
 
   function buildSelection(): ImportSelection {
     if (!preview) {
-      return { providers: [], routes: [], api_keys: [], settings: [] };
+      return {
+        providers: [],
+        routes: [],
+        api_keys: [],
+        settings: [],
+        token_stats: [],
+      };
     }
     const sel: ImportSelection = {
       providers: [],
       routes: [],
       api_keys: [],
       settings: [],
+      token_stats: [],
     };
     for (const scope of ALL_SCOPES) {
       for (const item of preview[scope]) {
@@ -361,13 +427,18 @@ export default function ConfigManagement() {
                     <span className="truncate font-medium text-text">
                       {item.label}
                     </span>
-                    {item.exists && (
-                      <Badge tone={isChecked ? "warning" : "neutral"}>
-                        {isChecked
-                          ? t("backup.overwriteBadge")
-                          : t("backup.existsBadge")}
-                      </Badge>
-                    )}
+                    {item.exists &&
+                      (scope === "token_stats" ? (
+                        <Badge tone="info">
+                          {t("backup.mergeBadge")}
+                        </Badge>
+                      ) : (
+                        <Badge tone={isChecked ? "warning" : "neutral"}>
+                          {isChecked
+                            ? t("backup.overwriteBadge")
+                            : t("backup.existsBadge")}
+                        </Badge>
+                      ))}
                     {item.encrypted && (
                       <Badge tone="info">{t("backup.encryptedBadge")}</Badge>
                     )}
@@ -470,6 +541,7 @@ export default function ConfigManagement() {
                   routes: parsedBackup.routes.length,
                   apiKeys: parsedBackup.api_keys.length,
                   settings: parsedBackup.settings?.length ?? 0,
+                  tokenStats: parsedBackup.token_daily_stats?.length ?? 0,
                   encrypted: parsedBackup.encrypted
                     ? t("common.yes")
                     : t("common.no"),
@@ -497,6 +569,17 @@ export default function ConfigManagement() {
                     {t("backup.previewHint")}
                   </p>
                 </div>
+                {preview.token_stats.length > 0 && (
+                  <div className="flex items-start gap-2 rounded-sm border border-info/30 bg-info/5 px-3 py-2">
+                    <Info
+                      size={14}
+                      className="mt-0.5 shrink-0 text-info"
+                    />
+                    <p className="text-xs text-text-muted">
+                      {t("backup.tokenStatsMergeHint")}
+                    </p>
+                  </div>
+                )}
                 {renderPreviewGroup(
                   "providers",
                   t("backup.scope.providers"),
@@ -516,6 +599,11 @@ export default function ConfigManagement() {
                   "settings",
                   t("backup.scope.settings"),
                   preview.settings,
+                )}
+                {renderPreviewGroup(
+                  "token_stats",
+                  t("backup.scope.token_stats"),
+                  preview.token_stats,
                 )}
               </div>
             )}
@@ -580,6 +668,12 @@ export default function ConfigManagement() {
                     {t("backup.settingsResult", {
                       imported: restoreResult.settings_imported,
                       skipped: restoreResult.settings_skipped,
+                    })}
+                  </li>
+                  <li>
+                    {t("backup.tokenStatsResult", {
+                      imported: restoreResult.token_stats_imported,
+                      skipped: restoreResult.token_stats_skipped,
                     })}
                   </li>
                 </ul>

@@ -83,6 +83,7 @@ export default function Setup() {
   const [selectedId, setSelectedId] = useState<string | null>(null); // null = local
   const [healthMap, setHealthMap] = useState<Record<string, HealthStatus>>({});
   const [localHealth, setLocalHealth] = useState<HealthStatus | null>(null);
+  const [localUrl, setLocalUrl] = useState<string | null>(null);
   // Add / edit form
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -117,7 +118,9 @@ export default function Setup() {
         // Probe health for the local sidecar.
         const port = await tauriGetServerPort();
         if (port && !cancelled) {
-          tauriCheckInstanceHealth(`http://127.0.0.1:${port}`, false).then(
+          const url = `http://127.0.0.1:${port}`;
+          setLocalUrl(url);
+          tauriCheckInstanceHealth(url, false).then(
             (status) => {
               if (!cancelled) setLocalHealth(status);
             },
@@ -406,9 +409,11 @@ export default function Setup() {
                       <p className="font-medium text-text">
                         {t("setup.localInstance")}
                       </p>
-                      <p className="mt-0.5 text-sm text-text-muted">
-                        {t("setup.localInstanceDesc")}
-                      </p>
+                      {localUrl && (
+                        <p className="mt-0.5 truncate text-xs text-text-muted">
+                          {localUrl}
+                        </p>
+                      )}
                     </div>
                     {selectedId === null && (
                       <span className="text-xs font-medium text-primary">

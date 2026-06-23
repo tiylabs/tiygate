@@ -521,10 +521,28 @@ impl From<Route> for RouteView {
     }
 }
 
-async fn list_routes(State(state): State<AdminState>) -> Result<Response, AdminError> {
-    let routes = state.store.list_routes().await?;
-    let views: Vec<RouteView> = routes.into_iter().map(Into::into).collect();
-    Ok(Json(views).into_response())
+/// Query parameters for `GET /admin/v1/routes` (paginated list).
+#[derive(Debug, Deserialize)]
+struct RouteListQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+async fn list_routes(
+    State(state): State<AdminState>,
+    axum::extract::Query(q): axum::extract::Query<RouteListQuery>,
+) -> Result<Response, AdminError> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0);
+    let (routes, total) = state.store.list_routes_paginated(limit, offset).await?;
+    let entries: Vec<RouteView> = routes.into_iter().map(Into::into).collect();
+    Ok(Json(json!({
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "entries": entries
+    }))
+    .into_response())
 }
 
 async fn get_route(
@@ -1385,6 +1403,8 @@ async fn import_config(
             "api_keys_skipped": report.api_keys_skipped,
             "settings_imported": report.settings_imported,
             "settings_skipped": report.settings_skipped,
+            "token_stats_imported": report.token_stats_imported,
+            "token_stats_skipped": report.token_stats_skipped,
         }),
     )
     .await;
