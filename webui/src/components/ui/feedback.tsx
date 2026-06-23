@@ -30,12 +30,38 @@ export function Skeleton({ className }: { className?: string }) {
   );
 }
 
-/** Table skeleton placeholder (docs §9: >1s list loading prefers skeleton). */
-export function TableSkeleton({ rows = 5 }: { rows?: number }) {
+/**
+ * Table skeleton placeholder (docs §9: >1s list loading prefers skeleton).
+ * `rowHeight` should approximate the real row height so the skeleton does not
+ * collapse shorter than the loaded content, which causes a visible jump.
+ */
+export function TableSkeleton({
+  rows = 5,
+  rowHeight = "h-9",
+  className,
+}: {
+  rows?: number;
+  rowHeight?: string;
+  className?: string;
+}) {
+  // When a min-h/flex container is supplied via className, stretch each row
+  // with flex-1 so they evenly fill the available height instead of leaving
+  // a gap at the bottom.
+  const fill = !!className;
   return (
-    <div className="space-y-2 p-4" aria-hidden>
+    <div
+      className={cn(
+        "p-4",
+        fill ? "flex flex-col gap-2" : "space-y-2",
+        className,
+      )}
+      aria-hidden
+    >
       {Array.from({ length: rows }).map((_, i) => (
-        <Skeleton key={i} className="h-9 w-full" />
+        <Skeleton
+          key={i}
+          className={cn("w-full", fill ? "flex-1" : rowHeight)}
+        />
       ))}
     </div>
   );

@@ -116,7 +116,7 @@ function StatsTableContent({
   const { t } = useTranslation();
   const buckets: StatBucket[] = query.data?.buckets ?? [];
 
-  if (query.isLoading) return <TableSkeleton rows={4} />;
+  if (query.isLoading) return <TableSkeleton rows={4} rowHeight="h-14" />;
 
   if (query.error) {
     return (
@@ -432,7 +432,7 @@ export default function Dashboard() {
         <Card>
           <CardHeader title={t("dashboard.circuitBreakers")} />
           {breakers.isLoading ? (
-            <TableSkeleton rows={4} />
+            <TableSkeleton rows={4} rowHeight="h-16" />
           ) : breakers.error ? (
             <div className="p-4">
               <ErrorBox

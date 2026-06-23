@@ -194,12 +194,16 @@ export default function Audit() {
       ) : (
         <Card>
           {isLoading ? (
-            <TableSkeleton rows={8} />
+            <TableSkeleton
+              rows={20}
+              rowHeight="h-10"
+              className="min-h-[calc(100vh-14rem)] lg:min-h-[calc(100vh-9rem)]"
+            />
           ) : entries.length === 0 ? (
             <EmptyState title={t("audit.empty")} />
           ) : (
             <Table
-              maxHeight={["max-h-[calc(100vh-10rem)]", "lg:max-h-[calc(100vh-6rem)]"]}
+              maxHeight={["max-h-[calc(100vh-14rem)]", "lg:max-h-[calc(100vh-9rem)]"]}
               tableClassName="min-w-max border-separate border-spacing-0"
               containerRef={scrollRef}
             >

@@ -270,7 +270,7 @@ export default function Providers() {
       ) : (
         <Card>
           {isLoading ? (
-            <TableSkeleton />
+            <TableSkeleton rowHeight="h-14" />
           ) : (data ?? []).length === 0 ? (
             <EmptyState
               title={t("common.emptyTitle")}

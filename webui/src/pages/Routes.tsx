@@ -519,7 +519,11 @@ export default function RoutesPage() {
       ) : (
         <Card>
           {isLoading ? (
-            <TableSkeleton />
+            <TableSkeleton
+              rows={12}
+              rowHeight="h-[68px]"
+              className="min-h-[calc(100vh-14rem)] lg:min-h-[calc(100vh-10rem)]"
+            />
           ) : routes.length === 0 ? (
             <EmptyState
               title={t("common.emptyTitle")}
