@@ -32,6 +32,49 @@ use super::{apply_provider_auth, AppError, AppState};
 /// global `request_read_timeout` (which defaults to 30s for chat).
 const IMAGES_NONSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Check whether an HTTP 200 non-streaming response body is actually
+/// an error response (top-level `"error"` key). Some providers return
+/// HTTP 200 with `{"error": {...}}` instead of a proper non-2xx status
+/// code — e.g. `service_unavailable_error`, `overloaded_error`. When
+/// detected, this returns an `AppError` so the fallback loop can
+/// retry / try the next target, instead of silently passing the error
+/// body to the client as a success.
+///
+/// Only triggers when the top-level JSON object has an `"error"` key
+/// and does NOT simultaneously contain normal response fields
+/// (`choices`, `candidates`, `output`, `data`, etc.) that would
+/// indicate a mixed/success response. This avoids false positives on
+/// responses that merely mention "error" in metadata.
+fn check_nonstream_error_body(
+    response_body: &Value,
+    status: u16,
+    retry_after: Option<String>,
+    rate_limit_headers: Vec<(&'static str, String)>,
+) -> Option<AppError> {
+    let error = response_body.get("error")?;
+    // Guard against false positives: if the body also contains
+    // normal response fields, it's not a pure error response.
+    let has_normal_field = ["choices", "candidates", "output", "data", "messages"]
+        .iter()
+        .any(|k| response_body.get(k).is_some());
+    if has_normal_field {
+        return None;
+    }
+    let message = error["message"]
+        .as_str()
+        .unwrap_or("upstream returned error in 200 response body");
+    let mut app_err = AppError::new(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+        format!("Upstream error: {}", message),
+    );
+    app_err.upstream_status = Some(status);
+    if let Some(ra) = retry_after {
+        app_err = app_err.with_retry_after_header(ra);
+    }
+    app_err.rate_limit_headers = rate_limit_headers;
+    Some(app_err)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_upstream(
     state: &AppState,
@@ -228,6 +271,7 @@ pub(super) async fn execute_upstream(
                     is_stream: true,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -278,6 +322,8 @@ pub(super) async fn execute_upstream(
             Some(StreamCapture {
                 request_id: request_id.to_string(),
                 telemetry: state.telemetry.clone(),
+                health: Some(state.health.clone()),
+                health_key: Some(target.health_key()),
                 egress_method: egress_method.to_string(),
                 egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture,
@@ -375,6 +421,7 @@ pub(super) async fn execute_upstream(
                     is_stream: false,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -391,6 +438,37 @@ pub(super) async fn execute_upstream(
                 app_err = app_err.with_retry_after_header(ra);
             }
             app_err.rate_limit_headers = rate_limit_headers_vec;
+            return Err(app_err);
+        }
+
+        // Detect HTTP 200 responses that are actually error responses
+        // (top-level `"error"` key, e.g. service_unavailable_error).
+        // These must be treated as failures so fallback can retry.
+        if let Some(app_err) = check_nonstream_error_body(
+            &response_body,
+            status.as_u16(),
+            retry_after.clone(),
+            rate_limit_headers_vec.clone(),
+        ) {
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: false,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                    upstream_error: None,
+                },
+            );
             return Err(app_err);
         }
 
@@ -463,6 +541,7 @@ pub(super) async fn execute_upstream(
                 is_stream: false,
                 truncation_reason: None,
                 stream_duration_ms: None,
+                upstream_error: None,
             },
         );
         Ok((response, ttfb_ms))
@@ -628,6 +707,7 @@ pub(super) async fn execute_messages_upstream(
                     is_stream: true,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -674,6 +754,8 @@ pub(super) async fn execute_messages_upstream(
             Some(StreamCapture {
                 request_id: request_id.to_string(),
                 telemetry: state.telemetry.clone(),
+                health: Some(state.health.clone()),
+                health_key: Some(target.health_key()),
                 egress_method: egress_method.to_string(),
                 egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture,
@@ -751,6 +833,7 @@ pub(super) async fn execute_messages_upstream(
                     is_stream: false,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -767,6 +850,36 @@ pub(super) async fn execute_messages_upstream(
                 app_err = app_err.with_retry_after_header(ra);
             }
             app_err.rate_limit_headers = rate_limit_headers_vec;
+            return Err(app_err);
+        }
+
+        // Detect HTTP 200 responses that are actually error responses
+        // (top-level `"error"` key, e.g. service_unavailable_error).
+        if let Some(app_err) = check_nonstream_error_body(
+            &response_body,
+            status.as_u16(),
+            retry_after.clone(),
+            rate_limit_headers_vec.clone(),
+        ) {
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: false,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                    upstream_error: None,
+                },
+            );
             return Err(app_err);
         }
 
@@ -831,6 +944,7 @@ pub(super) async fn execute_messages_upstream(
                 is_stream: false,
                 truncation_reason: None,
                 stream_duration_ms: None,
+                upstream_error: None,
             },
         );
         Ok((response, ttfb_ms))
@@ -1045,6 +1159,7 @@ pub(super) async fn execute_embeddings_upstream(
                 is_stream: false,
                 truncation_reason: None,
                 stream_duration_ms: None,
+                upstream_error: None,
             },
         );
         let app_err = AppError::new(
@@ -1055,6 +1170,33 @@ pub(super) async fn execute_embeddings_upstream(
                     .as_str()
                     .unwrap_or("Unknown error")
             ),
+        );
+        return Err(app_err);
+    }
+
+    // Detect HTTP 200 responses that are actually error responses
+    // (top-level `"error"` key, e.g. service_unavailable_error).
+    if let Some(app_err) =
+        check_nonstream_error_body(&response_body, status.as_u16(), None, Vec::new())
+    {
+        spawn_capture(
+            state,
+            tiygate_core::ExchangeCapture {
+                request_id: req_id_capture.to_string(),
+                egress_method: egress_method.clone(),
+                egress_path: egress_path.clone(),
+                egress_headers: egress_headers_capture.clone(),
+                egress_body: egress_body_capture.clone(),
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                client_resp_headers: Vec::new(),
+                client_resp_body: None,
+                is_stream: false,
+                truncation_reason: None,
+                stream_duration_ms: None,
+                upstream_error: None,
+            },
         );
         return Err(app_err);
     }
@@ -1083,6 +1225,7 @@ pub(super) async fn execute_embeddings_upstream(
             is_stream: false,
             truncation_reason: None,
             stream_duration_ms: None,
+            upstream_error: None,
         },
     );
 
@@ -1234,6 +1377,7 @@ pub(super) async fn execute_responses_upstream(
                     is_stream: true,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -1268,6 +1412,8 @@ pub(super) async fn execute_responses_upstream(
             Some(StreamCapture {
                 request_id: req_id_capture.clone(),
                 telemetry: state.telemetry.clone(),
+                health: Some(state.health.clone()),
+                health_key: Some(target.health_key()),
                 egress_method: egress_method.to_string(),
                 egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture.clone(),
@@ -1361,6 +1507,7 @@ pub(super) async fn execute_responses_upstream(
                 is_stream: false,
                 truncation_reason: None,
                 stream_duration_ms: None,
+                upstream_error: None,
             },
         );
         let mut app_err = AppError::new(
@@ -1374,6 +1521,37 @@ pub(super) async fn execute_responses_upstream(
         app_err.rate_limit_headers = rate_limit_headers_vec;
         return Err(app_err);
     }
+
+    // Detect HTTP 200 responses that are actually error responses
+    // (top-level "error" key, e.g. service_unavailable_error).
+    if let Some(app_err) = check_nonstream_error_body(
+        &response_body,
+        status.as_u16(),
+        retry_after.clone(),
+        rate_limit_headers_vec.clone(),
+    ) {
+        spawn_capture(
+            state,
+            tiygate_core::ExchangeCapture {
+                request_id: req_id_capture.clone(),
+                egress_method: egress_method.clone(),
+                egress_path: egress_path.clone(),
+                egress_headers: egress_headers_capture.clone(),
+                egress_body: egress_body_capture.clone(),
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                client_resp_headers: Vec::new(),
+                client_resp_body: None,
+                is_stream: false,
+                truncation_reason: None,
+                stream_duration_ms: None,
+                upstream_error: None,
+            },
+        );
+        return Err(app_err);
+    }
+
     let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
     let response_body = if is_same_protocol {
         response_body
@@ -1434,6 +1612,7 @@ pub(super) async fn execute_responses_upstream(
             is_stream: false,
             truncation_reason: None,
             stream_duration_ms: None,
+            upstream_error: None,
         },
     );
     Ok((resp, ttfb_ms))
@@ -1603,6 +1782,7 @@ pub(super) async fn execute_gemini_upstream(
                     is_stream: true,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -1637,6 +1817,8 @@ pub(super) async fn execute_gemini_upstream(
             Some(StreamCapture {
                 request_id: req_id_capture.clone(),
                 telemetry: state.telemetry.clone(),
+                health: Some(state.health.clone()),
+                health_key: Some(target.health_key()),
                 egress_method: egress_method.to_string(),
                 egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture.clone(),
@@ -1730,6 +1912,7 @@ pub(super) async fn execute_gemini_upstream(
                 is_stream: false,
                 truncation_reason: None,
                 stream_duration_ms: None,
+                upstream_error: None,
             },
         );
         let mut app_err = AppError::new(
@@ -1743,6 +1926,37 @@ pub(super) async fn execute_gemini_upstream(
         app_err.rate_limit_headers = rate_limit_headers_vec;
         return Err(app_err);
     }
+
+    // Detect HTTP 200 responses that are actually error responses
+    // (top-level "error" key, e.g. service_unavailable_error).
+    if let Some(app_err) = check_nonstream_error_body(
+        &response_body,
+        status.as_u16(),
+        retry_after.clone(),
+        rate_limit_headers_vec.clone(),
+    ) {
+        spawn_capture(
+            state,
+            tiygate_core::ExchangeCapture {
+                request_id: req_id_capture.clone(),
+                egress_method: egress_method.clone(),
+                egress_path: egress_path.clone(),
+                egress_headers: egress_headers_capture.clone(),
+                egress_body: egress_body_capture.clone(),
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                client_resp_headers: Vec::new(),
+                client_resp_body: None,
+                is_stream: false,
+                truncation_reason: None,
+                stream_duration_ms: None,
+                upstream_error: None,
+            },
+        );
+        return Err(app_err);
+    }
+
     let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
     let response_body = if is_same_protocol {
         response_body
@@ -1803,6 +2017,7 @@ pub(super) async fn execute_gemini_upstream(
             is_stream: false,
             truncation_reason: None,
             stream_duration_ms: None,
+            upstream_error: None,
         },
     );
     Ok((resp, ttfb_ms))
@@ -1934,6 +2149,7 @@ pub(super) async fn execute_images_generations_upstream(
                     is_stream: true,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -1977,6 +2193,8 @@ pub(super) async fn execute_images_generations_upstream(
             Some(StreamCapture {
                 request_id: request_id.to_string(),
                 telemetry: state.telemetry.clone(),
+                health: Some(state.health.clone()),
+                health_key: Some(target.health_key()),
                 egress_method: egress_method.to_string(),
                 egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture,
@@ -2065,6 +2283,7 @@ pub(super) async fn execute_images_generations_upstream(
                     is_stream: false,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -2081,6 +2300,36 @@ pub(super) async fn execute_images_generations_upstream(
                 app_err = app_err.with_retry_after_header(ra);
             }
             app_err.rate_limit_headers = rate_limit_headers_vec;
+            return Err(app_err);
+        }
+
+        // Detect HTTP 200 responses that are actually error responses
+        // (top-level `"error"` key, e.g. service_unavailable_error).
+        if let Some(app_err) = check_nonstream_error_body(
+            &response_body,
+            status.as_u16(),
+            retry_after.clone(),
+            rate_limit_headers_vec.clone(),
+        ) {
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: false,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                    upstream_error: None,
+                },
+            );
             return Err(app_err);
         }
 
@@ -2150,6 +2399,7 @@ pub(super) async fn execute_images_generations_upstream(
                 is_stream: false,
                 truncation_reason: None,
                 stream_duration_ms: None,
+                upstream_error: None,
             },
         );
         Ok((response, ttfb_ms))
@@ -2233,6 +2483,7 @@ pub(super) async fn execute_images_edits_upstream(
                     is_stream: true,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -2279,6 +2530,8 @@ pub(super) async fn execute_images_edits_upstream(
             Some(StreamCapture {
                 request_id: request_id.to_string(),
                 telemetry: state.telemetry.clone(),
+                health: Some(state.health.clone()),
+                health_key: Some(target.health_key()),
                 egress_method: egress_method.to_string(),
                 egress_path: egress_path.to_string(),
                 egress_headers: egress_headers_capture,
@@ -2359,6 +2612,7 @@ pub(super) async fn execute_images_edits_upstream(
                     is_stream: false,
                     truncation_reason: None,
                     stream_duration_ms: None,
+                    upstream_error: None,
                 },
             );
             let mut app_err = AppError::new(
@@ -2375,6 +2629,36 @@ pub(super) async fn execute_images_edits_upstream(
                 app_err = app_err.with_retry_after_header(ra);
             }
             app_err.rate_limit_headers = rate_limit_headers_vec;
+            return Err(app_err);
+        }
+
+        // Detect HTTP 200 responses that are actually error responses
+        // (top-level `"error"` key, e.g. service_unavailable_error).
+        if let Some(app_err) = check_nonstream_error_body(
+            &response_body,
+            status.as_u16(),
+            retry_after.clone(),
+            rate_limit_headers_vec.clone(),
+        ) {
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: None,
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: false,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                    upstream_error: None,
+                },
+            );
             return Err(app_err);
         }
 
@@ -2417,8 +2701,60 @@ pub(super) async fn execute_images_edits_upstream(
                 is_stream: false,
                 truncation_reason: None,
                 stream_duration_ms: None,
+                upstream_error: None,
             },
         );
         Ok((response, ttfb_ms))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_nonstream_error_body_detects_pure_error() {
+        let body = json!({
+            "error": {
+                "type": "service_unavailable_error",
+                "message": "Service unavailable"
+            }
+        });
+        let result = check_nonstream_error_body(&body, 200, None, Vec::new());
+        assert!(result.is_some(), "should detect error body");
+        let err = result.unwrap();
+        assert!(err.message.contains("Service unavailable"));
+        assert_eq!(err.upstream_status, Some(200));
+    }
+
+    #[test]
+    fn check_nonstream_error_body_not_flagged_with_choices() {
+        let body = json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "error": {"type": "minor_warning", "message": "rate limit warning"}
+        });
+        let result = check_nonstream_error_body(&body, 200, None, Vec::new());
+        assert!(result.is_none(), "should not flag when choices present");
+    }
+
+    #[test]
+    fn check_nonstream_error_body_not_flagged_without_error_key() {
+        let body = json!({
+            "choices": [{"message": {"content": "hello"}}]
+        });
+        let result = check_nonstream_error_body(&body, 200, None, Vec::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn check_nonstream_error_body_preserves_retry_after() {
+        let body = json!({
+            "error": {"type": "rate_limit", "message": "Too many requests"}
+        });
+        let result = check_nonstream_error_body(&body, 429, Some("30".to_string()), Vec::new());
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert_eq!(err.retry_after_header, Some("30".to_string()));
     }
 }

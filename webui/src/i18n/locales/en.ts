@@ -86,6 +86,7 @@ const en = {
   },
   common: {
     loading: "Loading…",
+    bootLoading: "Loading resources, please wait…",
     error: "Error: {{message}}",
     empty: "No data.",
     emptyTitle: "Nothing here yet",

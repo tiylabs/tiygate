@@ -85,6 +85,7 @@ const zh: Translation = {
   },
   common: {
     loading: "加载中…",
+    bootLoading: "正在加载资源，请稍候…",
     error: "错误：{{message}}",
     empty: "暂无数据。",
     emptyTitle: "这里还没有内容",

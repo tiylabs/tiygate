@@ -633,7 +633,9 @@ export default function RequestLogs() {
                       )}
                     </Td>
                     <Td className="text-right tabular-nums">
-                      {r.ttfb_ms ?? "—"}
+                      {r.ttfb_ms != null
+                        ? `${Math.max(0.01, r.ttfb_ms / 1000).toFixed(2)}s`
+                        : "—"}
                     </Td>
                     <Td className="text-right tabular-nums">
                       {r.stream_duration_ms &&

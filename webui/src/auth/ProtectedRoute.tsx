@@ -3,7 +3,7 @@ import { Navigate } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
 import { shouldShowLocalSetup } from "@/auth/setup";
 import { useEffect, useState } from "react";
-import { Spinner } from "@/components/ui";
+import { BootScreen } from "@/components/BootScreen";
 
 export default function ProtectedRoute({ children }: PropsWithChildren) {
   const { isAuthenticated, isTauri, isInitializing } = useAuth();
@@ -34,11 +34,7 @@ export default function ProtectedRoute({ children }: PropsWithChildren) {
     isTauri &&
     (isInitializing || (!isAuthenticated && needsLocalSetup === null))
   ) {
-    return (
-      <div className="flex min-h-full items-center justify-center bg-bg">
-        <Spinner />
-      </div>
-    );
+    return <BootScreen />;
   }
 
   // In Tauri mode, only force setup for the local sidecar.

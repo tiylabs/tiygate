@@ -10,11 +10,11 @@ import {
   ErrorBox,
   Field,
   PasswordInput,
-  Spinner,
   Switch,
 } from "@/components/ui";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { InstanceIndicator } from "@/components/InstanceIndicator";
+import { BootScreen } from "@/components/BootScreen";
 import { cn } from "@/lib/cn";
 
 export default function Login() {
@@ -75,11 +75,7 @@ export default function Login() {
   }
 
   if (isTauri && !tauriCheckDone) {
-    return (
-      <div className="flex min-h-full items-center justify-center bg-bg">
-        <Spinner />
-      </div>
-    );
+    return <BootScreen />;
   }
 
   return (

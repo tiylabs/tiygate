@@ -47,7 +47,71 @@
     </script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- Pre-React boot screen: shown until main.tsx mounts.
+           Inline CSS keeps it dependency-free and theme-aware. -->
+      <div id="boot-splash" style="display:flex;min-height:100vh;align-items:center;justify-content:center;">
+        <div style="display:flex;flex-direction:column;align-items:center;gap:24px;width:100%;max-width:320px;padding:0 16px;">
+          <span style="display:flex;height:48px;width:48px;align-items:center;justify-content:center;border-radius:8px;overflow:hidden;">
+            <img src="./icon.svg" alt="" aria-hidden="true" style="height:48px;width:48px;" />
+          </span>
+          <div style="width:100%;">
+            <div style="height:4px;width:100%;border-radius:9999px;background-color:rgba(128,128,128,0.2);overflow:hidden;">
+              <div id="boot-progress" style="height:100%;width:8%;border-radius:9999px;background-color:#6366f1;transition:width 0.3s ease-out;"></div>
+            </div>
+          </div>
+          <p id="boot-hint" style="font-size:14px;color:rgba(128,128,128,0.8);">Loading resources, please wait…</p>
+        </div>
+      </div>
+    </div>
+    <script>
+      // Animate the inline progress bar and localize the hint text.
+      (() => {
+        const root = document.documentElement;
+        const isDark = root.getAttribute("data-theme") === "dark";
+        const bar = document.getElementById("boot-progress");
+        const hint = document.getElementById("boot-hint");
+        // Localize the hint text — prefer stored i18n preference.
+        let i18nLang = "";
+        try { i18nLang = (window.localStorage.getItem("i18nextLng") || "").toLowerCase(); } catch {}
+        const lang = (i18nLang || navigator.language || "en").toLowerCase();
+
+        // Localize the hint text.
+        if (lang.startsWith("zh")) {
+          hint.textContent = "正在加载资源，请稍候…";
+        } else {
+          hint.textContent = "Loading resources, please wait…";
+        }
+
+        // Theme-aware bar color — try the CSS variable first, fall back
+        // to hardcoded values for the default theme.
+        let primaryColor = isDark ? "#84a6ff" : "#2e5be6";
+        try {
+          const cs = getComputedStyle(root);
+          const cssPrimary = cs.getPropertyValue("--primary").trim();
+          if (cssPrimary) primaryColor = cssPrimary;
+        } catch {}
+        bar.style.backgroundColor = primaryColor;
+
+        // Simulate progress toward 90% — the React app will replace
+        // this element when it mounts.
+        let progress = 8;
+        const timer = setInterval(() => {
+          if (progress >= 88) return;
+          const remaining = 90 - progress;
+          progress = Math.min(90, progress + Math.max(1, remaining * 0.12));
+          bar.style.width = progress + "%";
+        }, 200);
+
+        // Clean up when React takes over.
+        new MutationObserver((_, observer) => {
+          if (!document.getElementById("boot-splash")) {
+            clearInterval(timer);
+            observer.disconnect();
+          }
+        }).observe(document.getElementById("root"), { childList: true, subtree: true });
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -17,6 +17,7 @@ import {
   Input,
   PasswordInput,
   Select,
+  Skeleton,
   Switch,
   useToast,
 } from "@/components/ui";
@@ -181,8 +182,45 @@ export default function SettingsPage() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center py-20">
-        <span className="text-muted-foreground">{t("common.loading")}</span>
+      <div className="space-y-6">
+        {/* PageHeader skeleton */}
+        <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="space-y-2">
+            <Skeleton className="h-7 w-48" />
+            <Skeleton className="h-4 w-72" />
+          </div>
+          <div className="flex gap-2">
+            <Skeleton className="h-9 w-20" />
+            <Skeleton className="h-9 w-20" />
+          </div>
+        </div>
+
+        {/* Card skeleton: 2-column grid of field placeholders */}
+        {[
+          { rows: 5, cols: true },
+          { rows: 12, cols: true },
+          { rows: 7, cols: true },
+          { rows: 5, cols: true },
+          { rows: 2, cols: false },
+        ].map((section, i) => (
+          <Card key={i}>
+            <div className="border-b border-border px-4 py-3">
+              <Skeleton className="h-4 w-40" />
+            </div>
+            <CardBody
+              className={
+                section.cols ? "grid gap-4 sm:grid-cols-2" : "grid gap-4"
+              }
+            >
+              {Array.from({ length: section.rows }).map((_, j) => (
+                <div key={j} className="space-y-2">
+                  <Skeleton className="h-4 w-28" />
+                  <Skeleton className="h-9 w-full" />
+                </div>
+              ))}
+            </CardBody>
+          </Card>
+        ))}
       </div>
     );
   }

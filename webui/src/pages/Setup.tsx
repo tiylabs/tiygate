@@ -33,6 +33,7 @@ import {
   Switch,
 } from "@/components/ui";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
+import { BootScreen } from "@/components/BootScreen";
 import { cn } from "@/lib/cn";
 
 type Mode =
@@ -339,14 +340,7 @@ export default function Setup() {
   }
 
   if (mode === "busy") {
-    return (
-      <div className="flex min-h-full items-center justify-center bg-bg px-4 py-10">
-        <div className="flex flex-col items-center gap-3">
-          <Spinner />
-          <p className="text-sm text-text-muted">{t("setup.starting")}</p>
-        </div>
-      </div>
-    );
+    return <BootScreen />;
   }
 
   return (

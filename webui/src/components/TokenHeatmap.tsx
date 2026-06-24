@@ -185,8 +185,18 @@ export function TokenHeatmap({ data, spanDays = 365, isLoading }: TokenHeatmapPr
   ];
 
   if (isLoading) {
+    // Match the real heatmap's intrinsic width: 53 week-columns × 14px
+    // (11px cell + 3px gap) − 3px trailing gap ≈ 739px.
     return (
-      <div className="h-[160px] animate-pulse rounded-lg bg-surface-secondary" />
+      <div className="space-y-3" style={{ minWidth: 739 }}>
+        {/* Header placeholder */}
+        <div className="flex items-center justify-between">
+          <div className="h-4 w-24 animate-pulse rounded bg-surface-secondary" />
+          <div className="h-6 w-24 animate-pulse rounded-md bg-surface-secondary" />
+        </div>
+        {/* Grid placeholder */}
+        <div className="h-[113px] animate-pulse rounded-lg bg-surface-secondary" />
+      </div>
     );
   }
 

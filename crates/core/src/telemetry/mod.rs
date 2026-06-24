@@ -363,6 +363,13 @@ pub struct ExchangeCapture {
     /// `None` for non-stream exchanges. Used to compute output
     /// token rate: `completion_tokens / (stream_duration_ms / 1000)`.
     pub stream_duration_ms: Option<u64>,
+    /// When the upstream returned HTTP 200 but the SSE stream
+    /// contained an embedded error frame (e.g.
+    /// `service_unavailable_error`, `overloaded_error`), this
+    /// carries the error message so the OLTP sink can mark the
+    /// request as failed despite the 200 status. `None` for clean
+    /// streams and non-stream exchanges.
+    pub upstream_error: Option<String>,
 }
 
 /// The telemetry bus — decouples event production from consumption.

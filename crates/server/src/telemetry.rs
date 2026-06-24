@@ -321,6 +321,7 @@ mod tests {
             is_stream: false,
             truncation_reason: None,
             stream_duration_ms: None,
+            upstream_error: None,
         }
     }
 }
