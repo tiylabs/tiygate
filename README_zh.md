@@ -50,7 +50,7 @@ TiyGate 是一款用 **Rust** 编写的**开源 AI 网关**，适合同时使用
 按使用场景选择入口：
 
 - **桌面版：** 🖥️ 从 [Releases](https://github.com/tiylabs/tiygate/releases) 下载最新 macOS 或 Windows 安装包，启动后在管理控制台配置服务商与虚拟模型。
-- **Docker：** 🐳 运行 `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest`，生产配置参考[部署与运维文档](docs/deployment-operations_zh.md)。
+- **Docker：** 🐳 运行 `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest`，生产配置参考[部署与运维文档](docs/deployment-operations.md)。
 - **源码启动：** 🦀 需要 Rust 1.88+ 和 Node.js 20+。
 
 ```bash
@@ -64,7 +64,7 @@ make dev
 
 ## 文档
 
-- [部署与运维](docs/deployment-operations_zh.md)：部署模式、健康探针、配置、优雅排空、缓存、S3 payload 归档与追踪。
+- [部署与运维](docs/deployment-operations.md)：部署模式、健康探针、配置、优雅排空、缓存、S3 payload 归档与追踪。
 - [协议能力矩阵](docs/protocol-capability-matrix.md)：协议转换行为与有损字段处理。
 - [请求日志](docs/request-logging.md)：请求/响应捕获与回放细节。
 
