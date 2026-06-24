@@ -526,6 +526,20 @@ impl TruncationReason {
     }
 }
 
+/// An error frame detected inside an otherwise-successful upstream
+/// stream (HTTP 200 with an embedded `{"error": ...}` SSE frame, e.g.
+/// `service_unavailable_error`). The gateway cannot retry these because
+/// the response headers are already committed to the client, but it
+/// must still record the failure for health tracking and telemetry.
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamStreamError {
+    /// Human-readable error message extracted from the error frame.
+    pub message: String,
+    /// Protocol-specific error code/type (e.g. `service_unavailable_error`,
+    /// `overloaded_error`, `429`).
+    pub code: Option<String>,
+}
+
 /// Accumulates usage from streaming responses for billing when the
 /// client disconnects mid-stream. Estimates token counts from
 /// character counts as a fallback.
@@ -544,6 +558,11 @@ pub struct UsageAccumulator {
     /// `completed == true` in the sense that the gateway never sets
     /// both flags — the last call wins.
     pub truncated: Option<TruncationReason>,
+    /// If an error frame was detected inside an otherwise-successful
+    /// upstream stream (HTTP 200 + embedded error SSE frame), this
+    /// holds the error details so downstream observers (capture guard,
+    /// telemetry) can record the failure.
+    pub upstream_error: Option<UpstreamStreamError>,
 }
 
 impl UsageAccumulator {
@@ -574,6 +593,19 @@ impl UsageAccumulator {
     pub fn mark_truncated(&mut self, reason: TruncationReason) {
         self.completed = false;
         self.truncated = Some(reason);
+    }
+
+    /// Record an error frame detected inside the upstream SSE stream
+    /// (HTTP 200 with an embedded `{"error": ...}` frame). The first
+    /// error wins — subsequent calls are ignored so the original
+    /// cause is preserved.
+    pub fn set_upstream_error(&mut self, message: &str, code: Option<&str>) {
+        if self.upstream_error.is_none() {
+            self.upstream_error = Some(UpstreamStreamError {
+                message: message.to_string(),
+                code: code.map(String::from),
+            });
+        }
     }
 
     /// Estimate usage from accumulated characters.

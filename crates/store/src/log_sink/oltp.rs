@@ -358,6 +358,30 @@ impl EventSink for OltpSink {
             }
         }
 
+        // When the upstream returned HTTP 200 but the SSE stream
+        // contained an embedded error frame (e.g.
+        // service_unavailable_error), mark the request as failed.
+        // This is the streaming equivalent of a non-2xx error body:
+        // the gateway already forwarded the error frame to the
+        // client, but the hot-path `emit_ok` recorded the request
+        // as success because the HTTP status was 200. This
+        // write-back corrects the status so the dashboard surfaces
+        // the failure. Uses the same upsert strategy as
+        // `update_request_truncation` so it is order-independent
+        // with `write_request_event`.
+        if let Some(error_source) = &capture.upstream_error {
+            if let Err(e) = self
+                .update_request_failure(&capture.request_id, "transient", error_source)
+                .await
+            {
+                warn!(
+                    error = %e,
+                    request_id = %capture.request_id,
+                    "oltp sink: upstream_error failure write-back failed"
+                );
+            }
+        }
+
         // Only after the payload row and the best-effort SSE parsed
         // fields have been written do we expose the row to the archive
         // worker. Terminal archive states are preserved so a late or
@@ -579,6 +603,14 @@ impl OltpSink {
     /// error frame. Uses the same upsert placeholder strategy as
     /// [`update_request_truncation`] so it is order-independent with
     /// `write_request_event`.
+    ///
+    /// Also sets `truncation_reason` to the provided value so the
+    /// `write_request_event` `ON CONFLICT` clause (which preserves
+    /// `status`/`error_class`/`error_source` when
+    /// `truncation_reason` is in the failure set) does not clobber
+    /// the failure with the hot-path `Success` status. This is used
+    /// both for genuine truncation failures and for upstream error
+    /// frames embedded in an HTTP 200 SSE stream.
     async fn update_request_failure(
         &self,
         request_id: &str,
@@ -590,12 +622,13 @@ impl OltpSink {
             "INSERT INTO request_logs (\
                 request_id, ts, virtual_model, ingress_protocol, status, \
                 total_latency_ms, upstream_latency_ms, queue_latency_ms, lossy, \
-                error_class, error_source) \
-             VALUES ($1, $2, '', '', 'failed', 0, 0, 0, 0, $3, $4) \
+                error_class, error_source, truncation_reason) \
+             VALUES ($1, $2, '', '', 'failed', 0, 0, 0, 0, $3, $4, 'upstream_error') \
              ON CONFLICT(request_id) DO UPDATE SET \
                 status = excluded.status, \
                 error_class = excluded.error_class, \
-                error_source = excluded.error_source",
+                error_source = excluded.error_source, \
+                truncation_reason = COALESCE(request_logs.truncation_reason, excluded.truncation_reason)",
         )
         .bind(request_id)
         .bind(now)
@@ -3158,6 +3191,7 @@ mod tests {
             is_stream: false,
             truncation_reason: None,
             stream_duration_ms: None,
+            upstream_error: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -3216,6 +3250,7 @@ mod tests {
             is_stream: false,
             truncation_reason: None,
             stream_duration_ms: None,
+            upstream_error: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -3723,7 +3758,9 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             client_resp_body: None,
             is_stream: false,
             truncation_reason: None,
-            stream_duration_ms: None,        };
+            stream_duration_ms: None,
+            upstream_error: None,
+        };
         sink.write_capture(&capture).await.expect("write capture");
 
         let row =
@@ -3777,6 +3814,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             is_stream: false,
             truncation_reason: None,
             stream_duration_ms: None,
+            upstream_error: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -3826,6 +3864,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             is_stream: true,
             truncation_reason: None,
             stream_duration_ms: None,
+            upstream_error: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -3868,6 +3907,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             is_stream: false,
             truncation_reason: None,
             stream_duration_ms: None,
+            upstream_error: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
         let count: i64 =
@@ -3919,6 +3959,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             is_stream: true,
             truncation_reason: Some("idle".to_string()),
             stream_duration_ms: None,
+            upstream_error: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -3964,6 +4005,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             is_stream: true,
             truncation_reason: Some("upstream_error".to_string()),
             stream_duration_ms: None,
+            upstream_error: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -4017,6 +4059,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             is_stream: true,
             truncation_reason: Some("client_disconnect".to_string()),
             stream_duration_ms: None,
+            upstream_error: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -4037,5 +4080,67 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             row.get::<Option<String>, _>("truncation_reason"),
             Some("client_disconnect".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn write_capture_upstream_error_marks_request_failed() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        // Hot path emits a success RequestEvent (the normal flow for a
+        // streaming response whose upstream error is discovered later).
+        sink.write_request_event(&dummy_request_event())
+            .await
+            .expect("write event");
+
+        let capture = ExchangeCapture {
+            request_id: "req-1".to_string(),
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(200),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: Some(
+                "data: {\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"Service unavailable\"}}\n\n".to_string(),
+            ),
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: true,
+            truncation_reason: None,
+            stream_duration_ms: None,
+            upstream_error: Some(
+                "Service unavailable (service_unavailable_error)".to_string(),
+            ),
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        // The success RequestEvent arrives later (hot path). Its
+        // status must NOT override the failure already written by the
+        // capture's upstream_error write-back, because
+        // update_request_failure sets truncation_reason =
+        // 'upstream_error'.
+        let mut ev = dummy_request_event();
+        ev.request_id = "req-1".to_string();
+        sink.write_request_event(&ev).await.expect("write event");
+
+        let row = sqlx::query(
+            "SELECT status, error_class, error_source \
+             FROM request_logs WHERE request_id = $1",
+        )
+        .bind("req-1")
+        .fetch_one(pool.any())
+        .await
+        .expect("query");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_class"),
+            Some("transient".to_string())
+        );
+        assert!(row
+            .get::<Option<String>, _>("error_source")
+            .unwrap()
+            .contains("Service unavailable"));
     }
 }

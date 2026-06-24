@@ -621,6 +621,61 @@ async fn test_streaming_chat_completion_forwards_done_frame() {
 }
 
 #[tokio::test]
+async fn test_streaming_error_frame_injects_end_marker() {
+    // When the upstream returns HTTP 200 with an SSE error frame (e.g.
+    // service_unavailable_error) and then closes the stream WITHOUT a
+    // natural terminal frame (`data: [DONE]`), the gateway must inject
+    // the protocol-native end marker so the client SDK does not time
+    // out waiting for it.
+    let mock_server = wiremock::MockServer::start().await;
+
+    let sse_error = "data: {\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"Service unavailable\"}}\n\n";
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_error),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app = build_openai_test_app(mock_server.uri(), "gpt-4o");
+
+    let body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    // The upstream error frame must be forwarded.
+    assert!(
+        body_str.contains("service_unavailable_error"),
+        "expected upstream error frame, got: {body_str}"
+    );
+    // The gateway must inject `data: [DONE]` so the client SDK can
+    // close the stream cleanly.
+    assert!(
+        body_str.contains("data: [DONE]"),
+        "expected gateway-injected end marker, got: {body_str}"
+    );
+}
+
+#[tokio::test]
 async fn test_passthrough_forwards_raw_body_verbatim() {
     // PassThrough contract: when the target's protocol suite matches the
     // ingress suite and the codec declares Passthrough, the gateway

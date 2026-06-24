@@ -191,6 +191,15 @@ pub(super) struct StreamCapture {
     /// (denylist-filtered upstream headers + content-type), recorded as
     /// the `client_resp_headers` in the detail view.
     pub client_resp_headers: Vec<(String, String)>,
+    /// Health registry for recording stream-level failures (error
+    /// frames, truncation) that arrive after the HTTP 200 `record_success`
+    /// in the fallback loop. When `Some`, the guard calls
+    /// `record_failure` on stream termination if an upstream error or
+    /// truncation was observed.
+    pub health: Option<Arc<tiygate_core::HealthRegistry>>,
+    /// The health-registry key for this routing target
+    /// (`provider_id:model_id`). Paired with `health`.
+    pub health_key: Option<String>,
 }
 
 /// Shared, single-shot finalizer for stream exchange capture.
@@ -202,6 +211,8 @@ pub(super) struct StreamCapture {
 struct StreamCaptureGuard {
     inner: Arc<std::sync::Mutex<StreamCaptureState>>,
     accum: Arc<std::sync::Mutex<UsageAccumulator>>,
+    health: Option<Arc<tiygate_core::HealthRegistry>>,
+    health_key: Option<String>,
 }
 
 struct StreamCaptureState {
@@ -223,6 +234,10 @@ struct StreamCaptureState {
 
 impl StreamCaptureGuard {
     fn new(capture: Option<StreamCapture>, accum: Arc<std::sync::Mutex<UsageAccumulator>>) -> Self {
+        let (health, health_key) = capture
+            .as_ref()
+            .map(|c| (c.health.clone(), c.health_key.clone()))
+            .unwrap_or((None, None));
         Self {
             inner: Arc::new(std::sync::Mutex::new(StreamCaptureState {
                 capture,
@@ -234,6 +249,8 @@ impl StreamCaptureGuard {
                 upstream_completed: false,
             })),
             accum,
+            health,
+            health_key,
         }
     }
 
@@ -276,12 +293,48 @@ impl StreamCaptureGuard {
             .unwrap_or_default()
     }
 
+    /// Check whether the stream terminated with an upstream error or
+    /// gateway-observed truncation, and if so, record a health-registry
+    /// failure for this routing target. This corrects the optimistic
+    /// `record_success` called in the fallback loop (which fires on the
+    /// HTTP 200 before the stream body is consumed) so that consecutive
+    /// stream-level failures still drive the circuit breaker.
+    fn record_health_failure_if_needed(&self) {
+        let should_fail = {
+            let state = self.inner.lock().ok();
+            let truncation_is_failure = state
+                .as_ref()
+                .and_then(|s| s.last_reason)
+                .map(|r| {
+                    matches!(
+                        r,
+                        TruncationReason::UpstreamError
+                            | TruncationReason::Idle
+                            | TruncationReason::Total
+                    )
+                })
+                .unwrap_or(false);
+            let has_upstream_error = self
+                .accum
+                .lock()
+                .map(|a| a.upstream_error.is_some())
+                .unwrap_or(false);
+            truncation_is_failure || has_upstream_error
+        };
+        if should_fail {
+            if let (Some(health), Some(key)) = (&self.health, &self.health_key) {
+                health.record_failure(key);
+            }
+        }
+    }
+
     /// Mark finalized and fire-and-forget the capture via `tokio::spawn`.
     /// Use this **before** the final `yield` / `break` in the stream loop
     /// so that a client disconnect immediately after the last frame does
     /// not cancel an in-flight `finalize().await` and trigger the `Drop`
     /// fallback (`client_disconnect`).
     fn finalize_spawn(&self) {
+        self.record_health_failure_if_needed();
         if let Some((telemetry, capture)) = self.take_capture(None) {
             tokio::spawn(async move {
                 telemetry.send_capture(capture).await;
@@ -317,6 +370,19 @@ impl StreamCaptureGuard {
         } else {
             Some(String::from_utf8_lossy(&state.client_body).into_owned())
         };
+        // Check if the accumulator detected an embedded upstream
+        // error frame (HTTP 200 + SSE error frame like
+        // service_unavailable_error). If so, propagate it to the
+        // capture so the OLTP sink can mark the request as failed.
+        let upstream_error = self.accum.lock().ok().and_then(|a| {
+            a.upstream_error.as_ref().map(|e| {
+                if let Some(code) = &e.code {
+                    format!("{} ({})", e.message, code)
+                } else {
+                    e.message.clone()
+                }
+            })
+        });
         Some((
             telemetry,
             tiygate_core::ExchangeCapture {
@@ -333,6 +399,7 @@ impl StreamCaptureGuard {
                 is_stream: true,
                 truncation_reason: state.last_reason.map(|r| r.as_str().to_string()),
                 stream_duration_ms,
+                upstream_error,
             },
         ))
     }
@@ -355,6 +422,11 @@ impl Drop for StreamCaptureGuard {
         let Some((telemetry, capture)) = self.take_capture(disconnect_reason) else {
             return;
         };
+        // Only reached when finalize_spawn did NOT run (client
+        // disconnect or cancelled future). Record a health failure if
+        // the stream saw an upstream error or a gateway-observed
+        // truncation before the disconnect.
+        self.record_health_failure_if_needed();
         if let Some(reason) = disconnect_reason {
             if let Ok(mut a) = self.accum.lock() {
                 a.mark_truncated(reason);
@@ -397,6 +469,67 @@ pub(super) struct StreamTranscode {
     pub encoder: Box<dyn tiygate_core::StreamEncoder>,
 }
 
+/// Lightweight scan of verbatim upstream SSE bytes for error frames.
+///
+/// In the verbatim (same-protocol) streaming path the gateway forwards
+/// upstream bytes without parsing them. This function performs a cheap
+/// detection pass to find `data:` lines whose JSON payload contains a
+/// top-level `"error"` key — the shape used by OpenAI, Anthropic, and
+/// Google when embedding an error frame inside an HTTP 200 SSE stream
+/// (e.g. `service_unavailable_error`, `overloaded_error`).
+///
+/// When an error frame is found, the details are recorded in the
+/// `UsageAccumulator` so downstream observers (capture guard, telemetry)
+/// can mark the request as failed despite the HTTP 200 status.
+///
+/// The scan is deliberately conservative: it only parses `data:` lines
+/// that contain the byte substring `"error"`, and only treats a payload
+/// as an error when the parsed JSON has a top-level `"error"` object.
+/// Normal response chunks that merely mention "error" in content text
+/// are not affected because their JSON will not have a top-level
+/// `"error"` key.
+fn detect_verbatim_error(bytes: &[u8], accum: &Arc<std::sync::Mutex<UsageAccumulator>>) {
+    // Quick gate: skip the parse entirely if `"error"` is not present.
+    if !bytes.windows(7).any(|w| w == b"\"error\"") {
+        return;
+    }
+    // Best-effort UTF-8 conversion for scanning SSE line prefixes.
+    let text = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => &String::from_utf8_lossy(bytes),
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // SSE data lines look like `data: { ... }` or `data:{ ... }`.
+        let json_str = if let Some(rest) = trimmed.strip_prefix("data:") {
+            rest.trim()
+        } else if trimmed.starts_with("event:") {
+            // Anthropic uses `event: error\ndata: {...}` — the error
+            // payload is on the following `data:` line, which will be
+            // picked up in the next iteration. Skip the event marker.
+            continue;
+        } else {
+            continue;
+        };
+        if json_str.is_empty() || json_str == "[DONE]" {
+            continue;
+        }
+        // Only attempt JSON parse if this line contains `"error"`.
+        if !json_str.contains("\"error\"") {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+            if let Some(error) = value.get("error") {
+                let message = error["message"].as_str().unwrap_or("upstream stream error");
+                let code = error["type"].as_str().or_else(|| error["code"].as_str());
+                if let Ok(mut a) = accum.lock() {
+                    a.set_upstream_error(message, code);
+                }
+            }
+        }
+    }
+}
+
 /// Split a UTF-8 SSE buffer into complete lines, returning the parsed lines
 /// and any trailing partial line (no terminating `\n` yet) that must be
 /// carried over to the next chunk. SSE events are delimited by blank lines
@@ -424,12 +557,12 @@ pub(super) fn drive_upstream_stream(
     _state: &AppState,
     accum: Arc<std::sync::Mutex<UsageAccumulator>>,
     response: reqwest::Response,
-    // Retained for API/call-site compatibility, but the gateway no longer
-    // synthesizes a success terminator: a clean upstream EOF ends the
-    // client stream at EOF (no fabricated `[DONE]`), and gateway-observed
-    // failures emit `error_marker` instead. See the `None`/idle/error
-    // branches below for the rationale.
-    _end_marker: Vec<u8>,
+    // Protocol-native end frame (e.g. `data: [DONE]\n\n`). Emitted on a
+    // clean upstream EOF **only** when the upstream delivered an error
+    // frame but no terminal signal — this lets the client SDK close the
+    // stream cleanly instead of timing out. Gateway-observed failures
+    // (idle / total / mid-stream error) emit `error_marker` instead.
+    end_marker: Vec<u8>,
     error_marker: Vec<u8>,
     idle_timeout: Duration,
     total_timeout: Duration,
@@ -569,6 +702,19 @@ pub(super) fn drive_upstream_stream(
                                                 ) {
                                                     saw_terminal = true;
                                                 }
+                                                // Detect upstream error frames
+                                                // embedded in an HTTP 200 SSE
+                                                // stream (e.g.
+                                                // service_unavailable_error).
+                                                // Record in the accumulator so
+                                                // the capture guard /
+                                                // telemetry can mark the
+                                                // request as failed.
+                                                if let tiygate_core::ir::StreamPart::Error { message, code } = part {
+                                                    if let Ok(mut a) = accum.lock() {
+                                                        a.set_upstream_error(message, code.as_deref());
+                                                    }
+                                                }
                                                 match tc.encoder.encode_part(part) {
                                                     Ok(b) => out.extend_from_slice(&b),
                                                     Err(e) => {
@@ -605,6 +751,19 @@ pub(super) fn drive_upstream_stream(
                                 // (`data: ...\n\n`); wrapping it in an axum
                                 // `Event` would double-prefix `data:` and
                                 // corrupt the stream. Pass the raw bytes.
+                                //
+                                // Lightweight error-frame scan: when the
+                                // chunk contains a `data:` SSE line whose
+                                // JSON payload has a top-level `"error"`
+                                // key (e.g.
+                                // `data: {"error":{"type":"service_unavailable_error",...}}`),
+                                // record it in the accumulator so the
+                                // capture guard / telemetry can mark the
+                                // request as failed despite the HTTP 200
+                                // status. The scan is cheap: a byte
+                                // substring search for `"error"` gates the
+                                // more expensive JSON parse.
+                                detect_verbatim_error(&bytes, &accum);
                                 capture_guard.append_client(&bytes);
                                 yield Ok(bytes);
                             }
@@ -754,6 +913,25 @@ pub(super) fn drive_upstream_stream(
                                         }
                                     }
                                 }
+                                // When the upstream sent an error frame
+                                // but no terminal signal, the client SDK
+                                // would hang waiting for its protocol-
+                                // native end frame. Emit `encode_done()`
+                                // (a pure terminator with no success
+                                // semantics, e.g. `data: [DONE]`) so the
+                                // SDK closes the stream cleanly.
+                                if !saw_terminal {
+                                    let has_upstream_error = accum
+                                        .lock()
+                                        .map(|a| a.upstream_error.is_some())
+                                        .unwrap_or(false);
+                                    if has_upstream_error {
+                                        let done = tc.encoder.encode_done();
+                                        if !done.is_empty() {
+                                            out.extend_from_slice(&done);
+                                        }
+                                    }
+                                }
                                 if !out.is_empty() {
                                     capture_guard.append_client(&out);
                                     yield Ok(Bytes::from(out));
@@ -773,6 +951,21 @@ pub(super) fn drive_upstream_stream(
                                 // and the appended terminator would glue onto a
                                 // half-written `data:` line. End at EOF and let
                                 // the client decide.
+                                //
+                                // Exception: when the upstream delivered an
+                                // error frame (detected via
+                                // `detect_verbatim_error`) but no natural
+                                // terminator, emit the protocol-native end
+                                // marker so the client SDK does not time out
+                                // waiting for it.
+                                let has_upstream_error = accum
+                                    .lock()
+                                    .map(|a| a.upstream_error.is_some())
+                                    .unwrap_or(false);
+                                if has_upstream_error && !end_marker.is_empty() {
+                                    capture_guard.append_client(&end_marker);
+                                    yield Ok(Bytes::from(end_marker.clone()));
+                                }
                             }
                             // Finalize capture BEFORE break: the client may
                             // close immediately after receiving the last frame
@@ -945,6 +1138,8 @@ mod tests {
             upstream_status: Some(200),
             upstream_resp_headers: Vec::new(),
             client_resp_headers: Vec::new(),
+            health: None,
+            health_key: None,
         }
     }
 
@@ -1064,5 +1259,200 @@ mod tests {
         // Accumulator should NOT be marked truncated.
         let acc = accum.lock().unwrap();
         assert!(acc.truncated.is_none());
+    }
+
+    // --- detect_verbatim_error tests ---
+
+    #[test]
+    fn detect_verbatim_error_openai_style() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"Service unavailable\"}}\n\n";
+        detect_verbatim_error(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        let err = acc.upstream_error.as_ref().expect("error should be set");
+        assert_eq!(err.message, "Service unavailable");
+        assert_eq!(err.code.as_deref(), Some("service_unavailable_error"));
+    }
+
+    #[test]
+    fn detect_verbatim_error_anthropic_style() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        // Anthropic uses event: error + data: {...}
+        let bytes = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        detect_verbatim_error(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        let err = acc.upstream_error.as_ref().expect("error should be set");
+        assert_eq!(err.message, "Overloaded");
+        assert_eq!(err.code.as_deref(), Some("overloaded_error"));
+    }
+
+    #[test]
+    fn detect_verbatim_error_normal_chunk_not_flagged() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        // A normal chunk that contains "error" in content text but not
+        // as a top-level key.
+        let bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"An error occurred\"}}]}\n\n";
+        detect_verbatim_error(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(acc.upstream_error.is_none(), "should not flag normal chunk");
+    }
+
+    #[test]
+    fn detect_verbatim_error_no_error_key_skipped() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
+        detect_verbatim_error(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(acc.upstream_error.is_none());
+    }
+
+    #[test]
+    fn detect_verbatim_error_first_error_wins() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes1 = b"data: {\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"First error\"}}\n\n";
+        let bytes2 =
+            b"data: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"Second error\"}}\n\n";
+        detect_verbatim_error(bytes1, &accum);
+        detect_verbatim_error(bytes2, &accum);
+        let acc = accum.lock().unwrap();
+        let err = acc.upstream_error.as_ref().expect("error should be set");
+        assert_eq!(err.message, "First error");
+    }
+
+    #[tokio::test]
+    async fn stream_capture_guard_propagates_upstream_error_to_capture() {
+        let bus = Arc::new(CapturingBus::default());
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        {
+            // Simulate detecting an error frame during streaming
+            {
+                let mut a = accum.lock().unwrap();
+                a.set_upstream_error("Service unavailable", Some("service_unavailable_error"));
+            }
+            let guard =
+                StreamCaptureGuard::new(Some(sample_stream_capture(bus.clone())), accum.clone());
+            guard.append_upstream(b"data: {\"error\":{...}}\n\n");
+            guard.append_client(b"data: {\"error\":{...}}\n\n");
+            guard.mark_upstream_completed();
+            guard.finalize_spawn();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bus.captures.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finalize_spawn should complete");
+
+        let captures = bus.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1);
+        let capture = &captures[0];
+        assert!(
+            capture.upstream_error.is_some(),
+            "upstream_error should be propagated"
+        );
+        assert!(capture
+            .upstream_error
+            .as_ref()
+            .unwrap()
+            .contains("Service unavailable"));
+        assert!(capture
+            .upstream_error
+            .as_ref()
+            .unwrap()
+            .contains("service_unavailable_error"));
+    }
+
+    #[tokio::test]
+    async fn record_health_failure_on_upstream_error() {
+        let health = Arc::new(tiygate_core::HealthRegistry::new(
+            1,
+            vec![Duration::from_secs(60)],
+        ));
+        let key = "provider:model".to_string();
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        {
+            let mut a = accum.lock().unwrap();
+            a.set_upstream_error("Service unavailable", Some("service_unavailable_error"));
+        }
+        let bus = Arc::new(CapturingBus::default());
+        let mut capture = sample_stream_capture(bus);
+        capture.health = Some(health.clone());
+        capture.health_key = Some(key.clone());
+        let guard = StreamCaptureGuard::new(Some(capture), accum.clone());
+        guard.finalize_spawn();
+        // After an upstream error, the target should be unhealthy
+        // (threshold = 1).
+        assert!(
+            !health.is_healthy(&key),
+            "health should record failure after upstream error"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_health_failure_on_clean_stream() {
+        let health = Arc::new(tiygate_core::HealthRegistry::new(
+            1,
+            vec![Duration::from_secs(60)],
+        ));
+        let key = "provider:model".to_string();
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bus = Arc::new(CapturingBus::default());
+        let mut capture = sample_stream_capture(bus);
+        capture.health = Some(health.clone());
+        capture.health_key = Some(key.clone());
+        let guard = StreamCaptureGuard::new(Some(capture), accum.clone());
+        guard.mark_upstream_completed();
+        guard.finalize_spawn();
+        assert!(
+            health.is_healthy(&key),
+            "health should remain healthy on clean stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_health_failure_on_truncation() {
+        let health = Arc::new(tiygate_core::HealthRegistry::new(
+            1,
+            vec![Duration::from_secs(60)],
+        ));
+        let key = "provider:model".to_string();
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bus = Arc::new(CapturingBus::default());
+        let mut capture = sample_stream_capture(bus);
+        capture.health = Some(health.clone());
+        capture.health_key = Some(key.clone());
+        let guard = StreamCaptureGuard::new(Some(capture), accum.clone());
+        guard.set_reason(Some(TruncationReason::Idle));
+        guard.finalize_spawn();
+        assert!(
+            !health.is_healthy(&key),
+            "health should record failure after idle truncation"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_health_failure_on_client_disconnect_only() {
+        let health = Arc::new(tiygate_core::HealthRegistry::new(
+            1,
+            vec![Duration::from_secs(60)],
+        ));
+        let key = "provider:model".to_string();
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bus = Arc::new(CapturingBus::default());
+        let mut capture = sample_stream_capture(bus);
+        capture.health = Some(health.clone());
+        capture.health_key = Some(key.clone());
+        // Simulate client disconnect without upstream error or gateway
+        // truncation — Drop path sets ClientDisconnect, which is NOT
+        // a failure reason for health.
+        drop(StreamCaptureGuard::new(Some(capture), accum));
+        assert!(
+            health.is_healthy(&key),
+            "client disconnect alone should not trigger health failure"
+        );
     }
 }
