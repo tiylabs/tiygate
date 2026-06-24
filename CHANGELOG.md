@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-06-24
+### :sparkles: New Features
+- [`9704b38`](https://github.com/tiylabs/tiygate/commit/9704b3843d82280f4106b3f16feb52d3c42e03e7) - **store**: ✨ add token stats export/import and fix Tauri desktop download *(PR [#6](https://github.com/tiylabs/tiygate/pull/6) by [@jorben](https://github.com/jorben))*
+
+### :bug: Bug Fixes
+- [`8e56a1c`](https://github.com/tiylabs/tiygate/commit/8e56a1cb00f56ef75a658d8c28179a6bc29cd7ed) - **ingress**: 🐛 inject end frame after stream error and improve admin console UX *(PR [#9](https://github.com/tiylabs/tiygate/pull/9) by [@jorben](https://github.com/jorben))*
+
+
 ## [0.1.5] - 2026-06-23
 ### :sparkles: New Features
 - [`d2accf6`](https://github.com/tiylabs/tiygate/commit/d2accf63c2d1097afe23fd815eb423e5e5ef2ece) - **ui**: ✨ show enabled state in target badges *(commit by [@jorben](https://github.com/jorben))*
@@ -130,3 +138,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.3]: https://github.com/tiylabs/tiygate/compare/0.1.2...0.1.3
 [0.1.4]: https://github.com/tiylabs/tiygate/compare/0.1.3...0.1.4
 [0.1.5]: https://github.com/tiylabs/tiygate/compare/0.1.4...0.1.5
+[0.1.6]: https://github.com/tiylabs/tiygate/compare/0.1.5...0.1.6
