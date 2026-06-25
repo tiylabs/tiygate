@@ -136,8 +136,8 @@ pub fn claude_preset() -> OAuthProviderPreset {
 pub fn xai_preset() -> OAuthProviderPreset {
     OAuthProviderPreset {
         vendor: "xai".to_string(),
-        auth_url: "https://auth.x.ai/oauth/authorize".to_string(),
-        token_url: "https://auth.x.ai/oauth/token".to_string(),
+        auth_url: "https://auth.x.ai/oauth2/authorize".to_string(),
+        token_url: "https://auth.x.ai/oauth2/token".to_string(),
         client_id: "b1a00492-073a-47ea-816f-4c329264a828".to_string(),
         redirect_url: "http://127.0.0.1:56121/callback".to_string(),
         scopes: vec![
@@ -634,8 +634,8 @@ mod tests {
     fn xai_preset_values() {
         let p = xai_preset();
         assert_eq!(p.vendor, "xai");
-        assert_eq!(p.auth_url, "https://auth.x.ai/oauth/authorize");
-        assert_eq!(p.token_url, "https://auth.x.ai/oauth/token");
+        assert_eq!(p.auth_url, "https://auth.x.ai/oauth2/authorize");
+        assert_eq!(p.token_url, "https://auth.x.ai/oauth2/token");
         assert_eq!(p.client_id, "b1a00492-073a-47ea-816f-4c329264a828");
         assert_eq!(p.redirect_url, "http://127.0.0.1:56121/callback");
         assert_eq!(
