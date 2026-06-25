@@ -34,7 +34,7 @@ impl Default for OpenCodeGoProvider {
 impl OpenCodeZenProvider {
     pub fn new() -> Self {
         Self {
-            metadata: opencode_metadata("OpenCodeZen", "https://opencode.ai/zen"),
+            metadata: opencode_metadata("OpenCodeZen", "https://opencode.ai/zen/v1"),
         }
     }
 }
@@ -42,7 +42,7 @@ impl OpenCodeZenProvider {
 impl OpenCodeGoProvider {
     pub fn new() -> Self {
         Self {
-            metadata: opencode_metadata("OpenCodeGo", "https://opencode.ai/zen/go"),
+            metadata: opencode_metadata("OpenCodeGo", "https://opencode.ai/zen/go/v1"),
         }
     }
 }
@@ -169,14 +169,14 @@ mod tests {
         let zen = OpenCodeZenProvider::new();
         assert_eq!(zen.id(), "opencode-zen");
         assert_eq!(zen.metadata().display_name, "OpenCodeZen");
-        assert_eq!(zen.metadata().base_url, "https://opencode.ai/zen");
+        assert_eq!(zen.metadata().base_url, "https://opencode.ai/zen/v1");
         assert!(matches!(zen.metadata().auth_mode, AuthMode::Bearer));
         assert_eq!(zen.metadata().channels, vec!["default"]);
 
         let go = OpenCodeGoProvider::new();
         assert_eq!(go.id(), "opencode-go");
         assert_eq!(go.metadata().display_name, "OpenCodeGo");
-        assert_eq!(go.metadata().base_url, "https://opencode.ai/zen/go");
+        assert_eq!(go.metadata().base_url, "https://opencode.ai/zen/go/v1");
         assert!(matches!(go.metadata().auth_mode, AuthMode::Bearer));
         assert_eq!(go.metadata().channels, vec!["default"]);
     }
@@ -249,16 +249,16 @@ mod tests {
         let compatible = ProtocolSuite::OpenAiCompatible.default_endpoint();
 
         assert_eq!(
-            provider.egress_api_base("https://example.test/zen/go", &messages),
-            "https://example.test/zen/go"
+            provider.egress_api_base("https://example.test/zen/go/v1", &messages),
+            "https://example.test/zen/go/v1"
         );
         assert_eq!(
-            provider.egress_api_base("https://example.test/zen/go", &gemini),
-            "https://example.test/zen/go"
+            provider.egress_api_base("https://example.test/zen/go/v1", &gemini),
+            "https://example.test/zen/go/v1"
         );
         assert_eq!(
-            provider.egress_api_base("https://example.test/zen/go", &compatible),
-            "https://example.test/zen/go"
+            provider.egress_api_base("https://example.test/zen/go/v1", &compatible),
+            "https://example.test/zen/go/v1"
         );
     }
 }
