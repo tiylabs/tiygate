@@ -149,6 +149,9 @@ pub struct AppState {
     /// `store.refresh()` when settings change; the data plane
     /// reads the current value via `state.tunables()`.
     tunables: Arc<arc_swap::ArcSwap<RuntimeTunables>>,
+    /// OAuth token manager. Handles OAuth token refresh and
+    /// injection for providers configured with `AuthMode::OAuth`.
+    pub oauth_manager: crate::oauth_manager::OAuthTokenManager,
 }
 
 impl AppState {
@@ -333,7 +336,7 @@ fn build_data_plane_router(
     };
     let state = AppState {
         config: Arc::new(config),
-        db_store,
+        db_store: db_store.clone(),
         health,
         concurrency_semaphore: semaphore,
         max_multimodal_body_bytes: server_config.max_multimodal_body_bytes,
@@ -343,6 +346,10 @@ fn build_data_plane_router(
         embedding_cache,
         redactor: Arc::new(tiygate_core::redaction::Redactor::with_defaults()),
         tunables: Arc::new(arc_swap::ArcSwap::from_pointee(tunables)),
+        oauth_manager: crate::oauth_manager::OAuthTokenManager::new(
+            db_store,
+            build_http_client(server_config),
+        ),
     };
 
     Router::new()
@@ -589,7 +596,23 @@ pub fn compute_pass_through<C: tiygate_core::EndpointCodec>(
 pub async fn apply_provider_auth(
     target: &tiygate_core::RoutingTarget,
     upstream_headers: &mut http::HeaderMap,
+    oauth_manager: &crate::oauth_manager::OAuthTokenManager,
 ) -> Result<(), AppError> {
+    // OAuth path: if the routing target carries an OAuth config,
+    // use the OAuthTokenManager to refresh/inject the access token.
+    // Return immediately on success; fall through to the static
+    // key path only when the target is not OAuth-mode.
+    match oauth_manager.apply(target, upstream_headers).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => { /* not OAuth — fall through to static key */ }
+        Err(e) => {
+            return Err(AppError::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("OAuth token error: {e}"),
+            ));
+        }
+    }
+
     if let Some(provider) = tiygate_core::provider::find_provider(&target.provider_id) {
         let auth = provider.auth();
         if let Err(e) = auth.apply(upstream_headers, target).await {

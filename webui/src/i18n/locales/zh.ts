@@ -184,6 +184,8 @@ const zh: Translation = {
       oauth: "OAuth",
     },
     unsupported: "暂不支持",
+    unsupportedVendor: "该厂商不支持",
+    oauthHint: "保存后，请前往 OAuth 页面完成授权流程。",
     apiKey: "API 密钥",
     apiKeyHint: "留空则保留现有密钥。",
     redacted: "密钥加密存储，永不返回明文。",
@@ -350,8 +352,7 @@ const zh: Translation = {
     viewDetail: "查看详情",
     replay: "回放信封",
     redactedNote: "请求头已脱敏。",
-    replayNote:
-      "这是已存储的快照，不会重新向上游发起请求；请求头已脱敏。",
+    replayNote: "这是已存储的快照，不会重新向上游发起请求；请求头已脱敏。",
     rawEnvelope: "原始信封",
     redactedHeaders: "脱敏请求头",
     prev: "上一页",

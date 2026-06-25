@@ -4,23 +4,23 @@
 //! out for the OAuth admin callback surface:
 //!
 //! * `POST /admin/v1/oauth/start` — accept a `provider_id`, look
-//!   up the provider's OAuth config, mint a `state` CSRF nonce +
-//!   PKCE code-verifier, and return the authorization URL the
-//!   caller must redirect the user-agent to. The `state` is
+//!   up the provider's OAuth preset by vendor, mint a `state` CSRF
+//!   nonce + PKCE code-verifier, and return the authorization URL
+//!   the caller must redirect the user-agent to. The `state` is
 //!   stashed in `AdminState::oauth_pending` so the callback can
 //!   validate the round-trip.
 //!
 //! * `GET /admin/v1/oauth/callback` — receive the provider's
 //!   redirect (with `code` + `state` query params), look up the
-//!   pending flow, exchange the code for an access token, persist
+//!   pending flow, exchange the code for tokens via the
+//!   provider-specific token endpoint (form or JSON body), persist
 //!   the encrypted refresh-token metadata to the provider row,
 //!   and return a small JSON summary.
 //!
 //! * `POST /admin/v1/oauth/refresh` — for a provider already
 //!   configured with a stored refresh token, run the OAuth
 //!   refresh flow to mint a new access token without
-//!   user-interaction. Used for background jobs and long-running
-//!   admin operations.
+//!   user-interaction.
 //!
 //! ## CSRF / state hygiene
 //!
@@ -33,14 +33,15 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use oauth2::PkceCodeVerifier;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use tiygate_auth::oauth::{OAuthAuthApplier, OAuthConfig, OAuthOutcome};
+use tiygate_auth::provider_oauth::{
+    build_authorize_url, do_refresh_token, exchange_code, generate_pkce, preset_for_vendor,
+};
 use tiygate_store::models::AuthMode;
 
 use crate::state::{AdminState, OAuthPendingFlow};
@@ -59,12 +60,6 @@ pub fn router() -> Router<AdminState> {
 /// multi-replica deployments must place an external store
 /// (Redis, DB) behind this — Phase 5+.
 pub type PendingFlowMap = Arc<Mutex<HashMap<String, OAuthPendingFlow>>>;
-
-// `OAuthPendingFlow` is defined in `crate::state` and re-used
-// here so the same struct flows through `state.oauth_pending`,
-// the `start` handler, and the `callback` handler. Keeping a
-// single definition avoids accidental drift between the writer
-// (start) and the reader (callback).
 
 /// `POST /admin/v1/oauth/start` — kick off the auth-code flow.
 ///
@@ -91,29 +86,30 @@ async fn start_oauth(
         ));
     }
 
-    // Build the OAuthConfig from the persisted metadata.
-    let oauth_meta = provider
-        .metadata_json
-        .get("oauth")
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("provider has no oauth metadata"))?;
-    let config: OAuthConfig = serde_json::from_value(oauth_meta)
-        .map_err(|e| ApiError::bad_request(format!("invalid oauth metadata: {e}")))?;
+    // Look up the OAuth preset for the provider's vendor.
+    let preset = preset_for_vendor(&provider.vendor).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "no built-in OAuth preset for vendor '{}'; \
+             supported vendors: openai, anthropic, xai",
+            provider.vendor
+        ))
+    })?;
 
-    // Build the applier and mint the auth URL + PKCE verifier.
-    let applier = OAuthAuthApplier::new(config);
-    let (url, pkce_verifier) = applier
-        .start()
-        .await
-        .map_err(|e| ApiError::internal(format!("oauth start failed: {e}")))?;
+    // Generate PKCE verifier + challenge.
+    let (verifier, challenge) = generate_pkce();
 
-    // Mint a `state` CSRF nonce and stash the pending flow.
+    // Mint a `state` CSRF nonce.
     let csrf_state = mint_state();
+
+    // Build the authorization URL.
+    let url = build_authorize_url(&preset, &csrf_state, &challenge);
+
+    // Stash the pending flow (provider_id + PKCE verifier).
     state.oauth_pending.lock().await.insert(
         csrf_state.clone(),
         OAuthPendingFlow {
             provider_id: req.provider_id.clone(),
-            verifier: pkce_verifier.secret().to_string(),
+            verifier,
         },
     );
 
@@ -146,70 +142,35 @@ async fn callback_oauth(
     let pending = state.oauth_pending.lock().await.remove(&q.state);
     let pending = pending.ok_or_else(|| ApiError::bad_request("invalid or expired `state`"))?;
 
-    // Build a synthetic `RoutingTarget` so we can reuse
-    // `OAuthAuthApplier::exchange`. The label defaults to the
-    // provider id; that is sufficient for the applier to find
-    // the in-memory token cache.
-    let target = tiygate_core::routing::RoutingTarget {
-        provider_id: pending.provider_id.clone(),
-        model_id: pending.provider_id.clone(),
-        api_base: String::new(),
-        api_key: String::new(),
-        api_protocol: tiygate_core::ProtocolEndpoint::new(
-            tiygate_core::ProtocolSuite::OpenAiCompatible,
-            "chat-completions",
-            "v1",
-        ),
-        account_label: None,
-        api_key_override: None,
-        api_base_override: None,
-        weight: 1.0,
-    };
-
-    // Reconstruct the PKCE verifier. The applier's `exchange` takes
-    // ownership of the verifier, so we need to recreate the
-    // `PkceCodeVerifier` from the secret string.
-    let pkce_verifier = PkceCodeVerifier::new(pending.verifier.clone());
-
-    // Look up the provider's OAuth config and build the applier
-    // (the same one used by `start_oauth`).
+    // Look up the provider and its OAuth preset.
     let provider = state
         .store
         .get_provider(&pending.provider_id)
         .await
         .map_err(|e| ApiError::internal(format!("lookup provider: {e}")))?
         .ok_or_else(|| ApiError::not_found("provider vanished during oauth flow"))?;
-    let oauth_meta = provider
-        .metadata_json
-        .get("oauth")
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("provider oauth metadata vanished"))?;
-    let config: OAuthConfig = serde_json::from_value(oauth_meta)
-        .map_err(|e| ApiError::bad_request(format!("invalid oauth metadata: {e}")))?;
-    let applier = OAuthAuthApplier::new(config);
 
-    let outcome = applier
-        .exchange(&target, &q.code, pkce_verifier)
+    let preset = preset_for_vendor(&provider.vendor).ok_or_else(|| {
+        ApiError::internal(format!(
+            "provider vendor '{}' has no built-in OAuth preset",
+            provider.vendor
+        ))
+    })?;
+
+    // Exchange the authorization code for tokens.
+    let http_client = reqwest::Client::new();
+    let result = exchange_code(&preset, &q.code, &pending.verifier, &http_client)
         .await
         .map_err(|e| ApiError::internal(format!("oauth exchange failed: {e}")))?;
 
-    let (access_token, refresh_token, expires_in) = match outcome {
-        OAuthOutcome::Token {
-            access_token,
-            refresh_token,
-            expires_in,
-        } => (access_token, refresh_token, expires_in),
-        OAuthOutcome::RedirectUrl(_) => {
-            return Err(ApiError::internal(
-                "oauth applier returned RedirectUrl from exchange (unexpected)",
-            ));
-        }
-    };
+    let access_token = result.access_token;
+    let refresh_token = result.refresh_token;
+    let expires_in = result.expires_in;
 
     // Persist the refresh-token metadata (encrypted at rest by
     // the `DbConfigStore`). The access token itself is *not*
     // persisted — it lives in the in-memory cache of the
-    // `OAuthAuthApplier` instance held by the data plane.
+    // `OAuthTokenCache` held by the data plane.
     let meta_json = json!({
         "refresh_token": refresh_token,
         "expires_in_s": expires_in.map(|d| d.as_secs()),
@@ -261,45 +222,60 @@ async fn refresh_oauth(
             "provider is not configured for OAuth",
         ));
     }
-    let oauth_meta = provider
-        .metadata_json
-        .get("oauth")
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("provider has no oauth metadata"))?;
-    let config: OAuthConfig = serde_json::from_value(oauth_meta)
-        .map_err(|e| ApiError::bad_request(format!("invalid oauth metadata: {e}")))?;
-    let applier = OAuthAuthApplier::new(config);
-    let target = tiygate_core::routing::RoutingTarget {
-        provider_id: req.provider_id.clone(),
-        model_id: req.provider_id.clone(),
-        api_base: String::new(),
-        api_key: String::new(),
-        api_protocol: tiygate_core::ProtocolEndpoint::new(
-            tiygate_core::ProtocolSuite::OpenAiCompatible,
-            "chat-completions",
-            "v1",
-        ),
-        account_label: None,
-        api_key_override: None,
-        api_base_override: None,
-        weight: 1.0,
-    };
-    let outcome = applier
-        .refresh(&target)
-        .await
-        .map_err(|e| ApiError::internal(format!("oauth refresh failed: {e}")))?;
-    let (access_token, _refresh, expires_in) = match outcome {
-        OAuthOutcome::Token {
-            access_token,
-            refresh_token,
-            expires_in,
-        } => (access_token, refresh_token, expires_in),
-        OAuthOutcome::RedirectUrl(_) => {
-            return Err(ApiError::internal(
-                "oauth applier returned RedirectUrl from refresh (unexpected)",
-            ));
+
+    let preset = preset_for_vendor(&provider.vendor).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "provider vendor '{}' has no built-in OAuth preset",
+            provider.vendor
+        ))
+    })?;
+
+    // Decrypt the stored OAuth metadata to get the refresh token.
+    let oauth_meta_str = provider
+        .oauth_meta_cleartext
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("provider has no stored OAuth metadata"))?;
+    let oauth_meta: serde_json::Value = serde_json::from_str(oauth_meta_str)
+        .map_err(|e| ApiError::bad_request(format!("invalid OAuth metadata: {e}")))?;
+    let refresh_token = oauth_meta
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::bad_request("OAuth metadata has no refresh_token"))?;
+
+    // Perform the refresh.
+    let http_client = reqwest::Client::new();
+    let result = do_refresh_token(
+        &preset.token_url,
+        &preset.client_id,
+        refresh_token,
+        &preset.scopes,
+        &preset.token_request_style,
+        &http_client,
+    )
+    .await
+    .map_err(|e| ApiError::internal(format!("oauth refresh failed: {e}")))?;
+
+    let access_token = result.access_token;
+    let new_refresh_token = result.refresh_token;
+    let expires_in = result.expires_in;
+
+    // If the refresh token was rotated, persist the new one.
+    if let Some(new_rt) = &new_refresh_token {
+        if new_rt != refresh_token {
+            let meta_json = json!({
+                "refresh_token": new_rt,
+                "expires_in_s": expires_in.map(|d| d.as_secs()),
+            });
+            let meta_str = serde_json::to_string(&meta_json)
+                .map_err(|e| ApiError::internal(format!("serialise oauth meta: {e}")))?;
+            state
+                .store
+                .set_provider_oauth_meta(&req.provider_id, &meta_str)
+                .await
+                .map_err(|e| ApiError::internal(format!("persist oauth meta: {e}")))?;
         }
-    };
+    }
+
     Ok(Json(RefreshOauthResponse {
         provider_id: req.provider_id,
         access_token: Some(access_token),

@@ -39,6 +39,7 @@ pub use protocol::{
     CodecRegistration, EndpointCapabilities, EndpointCodec, Error, PassThroughPolicy,
     ProtocolEndpoint, ProtocolSuite, StreamCaps, StreamDecoder, StreamEncoder, StreamPartStream,
 };
+pub use provider::oauth::{OAuthTargetConfig, TokenRequestStyle};
 pub use provider::{
     AuthApplier, AuthMode, Executor, Provider, ProviderMetadata, ProviderRegistration,
 };

@@ -38,6 +38,12 @@ pub struct RoutingTarget {
     pub api_base_override: Option<String>,
     /// Weight for weighted routing strategy.
     pub weight: f64,
+    /// OAuth configuration. `Some` when the provider's `auth_mode`
+    /// is `OAuth` and a refresh token is available. The data-plane
+    /// auth path checks this field first; when `Some`, it uses the
+    /// `OAuthTokenCache` instead of the static key path.
+    #[serde(default, skip)]
+    pub oauth: Option<crate::provider::oauth::OAuthTargetConfig>,
 }
 
 impl RoutingTarget {

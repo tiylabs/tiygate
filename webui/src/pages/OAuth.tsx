@@ -69,10 +69,13 @@ export default function OAuth() {
     }
   }
 
-  const hasProviders = (providers ?? []).length > 0;
+  // Only show OAuth-mode providers — others can't use the OAuth flow.
+  const oauthProviders = (providers ?? []).filter(
+    (p) => p.auth_mode === "oauth",
+  );
   const providerOptions = [
     { value: "", label: t("oauth.selectPlaceholder") },
-    ...(providers ?? []).map((p) => ({
+    ...oauthProviders.map((p) => ({
       value: p.id,
       label: `${p.name} (${p.id})`,
     })),
@@ -85,7 +88,7 @@ export default function OAuth() {
         <CardHeader title={t("oauth.subtitle")} />
         {isLoading ? (
           <Spinner />
-        ) : !hasProviders ? (
+        ) : oauthProviders.length === 0 ? (
           <EmptyState title={t("oauth.noProviders")} />
         ) : (
           <CardBody className="space-y-4">
@@ -158,7 +161,10 @@ export default function OAuth() {
                       {t("oauth.copyUrl")}
                     </Button>
                     <a href={authUrl} target="_blank" rel="noreferrer">
-                      <Button variant="accent" icon={<ExternalLink size={14} />}>
+                      <Button
+                        variant="accent"
+                        icon={<ExternalLink size={14} />}
+                      >
                         {t("oauth.openUrl")}
                       </Button>
                     </a>

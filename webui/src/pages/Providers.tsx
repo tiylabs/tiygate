@@ -3,7 +3,11 @@ import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Pencil, Trash2 } from "lucide-react";
 import { providersApi, providerCatalogApi } from "@/api/resources";
-import type { Provider, ProviderDeleteImpact, ProviderInput } from "@/api/types";
+import type {
+  Provider,
+  ProviderDeleteImpact,
+  ProviderInput,
+} from "@/api/types";
 import {
   Badge,
   Button,
@@ -24,6 +28,7 @@ import {
   Td,
   Th,
   Tr,
+  Alert,
   useStickyTableScroll,
   useToast,
 } from "@/components/ui";
@@ -32,10 +37,58 @@ import { cn } from "@/lib/cn";
 import { VendorIcon } from "@/lib/vendors";
 
 const AUTH_MODES = ["api_key", "oauth"];
-const SUPPORTED_AUTH_MODE = "api_key";
+
+/** Vendors that have a built-in OAuth preset (crates/auth/src/provider_oauth.rs). */
+const OAUTH_VENDORS = new Set(["openai", "anthropic", "xai"]);
+
+/**
+ * OAuth preset metadata embedded into `metadata_json["oauth"]` when a
+ * provider is saved with auth_mode=oauth. Mirrors the values in
+ * crates/auth/src/provider_oauth.rs so the backend's
+ * `build_oauth_target_config` can construct an `OAuthTargetConfig`.
+ */
+const OAUTH_PRESETS: Record<
+  string,
+  {
+    token_url: string;
+    client_id: string;
+    scopes: string[];
+  }
+> = {
+  openai: {
+    token_url: "https://auth.openai.com/oauth/token",
+    client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+    scopes: ["openid", "email", "profile", "offline_access"],
+  },
+  anthropic: {
+    token_url: "https://api.anthropic.com/v1/oauth/token",
+    client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    scopes: [
+      "user:profile",
+      "user:inference",
+      "user:sessions:claude_code",
+      "user:mcp_servers",
+      "user:file_upload",
+    ],
+  },
+  xai: {
+    token_url: "https://auth.x.ai/oauth/token",
+    client_id: "b1a00492-073a-47ea-816f-4c329264a828",
+    scopes: [
+      "openid",
+      "profile",
+      "email",
+      "offline_access",
+      "grok-cli:access",
+      "api:access",
+    ],
+  },
+};
 
 function authModeLabelKey(mode: string): string {
-  return mode === "oauth" ? "providers.authModes.oauth" : "providers.authModes.staticKey";
+  return mode === "oauth"
+    ? "providers.authModes.oauth"
+    : "providers.authModes.staticKey";
 }
 
 interface FormState {
@@ -61,7 +114,7 @@ function emptyForm(): FormState {
     vendor: "openai",
     api_base: "",
     api_key: "",
-    auth_mode: SUPPORTED_AUTH_MODE,
+    auth_mode: "api_key",
     enabled: true,
   };
 }
@@ -98,7 +151,9 @@ export default function Providers() {
   const [form, setForm] = useState<FormState>(emptyForm());
   const [editing, setEditing] = useState<Provider | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
-  const [pendingDelete, setPendingDelete] = useState<PendingDeleteState | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<PendingDeleteState | null>(
+    null,
+  );
 
   // Options for the vendor dropdown, sourced from the server catalog. When
   // editing a provider whose vendor is no longer in the catalog (server
@@ -129,7 +184,8 @@ export default function Providers() {
     return opts;
   }, [catalog, form.vendor]);
 
-  const invalidateProviders = () => qc.invalidateQueries({ queryKey: ["providers"] });
+  const invalidateProviders = () =>
+    qc.invalidateQueries({ queryKey: ["providers"] });
   const invalidateProviderDelete = () => {
     void qc.invalidateQueries({ queryKey: ["providers"] });
     void qc.invalidateQueries({ queryKey: ["routes"] });
@@ -176,7 +232,7 @@ export default function Providers() {
       vendor: p.vendor,
       api_base: p.api_base,
       api_key: "",
-      auth_mode: SUPPORTED_AUTH_MODE,
+      auth_mode: p.auth_mode,
       enabled: p.enabled,
     });
     setFormError(null);
@@ -190,7 +246,8 @@ export default function Providers() {
     try {
       const impact = await providersApi.deleteImpact(p.id);
       setPendingDelete((current) =>
-        deleteImpactRequestRef.current === requestId && current?.provider.id === p.id
+        deleteImpactRequestRef.current === requestId &&
+        current?.provider.id === p.id
           ? { provider: p, impact, loading: false }
           : current,
       );
@@ -200,7 +257,8 @@ export default function Providers() {
         toast.error(t("providers.deleteImpactLoadFailed"), message);
       }
       setPendingDelete((current) =>
-        deleteImpactRequestRef.current === requestId && current?.provider.id === p.id
+        deleteImpactRequestRef.current === requestId &&
+        current?.provider.id === p.id
           ? { provider: p, loading: false, error: message }
           : current,
       );
@@ -209,16 +267,28 @@ export default function Providers() {
 
   function submit() {
     setFormError(null);
+    const isOAuth = form.auth_mode === "oauth";
     const body: ProviderInput = {
       name: form.name,
       vendor: form.vendor,
       api_base: form.api_base,
-      auth_mode: SUPPORTED_AUTH_MODE,
+      auth_mode: form.auth_mode,
       enabled: form.enabled,
     };
     // Only send api_key when the operator typed one — blank keeps the
     // existing encrypted secret untouched.
     if (form.api_key.trim()) body.api_key = form.api_key.trim();
+
+    // For OAuth providers, embed the OAuth preset metadata so the
+    // backend's snapshot_to_routing_table can build OAuthTargetConfig
+    // (token_url, client_id, scopes, etc.) from metadata_json["oauth"].
+    if (isOAuth) {
+      const oauthConfig = OAUTH_PRESETS[form.vendor];
+      if (oauthConfig) {
+        body.metadata = { oauth: oauthConfig };
+      }
+    }
+
     saveMutation.mutate({ id: editing?.id, body });
   }
 
@@ -256,7 +326,11 @@ export default function Providers() {
       <PageHeader
         title={t("providers.title")}
         action={
-          <Button variant="primary" icon={<Plus size={16} />} onClick={openCreate}>
+          <Button
+            variant="primary"
+            icon={<Plus size={16} />}
+            onClick={openCreate}
+          >
             {t("providers.add")}
           </Button>
         }
@@ -287,7 +361,10 @@ export default function Providers() {
             />
           ) : (
             <Table
-              maxHeight={["max-h-[calc(100vh-9.5rem)]", "lg:max-h-[calc(100vh-5.5rem)]"]}
+              maxHeight={[
+                "max-h-[calc(100vh-9.5rem)]",
+                "lg:max-h-[calc(100vh-5.5rem)]",
+              ]}
               tableClassName="min-w-max border-separate border-spacing-0"
               containerRef={scrollRef}
             >
@@ -447,20 +524,29 @@ export default function Providers() {
               onValueChange={(v) => {
                 // On a fresh create, prefill api_base from the selected
                 // catalog entry only when still empty (don't clobber a typed URL).
-                // Auth mode is fixed to Static Key because OAuth is not supported yet.
                 const entry = catalog?.find((e) => e.id === v);
-                setForm((prev) => ({
-                  ...prev,
-                  vendor: v,
-                  api_base:
-                    !editing && !prev.api_base && entry
-                      ? entry.default_base_url
-                      : prev.api_base,
-                  auth_mode: SUPPORTED_AUTH_MODE,
-                }));
+                setForm((prev) => {
+                  // If switching to a vendor that doesn't support OAuth
+                  // while auth_mode is "oauth", reset to "api_key".
+                  const authMode =
+                    prev.auth_mode === "oauth" && !OAUTH_VENDORS.has(v)
+                      ? "api_key"
+                      : prev.auth_mode;
+                  return {
+                    ...prev,
+                    vendor: v,
+                    api_base:
+                      !editing && !prev.api_base && entry
+                        ? entry.default_base_url
+                        : prev.api_base,
+                    auth_mode: authMode,
+                  };
+                });
               }}
               ariaLabel={t("providers.vendor")}
-              disabled={catalogLoading || catalogError || vendorOptions.length === 0}
+              disabled={
+                catalogLoading || catalogError || vendorOptions.length === 0
+              }
               placeholder={
                 catalogLoading
                   ? t("providers.vendorLoading")
@@ -482,33 +568,41 @@ export default function Providers() {
             <Select
               value={form.auth_mode}
               onValueChange={(v) => {
-                if (v === SUPPORTED_AUTH_MODE) {
-                  setForm({ ...form, auth_mode: v });
-                }
+                setForm({ ...form, auth_mode: v });
               }}
               ariaLabel={t("providers.authMode")}
-              options={AUTH_MODES.map((m) => ({
-                value: m,
-                label:
-                  m === "oauth"
-                    ? `${t(authModeLabelKey(m))}（${t("providers.unsupported")}）`
-                    : t(authModeLabelKey(m)),
-                disabled: m !== SUPPORTED_AUTH_MODE,
-              }))}
+              options={AUTH_MODES.map((m) => {
+                const oauthSupported = OAUTH_VENDORS.has(form.vendor);
+                return {
+                  value: m,
+                  label:
+                    m === "oauth" && !oauthSupported
+                      ? `${t(authModeLabelKey(m))}（${t("providers.unsupportedVendor")}）`
+                      : t(authModeLabelKey(m)),
+                  disabled: m === "oauth" && !oauthSupported,
+                };
+              })}
             />
           </Field>
-          <Field
-            label={t("providers.apiKey")}
-            hint={editing ? t("providers.apiKeyHint") : t("providers.redacted")}
-          >
-            <PasswordInput
-              value={form.api_key}
-              onChange={(e) => setForm({ ...form, api_key: e.target.value })}
-              placeholder={editing ? "••••••••" : "sk-…"}
-              toggleLabel={t("providers.apiKey")}
-              autoComplete="off"
-            />
-          </Field>
+          {form.auth_mode === "oauth" ? (
+            <Alert tone="info">{t("providers.oauthHint")}</Alert>
+          ) : null}
+          {form.auth_mode !== "oauth" ? (
+            <Field
+              label={t("providers.apiKey")}
+              hint={
+                editing ? t("providers.apiKeyHint") : t("providers.redacted")
+              }
+            >
+              <PasswordInput
+                value={form.api_key}
+                onChange={(e) => setForm({ ...form, api_key: e.target.value })}
+                placeholder={editing ? "••••••••" : "sk-…"}
+                toggleLabel={t("providers.apiKey")}
+                autoComplete="off"
+              />
+            </Field>
+          ) : null}
           <Switch
             checked={form.enabled}
             onCheckedChange={(v) => setForm({ ...form, enabled: v })}

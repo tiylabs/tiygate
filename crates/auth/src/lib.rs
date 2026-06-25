@@ -6,3 +6,4 @@
 pub mod api_key;
 pub mod bearer;
 pub mod oauth;
+pub mod provider_oauth;

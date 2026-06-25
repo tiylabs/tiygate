@@ -24,6 +24,7 @@ mod config;
 mod drain;
 mod ingress;
 mod models;
+mod oauth_manager;
 mod telemetry;
 mod trace;
 #[cfg(feature = "webui")]

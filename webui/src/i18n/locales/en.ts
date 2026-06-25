@@ -188,6 +188,9 @@ const en = {
       oauth: "OAuth",
     },
     unsupported: "Not supported yet",
+    unsupportedVendor: "Vendor not supported",
+    oauthHint:
+      "After saving, go to the OAuth page to complete the authorization flow.",
     apiKey: "API key",
     apiKeyHint: "Leave blank to keep the existing secret.",
     redacted: "Secret is stored encrypted and never returned.",

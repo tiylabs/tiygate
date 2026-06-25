@@ -16,6 +16,12 @@ async-trait.workspace = true
 oauth2.workspace = true
 parking_lot.workspace = true
 zeroize.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+base64 = "0.22"
+rand.workspace = true
+dashmap.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

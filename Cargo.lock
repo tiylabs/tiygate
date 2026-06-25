@@ -5688,6 +5688,7 @@ dependencies = [
  "oauth2",
  "rand 0.8.6",
  "redis",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serial_test",
@@ -5711,15 +5712,21 @@ name = "tiygate-auth"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "dashmap",
  "http 1.4.2",
  "oauth2",
  "parking_lot",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tiygate-core",
  "tokio",
  "tracing",
+ "url",
  "zeroize",
 ]
 

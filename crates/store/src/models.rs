@@ -62,6 +62,14 @@ pub struct Provider {
     /// and the cleartext lives in `encrypted_api_key` verbatim).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_cleartext: Option<String>,
+    /// Decrypted cleartext of `encrypted_oauth_meta`. Populated by
+    /// `DbConfigStore::refresh()` for OAuth-mode providers so
+    /// `snapshot_to_routing_table` can extract the refresh token
+    /// without touching the DB or crypto on the hot path. `None`
+    /// when no master key is configured or the provider is not
+    /// OAuth-mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_meta_cleartext: Option<String>,
 }
 
 /// A single routing target inside a route's chain.

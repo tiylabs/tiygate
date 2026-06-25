@@ -470,6 +470,7 @@ mod tests {
             api_key_override: None,
             api_base_override: None,
             weight: 1.0,
+            oauth: None,
         }
     }
 

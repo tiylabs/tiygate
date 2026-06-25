@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use tiygate_core::protocol::{ProtocolEndpoint, ProtocolSuite};
 use tiygate_core::provider::find_provider;
+use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle};
 use tiygate_core::routing::{RouteEntry, RoutingTable, RoutingTarget};
 
 use crate::db::DbPool;
@@ -101,6 +102,7 @@ impl ConfigStore {
                 api_key_override: None,
                 api_base_override: None,
                 weight: 1.0,
+                oauth: None,
             }];
 
             table.insert("gpt-4o".to_string(), openai_targets.clone());
@@ -131,6 +133,7 @@ impl ConfigStore {
                 api_key_override: None,
                 api_base_override: None,
                 weight: 1.0,
+                oauth: None,
             }];
             table.insert("claude-sonnet-4-20250514".to_string(), anthropic_targets);
         }
@@ -242,6 +245,15 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
                 // not by reading an api_key column. Pass through.
                 AuthMode::OAuth | AuthMode::Iam => String::new(),
             };
+
+            // For OAuth-mode providers, build the OAuthTargetConfig
+            // from the decrypted oauth meta + provider preset.
+            let oauth_config = if matches!(provider.auth_mode, AuthMode::OAuth) {
+                build_oauth_target_config(provider)
+            } else {
+                None
+            };
+
             let raw_base = t
                 .api_base_override
                 .clone()
@@ -258,6 +270,7 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
                 api_key_override: t.api_key_override.clone(),
                 api_base_override: t.api_base_override.clone(),
                 weight: t.weight,
+                oauth: oauth_config,
             });
         }
         if !targets.is_empty() {
@@ -271,6 +284,114 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
         }
     }
     table
+}
+
+/// Build an `OAuthTargetConfig` for a provider configured with
+/// `AuthMode::OAuth`.
+///
+/// The OAuth configuration (token_url, client_id, scopes, etc.) is
+/// read from `provider.metadata_json["oauth"]`. The refresh token is
+/// extracted from `provider.oauth_meta_cleartext` (decrypted by
+/// `DbConfigStore::refresh()`). The `token_request_style` is
+/// determined by the provider's vendor: Anthropic uses JSON body,
+/// all others use form-encoded.
+///
+/// Returns `None` when the provider is missing the `oauth` metadata
+/// block or the refresh token is empty — in that case the data plane
+/// will fall through to the static key path (which will also fail,
+/// but with a clearer error).
+fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfig> {
+    let oauth_meta = provider.metadata_json.get("oauth")?;
+
+    let token_url = oauth_meta
+        .get("token_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let client_id = oauth_meta
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let scopes: Vec<String> = oauth_meta
+        .get("scopes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let authorization_header = oauth_meta
+        .get("authorization_header")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let authorization_prefix = oauth_meta
+        .get("authorization_prefix")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // Determine token request style from vendor.
+    let token_request_style = match provider.vendor.as_str() {
+        "anthropic" => TokenRequestStyle::Json,
+        _ => TokenRequestStyle::Form,
+    };
+
+    // Extract extra headers from metadata, if present.
+    let mut extra_headers: Vec<(String, String)> = oauth_meta
+        .get("extra_headers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let name = entry.get("name")?.as_str()?.to_string();
+                    let value = entry.get("value")?.as_str()?.to_string();
+                    Some((name, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Anthropic OAuth requires the `anthropic-beta` header.
+    if provider.vendor == "anthropic"
+        && !extra_headers
+            .iter()
+            .any(|(name, _)| name == "anthropic-beta")
+    {
+        extra_headers.push(("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()));
+    }
+
+    // Extract the refresh token from the decrypted oauth meta.
+    let refresh_token = provider
+        .oauth_meta_cleartext
+        .as_deref()
+        .and_then(|meta_str| serde_json::from_str::<serde_json::Value>(meta_str).ok())
+        .and_then(|meta| {
+            meta.get("refresh_token")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+
+    if token_url.is_empty() || client_id.is_empty() {
+        debug!(
+            provider = %provider.id,
+            "oauth target config not built: missing token_url or client_id in metadata"
+        );
+        return None;
+    }
+
+    Some(OAuthTargetConfig {
+        token_url,
+        client_id,
+        client_secret: None,
+        refresh_token,
+        scopes,
+        token_request_style,
+        authorization_header,
+        authorization_prefix,
+        extra_headers,
+    })
 }
 
 fn provider_egress_for_target(
@@ -467,6 +588,47 @@ impl DbConfigStore {
                 }
             }
         }
+
+        // Decrypt the OAuth metadata for OAuth-mode providers so the
+        // data plane can extract the refresh token on the hot path
+        // without re-running crypto. Same cleartext-fallback logic
+        // as the API key path above.
+        if let Some(enc) = self.encryption.as_ref() {
+            for provider in providers.iter_mut() {
+                if !matches!(provider.auth_mode, AuthMode::OAuth) {
+                    continue;
+                }
+                if provider.encrypted_oauth_meta.is_empty() {
+                    provider.oauth_meta_cleartext = Some(String::new());
+                    continue;
+                }
+                match keys::decrypt_oauth_meta(enc, &provider.encrypted_oauth_meta) {
+                    Ok(plain) => provider.oauth_meta_cleartext = Some(plain),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = %provider.id,
+                            error = %e,
+                            "decrypting provider oauth meta failed; \
+                             data plane will not be able to refresh OAuth tokens"
+                        );
+                        provider.oauth_meta_cleartext = None;
+                    }
+                }
+            }
+        } else {
+            for provider in providers.iter_mut() {
+                if !matches!(provider.auth_mode, AuthMode::OAuth) {
+                    continue;
+                }
+                if provider.encrypted_oauth_meta.is_empty() {
+                    provider.oauth_meta_cleartext = Some(String::new());
+                } else {
+                    // No master key: column holds cleartext.
+                    provider.oauth_meta_cleartext = Some(provider.encrypted_oauth_meta.clone());
+                }
+            }
+        }
+
         let routes = self.load_routes().await?;
         let epoch = self.bump_epoch().await?;
         let snapshot = ConfigSnapshot {
@@ -1469,6 +1631,7 @@ fn row_to_provider(row: sqlx::any::AnyRow) -> Result<Provider, StoreError> {
         created_at: parse_dt(row.get("created_at"))?,
         updated_at: parse_dt(row.get("updated_at"))?,
         api_key_cleartext: None,
+        oauth_meta_cleartext: None,
     })
 }
 
@@ -1567,6 +1730,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: Some("sk-test".to_string()),
+            oauth_meta_cleartext: None,
         };
         let route = Route {
             id: "route-fallback".to_string(),
@@ -1620,6 +1784,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: Some("sk-test".to_string()),
+            oauth_meta_cleartext: None,
         };
         // Two targets: one enabled, one disabled.
         let target_enabled = RouteTarget {
@@ -1687,6 +1852,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: Some("sk-test".to_string()),
+            oauth_meta_cleartext: None,
         };
         let route = Route {
             id: "route-1".to_string(),
@@ -1865,6 +2031,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     api_key_cleartext: None,
+                    oauth_meta_cleartext: None,
                 },
                 Provider {
                     id: "p-new".into(),
@@ -1879,6 +2046,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     api_key_cleartext: None,
+                    oauth_meta_cleartext: None,
                 },
             ],
             routes: vec![],
@@ -2081,6 +2249,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 api_key_cleartext: None,
+                oauth_meta_cleartext: None,
             }],
             routes: vec![],
             api_keys: vec![],
@@ -2129,6 +2298,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 api_key_cleartext: None,
+                oauth_meta_cleartext: None,
             }],
             routes: vec![],
             api_keys: vec![],

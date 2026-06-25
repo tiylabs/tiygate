@@ -14,6 +14,8 @@ use crate::ir::{IrRequest, IrResponse};
 use crate::pipeline::PipelineContext;
 use crate::protocol::{ProtocolEndpoint, ProtocolSuite};
 
+pub mod oauth;
+
 /// Declarative metadata for a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderMetadata {
