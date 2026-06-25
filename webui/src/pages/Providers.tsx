@@ -74,7 +74,7 @@ const OAUTH_PRESETS: Record<
     ],
   },
   xai: {
-    token_url: "https://auth.x.ai/oauth/token",
+    token_url: "https://auth.x.ai/oauth2/token",
     client_id: "b1a00492-073a-47ea-816f-4c329264a828",
     scopes: [
       "openid",
@@ -164,6 +164,7 @@ export default function Providers() {
 
   // OAuth flow state (used inside the edit dialog when auth_mode=oauth).
   const [oauthAuthUrl, setOauthAuthUrl] = useState<string | null>(null);
+  const [oauthState, setOauthState] = useState<string | null>(null);
   const [oauthCallbackUrl, setOauthCallbackUrl] = useState("");
   const [oauthMessage, setOauthMessage] = useState<string | null>(null);
   const [oauthError, setOauthError] = useState<string | null>(null);
@@ -232,6 +233,7 @@ export default function Providers() {
     onSuccess: (res) => {
       setOauthError(null);
       setOauthAuthUrl(res.url);
+      setOauthState(res.state);
       setOauthCallbackUrl("");
       setOauthMessage(t("oauth.started"));
     },
@@ -244,7 +246,7 @@ export default function Providers() {
 
   const oauthCallbackMutation = useMutation({
     mutationFn: () => {
-      const parsed = parseCallbackUrl(oauthCallbackUrl);
+      const parsed = parseCallbackUrl(oauthCallbackUrl, oauthState ?? undefined);
       if (!parsed) {
         throw new Error(t("oauth.callbackUrlInvalid"));
       }
@@ -256,6 +258,7 @@ export default function Providers() {
       setOauthMessage(t("oauth.callbackSuccess", { provider: label }));
       toast.success(t("oauth.callbackSuccess", { provider: label }));
       setOauthAuthUrl(null);
+      setOauthState(null);
       setOauthCallbackUrl("");
       // Refresh provider data so encrypted_oauth_meta is up to date.
       void invalidateProviders();
@@ -630,9 +633,6 @@ export default function Providers() {
             <Select
               value={form.vendor}
               onValueChange={(v) => {
-                // On a fresh create, prefill api_base from the selected
-                // catalog entry only when still empty (don't clobber a typed URL).
-                const entry = catalog?.find((e) => e.id === v);
                 setForm((prev) => {
                   // If switching to a vendor that doesn't support OAuth
                   // while auth_mode is "oauth", reset to "api_key".
@@ -643,10 +643,6 @@ export default function Providers() {
                   return {
                     ...prev,
                     vendor: v,
-                    api_base:
-                      !editing && !prev.api_base && entry
-                        ? entry.default_base_url
-                        : prev.api_base,
                     auth_mode: authMode,
                   };
                 });
@@ -669,7 +665,21 @@ export default function Providers() {
             <Input
               value={form.api_base}
               onChange={(e) => setForm({ ...form, api_base: e.target.value })}
-              placeholder="https://api.openai.com/v1"
+              placeholder={
+                catalog?.find((e) => e.id === form.vendor)?.default_base_url ?? ""
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Tab" && !form.api_base) {
+                  const entry = catalog?.find((el) => el.id === form.vendor);
+                  if (entry?.default_base_url) {
+                    e.preventDefault();
+                    setForm((prev) => ({
+                      ...prev,
+                      api_base: entry.default_base_url,
+                    }));
+                  }
+                }
+              }}
             />
           </Field>
           <Field label={t("providers.authMode")}>

@@ -200,8 +200,8 @@ const en = {
       openUrl: "Open",
       copyUrl: "Copy",
       callbackHint:
-        "After completing login authorization in the browser, paste the callback URL below and complete authorization",
-      callbackUrlPlaceholder: "http://localhost:1455/auth/callback?code=…&state=…",
+        "After completing login authorization in the browser, paste the callback URL or authorization code below and complete authorization",
+      callbackUrlPlaceholder: "http://127.0.0.1:56121/callback?code=…&state=…  or paste the authorization code",
       submitCallback: "Complete authorization",
     },
     apiKey: "API key",
@@ -332,10 +332,10 @@ const en = {
     callbackSuccess: "OAuth authorization complete for {{provider}}.",
     callbackError: "OAuth authorization failed.",
     callbackHint:
-      "After completing login authorization in the browser, paste the callback URL below and complete authorization",
-    callbackUrlPlaceholder: "http://localhost:1455/auth/callback?code=…&state=…",
+      "After completing login authorization in the browser, paste the callback URL or authorization code below and complete authorization",
+    callbackUrlPlaceholder: "http://127.0.0.1:56121/callback?code=…&state=…  or paste the authorization code",
     submitCallback: "Complete authorization",
-    callbackUrlInvalid: "Could not parse code and state from the URL. Make sure you copied the full redirect URL.",
+    callbackUrlInvalid: "Could not parse code and state from the input. Make sure you copied the full redirect URL or the authorization code.",
   },
   requests: {
     title: "Request Logs",

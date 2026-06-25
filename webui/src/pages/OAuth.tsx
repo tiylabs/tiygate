@@ -31,6 +31,7 @@ export default function OAuth() {
 
   const [providerId, setProviderId] = useState("");
   const [authUrl, setAuthUrl] = useState<string | null>(null);
+  const [oauthState, setOauthState] = useState<string | null>(null);
   const [callbackUrl, setCallbackUrl] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -40,6 +41,7 @@ export default function OAuth() {
     onSuccess: (res) => {
       setError(null);
       setAuthUrl(res.url);
+      setOauthState(res.state);
       setCallbackUrl("");
       setMessage(t("oauth.started"));
     },
@@ -52,7 +54,7 @@ export default function OAuth() {
 
   const callbackMutation = useMutation({
     mutationFn: () => {
-      const parsed = parseCallbackUrl(callbackUrl);
+      const parsed = parseCallbackUrl(callbackUrl, oauthState ?? undefined);
       if (!parsed) {
         throw new Error(t("oauth.callbackUrlInvalid"));
       }
@@ -64,6 +66,7 @@ export default function OAuth() {
       setMessage(t("oauth.callbackSuccess", { provider: label }));
       toast.success(t("oauth.callbackSuccess", { provider: label }));
       setAuthUrl(null);
+      setOauthState(null);
       setCallbackUrl("");
     },
     onError: (e: Error) => {
