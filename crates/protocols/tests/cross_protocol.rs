@@ -690,6 +690,7 @@ fn orphan_tool_result_to_gemini_returns_codec_error() {
             tool_call_id: "missing_call".to_string(),
             name: String::new(),
             content: "{}".to_string(),
+            id: None,
         }],
     });
 

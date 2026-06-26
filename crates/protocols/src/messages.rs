@@ -180,6 +180,7 @@ impl EndpointCodec for MessagesCodec {
                                     } else {
                                         block["input"].clone()
                                     },
+                                    call_id: None,
                                 });
                             }
                             Some("tool_result") => {
@@ -190,6 +191,7 @@ impl EndpointCodec for MessagesCodec {
                                         .to_string(),
                                     name: String::new(),
                                     content: flatten_anthropic_content(&block["content"]),
+                                    id: None,
                                 });
                             }
                             Some("image") => {
@@ -396,6 +398,7 @@ impl EndpointCodec for MessagesCodec {
                     id,
                     name,
                     arguments,
+                    ..
                 } => {
                     content_blocks.push(json!({
                         "type": "tool_use",
@@ -543,6 +546,7 @@ impl EndpointCodec for MessagesCodec {
                         id,
                         name,
                         arguments,
+                        ..
                     } => Some(
                         json!({"type": "tool_use", "id": id, "name": name, "input": arguments}),
                     ),
@@ -550,6 +554,7 @@ impl EndpointCodec for MessagesCodec {
                         tool_call_id,
                         name: _,
                         content,
+                        ..
                     } => Some(json!({
                         "type": "tool_result",
                         "tool_use_id": tool_call_id,
@@ -792,6 +797,7 @@ impl EndpointCodec for MessagesCodec {
                             id: block["id"].as_str().unwrap_or("").to_string(),
                             name: block["name"].as_str().unwrap_or("").to_string(),
                             arguments: block["input"].clone(),
+                            call_id: None,
                         });
                     }
                     _ => {}
@@ -1772,6 +1778,7 @@ mod tests {
                 id: "toolu_1".to_string(),
                 name: "get_weather".to_string(),
                 arguments: json!({"city": "London"}),
+                call_id: None,
             }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
@@ -1941,6 +1948,7 @@ mod tests {
                         id: "t1".to_string(),
                         name: "f".to_string(),
                         arguments: json!({}),
+                        call_id: None,
                     }],
                 },
                 Message {
@@ -1949,6 +1957,7 @@ mod tests {
                         tool_call_id: "t1".to_string(),
                         name: "f".to_string(),
                         content: "r1".to_string(),
+                        id: None,
                     }],
                 },
                 Message {
@@ -1957,6 +1966,7 @@ mod tests {
                         tool_call_id: "t2".to_string(),
                         name: "f".to_string(),
                         content: "r2".to_string(),
+                        id: None,
                     }],
                 },
             ],

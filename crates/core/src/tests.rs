@@ -395,6 +395,7 @@ mod tests {
             id: "tc1".to_string(),
             name: "get_weather".to_string(),
             arguments: serde_json::json!({"city": "London"}),
+            call_id: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["type"], "tool_call");

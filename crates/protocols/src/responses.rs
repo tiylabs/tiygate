@@ -52,8 +52,16 @@ fn unique_responses_call_id(
     candidate
 }
 
-fn responses_function_call_output(tool_call_id: &str, content: &str) -> Value {
-    json!({"type": "function_call_output", "call_id": tool_call_id, "output": content})
+fn responses_function_call_output(
+    tool_call_id: &str,
+    content: &str,
+    item_id: Option<&str>,
+) -> Value {
+    let mut v = json!({"type": "function_call_output", "call_id": tool_call_id, "output": content});
+    if let Some(id) = item_id {
+        v["id"] = json!(id);
+    }
+    v
 }
 
 impl ResponsesCodec {
@@ -199,11 +207,35 @@ impl EndpointCodec for ResponsesCodec {
                         .or_default()
                         .push_back(id.clone());
 
+                    // Preserve the Responses item `id` (item reference) when
+                    // it differs from `call_id`. The IR `id` carries the
+                    // call_id (used by all protocols) while `call_id` on the
+                    // IR preserves the original Responses `call_id`, and the
+                    // item ref is stored in `id`. When re-encoding for
+                    // Responses, both are replayed.
+                    let item_ref = item["id"].as_str().map(|s| s.to_string());
+                    let original_call_id = item["call_id"].as_str().map(|s| s.to_string());
+                    // If the item has both `id` (item ref) and `call_id`
+                    // (function-call identifier), store the item ref in IR
+                    // `id` and the call_id in IR `call_id`. Otherwise the
+                    // deduped id serves both roles.
+                    let (ir_id, ir_call_id) = if item_ref.is_some() && original_call_id.is_some() {
+                        // IR `id` = item reference (e.g. `fc_xxx`)
+                        // IR `call_id` = function-call id (e.g. `call_xxx`)
+                        (
+                            item_ref.clone().unwrap_or_default(),
+                            original_call_id.clone(),
+                        )
+                    } else {
+                        (id, None)
+                    };
+
                     vec![Content::ToolCall {
-                        id,
+                        id: ir_id,
                         name: item["name"].as_str().unwrap_or("").to_string(),
                         arguments: serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
                             .unwrap_or(json!({})),
+                        call_id: ir_call_id,
                     }]
                 } else if item["type"] == "function_call_output" {
                     // `output` is usually a string but some clients send a
@@ -219,10 +251,14 @@ impl EndpointCodec for ResponsesCodec {
                         .get_mut(raw_id)
                         .and_then(VecDeque::pop_front)
                         .unwrap_or_else(|| raw_id.to_string());
+                    // Preserve the item's own `id` (item reference) so it
+                    // can be replayed when re-encoding for Responses HTTP.
+                    let item_id = item["id"].as_str().map(|s| s.to_string());
                     vec![Content::ToolResult {
                         tool_call_id,
                         name: String::new(),
                         content: output,
+                        id: item_id,
                     }]
                 } else if item["type"] == "reasoning" {
                     // Reasoning input item (replayed assistant chain-of-thought).
@@ -434,8 +470,17 @@ impl EndpointCodec for ResponsesCodec {
                     id,
                     name,
                     arguments,
+                    call_id,
                 } => {
-                    tool_calls.push(json!({"call_id": id, "type": "function_call", "name": name, "arguments": serde_json::to_string(arguments).unwrap_or_default(), "status": "completed"}));
+                    // Use `call_id` when available (Responses round-trip),
+                    // otherwise fall back to `id` (cross-protocol).
+                    let wire_call_id = call_id.as_deref().unwrap_or(id);
+                    let mut tc = json!({"type": "function_call", "call_id": wire_call_id, "name": name, "arguments": serde_json::to_string(arguments).unwrap_or_default(), "status": "completed"});
+                    // Include the item reference `id` when available.
+                    if call_id.is_some() {
+                        tc["id"] = json!(id);
+                    }
+                    tool_calls.push(tc);
                 }
                 Content::Refusal { text, .. } => {
                     output_items.push(json!({"type": "refusal", "refusal": text}));
@@ -599,22 +644,34 @@ impl EndpointCodec for ResponsesCodec {
                                 id,
                                 name,
                                 arguments,
+                                call_id,
                             } => {
                                 let args_str = match arguments {
                                     serde_json::Value::String(s) => s.clone(),
                                     other => other.to_string(),
                                 };
-                                tool_calls_json.push(json!({
+                                // Use the dedicated `call_id` when present
+                                // (Responses round-trip); otherwise `id` serves
+                                // both roles (cross-protocol).
+                                let wire_call_id = call_id.as_deref().unwrap_or(id);
+                                let mut fc = json!({
                                     "type": "function_call",
-                                    "call_id": id,
+                                    "call_id": wire_call_id,
                                     "name": name,
                                     "arguments": args_str,
-                                }));
+                                });
+                                // Include the item reference `id` when the IR
+                                // carries a separate call_id.
+                                if call_id.is_some() {
+                                    fc["id"] = json!(id);
+                                }
+                                tool_calls_json.push(fc);
                             }
                             Content::ToolResult {
                                 tool_call_id,
                                 name: _,
                                 content,
+                                id,
                             } => {
                                 // Cross-protocol Anthropic Messages carries
                                 // `tool_result` blocks inside a user message,
@@ -622,8 +679,13 @@ impl EndpointCodec for ResponsesCodec {
                                 // `function_call_output` input item. Preserve
                                 // them regardless of the IR message role so
                                 // prior function calls have matching outputs.
-                                tool_outputs_json
-                                    .push(responses_function_call_output(tool_call_id, content));
+                                tool_outputs_json.push(
+                                    responses_function_call_output(
+                                        tool_call_id,
+                                        content,
+                                        id.as_deref(),
+                                    ),
+                                );
                             }
                             Content::Refusal { text, .. } => {
                                 text_parts.push(json!({"type": "input_text", "text": text}));
@@ -668,9 +730,14 @@ impl EndpointCodec for ResponsesCodec {
                             tool_call_id,
                             name: _,
                             content,
+                            id,
                         } = c
                         {
-                            input_items.push(responses_function_call_output(tool_call_id, content));
+                            input_items.push(responses_function_call_output(
+                                tool_call_id,
+                                content,
+                                id.as_deref(),
+                            ));
                         }
                     }
                 }
@@ -809,10 +876,18 @@ impl EndpointCodec for ResponsesCodec {
                         let args: Value =
                             serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
                                 .unwrap_or(json!({}));
+                        // Responses function_call items carry two distinct ids:
+                        // `id` (item reference, e.g. `fc_xxx`) and `call_id`
+                        // (function-call identifier, e.g. `call_xxx`). Both
+                        // must be preserved in the IR so re-encoding for
+                        // Responses HTTP reproduces a valid request.
+                        let item_id = item["id"].as_str().unwrap_or("").to_string();
+                        let call_id = item["call_id"].as_str().map(|s| s.to_string());
                         content.push(Content::ToolCall {
-                            id: item["id"].as_str().unwrap_or("").to_string(),
+                            id: item_id,
                             name: item["name"].as_str().unwrap_or("").to_string(),
                             arguments: args,
+                            call_id,
                         });
                     }
                     Some("reasoning") => {
@@ -2199,6 +2274,7 @@ mod tests {
                             id: "call_1".to_string(),
                             name: "get_weather".to_string(),
                             arguments: serde_json::json!({"location": "杭州"}),
+                            call_id: None,
                         },
                     ],
                 },
@@ -2208,6 +2284,7 @@ mod tests {
                         tool_call_id: "call_1".to_string(),
                         name: "get_weather".to_string(),
                         content: "cloudy".to_string(),
+                        id: None,
                     }],
                 },
             ],

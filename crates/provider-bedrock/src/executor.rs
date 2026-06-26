@@ -183,6 +183,7 @@ impl BedrockExecutor {
                         id: tu["toolUseId"].as_str().unwrap_or("").to_string(),
                         name: tu["name"].as_str().unwrap_or("").to_string(),
                         arguments: tu["input"].clone(),
+                        call_id: None,
                     });
                 }
             }

@@ -109,6 +109,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                             tool_call_id: msg["tool_call_id"].as_str().unwrap_or("").to_string(),
                             name: msg["name"].as_str().unwrap_or("").to_string(),
                             content: msg["content"].as_str().unwrap_or("").to_string(),
+                            id: None,
                         }]
                     }
                 } else if let Some(text) = msg["content"].as_str() {
@@ -174,6 +175,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                             id: tc["id"].as_str().unwrap_or("").to_string(),
                             name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
                             arguments,
+                            call_id: None,
                         });
                     }
                 }
@@ -423,6 +425,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                     id,
                     name,
                     arguments,
+                    ..
                 } => {
                     tool_calls_json.push(json!({
                         "id": id,
@@ -571,6 +574,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         id,
                         name,
                         arguments,
+                        ..
                     } => {
                         // Re-emit the tool call on the assistant message so the
                         // downstream API sees a self-consistent turn.
@@ -620,6 +624,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         tool_call_id,
                         name: _,
                         content,
+                        ..
                     } => {
                         // Tool results are a separate message in OpenAI format;
                         // emit them as their own {role:"tool", tool_call_id, content}
@@ -887,6 +892,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                             id: tc["id"].as_str().unwrap_or("").to_string(),
                             name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
                             arguments: args,
+                            call_id: None,
                         });
                     }
                 }
@@ -1530,6 +1536,7 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
                         tool_call_id: item["tool_call_id"].as_str().unwrap_or("").to_string(),
                         name: String::new(),
                         content: item["content"].as_str().unwrap_or("").to_string(),
+                        id: None,
                     }
                 } else {
                     Content::Text {
@@ -1848,6 +1855,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "get_weather".to_string(),
                 arguments: json!({"city": "London"}),
+                call_id: None,
             }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
@@ -2180,6 +2188,7 @@ mod tests {
                             id: "call_1".to_string(),
                             name: "get_weather".to_string(),
                             arguments: json!({"city": "杭州"}),
+                            call_id: None,
                         },
                     ],
                 },
@@ -2189,6 +2198,7 @@ mod tests {
                         tool_call_id: "call_1".to_string(),
                         name: "get_weather".to_string(),
                         content: "sunny".to_string(),
+                        id: None,
                     }],
                 },
                 // 纯文本轮:reasoning_content 应丢弃

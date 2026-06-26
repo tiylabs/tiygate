@@ -170,12 +170,24 @@ pub enum Content {
         id: String,
         name: String,
         arguments: serde_json::Value,
+        /// Responses-specific `call_id` that is distinct from the item `id`.
+        /// When present, `id` is the item reference (e.g. `fc_xxx`) and
+        /// `call_id` is the function-call identifier (e.g. `call_xxx`).
+        /// When absent, `id` serves both roles (Chat Completions, Messages,
+        /// Gemini all use a single identifier).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     /// A tool result provided by the user/system.
     ToolResult {
         tool_call_id: String,
         name: String,
         content: String,
+        /// Responses-specific item reference id for `function_call_output`.
+        /// Required by the Responses HTTP API so each output item has a
+        /// unique id that can be matched via `item_reference`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     /// A refusal from the model (OpenAI `message.refusal`, Responses
     /// `refusal` output item, Anthropic `stop_reason:"refusal"`).
