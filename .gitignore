@@ -20,6 +20,7 @@ Cargo.lock.bak
 .DS_Store
 .fleet/
 .zed/
+.workbuddy/
 
 # Local env & secrets
 .env
