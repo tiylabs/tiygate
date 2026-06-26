@@ -1837,3 +1837,113 @@ fn detail_roundtrip_responses_to_chat() {
         "detail should survive cross-protocol"
     );
 }
+
+// Bug 1: a reasoning item with an EMPTY summary but a non-empty
+// encrypted_content must NOT be dropped on decode — this is the shape OpenAI
+// returns when summaries are disabled and `include:
+// ["reasoning.encrypted_content"]` is set. Dropping it breaks encrypted
+// reasoning replay on later turns.
+#[test]
+fn responses_empty_summary_encrypted_only_reasoning_preserved() {
+    let codec = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [{
+            "type": "reasoning",
+            "id": "rs_only_enc",
+            "summary": [],
+            "encrypted_content": "enc-no-summary",
+        }],
+        "status": "completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    });
+    let ir = codec.decode_response(body).unwrap();
+    let reasoning = ir
+        .content
+        .iter()
+        .find_map(|c| match c {
+            Content::Reasoning {
+                id,
+                encrypted_content,
+                text,
+                ..
+            } => Some((id.clone(), encrypted_content.clone(), text.clone())),
+            _ => None,
+        })
+        .expect("encrypted-only reasoning item must survive decode");
+    assert_eq!(reasoning.0.as_deref(), Some("rs_only_enc"));
+    assert_eq!(reasoning.1.as_deref(), Some("enc-no-summary"));
+    assert!(reasoning.2.is_empty(), "summary was empty");
+
+    // And it must re-encode to `summary: []` (not a summary part with an empty
+    // string), carrying id + encrypted_content verbatim.
+    let encoded = codec.encode_response(&ir).unwrap();
+    let item = encoded["output"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|i| i["type"] == "reasoning"))
+        .expect("reasoning item must be re-encoded");
+    assert_eq!(item["id"], json!("rs_only_enc"));
+    assert_eq!(item["encrypted_content"], json!("enc-no-summary"));
+    assert_eq!(item["summary"], json!([]), "empty reasoning -> summary: []");
+}
+
+// Bug 2: a reasoning INPUT item carrying encrypted_content must preserve it
+// through decode_request (previously hard-coded to None), so same-protocol
+// multi-turn replays the encrypted payload back to the upstream.
+#[test]
+fn responses_decode_request_preserves_reasoning_encrypted_content() {
+    let codec = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let body = json!({
+        "model": "m",
+        "input": [{
+            "type": "reasoning",
+            "id": "rs_replay",
+            "summary": [{"type": "summary_text", "text": "earlier thought"}],
+            "encrypted_content": "enc-replay-456",
+        }]
+    });
+    let ir = codec.decode_request(body, &make_env()).expect("decode");
+    let enc = ir.messages.iter().find_map(|m| {
+        m.content.iter().find_map(|c| match c {
+            Content::Reasoning {
+                encrypted_content, ..
+            } => encrypted_content.clone(),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        enc.as_deref(),
+        Some("enc-replay-456"),
+        "decode_request must preserve reasoning encrypted_content"
+    );
+}
+
+// A reasoning item carrying ONLY an id (no summary text, no encrypted_content)
+// is an empty shell with nothing to replay. It must be dropped on decode rather
+// than producing an orphaned, content-free IR Reasoning that some downstream
+// providers reject.
+#[test]
+fn responses_id_only_reasoning_is_dropped() {
+    let codec = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let body = json!({
+        "id": "resp_2",
+        "object": "response",
+        "output": [{
+            "type": "reasoning",
+            "id": "rs_id_only",
+            "summary": [],
+        }],
+        "status": "completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    });
+    let ir = codec.decode_response(body).unwrap();
+    let has_reasoning = ir
+        .content
+        .iter()
+        .any(|c| matches!(c, Content::Reasoning { .. }));
+    assert!(
+        !has_reasoning,
+        "an id-only reasoning item (no text, no encrypted_content) must be dropped"
+    );
+}

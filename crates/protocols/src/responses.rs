@@ -243,7 +243,14 @@ impl EndpointCodec for ResponsesCodec {
                         text,
                         signature: None,
                         id: item["id"].as_str().map(|s| s.to_string()),
-                        encrypted_content: None,
+                        // Preserve the client-supplied encrypted reasoning so it
+                        // can be replayed verbatim to the upstream provider,
+                        // mirroring decode_response. Dropping it here would
+                        // strip the encrypted payload from same-protocol
+                        // multi-turn replay.
+                        encrypted_content: item["encrypted_content"]
+                            .as_str()
+                            .map(|s| s.to_string()),
                     }]
                 } else {
                     vec![Content::Text {
@@ -406,7 +413,15 @@ impl EndpointCodec for ResponsesCodec {
                     encrypted_content,
                     ..
                 } => {
-                    let mut item = json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": text}]});
+                    // Empty reasoning text re-encodes to `summary: []` (not a
+                    // summary part with an empty string) so encrypted-only
+                    // reasoning round-trips to the exact OpenAI wire shape.
+                    let summary = if text.is_empty() {
+                        json!([])
+                    } else {
+                        json!([{"type": "summary_text", "text": text}])
+                    };
+                    let mut item = json!({"type": "reasoning", "summary": summary});
                     if let Some(rid) = id {
                         item["id"] = json!(rid);
                     }
@@ -563,9 +578,14 @@ impl EndpointCodec for ResponsesCodec {
                                 // reasoning has no Responses id (id == None),
                                 // so we emit it idless rather than fabricate
                                 // one.
+                                let summary = if text.is_empty() {
+                                    json!([])
+                                } else {
+                                    json!([{"type": "summary_text", "text": text}])
+                                };
                                 let mut item = json!({
                                     "type": "reasoning",
-                                    "summary": [{"type": "summary_text", "text": text}],
+                                    "summary": summary,
                                 });
                                 if let Some(rid) = id {
                                     item["id"] = json!(rid);
@@ -800,22 +820,38 @@ impl EndpointCodec for ResponsesCodec {
                         // so the Responses `id` maps to exactly one IR
                         // Reasoning content (and re-encodes to exactly one
                         // reasoning item, avoiding duplicate-id orphans).
-                        if let Some(summary) = item["summary"].as_array() {
-                            let text = summary
-                                .iter()
-                                .filter_map(|s| s["text"].as_str())
-                                .collect::<Vec<_>>()
-                                .join("");
-                            if !text.is_empty() {
-                                content.push(Content::Reasoning {
-                                    text,
-                                    signature: None,
-                                    id: item["id"].as_str().map(|s| s.to_string()),
-                                    encrypted_content: item["encrypted_content"]
-                                        .as_str()
-                                        .map(|s| s.to_string()),
-                                });
-                            }
+                        let text = item["summary"]
+                            .as_array()
+                            .map(|summary| {
+                                summary
+                                    .iter()
+                                    .filter_map(|s| s["text"].as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            })
+                            .unwrap_or_default();
+                        let id = item["id"].as_str().map(|s| s.to_string());
+                        let encrypted_content =
+                            item["encrypted_content"].as_str().map(|s| s.to_string());
+                        // Keep the reasoning item only when it carries a
+                        // replayable payload — summary text or encrypted
+                        // content. When `include:
+                        // ["reasoning.encrypted_content"]` is set with summaries
+                        // disabled, OpenAI returns `summary: []` plus an
+                        // `encrypted_content`; dropping the item there would
+                        // break encrypted reasoning replay on later turns.
+                        //
+                        // A lone `id` with neither text nor encrypted content is
+                        // an empty shell with nothing to replay (and would
+                        // re-encode to an orphaned reasoning item that some
+                        // providers reject), so it is intentionally dropped.
+                        if !text.is_empty() || encrypted_content.is_some() {
+                            content.push(Content::Reasoning {
+                                text,
+                                signature: None,
+                                id,
+                                encrypted_content,
+                            });
                         }
                     }
                     Some("refusal") => {
@@ -947,6 +983,14 @@ pub struct ResponsesStreamEncoder {
     reasoning_output_index: Option<u32>,
     /// Accumulated reasoning text for `output_item.done` and `completed_event`.
     reasoning_text: String,
+    /// Provider-issued reasoning item id carried on the IR ReasoningDelta, so
+    /// the emitted reasoning output item replays the original `rs_...` id
+    /// instead of a synthesized `{response_id}_rs`.
+    reasoning_id: Option<String>,
+    /// Encrypted reasoning content carried on the IR ReasoningDelta, echoed on
+    /// the terminal reasoning `output_item.done` and the reconstructed
+    /// `response.completed.output` item for cross-turn replay.
+    reasoning_encrypted: Option<String>,
 }
 impl Default for ResponsesStreamEncoder {
     fn default() -> Self {
@@ -972,6 +1016,8 @@ impl ResponsesStreamEncoder {
             pending_finish_status: None,
             reasoning_output_index: None,
             reasoning_text: String::new(),
+            reasoning_id: None,
+            reasoning_encrypted: None,
         }
     }
 
@@ -980,6 +1026,16 @@ impl ResponsesStreamEncoder {
         let s = self.sequence_number;
         self.sequence_number += 1;
         s
+    }
+
+    /// The id used for the reasoning output item across all of its lifecycle
+    /// events. Prefers the provider-issued `rs_...` id carried on the IR
+    /// ReasoningDelta (so the item can be replayed verbatim on later turns),
+    /// falling back to a synthesized `{response_id}_rs` when none is available.
+    fn reasoning_item_id(&self) -> String {
+        self.reasoning_id
+            .clone()
+            .unwrap_or_else(|| format!("{}_rs", self.response_id.as_deref().unwrap_or("")))
     }
 
     /// Format a Responses SSE event, injecting the `sequence_number`.
@@ -1069,13 +1125,22 @@ impl ResponsesStreamEncoder {
         // response.completed even when incremental events were missed.
         let mut output = Vec::<Value>::new();
         if self.reasoning_output_index.is_some() {
-            let item_id = format!("{}_rs", id);
-            output.push(json!({
+            let item_id = self.reasoning_item_id();
+            let summary = if self.reasoning_text.is_empty() {
+                json!([])
+            } else {
+                json!([{"type": "summary_text", "text": &self.reasoning_text}])
+            };
+            let mut item = json!({
                 "id": item_id,
                 "type": "reasoning",
                 "status": status,
-                "summary": [{"type": "summary_text", "text": &self.reasoning_text}]
-            }));
+                "summary": summary,
+            });
+            if let Some(enc) = &self.reasoning_encrypted {
+                item["encrypted_content"] = json!(enc);
+            }
+            output.push(item);
         }
         if self.text_output_index.is_some() {
             let item_id = format!("{}_msg", id);
@@ -1142,8 +1207,31 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 out.push_str(&self.event(json!({"type": "response.output_text.delta", "item_id": item_id, "output_index": idx, "content_index": 0, "delta": text})));
                 out
             }
-            StreamPart::ReasoningDelta { text } => {
-                let item_id = format!("{}_rs", self.response_id.as_deref().unwrap_or(""));
+            StreamPart::ReasoningDelta {
+                text,
+                id,
+                encrypted_content,
+            } => {
+                // Latch the provider reasoning id / encrypted content the first
+                // time each arrives so every lifecycle event (added → delta →
+                // done → completed) uses the same identity and the encrypted
+                // payload survives to the terminal item. Both use the same
+                // first-wins policy: the id must stay stable because it is
+                // already emitted on `output_item.added`, and `encrypted_content`
+                // is a terminal artifact that OpenAI emits exactly once, so
+                // first-wins and last-wins are equivalent in practice while
+                // keeping the two fields symmetric.
+                if self.reasoning_id.is_none() {
+                    if let Some(rid) = id {
+                        self.reasoning_id = Some(rid.clone());
+                    }
+                }
+                if self.reasoning_encrypted.is_none() {
+                    if let Some(enc) = encrypted_content {
+                        self.reasoning_encrypted = Some(enc.clone());
+                    }
+                }
+                let item_id = self.reasoning_item_id();
                 let mut out = String::new();
                 let idx = if let Some(i) = self.reasoning_output_index {
                     i
@@ -1156,7 +1244,12 @@ impl StreamEncoder for ResponsesStreamEncoder {
                     i
                 };
                 self.reasoning_text.push_str(text);
-                out.push_str(&self.event(json!({"type": "response.reasoning_summary_text.delta", "item_id": item_id, "output_index": idx, "summary_index": 0, "delta": text})));
+                // A zero-text delta (encrypted-only reasoning flushed at item
+                // done) carries no summary delta — the encrypted payload rides
+                // on the terminal output_item.done instead.
+                if !text.is_empty() {
+                    out.push_str(&self.event(json!({"type": "response.reasoning_summary_text.delta", "item_id": item_id, "output_index": idx, "summary_index": 0, "delta": text})));
+                }
                 out
             }
             StreamPart::ToolCallDelta {
@@ -1208,10 +1301,23 @@ impl StreamEncoder for ResponsesStreamEncoder {
                     // Close reasoning item lifecycle first (reasoning precedes
                     // text in the output sequence).
                     if let Some(idx) = self.reasoning_output_index {
-                        let item_id = format!("{}_rs", self.response_id.as_deref().unwrap_or(""));
+                        let item_id = self.reasoning_item_id();
                         out.push_str(&self.event(json!({"type": "response.reasoning_summary_text.done", "output_index": idx, "item_id": item_id, "summary_index": 0})));
                         out.push_str(&self.event(json!({"type": "response.reasoning_summary_part.done", "output_index": idx, "item_id": item_id, "summary_index": 0})));
-                        out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": item_id, "type": "reasoning", "status": status, "summary": [{"type": "summary_text", "text": &self.reasoning_text}]}})));
+                        // Mirror completed_event: empty reasoning text re-encodes
+                        // to `summary: []` (not a summary part with an empty
+                        // string) so encrypted-only reasoning round-trips to the
+                        // exact OpenAI wire shape on output_item.done too.
+                        let summary = if self.reasoning_text.is_empty() {
+                            json!([])
+                        } else {
+                            json!([{"type": "summary_text", "text": &self.reasoning_text}])
+                        };
+                        let mut done_item = json!({"id": item_id, "type": "reasoning", "status": status, "summary": summary});
+                        if let Some(enc) = &self.reasoning_encrypted {
+                            done_item["encrypted_content"] = json!(enc);
+                        }
+                        out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": done_item})));
                     }
                     if let Some(idx) = self.text_output_index {
                         let item_id = format!("{}_msg", self.response_id.as_deref().unwrap_or(""));
@@ -1277,6 +1383,15 @@ pub struct ResponsesStreamDecoder {
     /// signal that the turn ended to call a tool is the presence of a
     /// `function_call` output item, NOT the status.
     saw_function_call: bool,
+    /// Reasoning item id captured from `response.output_item.added`
+    /// (item.type == "reasoning"). Attached to the first `ReasoningDelta` of
+    /// the item and then cleared, so the id survives the stream boundary
+    /// without being repeated on every delta.
+    pending_reasoning_id: Option<String>,
+    /// Encrypted reasoning content captured from the reasoning output item
+    /// (`response.output_item.added` or `.done`). Attached to a `ReasoningDelta`
+    /// once and then cleared.
+    pending_reasoning_encrypted: Option<String>,
 }
 impl Default for ResponsesStreamDecoder {
     fn default() -> Self {
@@ -1292,6 +1407,8 @@ impl ResponsesStreamDecoder {
             current_call_id: None,
             current_call_name: None,
             saw_function_call: false,
+            pending_reasoning_id: None,
+            pending_reasoning_encrypted: None,
         }
     }
 }
@@ -1336,8 +1453,13 @@ impl StreamDecoder for ResponsesStreamDecoder {
             Some("response.reasoning_text.delta")
             | Some("response.reasoning_summary_text.delta") => {
                 if let Some(text) = event["delta"].as_str() {
+                    // Attach the reasoning id / encrypted content captured from
+                    // the reasoning output item to the first delta, then clear
+                    // it so it is not repeated on subsequent deltas.
                     parts.push(StreamPart::ReasoningDelta {
                         text: text.to_string(),
+                        id: self.pending_reasoning_id.take(),
+                        encrypted_content: self.pending_reasoning_encrypted.take(),
                     });
                 }
             }
@@ -1353,6 +1475,17 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         name: self.current_call_name.clone(),
                         arguments: String::new(),
                     });
+                } else if item["type"] == "reasoning" {
+                    // Stash the reasoning item id / encrypted content so the
+                    // first ReasoningDelta can carry them across the stream
+                    // boundary. The added event normally has empty summaries,
+                    // so the text itself still arrives via the delta events.
+                    if let Some(id) = item["id"].as_str() {
+                        self.pending_reasoning_id = Some(id.to_string());
+                    }
+                    if let Some(enc) = item["encrypted_content"].as_str() {
+                        self.pending_reasoning_encrypted = Some(enc.to_string());
+                    }
                 }
             }
             Some("response.function_call_arguments.delta") => {
@@ -1368,6 +1501,30 @@ impl StreamDecoder for ResponsesStreamDecoder {
                 }
             }
             Some("response.output_item.done") => {
+                let item = &event["item"];
+                if item["type"] == "reasoning" {
+                    // The terminal reasoning item often carries the final
+                    // encrypted_content (and id) that the `.added` event lacked.
+                    // Capture it; if no ReasoningDelta consumed the pending
+                    // payload (e.g. summaries disabled, encrypted-only
+                    // reasoning), flush it on a zero-text delta so the
+                    // encrypted reasoning is not lost.
+                    if let Some(id) = item["id"].as_str() {
+                        self.pending_reasoning_id = Some(id.to_string());
+                    }
+                    if let Some(enc) = item["encrypted_content"].as_str() {
+                        self.pending_reasoning_encrypted = Some(enc.to_string());
+                    }
+                    if self.pending_reasoning_id.is_some()
+                        || self.pending_reasoning_encrypted.is_some()
+                    {
+                        parts.push(StreamPart::ReasoningDelta {
+                            text: String::new(),
+                            id: self.pending_reasoning_id.take(),
+                            encrypted_content: self.pending_reasoning_encrypted.take(),
+                        });
+                    }
+                }
                 self.in_function_call = false;
                 self.current_call_id = None;
                 self.current_call_name = None;
@@ -1685,6 +1842,8 @@ mod tests {
         let bytes1 = enc
             .encode_part(&StreamPart::ReasoningDelta {
                 text: "thinking".to_string(),
+                id: None,
+                encrypted_content: None,
             })
             .unwrap();
         let s1 = String::from_utf8_lossy(&bytes1);
@@ -1713,6 +1872,8 @@ mod tests {
         let bytes2 = enc
             .encode_part(&StreamPart::ReasoningDelta {
                 text: " harder".to_string(),
+                id: None,
+                encrypted_content: None,
             })
             .unwrap();
         let s2 = String::from_utf8_lossy(&bytes2);
@@ -1776,6 +1937,67 @@ mod tests {
         assert!(
             sf.contains("\"reasoning_tokens\":15"),
             "completed usage must include reasoning_tokens: {sf}"
+        );
+    }
+
+    #[test]
+    fn test_stream_encoder_encrypted_only_reasoning_empty_summary() {
+        // Encrypted-only reasoning: zero text delta carries no summary delta;
+        // both output_item.done and response.completed must emit `summary: []`
+        // (not a summary part with an empty string) and preserve the
+        // encrypted_content + provider id.
+        let mut enc = ResponsesStreamEncoder::new();
+        let _ = enc
+            .encode_part(&StreamPart::ResponseStarted {
+                id: "resp_e1".to_string(),
+            })
+            .unwrap();
+        let _ = enc
+            .encode_part(&StreamPart::ReasoningDelta {
+                text: String::new(),
+                id: Some("rs_enc1".to_string()),
+                encrypted_content: Some("enc-blob".to_string()),
+            })
+            .unwrap();
+        let _ = enc
+            .encode_part(&StreamPart::Usage {
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    reasoning_tokens: Some(1),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let finish_bytes = enc
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::Stop,
+            })
+            .unwrap();
+        let sf = String::from_utf8_lossy(&finish_bytes);
+
+        // output_item.done uses the provider-issued rs_... id
+        assert!(
+            sf.contains("\"id\":\"rs_enc1\""),
+            "output_item.done must use provider reasoning id: {sf}"
+        );
+        assert!(
+            sf.contains("\"encrypted_content\":\"enc-blob\""),
+            "output_item.done must carry encrypted_content: {sf}"
+        );
+        // No summary_text delta emitted for zero-text reasoning
+        assert!(
+            !sf.contains("response.reasoning_summary_text.delta"),
+            "zero-text reasoning must not emit summary_text.delta: {sf}"
+        );
+        // summary: [] must appear (not summary_text with empty string)
+        assert!(
+            sf.contains("\"summary\":[]"),
+            "output_item.done must emit summary: [] for encrypted-only reasoning: {sf}"
+        );
+        assert!(
+            !sf.contains("\"text\":\"\""),
+            "must not emit an empty-string summary_text part: {sf}"
         );
     }
 

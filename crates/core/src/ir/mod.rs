@@ -65,7 +65,21 @@ pub enum StreamPart {
     /// An incremental text delta.
     TextDelta { text: String },
     /// An incremental reasoning/thinking delta.
-    ReasoningDelta { text: String },
+    ReasoningDelta {
+        text: String,
+        /// Provider-issued reasoning item id (e.g. OpenAI Responses `rs_...`),
+        /// surfaced during streaming so it survives to the stream boundary and
+        /// can be replayed on later turns. `None` for protocols that do not
+        /// carry a streaming reasoning id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// Encrypted reasoning content streamed alongside the delta (e.g.
+        /// OpenAI Responses `reasoning.encrypted_content` carried on the
+        /// reasoning output item). Must be replayed verbatim on subsequent
+        /// turns; `None` for plain-text streaming reasoning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
     /// A tool call being built incrementally.
     ToolCallDelta {
         id: String,

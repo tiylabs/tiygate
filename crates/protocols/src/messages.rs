@@ -1025,7 +1025,7 @@ impl StreamEncoder for MessagesStreamEncoder {
                 ));
                 out
             }
-            StreamPart::ReasoningDelta { text } => {
+            StreamPart::ReasoningDelta { text, .. } => {
                 let mut out =
                     self.ensure_block("thinking", json!({"type": "thinking", "thinking": ""}));
                 let idx = self.current_index.unwrap_or(0);
@@ -1322,6 +1322,8 @@ impl StreamDecoder for MessagesStreamDecoder {
                         if let Some(thinking) = block["thinking"].as_str() {
                             parts.push(StreamPart::ReasoningDelta {
                                 text: thinking.to_string(),
+                                id: None,
+                                encrypted_content: None,
                             });
                         }
                     }
@@ -1354,6 +1356,8 @@ impl StreamDecoder for MessagesStreamDecoder {
                         if let Some(thinking) = delta["thinking"].as_str() {
                             parts.push(StreamPart::ReasoningDelta {
                                 text: thinking.to_string(),
+                                id: None,
+                                encrypted_content: None,
                             });
                         }
                     }
@@ -1805,6 +1809,8 @@ mod tests {
             },
             StreamPart::ReasoningDelta {
                 text: "think".to_string(),
+                id: None,
+                encrypted_content: None,
             },
             StreamPart::ToolCallDelta {
                 id: "tc1".to_string(),

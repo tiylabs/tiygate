@@ -1153,7 +1153,7 @@ impl StreamEncoder for GeminiStreamEncoder {
                 "data: {}\n\n",
                 json!({"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}}]})
             ),
-            StreamPart::ReasoningDelta { text } => format!(
+            StreamPart::ReasoningDelta { text, .. } => format!(
                 "data: {}\n\n",
                 json!({"candidates": [{"content": {"parts": [{"text": text, "thought": true}]}}]})
             ),
@@ -1335,6 +1335,8 @@ impl StreamDecoder for GeminiStreamDecoder {
                             if let Some(text) = p["text"].as_str() {
                                 parts.push(StreamPart::ReasoningDelta {
                                     text: text.to_string(),
+                                    id: None,
+                                    encrypted_content: None,
                                 });
                             }
                         } else {
@@ -1349,6 +1351,8 @@ impl StreamDecoder for GeminiStreamDecoder {
                             {
                                 parts.push(StreamPart::ReasoningDelta {
                                     text: t.to_string(),
+                                    id: None,
+                                    encrypted_content: None,
                                 });
                             }
                         }
@@ -1550,6 +1554,8 @@ mod tests {
             },
             StreamPart::ReasoningDelta {
                 text: "think".to_string(),
+                id: None,
+                encrypted_content: None,
             },
             StreamPart::ToolCallDelta {
                 id: "t1".to_string(),

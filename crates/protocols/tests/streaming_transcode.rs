@@ -116,7 +116,7 @@ fn collected_reasoning(parts: &[StreamPart]) -> String {
     parts
         .iter()
         .filter_map(|p| match p {
-            StreamPart::ReasoningDelta { text } => Some(text.clone()),
+            StreamPart::ReasoningDelta { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect()
@@ -402,9 +402,13 @@ fn matrix_reasoning_delta_roundtrip_all_pairs() {
         },
         StreamPart::ReasoningDelta {
             text: "thinking ".to_string(),
+            id: None,
+            encrypted_content: None,
         },
         StreamPart::ReasoningDelta {
             text: "harder".to_string(),
+            id: None,
+            encrypted_content: None,
         },
         StreamPart::TextDelta {
             text: "answer".to_string(),

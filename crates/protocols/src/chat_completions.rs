@@ -1050,7 +1050,7 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                     })
                 )
             }
-            StreamPart::ReasoningDelta { text } => {
+            StreamPart::ReasoningDelta { text, .. } => {
                 // Deepseek thinking mode streams the CoT as `reasoning_content`
                 // in the SSE delta. Other OpenAI-compatible providers may use
                 // a different field; we always emit `reasoning_content` so
@@ -1334,12 +1334,16 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                             if !text.is_empty() {
                                 parts.push(StreamPart::ReasoningDelta {
                                     text: text.to_string(),
+                                    id: None,
+                                    encrypted_content: None,
                                 });
                             }
                         } else if let Some(reasoning) = delta.get("reasoning_details") {
                             if let Some(text) = reasoning["text"].as_str() {
                                 parts.push(StreamPart::ReasoningDelta {
                                     text: text.to_string(),
+                                    id: None,
+                                    encrypted_content: None,
                                 });
                             }
                         }
@@ -1882,6 +1886,8 @@ mod tests {
             },
             StreamPart::ReasoningDelta {
                 text: "think".to_string(),
+                id: None,
+                encrypted_content: None,
             },
             StreamPart::ToolCallDelta {
                 id: "tc1".to_string(),
@@ -2252,7 +2258,7 @@ mod tests {
         let rc_text: String = parts
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ReasoningDelta { text } => Some(text.clone()),
+                StreamPart::ReasoningDelta { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -2269,7 +2275,7 @@ mod tests {
         let r_text: String = parts2
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ReasoningDelta { text } => Some(text.clone()),
+                StreamPart::ReasoningDelta { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -2286,7 +2292,7 @@ mod tests {
         let empty_text: String = parts3
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ReasoningDelta { text } => Some(text.clone()),
+                StreamPart::ReasoningDelta { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -2303,7 +2309,7 @@ mod tests {
         let prio_text: String = parts4
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ReasoningDelta { text } => Some(text.clone()),
+                StreamPart::ReasoningDelta { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
