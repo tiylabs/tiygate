@@ -196,7 +196,7 @@ impl Default for ServerConfig {
             listen_addr: "0.0.0.0:3000".to_string(),
             mode: DeployMode::All,
             max_request_body_bytes: 10 * 1024 * 1024, // 10 MiB
-            max_multimodal_body_bytes: 32 * 1024 * 1024, // 32 MiB
+            max_multimodal_body_bytes: 64 * 1024 * 1024, // 64 MiB
             request_read_timeout_secs: 30,
             max_inflight_requests: 1024,
             max_queue_depth: 256,
@@ -238,6 +238,11 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("TIYGATE_MAX_BODY_BYTES") {
             if let Ok(n) = v.parse() {
                 cfg.max_request_body_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TIYGATE_MAX_MULTIMODAL_BODY_BYTES") {
+            if let Ok(n) = v.parse() {
+                cfg.max_multimodal_body_bytes = n;
             }
         }
         if let Ok(v) = std::env::var("TIYGATE_MAX_INFLIGHT") {
