@@ -24,7 +24,7 @@ use tracing::warn;
 
 use tiygate_core::ir::Usage;
 use tiygate_core::redaction::Redactor;
-use tiygate_core::telemetry::{RequestErrorClass, RequestStatus};
+use tiygate_core::telemetry::{EventPayload, RequestErrorClass, RequestStatus};
 use tiygate_core::{EventSink, ExchangeCapture, PipelineEvent, RequestEvent};
 
 use crate::db::DbPool;
@@ -79,11 +79,55 @@ impl OltpSink {
 
 #[async_trait]
 impl EventSink for OltpSink {
-    async fn write_event(&self, _event: &PipelineEvent) -> Result<(), tiygate_core::Error> {
-        // Pipeline events are lifecycle markers — we only persist
-        // the aggregated `RequestEvent` from the request hot path.
-        // Silently dropping pipeline events here keeps the OLTP
-        // table focused on analysis.
+    async fn write_event(&self, event: &PipelineEvent) -> Result<(), tiygate_core::Error> {
+        let res = match &event.payload {
+            EventPayload::HopStart {
+                target,
+                provider,
+                model,
+                egress_protocol,
+                hop,
+            } => {
+                self.upsert_attempt_started(event, target, provider, model, egress_protocol, *hop)
+                    .await
+            }
+            EventPayload::HopSuccess {
+                target,
+                hop,
+                latency_ms,
+                ..
+            } => {
+                self.upsert_attempt_success(event, target, *hop, *latency_ms)
+                    .await
+            }
+            EventPayload::HopFailure {
+                target,
+                hop,
+                error,
+                error_class,
+                latency_ms,
+            } => {
+                self.upsert_attempt_failure(event, target, *hop, error, error_class, *latency_ms)
+                    .await
+            }
+            EventPayload::HopDecision {
+                target,
+                hop,
+                decision,
+            } => {
+                self.update_attempt_decision(event, target, *hop, decision)
+                    .await
+            }
+            EventPayload::RequestStarted { .. }
+            | EventPayload::RouteResolved { .. }
+            | EventPayload::RequestCompleted { .. } => Ok(()),
+        };
+        if let Err(e) = res {
+            warn!(error = %e, request_id = %event.request_id, "oltp sink: pipeline event write failed");
+            return Err(tiygate_core::Error::Telemetry(format!(
+                "oltp pipeline event: {e}"
+            )));
+        }
         Ok(())
     }
 
@@ -425,6 +469,136 @@ struct RequestPayloadsRow {
 }
 
 impl OltpSink {
+    async fn upsert_attempt_started(
+        &self,
+        event: &PipelineEvent,
+        target: &str,
+        provider: &str,
+        model: &str,
+        egress_protocol: &str,
+        hop: usize,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO request_attempts (\
+                request_id, hop, ts, stage, target, provider, model, egress_protocol, \
+                status, error_class, error, latency_ms, fallback_decision) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'started', NULL, NULL, NULL, NULL) \
+             ON CONFLICT(request_id, hop) DO UPDATE SET \
+                ts = COALESCE(request_attempts.ts, excluded.ts), \
+                stage = excluded.stage, \
+                target = excluded.target, \
+                provider = excluded.provider, \
+                model = excluded.model, \
+                egress_protocol = excluded.egress_protocol, \
+                status = CASE WHEN request_attempts.status IN ('success', 'failed') THEN request_attempts.status ELSE excluded.status END",
+        )
+        .bind(&event.request_id)
+        .bind(hop as i64)
+        .bind(event.timestamp.to_rfc3339())
+        .bind(&event.stage)
+        .bind(target)
+        .bind(provider)
+        .bind(model)
+        .bind(egress_protocol)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_attempt_success(
+        &self,
+        event: &PipelineEvent,
+        target: &str,
+        hop: usize,
+        latency_ms: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO request_attempts (\
+                request_id, hop, ts, stage, target, status, error_class, error, \
+                latency_ms, fallback_decision) \
+             VALUES ($1, $2, $3, $4, $5, 'success', NULL, NULL, $6, NULL) \
+             ON CONFLICT(request_id, hop) DO UPDATE SET \
+                ts = excluded.ts, \
+                stage = excluded.stage, \
+                target = excluded.target, \
+                status = 'success', \
+                error_class = NULL, \
+                error = NULL, \
+                latency_ms = excluded.latency_ms",
+        )
+        .bind(&event.request_id)
+        .bind(hop as i64)
+        .bind(event.timestamp.to_rfc3339())
+        .bind(&event.stage)
+        .bind(target)
+        .bind(latency_ms as i64)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_attempt_failure(
+        &self,
+        event: &PipelineEvent,
+        target: &str,
+        hop: usize,
+        error: &str,
+        error_class: &str,
+        latency_ms: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO request_attempts (\
+                request_id, hop, ts, stage, target, status, error_class, error, \
+                latency_ms, fallback_decision) \
+             VALUES ($1, $2, $3, $4, $5, 'failed', $6, $7, $8, NULL) \
+             ON CONFLICT(request_id, hop) DO UPDATE SET \
+                ts = excluded.ts, \
+                stage = excluded.stage, \
+                target = excluded.target, \
+                status = 'failed', \
+                error_class = excluded.error_class, \
+                error = excluded.error, \
+                latency_ms = excluded.latency_ms",
+        )
+        .bind(&event.request_id)
+        .bind(hop as i64)
+        .bind(event.timestamp.to_rfc3339())
+        .bind(&event.stage)
+        .bind(target)
+        .bind(error_class)
+        .bind(error)
+        .bind(latency_ms as i64)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    async fn update_attempt_decision(
+        &self,
+        event: &PipelineEvent,
+        target: &str,
+        hop: usize,
+        decision: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO request_attempts (\
+                request_id, hop, ts, stage, target, status, fallback_decision) \
+             VALUES ($1, $2, $3, $4, $5, 'started', $6) \
+             ON CONFLICT(request_id, hop) DO UPDATE SET \
+                fallback_decision = excluded.fallback_decision, \
+                target = COALESCE(request_attempts.target, excluded.target)",
+        )
+        .bind(&event.request_id)
+        .bind(hop as i64)
+        .bind(event.timestamp.to_rfc3339())
+        .bind(&event.stage)
+        .bind(target)
+        .bind(decision)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
     /// Convert a raw `ExchangeCapture` into a persisted row, applying
     /// header + JSON-body redaction and (for streaming responses)
     /// best-effort SSE merge parsing. This runs on the telemetry
@@ -2589,6 +2763,60 @@ pub async fn list_requests(
     Ok((entries, total as u64))
 }
 
+/// A per-hop execution attempt for request log drill-down.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RequestAttemptEntry {
+    pub request_id: String,
+    pub hop: u64,
+    pub ts: String,
+    pub stage: String,
+    pub target: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub egress_protocol: Option<String>,
+    pub status: String,
+    pub error_class: Option<String>,
+    pub error: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub fallback_decision: Option<String>,
+}
+
+fn row_to_attempt_entry(row: &sqlx::any::AnyRow) -> RequestAttemptEntry {
+    RequestAttemptEntry {
+        request_id: row.get("request_id"),
+        hop: row.get::<i64, _>("hop") as u64,
+        ts: row.get("ts"),
+        stage: row.get("stage"),
+        target: row.get("target"),
+        provider: row.get("provider"),
+        model: row.get("model"),
+        egress_protocol: row.get("egress_protocol"),
+        status: row.get("status"),
+        error_class: row.get("error_class"),
+        error: row.get("error"),
+        latency_ms: row.get::<Option<i64>, _>("latency_ms").map(|n| n as u64),
+        fallback_decision: row.get("fallback_decision"),
+    }
+}
+
+/// List hop-level attempts for a request, ordered by hop then timestamp.
+pub async fn list_request_attempts(
+    pool: &DbPool,
+    request_id: &str,
+) -> Result<Vec<RequestAttemptEntry>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT request_id, hop, ts, stage, target, provider, model, egress_protocol, \
+                status, error_class, error, latency_ms, fallback_decision \
+         FROM request_attempts \
+         WHERE request_id = $1 \
+         ORDER BY hop ASC, ts ASC",
+    )
+    .bind(request_id)
+    .fetch_all(pool.any())
+    .await?;
+    Ok(rows.iter().map(row_to_attempt_entry).collect())
+}
+
 #[derive(Debug, Default, serde::Serialize)]
 pub struct RequestFilterOptions {
     pub models: Vec<String>,
@@ -2679,6 +2907,7 @@ pub struct RequestReplay {
     pub payload_archive_locked_at: Option<String>,
     pub payload_archived_at: Option<String>,
     pub payload_archive_manifest_json: Option<String>,
+    pub attempts: Vec<RequestAttemptEntry>,
 }
 
 /// Fetch the raw envelope (redacted) for a given request id.
@@ -2721,6 +2950,7 @@ pub async fn get_request_replay(
     .fetch_optional(pool.any())
     .await?;
     if let Some(r) = row {
+        let attempts = list_request_attempts(pool, request_id).await?;
         Ok(Some(RequestReplay {
             request_id: r.get("request_id"),
             raw_envelope_json: r.get("raw_envelope_json"),
@@ -2759,6 +2989,7 @@ pub async fn get_request_replay(
             payload_archive_locked_at: r.get("payload_archive_locked_at"),
             payload_archived_at: r.get("payload_archived_at"),
             payload_archive_manifest_json: r.get("payload_archive_manifest_json"),
+            attempts,
         }))
     } else {
         Ok(None)
@@ -2771,7 +3002,7 @@ mod tests {
     use super::*;
     use crate::db;
     use chrono::Utc;
-    use tiygate_core::telemetry::LatencyBreakdown;
+    use tiygate_core::telemetry::{EventPayload, LatencyBreakdown, PipelineEvent};
 
     fn dummy_request_event() -> RequestEvent {
         RequestEvent {
@@ -2830,6 +3061,86 @@ mod tests {
         assert!(!by_model.is_empty());
         assert_eq!(by_model[0].bucket, "gpt-4o");
         assert_eq!(by_model[0].prompt_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn write_pipeline_events_persist_request_attempts_out_of_order() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+        let request_id = "req-attempts".to_string();
+        let target = "openai:gpt-4o".to_string();
+
+        sink.write_event(&PipelineEvent {
+            request_id: request_id.clone(),
+            timestamp: Utc::now(),
+            stage: "execute".to_string(),
+            payload: EventPayload::HopFailure {
+                target: target.clone(),
+                hop: 1,
+                error: "upstream 500".to_string(),
+                error_class: "transient".to_string(),
+                latency_ms: 42,
+            },
+        })
+        .await
+        .expect("write failure");
+
+        sink.write_event(&PipelineEvent {
+            request_id: request_id.clone(),
+            timestamp: Utc::now(),
+            stage: "execute".to_string(),
+            payload: EventPayload::HopStart {
+                target: target.clone(),
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+                egress_protocol: "openai/chat-completions/v1".to_string(),
+                hop: 1,
+            },
+        })
+        .await
+        .expect("write late start");
+
+        sink.write_event(&PipelineEvent {
+            request_id: request_id.clone(),
+            timestamp: Utc::now(),
+            stage: "execute".to_string(),
+            payload: EventPayload::HopDecision {
+                target: target.clone(),
+                hop: 1,
+                decision: "try_next".to_string(),
+            },
+        })
+        .await
+        .expect("write decision");
+
+        sink.write_event(&PipelineEvent {
+            request_id: request_id.clone(),
+            timestamp: Utc::now(),
+            stage: "execute".to_string(),
+            payload: EventPayload::HopSuccess {
+                target: "anthropic:claude".to_string(),
+                hop: 2,
+                latency_ms: 17,
+                usage: None,
+            },
+        })
+        .await
+        .expect("write success");
+
+        let attempts = list_request_attempts(&pool, &request_id)
+            .await
+            .expect("attempts");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].hop, 1);
+        assert_eq!(attempts[0].status, "failed");
+        assert_eq!(attempts[0].provider.as_deref(), Some("openai"));
+        assert_eq!(attempts[0].model.as_deref(), Some("gpt-4o"));
+        assert_eq!(attempts[0].error_class.as_deref(), Some("transient"));
+        assert_eq!(attempts[0].fallback_decision.as_deref(), Some("try_next"));
+        assert_eq!(attempts[1].hop, 2);
+        assert_eq!(attempts[1].status, "success");
+        assert_eq!(attempts[1].latency_ms, Some(17));
     }
 
     #[tokio::test]
@@ -3150,6 +3461,20 @@ mod tests {
         let mut ev = dummy_request_event();
         ev.raw_envelope = Some(envelope);
         sink.write_request_event(&ev).await.expect("write");
+        sink.write_event(&PipelineEvent {
+            request_id: "req-1".to_string(),
+            timestamp: Utc::now(),
+            stage: "execute".to_string(),
+            payload: EventPayload::HopStart {
+                target: "openai:gpt-4o".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+                egress_protocol: "openai/chat-completions/v1".to_string(),
+                hop: 1,
+            },
+        })
+        .await
+        .expect("write attempt");
 
         let replay = get_request_replay(&pool, "req-1")
             .await
@@ -3157,6 +3482,9 @@ mod tests {
             .expect("should exist");
         assert_eq!(replay.request_id, "req-1");
         assert!(replay.raw_envelope_json.is_some());
+        assert_eq!(replay.attempts.len(), 1);
+        assert_eq!(replay.attempts[0].status, "started");
+        assert_eq!(replay.attempts[0].provider.as_deref(), Some("openai"));
         // The envelope JSON should contain model name (exact format
         // depends on serde_json serialization).
         assert!(replay.raw_envelope_json.unwrap().contains("gpt-4o"));

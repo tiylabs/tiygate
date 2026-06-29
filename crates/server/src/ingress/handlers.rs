@@ -191,15 +191,66 @@ pub(super) async fn acquire_permit(
     }
 }
 
+fn early_error_class(err: &AppError) -> RequestErrorClass {
+    match err.http_status() {
+        StatusCode::BAD_REQUEST
+        | StatusCode::PAYLOAD_TOO_LARGE
+        | StatusCode::UNSUPPORTED_MEDIA_TYPE => RequestErrorClass::BadRequest,
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS => {
+            RequestErrorClass::Transient
+        }
+        _ => RequestErrorClass::InternalError,
+    }
+}
+
+fn emit_early_error(scope: crate::ingress::observability::RequestScope<'_>, err: &AppError) {
+    scope.emit_error(
+        early_error_class(err),
+        Some(&err.message),
+        Some(err.http_status().as_u16()),
+    );
+}
+
+async fn acquire_or_log<'a>(
+    state: &'a AppState,
+    scope: crate::ingress::observability::RequestScope<'a>,
+) -> Result<
+    (
+        tokio::sync::OwnedSemaphorePermit,
+        crate::ingress::observability::RequestScope<'a>,
+    ),
+    AppError,
+> {
+    match acquire_permit(state).await {
+        Ok(permit) => Ok((permit, scope)),
+        Err(err) => {
+            emit_early_error(scope, &err);
+            Err(err)
+        }
+    }
+}
+
+fn enforce_body_limit_or_log<'a>(
+    state: &AppState,
+    scope: crate::ingress::observability::RequestScope<'a>,
+    content_type: Option<&str>,
+    body_size: u64,
+) -> Result<crate::ingress::observability::RequestScope<'a>, AppError> {
+    match enforce_body_limit(state, content_type, body_size) {
+        Ok(()) => Ok(scope),
+        Err(err) => {
+            emit_early_error(scope, &err);
+            Err(err)
+        }
+    }
+}
+
 /// Handle POST /v1/chat/completions.
 pub(super) async fn handle_chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
-    // Acquire concurrency permit
-    let _permit = acquire_permit(&state).await?;
-
     let codec = ChatCompletionsCodec::new();
     let ingress_protocol = codec.id().clone();
 
@@ -210,12 +261,11 @@ pub(super) async fn handle_chat_completions(
     let body_size = serde_json::to_string(&body)
         .map(|s| s.len() as u64)
         .unwrap_or(0);
-    enforce_body_limit(&state, content_type, body_size)?;
 
     // Wall-clock anchor for the Phase 4 `RequestEvent`. We measure
-    // the *whole* request handler duration (including fallback
-    // retries) so the latency column reflects what the client
-    // actually experienced.
+    // the *whole* request handler duration (including queueing and
+    // fallback retries) so the latency column reflects what the
+    // client actually experienced.
     let started = Instant::now();
     let request_id = uuid::Uuid::now_v7().to_string();
 
@@ -228,13 +278,10 @@ pub(super) async fn handle_chat_completions(
         &headers,
     );
 
-    // Build the RequestScope *after* the body-limit check passes so
-    // that an oversized payload surfaces as the appropriate 413
-    // (no terminal RequestEvent needed for the data-plane
-    // pre-pipeline checks; the existing app-level logger captures
-    // it). We do install the scope for the downstream pipeline
-    // (decode → quota → route → execute) so every code path emits.
-    let mut scope = crate::ingress::observability::RequestScope::new(
+    // Build the RequestScope before permit acquisition and body-limit
+    // checks so 503 overload and 413/415 pre-pipeline failures still
+    // produce a terminal RequestEvent.
+    let scope = crate::ingress::observability::RequestScope::new(
         &state,
         request_id.clone(),
         "unknown",
@@ -242,12 +289,13 @@ pub(super) async fn handle_chat_completions(
         trace_ctx.clone(),
         started,
     );
-    // Persist the redacted envelope on the terminal RequestEvent
-    // for audit / replay (§8 #3 / #8). `Redactor` is already
-    // applied at envelope build time, so the value is safe to
-    // store as-is in the OLTP `request_logs.raw_envelope_json`
-    // column.
-    scope.set_envelope(raw_env.clone());
+    let scope = {
+        let mut scope = scope;
+        scope.set_envelope(raw_env.clone());
+        scope
+    };
+    let (_permit, scope) = acquire_or_log(&state, scope).await?;
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size)?;
 
     // Phase 4 §4.6: api key resolution + quota enforcement. The
     // resolved `api_key` is bound to the scope so the terminal
@@ -385,9 +433,6 @@ pub(super) async fn handle_messages(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
-    // Acquire concurrency permit
-    let _permit = acquire_permit(&state).await?;
-
     let codec = MessagesCodec::new();
     let ingress_protocol = codec.id().clone();
 
@@ -404,10 +449,9 @@ pub(super) async fn handle_messages(
         &headers,
     );
 
-    // Build the RequestScope so every early-return path emits a
-    // terminal `RequestEvent`. See `handle_chat_completions` for
-    // the full rationale.
-    let mut scope = crate::ingress::observability::RequestScope::new(
+    // Build the RequestScope before permit acquisition so 503
+    // overload failures still produce a terminal RequestEvent.
+    let scope = crate::ingress::observability::RequestScope::new(
         &state,
         request_id.clone(),
         "unknown",
@@ -415,12 +459,12 @@ pub(super) async fn handle_messages(
         trace_ctx.clone(),
         started,
     );
-    // Persist the redacted envelope on the terminal RequestEvent
-    // for audit / replay (§8 #3 / #8). `Redactor` is already
-    // applied at envelope build time, so the value is safe to
-    // store as-is in the OLTP `request_logs.raw_envelope_json`
-    // column.
-    scope.set_envelope(raw_env.clone());
+    let scope = {
+        let mut scope = scope;
+        scope.set_envelope(raw_env.clone());
+        scope
+    };
+    let (_permit, mut scope) = acquire_or_log(&state, scope).await?;
 
     // Phase 4 §4.6: api key resolution + quota enforcement (parity
     // with the chat-completions path). The resolved `api_key` is
@@ -547,8 +591,6 @@ pub(super) async fn handle_embeddings(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
-    let _permit = acquire_permit(&state).await?;
-
     let codec = EmbeddingsCodec::new();
     let ingress_protocol = codec.id().clone();
     let raw_env = crate::ingress::observability::build_redacted_envelope(
@@ -566,7 +608,7 @@ pub(super) async fn handle_embeddings(
     let trace_ctx = crate::ingress::observability::extract_trace(&headers);
 
     // Wall-clock anchor + scope so every return path emits a
-    // terminal `RequestEvent` (parity with the other 4 handlers).
+    // terminal `RequestEvent` (parity with the other handlers).
     // The `started` clock is also used for the `latency_ms` column
     // on the miss / hit events below.
     let started = Instant::now();
@@ -582,6 +624,7 @@ pub(super) async fn handle_embeddings(
     // Persist the redacted envelope on the terminal RequestEvent
     // for audit / replay (§8 #3 / #8).
     scope.set_envelope(raw_env.clone());
+    let (_permit, mut scope) = acquire_or_log(&state, scope).await?;
 
     // Phase 4 §4.6: api key resolution + quota enforcement, parity
     // with the chat/messages/responses/gemini handlers. Embedding
@@ -759,7 +802,6 @@ pub(super) async fn handle_responses(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
-    let _permit = acquire_permit(&state).await?;
     let codec = ResponsesCodec::new();
     let ingress_protocol = codec.id().clone();
     let content_type = headers
@@ -768,7 +810,6 @@ pub(super) async fn handle_responses(
     let body_size = serde_json::to_string(&body)
         .map(|s| s.len() as u64)
         .unwrap_or(0);
-    enforce_body_limit(&state, content_type, body_size)?;
 
     let trace_ctx = crate::ingress::observability::extract_trace(&headers);
     let raw_env = crate::ingress::observability::build_redacted_envelope(
@@ -797,6 +838,8 @@ pub(super) async fn handle_responses(
     // Persist the redacted envelope on the terminal RequestEvent
     // for audit / replay (§8 #3 / #8).
     scope.set_envelope(raw_env.clone());
+    let (_permit, scope) = acquire_or_log(&state, scope).await?;
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size)?;
     // Bind the api key id so the terminal RequestEvent attributes the
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
@@ -925,6 +968,25 @@ pub(super) async fn handle_gemini_generate(
     axum::extract::Path(capture): axum::extract::Path<String>,
     Json(mut body): Json<Value>,
 ) -> Result<Response, AppError> {
+    let codec = GeminiCodec::new();
+    let ingress_protocol = codec.id().clone();
+    let started = Instant::now();
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let trace_ctx = crate::ingress::observability::extract_trace(&headers);
+    let raw_path = format!("/v1beta/models/{capture}");
+    let raw_env = crate::ingress::observability::build_redacted_envelope(
+        &state, "POST", &raw_path, &body, &headers,
+    );
+    let mut scope = crate::ingress::observability::RequestScope::new(
+        &state,
+        request_id,
+        "unknown",
+        ingress_protocol.clone(),
+        trace_ctx.clone(),
+        started,
+    );
+    scope.set_envelope(raw_env.clone());
+
     // The router registers two path shapes for Gemini ingress:
     //   * colon shape  — `/v1beta/models/:capture`  (the `:capture`
     //     value is e.g. `foo:generateContent` per the Google
@@ -938,47 +1000,30 @@ pub(super) async fn handle_gemini_generate(
     let (model, method) = match split_gemini_capture(&capture) {
         Some(pair) => pair,
         None => {
-            return Err(AppError::new(
+            let app_err = AppError::new(
                 StatusCode::BAD_REQUEST,
                 format!("Invalid Gemini path capture: {capture:?}"),
-            ));
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error(
+                RequestErrorClass::BadRequest,
+                Some(&app_err.message),
+                Some(http_status),
+            );
+            return Err(app_err);
         }
     };
     let is_gemini_stream = method == "streamGenerateContent";
     let model = model.to_string();
-    let _permit = acquire_permit(&state).await?;
-    let codec = GeminiCodec::new();
-    let ingress_protocol = codec.id().clone();
+    scope.set_virtual_model(model.clone());
+    let (_permit, scope) = acquire_or_log(&state, scope).await?;
     let content_type = headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
     let body_size = serde_json::to_string(&body)
         .map(|s| s.len() as u64)
         .unwrap_or(0);
-    enforce_body_limit(&state, content_type, body_size)?;
-
-    let trace_ctx = crate::ingress::observability::extract_trace(&headers);
-    let raw_env = crate::ingress::observability::build_redacted_envelope(
-        &state,
-        "POST",
-        &format!("/v1beta/models/{model}/generateContent"),
-        &body,
-        &headers,
-    );
-
-    let started = Instant::now();
-    let request_id = uuid::Uuid::now_v7().to_string();
-    let mut scope = crate::ingress::observability::RequestScope::new(
-        &state,
-        request_id,
-        model.clone(),
-        ingress_protocol.clone(),
-        trace_ctx.clone(),
-        started,
-    );
-    // Persist the redacted envelope on the terminal RequestEvent
-    // for audit / replay (§8 #3 / #8).
-    scope.set_envelope(raw_env.clone());
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size)?;
     // Bind the api key id so the terminal RequestEvent attributes the
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
@@ -1114,8 +1159,6 @@ pub(super) async fn handle_images_generations(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
-    let _permit = acquire_permit(&state).await?;
-
     let codec = ImagesGenerationsCodec::new();
     let ingress_protocol = codec.id().clone();
 
@@ -1126,7 +1169,6 @@ pub(super) async fn handle_images_generations(
     let body_size = serde_json::to_string(&body)
         .map(|s| s.len() as u64)
         .unwrap_or(0);
-    enforce_body_limit(&state, content_type, body_size)?;
 
     let started = Instant::now();
     let request_id = uuid::Uuid::now_v7().to_string();
@@ -1149,6 +1191,8 @@ pub(super) async fn handle_images_generations(
         started,
     );
     scope.set_envelope(raw_env.clone());
+    let (_permit, scope) = acquire_or_log(&state, scope).await?;
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size)?;
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
@@ -1321,8 +1365,6 @@ pub(super) async fn handle_images_edits(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let _permit = acquire_permit(&state).await?;
-
     let codec = ImagesEditsCodec::new();
     let ingress_protocol = codec.id().clone();
 
@@ -1331,7 +1373,6 @@ pub(super) async fn handle_images_edits(
     let content_type = headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    enforce_body_limit(&state, content_type, body.len() as u64)?;
 
     let started = Instant::now();
     let request_id = uuid::Uuid::now_v7().to_string();
@@ -1362,6 +1403,8 @@ pub(super) async fn handle_images_edits(
         started,
     );
     scope.set_envelope(raw_env.clone());
+    let (_permit, scope) = acquire_or_log(&state, scope).await?;
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body.len() as u64)?;
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());

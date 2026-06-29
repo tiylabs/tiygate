@@ -117,6 +117,14 @@ pub async fn cleanup_once(pool: &DbPool, retention_days: u32) -> Result<u64, sql
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
     let cutoff_str = cutoff.to_rfc3339();
     let mut tx = pool.any().begin().await?;
+    let attempt_res = sqlx::query(
+        "DELETE FROM request_attempts \
+         WHERE request_id IN (SELECT request_id FROM request_logs WHERE ts < $1) \
+            OR ts < $1",
+    )
+    .bind(&cutoff_str)
+    .execute(&mut *tx)
+    .await?;
     let payload_res = sqlx::query(
         "DELETE FROM request_payloads \
          WHERE request_id IN (SELECT request_id FROM request_logs WHERE ts < $1) \
@@ -131,13 +139,18 @@ pub async fn cleanup_once(pool: &DbPool, retention_days: u32) -> Result<u64, sql
         .await?;
     tx.commit().await?;
 
+    let deleted_attempts = attempt_res.rows_affected();
     let deleted_payloads = payload_res.rows_affected();
     let deleted_logs = log_res.rows_affected();
-    let deleted = deleted_payloads + deleted_logs;
+    let deleted = deleted_attempts + deleted_payloads + deleted_logs;
     if deleted > 0 {
         info!(
             deleted,
-            deleted_logs, deleted_payloads, retention_days, "log retention cleanup pass"
+            deleted_logs,
+            deleted_payloads,
+            deleted_attempts,
+            retention_days,
+            "log retention cleanup pass"
         );
     }
     Ok(deleted)
@@ -180,6 +193,18 @@ mod tests {
         .expect("insert payload");
     }
 
+    async fn insert_attempt(pool: &DbPool, request_id: &str, ts: &str) {
+        sqlx::query(
+            "INSERT INTO request_attempts (request_id, hop, ts, stage, target, status) \
+             VALUES ($1, 1, $2, 'execute', 'target', 'failed')",
+        )
+        .bind(request_id)
+        .bind(ts)
+        .execute(pool.any())
+        .await
+        .expect("insert attempt");
+    }
+
     async fn log_count(pool: &DbPool, request_id: &str) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE request_id = $1")
             .bind(request_id)
@@ -196,6 +221,14 @@ mod tests {
             .expect("payload count")
     }
 
+    async fn attempt_count(pool: &DbPool, request_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_attempts WHERE request_id = $1")
+            .bind(request_id)
+            .fetch_one(pool.any())
+            .await
+            .expect("attempt count")
+    }
+
     #[tokio::test]
     async fn cleanup_once_deletes_old_logs_payloads_and_orphans() {
         let pool = in_mem_pool().await;
@@ -203,23 +236,31 @@ mod tests {
         let new_ts = chrono::Utc::now().to_rfc3339();
         insert_log(pool.as_ref(), "old", &old_ts).await;
         insert_payload(pool.as_ref(), "old", &new_ts).await;
+        insert_attempt(pool.as_ref(), "old", &new_ts).await;
         insert_log(pool.as_ref(), "new", &new_ts).await;
         insert_payload(pool.as_ref(), "new", &new_ts).await;
+        insert_attempt(pool.as_ref(), "new", &new_ts).await;
         insert_payload(pool.as_ref(), "orphan-old", &old_ts).await;
         insert_payload(pool.as_ref(), "orphan-new", &new_ts).await;
+        insert_attempt(pool.as_ref(), "orphan-old", &old_ts).await;
+        insert_attempt(pool.as_ref(), "orphan-new", &new_ts).await;
 
         let deleted = cleanup_once(pool.as_ref(), 30).await.expect("cleanup");
         assert_eq!(
-            deleted, 3,
-            "old log, old payload, and old orphan payload must be deleted"
+            deleted, 5,
+            "old log, old payload, old attempt, and old orphans must be deleted"
         );
 
         assert_eq!(log_count(pool.as_ref(), "old").await, 0);
         assert_eq!(payload_count(pool.as_ref(), "old").await, 0);
+        assert_eq!(attempt_count(pool.as_ref(), "old").await, 0);
         assert_eq!(log_count(pool.as_ref(), "new").await, 1);
         assert_eq!(payload_count(pool.as_ref(), "new").await, 1);
+        assert_eq!(attempt_count(pool.as_ref(), "new").await, 1);
         assert_eq!(payload_count(pool.as_ref(), "orphan-old").await, 0);
         assert_eq!(payload_count(pool.as_ref(), "orphan-new").await, 1);
+        assert_eq!(attempt_count(pool.as_ref(), "orphan-old").await, 0);
+        assert_eq!(attempt_count(pool.as_ref(), "orphan-new").await, 1);
     }
 
     #[tokio::test]
@@ -228,12 +269,16 @@ mod tests {
         let old_ts = (chrono::Utc::now() - chrono::Duration::days(365)).to_rfc3339();
         insert_log(pool.as_ref(), "very-old", &old_ts).await;
         insert_payload(pool.as_ref(), "very-old", &old_ts).await;
+        insert_attempt(pool.as_ref(), "very-old", &old_ts).await;
         insert_payload(pool.as_ref(), "very-old-orphan", &old_ts).await;
+        insert_attempt(pool.as_ref(), "very-old-orphan", &old_ts).await;
         let deleted = cleanup_once(pool.as_ref(), 0).await.expect("cleanup");
         assert_eq!(deleted, 0);
         assert_eq!(log_count(pool.as_ref(), "very-old").await, 1);
         assert_eq!(payload_count(pool.as_ref(), "very-old").await, 1);
+        assert_eq!(attempt_count(pool.as_ref(), "very-old").await, 1);
         assert_eq!(payload_count(pool.as_ref(), "very-old-orphan").await, 1);
+        assert_eq!(attempt_count(pool.as_ref(), "very-old-orphan").await, 1);
     }
 
     #[tokio::test]

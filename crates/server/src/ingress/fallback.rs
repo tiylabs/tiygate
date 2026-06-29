@@ -15,6 +15,31 @@ use tiygate_core::{
 
 use super::{build_strategy, AppError, AppState};
 
+async fn emit_hop_decision(
+    state: &AppState,
+    request_id: &str,
+    target: &str,
+    hop: usize,
+    decision: &str,
+) {
+    use chrono::Utc;
+    use tiygate_core::telemetry::{EventPayload, PipelineEvent};
+
+    state
+        .telemetry
+        .send(PipelineEvent {
+            request_id: request_id.to_string(),
+            timestamp: Utc::now(),
+            stage: "execute".to_string(),
+            payload: EventPayload::HopDecision {
+                target: target.to_string(),
+                hop,
+                decision: decision.to_string(),
+            },
+        })
+        .await;
+}
+
 // ---------------------------------------------------------------------------
 // Unified fallback / circuit-breaker / retry loop
 // ---------------------------------------------------------------------------
@@ -82,6 +107,7 @@ where
     let deadline = Instant::now() + fallback.deadline;
 
     let mut attempt = 0usize;
+    let mut hop = 0usize;
     let mut target_index = 0usize;
     let mut last_error: Option<AppError> = None;
     let bytes_emitted: u64 = 0;
@@ -127,6 +153,8 @@ where
         // Check health — skip circuit-broken targets
         let health_key = target.health_key();
         if !state.health.is_healthy(&health_key) {
+            hop += 1;
+            let current_hop = hop;
             state
                 .telemetry
                 .send(PipelineEvent {
@@ -135,12 +163,14 @@ where
                     stage: "routing".to_string(),
                     payload: EventPayload::HopFailure {
                         target: health_key.clone(),
+                        hop: current_hop,
                         error: "circuit-broken".to_string(),
                         error_class: "circuit_breaker".to_string(),
                         latency_ms: 0,
                     },
                 })
                 .await;
+            emit_hop_decision(state, request_id, &health_key, current_hop, "try_next").await;
             target_index += 1;
             continue;
         }
@@ -152,6 +182,8 @@ where
         }
 
         attempt += 1;
+        hop += 1;
+        let current_hop = hop;
 
         // Telemetry: HopStart
         let hop_started = Utc::now();
@@ -169,7 +201,7 @@ where
                         "{:?}/{}",
                         target.api_protocol.suite, target.api_protocol.name
                     ),
-                    hop: attempt,
+                    hop: current_hop,
                 },
             })
             .await;
@@ -193,11 +225,13 @@ where
                         stage: "execute".to_string(),
                         payload: EventPayload::HopSuccess {
                             target: health_key.clone(),
+                            hop: current_hop,
                             latency_ms: hop_elapsed_ms,
                             usage: None,
                         },
                     })
                     .await;
+                emit_hop_decision(state, request_id, &health_key, current_hop, "success").await;
                 scope.set_ttfb_ms(ttfb_ms);
                 return FallbackOutcome::Success { response, ttfb_ms };
             }
@@ -219,6 +253,7 @@ where
                         stage: "execute".to_string(),
                         payload: EventPayload::HopFailure {
                             target: health_key.clone(),
+                            hop: current_hop,
                             error: app_err.message.clone(),
                             error_class: classification.class.as_str().to_string(),
                             latency_ms: hop_elapsed_ms,
@@ -251,6 +286,8 @@ where
 
                 match decision {
                     FallbackDecision::TryNext => {
+                        emit_hop_decision(state, request_id, &health_key, current_hop, "try_next")
+                            .await;
                         // Auth 401/403: extended cooling + skip same account
                         if classification.fallback_class == ErrorClass::Auth {
                             state.health.apply_cooling(
@@ -275,10 +312,14 @@ where
                         continue;
                     }
                     FallbackDecision::Retry => {
+                        emit_hop_decision(state, request_id, &health_key, current_hop, "retry")
+                            .await;
                         last_error = Some(app_err);
                         continue;
                     }
                     FallbackDecision::Fail => {
+                        emit_hop_decision(state, request_id, &health_key, current_hop, "fail")
+                            .await;
                         return FallbackOutcome::Failed {
                             error: app_err,
                             error_class: classification.class,

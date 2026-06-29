@@ -237,15 +237,23 @@ pub enum EventPayload {
     /// Execution succeeded.
     HopSuccess {
         target: String,
+        hop: usize,
         latency_ms: u64,
         usage: Option<Usage>,
     },
     /// Execution failed.
     HopFailure {
         target: String,
+        hop: usize,
         error: String,
         error_class: String,
         latency_ms: u64,
+    },
+    /// Fallback policy decision after an execution attempt.
+    HopDecision {
+        target: String,
+        hop: usize,
+        decision: String,
     },
     /// Request completed (success or failure).
     RequestCompleted {
