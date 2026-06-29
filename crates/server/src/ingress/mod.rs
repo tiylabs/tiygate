@@ -403,6 +403,7 @@ fn build_data_plane_router(
         )
         .route("/healthz", axum::routing::get(handle_healthz))
         .route("/readyz", axum::routing::get(handle_readyz))
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(
             server_config.request_read_timeout_secs,
         )))
