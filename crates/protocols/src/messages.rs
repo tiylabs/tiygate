@@ -266,22 +266,28 @@ impl EndpointCodec for MessagesCodec {
                 })
                 .unwrap_or_default(),
             thinking: body.get("thinking").and_then(|t| {
-                // Parse effort from the adaptive thinking mechanism
-                // (thinking.output_config.effort). Anthropic supports
-                // low/medium/high/xhigh/max; we also accept "minimal"
-                // leniently for cross-protocol symmetry.
-                let effort = t["output_config"]["effort"].as_str().map(|s| {
-                    use tiygate_core::ThinkingEffort;
-                    match s {
-                        "minimal" => ThinkingEffort::Minimal,
-                        "low" => ThinkingEffort::Low,
-                        "medium" => ThinkingEffort::Medium,
-                        "high" => ThinkingEffort::High,
-                        "xhigh" => ThinkingEffort::XHigh,
-                        "max" => ThinkingEffort::Max,
-                        _ => ThinkingEffort::High,
-                    }
-                });
+                // Parse effort from the top-level output_config field
+                // (output_config.effort). Per the Anthropic API schema,
+                // output_config is a sibling of thinking, not a child.
+                // We also check the legacy nested path
+                // (thinking.output_config.effort) for backward compat.
+                let effort = body
+                    .get("output_config")
+                    .and_then(|oc| oc.get("effort"))
+                    .or_else(|| t.get("output_config").and_then(|oc| oc.get("effort")))
+                    .and_then(|v| v.as_str())
+                    .map(|s| {
+                        use tiygate_core::ThinkingEffort;
+                        match s {
+                            "minimal" => ThinkingEffort::Minimal,
+                            "low" => ThinkingEffort::Low,
+                            "medium" => ThinkingEffort::Medium,
+                            "high" => ThinkingEffort::High,
+                            "xhigh" => ThinkingEffort::XHigh,
+                            "max" => ThinkingEffort::Max,
+                            _ => ThinkingEffort::High,
+                        }
+                    });
                 let budget_tokens = t["budget_tokens"].as_u64().map(|v| v as u32);
                 let display = t["display"].as_str().map(|s| match s {
                     "summarized" => tiygate_core::ThinkingDisplay::Summarized,
@@ -658,7 +664,7 @@ impl EndpointCodec for MessagesCodec {
         // Thinking config: output Anthropic thinking block from params.thinking.
         //
         // Cross-protocol derivation:
-        // - effort → adaptive thinking with output_config.effort (new mechanism)
+        // - effort → adaptive thinking with top-level output_config.effort (new mechanism)
         // - budget_tokens (without effort) → enabled thinking with budget_tokens
         // - display ← include_thoughts (derived when display is missing)
         //
@@ -679,18 +685,13 @@ impl EndpointCodec for MessagesCodec {
                 // Effort-based adaptive thinking (new Anthropic mechanism).
                 // Anthropic supports low/medium/high/xhigh/max; Minimal clamps
                 // to "low" since Anthropic has no "minimal" effort level.
+                //
+                // Per the Anthropic API schema, `output_config` is a
+                // top-level request body field (sibling of `thinking`),
+                // NOT a nested child of `thinking`. The `thinking` object
+                // only carries `type` and optional `display`.
                 let mut t = json!({
                     "type": "adaptive",
-                    "output_config": {
-                        "effort": match effort {
-                            tiygate_core::ThinkingEffort::Minimal => "low",
-                            tiygate_core::ThinkingEffort::Low => "low",
-                            tiygate_core::ThinkingEffort::Medium => "medium",
-                            tiygate_core::ThinkingEffort::High => "high",
-                            tiygate_core::ThinkingEffort::XHigh => "xhigh",
-                            tiygate_core::ThinkingEffort::Max => "max",
-                        }
-                    }
                 });
                 if let Some(d) = display {
                     t["display"] = json!(match d {
@@ -699,6 +700,16 @@ impl EndpointCodec for MessagesCodec {
                     });
                 }
                 body["thinking"] = t;
+                body["output_config"] = json!({
+                    "effort": match effort {
+                        tiygate_core::ThinkingEffort::Minimal => "low",
+                        tiygate_core::ThinkingEffort::Low => "low",
+                        tiygate_core::ThinkingEffort::Medium => "medium",
+                        tiygate_core::ThinkingEffort::High => "high",
+                        tiygate_core::ThinkingEffort::XHigh => "xhigh",
+                        tiygate_core::ThinkingEffort::Max => "max",
+                    }
+                });
             } else if let Some(budget) = thinking.budget_tokens {
                 // Budget-based enabled thinking (traditional mechanism).
                 // Anthropic's enabled type requires budget_tokens; when only

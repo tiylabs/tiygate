@@ -969,9 +969,9 @@ fn chat_thinking_effort_cross_to_anthropic() {
         Some(ThinkingEffort::Medium)
     );
     let (encoded, _) = anthropic.encode_request(&ir).unwrap();
-    // Effort must be expressed as adaptive thinking with output_config.effort.
+    // Effort must be expressed as top-level output_config.effort (sibling of thinking).
     assert_eq!(encoded["thinking"]["type"], "adaptive");
-    assert_eq!(encoded["thinking"]["output_config"]["effort"], "medium");
+    assert_eq!(encoded["output_config"]["effort"], "medium");
 }
 
 // ── Cross-protocol thinking config mapping tests ───────────────────
@@ -1012,7 +1012,7 @@ fn thinking_ir_for_model(model: &str, thinking: ThinkingConfig) -> IrRequest {
 
 #[test]
 fn cross_thinking_chat_effort_to_anthropic_adaptive() {
-    // Chat effort → Anthropic adaptive thinking with output_config.effort
+    // Chat effort → Anthropic adaptive thinking with top-level output_config.effort
     let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
     let ir = thinking_ir(ThinkingConfig {
         effort: Some(ThinkingEffort::High),
@@ -1020,7 +1020,7 @@ fn cross_thinking_chat_effort_to_anthropic_adaptive() {
     });
     let (out, _) = anthropic.encode_request(&ir).unwrap();
     assert_eq!(out["thinking"]["type"], "adaptive");
-    assert_eq!(out["thinking"]["output_config"]["effort"], "high");
+    assert_eq!(out["output_config"]["effort"], "high");
 }
 
 #[test]
@@ -1157,7 +1157,7 @@ fn cross_thinking_gemini_thinking_level_to_chat_effort() {
 
 #[test]
 fn cross_thinking_gemini_thinking_level_to_anthropic_adaptive() {
-    // Gemini thinkingLevel → Anthropic adaptive thinking with output_config.effort
+    // Gemini thinkingLevel → Anthropic adaptive thinking with top-level output_config.effort
     let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
     let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
     let env = make_env();
@@ -1175,12 +1175,12 @@ fn cross_thinking_gemini_thinking_level_to_anthropic_adaptive() {
     );
     let (out, _) = anthropic.encode_request(&ir).unwrap();
     assert_eq!(out["thinking"]["type"], "adaptive");
-    assert_eq!(out["thinking"]["output_config"]["effort"], "low");
+    assert_eq!(out["output_config"]["effort"], "low");
 }
 
 #[test]
 fn cross_thinking_anthropic_adaptive_decode_to_chat() {
-    // Anthropic adaptive thinking with output_config.effort → Chat reasoning_effort
+    // Anthropic adaptive thinking with top-level output_config.effort → Chat reasoning_effort
     let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
     let env = make_env();
@@ -1188,10 +1188,8 @@ fn cross_thinking_anthropic_adaptive_decode_to_chat() {
         "model": "claude-sonnet-4",
         "max_tokens": 4096,
         "messages": [{"role": "user", "content": "hi"}],
-        "thinking": {
-            "type": "adaptive",
-            "output_config": {"effort": "xhigh"}
-        },
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "xhigh"},
     });
     let ir = anthropic.decode_request(body, &env).unwrap();
     assert_eq!(
@@ -1212,10 +1210,8 @@ fn cross_thinking_anthropic_adaptive_decode_to_gemini() {
         "model": "claude-sonnet-4",
         "max_tokens": 4096,
         "messages": [{"role": "user", "content": "hi"}],
-        "thinking": {
-            "type": "adaptive",
-            "output_config": {"effort": "max"}
-        },
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "max"},
     });
     let mut ir = anthropic.decode_request(body, &env).unwrap();
     ir.model = "gemini-3.0-pro".to_string();
@@ -1279,7 +1275,7 @@ fn cross_thinking_minimal_effort_clamping() {
     );
     let (anth_out, _) = anthropic.encode_request(&ir).unwrap();
     // Anthropic doesn't support "minimal", clamps to "low"
-    assert_eq!(anth_out["thinking"]["output_config"]["effort"], "low");
+    assert_eq!(anth_out["output_config"]["effort"], "low");
 
     let (gem_out, _) = gemini.encode_request(&ir).unwrap();
     // Gemini supports "minimal"

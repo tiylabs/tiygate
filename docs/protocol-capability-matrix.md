@@ -85,7 +85,7 @@
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
 |------|:---:|:---:|:---:|:---:|:---:|
-| `effort` (minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`) | ✅ (`thinking.output_config.effort`，adaptive 类型) | ✅ (`reasoning.effort`) | ✅ (Gemini 3+ `thinkingConfig.thinkingLevel`；2.5 → 推导 `thinkingBudget`) | N/A |
+| `effort` (minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`) | ✅ (`output_config.effort`，adaptive 类型) | ✅ (`reasoning.effort`) | ✅ (Gemini 3+ `thinkingConfig.thinkingLevel`；2.5 → 推导 `thinkingBudget`) | N/A |
 | `budget_tokens` | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinking.budget_tokens`，enabled 类型) | ✅ → 推导 effort（`budget_to_effort`） | ✅ (Gemini 2.5 `thinkingConfig.thinkingBudget`；3+ → 推导 `thinkingLevel`) | N/A |
 | `display` (summarized/omitted) | ⚠️ → 丢弃 | ✅ (`thinking.display`) | ⚠️ → 丢弃 | ✅ → 推导 `includeThoughts` | N/A |
 | `include_thoughts` | ⚠️ → 丢弃 | ✅ → 推导 `display`（需同时有 effort 或 budget_tokens） | ⚠️ → 丢弃 | ✅ (`thinkingConfig.includeThoughts`) | N/A |
@@ -94,7 +94,7 @@
 
 **effort 级别映射**：IR 使用 6 级枚举（Minimal/Low/Medium/High/XHigh/Max）。各协议支持级别不同，超出部分 clamp：
 - OpenAI: minimal/low/medium/high/xhigh（Max → xhigh）
-- Anthropic: low/medium/high/xhigh/max（Minimal → low，使用 adaptive thinking + `output_config.effort`）
+- Anthropic: low/medium/high/xhigh/max（Minimal → low，使用 adaptive thinking + 顶层 `output_config.effort`）
 - Gemini: 3+ 使用 minimal/low/medium/high（XHigh/Max → high）并只输出 `thinkingLevel`；2.5 使用 `thinkingBudget`。官方协议不允许同一请求同时包含 `thinkingLevel` 和 `thinkingBudget`。
 
 **effort ↔ budget_tokens 双向映射**：`ThinkingConfig::effort_to_budget` / `budget_to_effort` 提供数值映射，各协议 encode 时自动推导缺失字段。

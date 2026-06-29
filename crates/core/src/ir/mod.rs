@@ -306,7 +306,7 @@ pub struct GenerationParams {
 /// Six canonical levels that map across all protocols:
 /// - **OpenAI Chat/Responses**: `reasoning_effort` / `reasoning.effort`
 ///   (minimal/low/medium/high/xhigh; Max clamps to xhigh)
-/// - **Anthropic**: `thinking.output_config.effort` (low/medium/high/xhigh/max;
+/// - **Anthropic**: `output_config.effort` (low/medium/high/xhigh/max;
 ///   Minimal clamps to low) or `thinking.budget_tokens` (numeric)
 /// - **Gemini**: `thinkingConfig.thinkingLevel` (minimal/low/medium/high;
 ///   XHigh/Max clamp to high) or `thinkingConfig.thinkingBudget` (numeric;
