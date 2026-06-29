@@ -355,6 +355,11 @@ pub struct ThinkingConfig {
     /// `includeThoughts`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_thoughts: Option<bool>,
+    /// Reasoning summary mode (OpenAI Responses `reasoning.summary`,
+    /// e.g. "auto"). Controls whether the API returns a human-readable
+    /// summary of the reasoning alongside encrypted content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 impl ThinkingConfig {

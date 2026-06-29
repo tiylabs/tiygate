@@ -1948,3 +1948,57 @@ fn responses_id_only_reasoning_is_dropped() {
         "an id-only reasoning item (no text, no encrypted_content) must be dropped"
     );
 }
+
+#[test]
+fn responses_codex_local_shell_to_chat_completions() {
+    let responses = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let body = json!({
+        "model": "m",
+        "input": [
+            {"role": "user", "content": "list files"},
+            {"type": "local_shell_call", "call_id": "call_shell_1", "action": {"command": ["ls", "-la"]}}
+        ]
+    });
+    let ir = responses.decode_request(body, &make_env()).expect("decode");
+    let (out, _h) = chat.encode_request(&ir).expect("encode");
+    let messages = out["messages"].as_array().unwrap();
+    let tool_calls: Vec<_> = messages
+        .iter()
+        .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+        .filter(|tc| tc["function"]["name"] == "local_shell")
+        .collect();
+    assert!(
+        !tool_calls.is_empty(),
+        "local_shell_call should survive cross-protocol to Chat Completions as a tool_call"
+    );
+    assert_eq!(tool_calls[0]["id"], "call_shell_1");
+}
+
+#[test]
+fn responses_codex_opaque_items_dropped_cross_protocol() {
+    let responses = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let body = json!({
+        "model": "m",
+        "input": [
+            {"role": "user", "content": "hi"},
+            {"type": "compaction", "id": "comp_1", "summary": "compacted"},
+            {"type": "agent_message", "content": "agent msg"}
+        ]
+    });
+    let ir = responses.decode_request(body, &make_env()).expect("decode");
+    // Verify opaque items are in extensions
+    assert!(ir.extensions.contains_key("codex_opaque_items"));
+    let (out, _h) = chat.encode_request(&ir).expect("encode");
+    let messages = out["messages"].as_array().unwrap();
+    // The user message should be present but opaque items should be dropped
+    let has_user_msg = messages.iter().any(|m| m["role"] == "user");
+    assert!(has_user_msg, "user message should survive");
+    // No compaction or agent_message types should leak into chat completions
+    let serialized = serde_json::to_string(&out).unwrap();
+    assert!(
+        !serialized.contains("compaction") && !serialized.contains("agent_message"),
+        "opaque Codex items should be dropped in cross-protocol conversion"
+    );
+}

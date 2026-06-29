@@ -376,3 +376,27 @@ fn error_message_names_dimension() {
         "error should name the dimension; got: {msg}"
     );
 }
+
+// --- Codex extension: opaque items should not trigger lossy rejection ---
+
+#[test]
+fn codex_opaque_items_do_not_trigger_lossy_rejection() {
+    let mut req = text_only_req();
+    req.extensions.insert(
+        "codex_opaque_items".to_string(),
+        serde_json::json!([{"type": "compaction", "id": "comp_1"}]),
+    );
+    // Should pass to all protocols — opaque items are silently dropped, not rejected.
+    for (label, endpoint, caps) in [
+        ("chat", chat_endpoint(), chat_caps()),
+        ("anthropic", anthropic_endpoint(), messages_caps()),
+        ("gemini", gemini_endpoint(), gemini_caps()),
+        ("responses", responses_endpoint(), responses_caps()),
+    ] {
+        let err = check_lossy_conversion(&req, &endpoint, &caps);
+        assert!(
+            err.is_ok(),
+            "codex_opaque_items should not trigger lossy rejection at {label}: {err:?}"
+        );
+    }
+}

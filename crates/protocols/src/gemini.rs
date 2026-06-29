@@ -507,6 +507,7 @@ impl EndpointCodec for GeminiCodec {
                     budget_tokens,
                     effort,
                     display,
+                    summary: None,
                 })
             }
         });

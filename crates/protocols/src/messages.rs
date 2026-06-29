@@ -303,6 +303,7 @@ impl EndpointCodec for MessagesCodec {
                         budget_tokens,
                         display,
                         include_thoughts,
+                        summary: None,
                     })
                 }
             }),

@@ -143,3 +143,49 @@
 | `stop_details` (structured) | ⚠️ → 仅 `finish_reason` | ✅ (`stop_details` object) | ⚠️ → 仅 `status` | ⚠️ → 仅 `finishReason` | N/A |
 
 **跨协议策略**：stop_details 跨协议时映射到目标协议的 stop reason 字段，结构化 details（type/category/explanation）可能丢失。
+
+## 12. Codex 扩展兼容性
+
+Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字段。同协议 Passthrough（Responses→Responses）时原始字节无损通过；以下行为仅适用于跨协议转换（Convert 模式）。
+
+### Codex Input Item 类型
+
+| Item 类型 | 跨协议行为 |
+|-----------|-----------|
+| `local_shell_call` | ✅ 映射为 IR `Content::ToolCall { name: "local_shell" }`，跨协议可转换 |
+| `local_shell_call_output` | ✅ 映射为 IR `Content::ToolResult`，跨协议可转换 |
+| `custom_tool_call` | ✅ 映射为 IR `Content::ToolCall`（input 文本包装为 JSON arguments），跨协议可转换 |
+| `custom_tool_call_output` | ✅ 映射为 IR `Content::ToolResult`，跨协议可转换 |
+| `tool_search_call` | ⚠️ 原始 JSON 存入 `extensions["codex_opaque_items"]`，同协议 egress 还原，跨协议丢弃 |
+| `tool_search_output` | ⚠️ 同上 |
+| `agent_message` | ⚠️ 同上 |
+| `compaction` | ⚠️ 同上 |
+| `compaction_trigger` | ⚠️ 同上 |
+| `context_compaction` | ⚠️ 同上 |
+
+**注意**：`local_shell_call` 映射为 `Content::ToolCall` 时 tool name 设为 `local_shell`，跨协议到 Chat Completions 后上游可能不识别此工具名——这是固有的语义有损，但不触发 lossy rejection。
+
+### Codex Response Output Item 类型
+
+| Item 类型 | 跨协议行为 |
+|-----------|-----------|
+| `local_shell_call` | ✅ 映射为 IR `Content::ToolCall`，计入 `FinishReason::ToolCalls` 判断 |
+| `custom_tool_call` | ✅ 映射为 IR `Content::ToolCall` |
+| `tool_search_call` / `agent_message` / `compaction` 等 | ⚠️ 静默丢弃（响应中的这些 item 对跨协议客户端无意义） |
+
+### Codex 扩展字段
+
+| 字段 | 跨协议行为 |
+|------|-----------|
+| `reasoning.summary` | ✅ 解析到 IR `ThinkingConfig.summary`，Responses egress 时回写；跨协议到 Anthropic/Gemini 时丢弃（不拒绝） |
+| `text.verbosity` | ⚠️ 随 `extensions["text"]` 整体透传，仅 Responses egress 消费；跨协议到非 Responses 协议时有损丢弃 |
+| `client_metadata` | ✅ 加入 `responses_extra` 透传列表，同协议 egress 自动回写；跨协议时丢弃 |
+
+### Codex 自定义请求头
+
+| 头 | 跨协议行为 |
+|----|-----------|
+| `x-codex-*` | ✅ 不在 `DEFAULT_REQUEST_DENY` / `DEFAULT_RESPONSE_DENY` 中，C→G→P 和 P→G→C 方向均自动转发 |
+| `x-openai-subagent` | ✅ 同上 |
+| `x-codex-turn-state` | ✅ 响应头，不在 `DEFAULT_RESPONSE_DENY` 中，自动转发回客户端 |
+| `OpenAI-Beta` | ✅ 通用客户端头，自动转发 |

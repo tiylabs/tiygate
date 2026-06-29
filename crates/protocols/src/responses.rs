@@ -112,6 +112,7 @@ impl EndpointCodec for ResponsesCodec {
         let stream = body["stream"].as_bool().unwrap_or(false);
         let system = body["instructions"].as_str().map(String::from);
         let mut messages: Vec<Message> = Vec::new();
+        let mut codex_opaque_items: Vec<Value> = Vec::new();
 
         if let Some(arr) = body["input"].as_array() {
             let mut call_id_counts: HashMap<String, usize> = HashMap::new();
@@ -126,8 +127,13 @@ impl EndpointCodec for ResponsesCodec {
                 // conversion (e.g. function_call → Assistant, which Anthropic
                 // requires for tool_use blocks).
                 let role = match item["type"].as_str() {
-                    Some("function_call") | Some("reasoning") => Role::Assistant,
-                    Some("function_call_output") => Role::Tool,
+                    Some("function_call")
+                    | Some("reasoning")
+                    | Some("local_shell_call")
+                    | Some("custom_tool_call") => Role::Assistant,
+                    Some("function_call_output")
+                    | Some("local_shell_call_output")
+                    | Some("custom_tool_call_output") => Role::Tool,
                     _ => match item["role"].as_str().unwrap_or("user") {
                         "system" | "developer" => Role::System,
                         "user" => Role::User,
@@ -136,7 +142,23 @@ impl EndpointCodec for ResponsesCodec {
                         _ => Role::User,
                     },
                 };
-                let content = if let Some(text) = item["content"].as_str() {
+                let content = if matches!(
+                    item["type"].as_str(),
+                    Some("tool_search_call")
+                        | Some("tool_search_output")
+                        | Some("agent_message")
+                        | Some("compaction")
+                        | Some("compaction_trigger")
+                        | Some("context_compaction")
+                ) {
+                    // Known Codex opaque item types: preserve the raw JSON
+                    // for same-protocol replay. Cross-protocol egress drops
+                    // these silently (no lossy rejection). Must be checked
+                    // BEFORE the content-based branches because some opaque
+                    // items (e.g. agent_message) carry a `content` field.
+                    codex_opaque_items.push(item.clone());
+                    vec![]
+                } else if let Some(text) = item["content"].as_str() {
                     vec![Content::Text {
                         text: text.to_string(),
                         annotations: None,
@@ -288,6 +310,56 @@ impl EndpointCodec for ResponsesCodec {
                             .as_str()
                             .map(|s| s.to_string()),
                     }]
+                } else if item["type"] == "local_shell_call" {
+                    // Codex local_shell_call: map to a ToolCall so it
+                    // survives cross-protocol conversion. The `action`
+                    // object is serialized as the tool call arguments.
+                    let id = responses_call_id(item).unwrap_or("").to_string();
+                    let arguments = item.get("action").cloned().unwrap_or(json!({}));
+                    vec![Content::ToolCall {
+                        id: id.clone(),
+                        call_id: Some(id),
+                        name: "local_shell".to_string(),
+                        arguments,
+                    }]
+                } else if item["type"] == "local_shell_call_output" {
+                    let output = match &item["output"] {
+                        Value::String(s) => s.clone(),
+                        Value::Null => String::new(),
+                        other => serde_json::to_string(other).unwrap_or_default(),
+                    };
+                    let raw_id = responses_call_id(item).unwrap_or("");
+                    vec![Content::ToolResult {
+                        tool_call_id: raw_id.to_string(),
+                        name: String::new(),
+                        content: output,
+                        id: None,
+                    }]
+                } else if item["type"] == "custom_tool_call" {
+                    // Codex custom_tool_call: map to a ToolCall with the
+                    // tool name and input text wrapped as JSON arguments.
+                    let id = responses_call_id(item).unwrap_or("").to_string();
+                    let name = item["name"].as_str().unwrap_or("").to_string();
+                    let input_text = item["input"].as_str().unwrap_or("").to_string();
+                    vec![Content::ToolCall {
+                        id: id.clone(),
+                        call_id: Some(id),
+                        name,
+                        arguments: json!({"input": input_text}),
+                    }]
+                } else if item["type"] == "custom_tool_call_output" {
+                    let output = match &item["output"] {
+                        Value::String(s) => s.clone(),
+                        Value::Null => String::new(),
+                        other => serde_json::to_string(other).unwrap_or_default(),
+                    };
+                    let raw_id = responses_call_id(item).unwrap_or("");
+                    vec![Content::ToolResult {
+                        tool_call_id: raw_id.to_string(),
+                        name: String::new(),
+                        content: output,
+                        id: None,
+                    }]
                 } else {
                     vec![Content::Text {
                         text: String::new(),
@@ -300,6 +372,11 @@ impl EndpointCodec for ResponsesCodec {
                 // cross-protocol conversion: the Chat Completions encoder gates
                 // reasoning_content on the presence of tool_calls *within the
                 // same message*, so splitting them would silently drop reasoning.
+                if content.is_empty() {
+                    // Opaque Codex items produce no IR content; skip message
+                    // creation to avoid inserting empty placeholder messages.
+                    continue;
+                }
                 if let Some(last) = messages.last_mut() {
                     if last.role == role {
                         last.content.extend(content);
@@ -350,9 +427,9 @@ impl EndpointCodec for ResponsesCodec {
                 })
                 .unwrap_or_default(),
             thinking: body.get("reasoning").and_then(|r| {
-                r.get("effort").and_then(|v| v.as_str()).map(|s| {
+                let effort = r.get("effort").and_then(|v| v.as_str()).map(|s| {
                     use tiygate_core::ThinkingEffort;
-                    let effort = match s {
+                    match s {
                         "minimal" => ThinkingEffort::Minimal,
                         "low" => ThinkingEffort::Low,
                         "medium" => ThinkingEffort::Medium,
@@ -360,12 +437,18 @@ impl EndpointCodec for ResponsesCodec {
                         "xhigh" => ThinkingEffort::XHigh,
                         "max" => ThinkingEffort::Max,
                         _ => ThinkingEffort::High,
-                    };
-                    tiygate_core::ThinkingConfig {
-                        effort: Some(effort),
-                        ..Default::default()
                     }
-                })
+                });
+                let summary = r.get("summary").and_then(|v| v.as_str()).map(String::from);
+                if effort.is_none() && summary.is_none() {
+                    None
+                } else {
+                    Some(tiygate_core::ThinkingConfig {
+                        effort,
+                        summary,
+                        ..Default::default()
+                    })
+                }
             }),
             ..Default::default()
         };
@@ -385,6 +468,8 @@ impl EndpointCodec for ResponsesCodec {
             if let Some(effort) = re.get("effort").and_then(|v| v.as_str()) {
                 extensions.insert("reasoning_effort".to_string(), json!(effort));
             }
+            // Store the full reasoning object for same-protocol replay.
+            extensions.insert("reasoning_full".to_string(), re.clone());
         }
 
         // Preserve Responses-specific top-level fields the IR does not model so
@@ -402,6 +487,7 @@ impl EndpointCodec for ResponsesCodec {
                 "include",
                 "prompt_cache_key",
                 "prompt_cache_retention",
+                "client_metadata",
             ] {
                 if let Some(v) = body.get(key) {
                     extra.insert(key.to_string(), v.clone());
@@ -410,6 +496,13 @@ impl EndpointCodec for ResponsesCodec {
             if !extra.is_empty() {
                 extensions.insert("responses_extra".to_string(), json!(extra));
             }
+        }
+
+        // Preserve Codex opaque input items (tool_search_call, agent_message,
+        // compaction, etc.) for same-protocol replay. Cross-protocol egress
+        // drops these silently.
+        if !codex_opaque_items.is_empty() {
+            extensions.insert("codex_opaque_items".to_string(), json!(codex_opaque_items));
         }
 
         Ok(IrRequest {
@@ -744,6 +837,19 @@ impl EndpointCodec for ResponsesCodec {
             }
         }
         body["input"] = json!(input_items);
+        // Restore Codex opaque input items (tool_search_call, agent_message,
+        // compaction, etc.) from extensions for same-protocol replay.
+        if let Some(opaque) = ir
+            .extensions
+            .get("codex_opaque_items")
+            .and_then(|v| v.as_array())
+        {
+            if let Some(arr) = body["input"].as_array_mut() {
+                for item in opaque {
+                    arr.push(item.clone());
+                }
+            }
+        }
         if !ir.tools.is_empty() {
             let tools: Vec<Value> = ir.tools.iter().map(|t| json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.parameters})).collect();
             body["tools"] = json!(tools);
@@ -783,7 +889,11 @@ impl EndpointCodec for ResponsesCodec {
         // Cross-protocol derivation: when effort is missing but budget_tokens
         // is present (e.g. from Anthropic/Gemini), derive effort from budget.
         if body.get("reasoning").is_none() {
-            if let Some(ref thinking) = ir.params.thinking {
+            // Same-protocol replay: if the full reasoning object was captured
+            // at decode time, restore it verbatim (preserves summary, etc.).
+            if let Some(re_full) = ir.extensions.get("reasoning_full") {
+                body["reasoning"] = re_full.clone();
+            } else if let Some(ref thinking) = ir.params.thinking {
                 let effort = thinking.effort.or_else(|| {
                     thinking
                         .budget_tokens
@@ -800,6 +910,14 @@ impl EndpointCodec for ResponsesCodec {
                         tiygate_core::ThinkingEffort::XHigh => "xhigh",
                         tiygate_core::ThinkingEffort::Max => "xhigh",
                     }});
+                }
+                // Attach reasoning.summary if present in params.thinking.
+                if let Some(ref summary) = thinking.summary {
+                    if let Some(obj) = body["reasoning"].as_object_mut() {
+                        obj.insert("summary".to_string(), json!(summary));
+                    } else {
+                        body["reasoning"] = json!({"summary": summary});
+                    }
                 }
             } else if let Some(effort) = ir
                 .extensions
@@ -938,6 +1056,29 @@ impl EndpointCodec for ResponsesCodec {
                                 });
                             }
                         }
+                    }
+                    Some("local_shell_call") => {
+                        // Codex local_shell_call output item: map to ToolCall.
+                        let id = responses_call_id(item).unwrap_or("").to_string();
+                        let arguments = item.get("action").cloned().unwrap_or(json!({}));
+                        content.push(Content::ToolCall {
+                            id: id.clone(),
+                            call_id: Some(id),
+                            name: "local_shell".to_string(),
+                            arguments,
+                        });
+                    }
+                    Some("custom_tool_call") => {
+                        // Codex custom_tool_call output item: map to ToolCall.
+                        let id = responses_call_id(item).unwrap_or("").to_string();
+                        let name = item["name"].as_str().unwrap_or("").to_string();
+                        let input_text = item["input"].as_str().unwrap_or("").to_string();
+                        content.push(Content::ToolCall {
+                            id: id.clone(),
+                            call_id: Some(id),
+                            name,
+                            arguments: json!({"input": input_text}),
+                        });
                     }
                     _ => {}
                 }
@@ -1561,6 +1702,35 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     if let Some(enc) = item["encrypted_content"].as_str() {
                         self.pending_reasoning_encrypted = Some(enc.to_string());
                     }
+                } else if item["type"] == "local_shell_call" {
+                    // Codex local_shell_call: treat as a tool call so the
+                    // streaming finish_reason is ToolCalls, not Stop.
+                    self.in_function_call = true;
+                    self.saw_function_call = true;
+                    let id = responses_call_id(item).unwrap_or("").to_string();
+                    let action = item.get("action").cloned().unwrap_or(json!({}));
+                    self.current_call_id = Some(id.clone());
+                    self.current_call_name = Some("local_shell".to_string());
+                    parts.push(StreamPart::ToolCallDelta {
+                        id,
+                        name: Some("local_shell".to_string()),
+                        arguments: action.to_string(),
+                    });
+                } else if item["type"] == "custom_tool_call" {
+                    // Codex custom_tool_call: treat as a tool call so the
+                    // streaming finish_reason is ToolCalls, not Stop.
+                    self.in_function_call = true;
+                    self.saw_function_call = true;
+                    let id = responses_call_id(item).unwrap_or("").to_string();
+                    let name = item["name"].as_str().unwrap_or("").to_string();
+                    let input_text = item["input"].as_str().unwrap_or("").to_string();
+                    self.current_call_id = Some(id.clone());
+                    self.current_call_name = Some(name.clone());
+                    parts.push(StreamPart::ToolCallDelta {
+                        id,
+                        name: Some(name),
+                        arguments: json!({"input": input_text}).to_string(),
+                    });
                 }
             }
             Some("response.function_call_arguments.delta") => {
@@ -2607,5 +2777,235 @@ mod tests {
         assert_eq!(ir.messages[1].role, Role::Assistant);
         assert_eq!(ir.messages[2].role, Role::Tool);
         assert_eq!(ir.messages[3].role, Role::User);
+    }
+
+    #[test]
+    fn test_decode_local_shell_call_input_item() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5",
+            "input": [
+                {"role": "user", "content": "list files"},
+                {"type": "local_shell_call", "call_id": "call_shell_1", "action": {"command": ["ls", "-la"]}}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let tool_call = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find(|c| matches!(c, Content::ToolCall { name, .. } if name == "local_shell"))
+            .expect("local_shell_call should map to ToolCall");
+        if let Content::ToolCall {
+            id,
+            name,
+            arguments,
+            call_id: _,
+        } = tool_call
+        {
+            assert_eq!(id, "call_shell_1");
+            assert_eq!(name, "local_shell");
+            assert_eq!(arguments["command"], json!(["ls", "-la"]));
+        }
+    }
+
+    #[test]
+    fn test_decode_custom_tool_call_input_item() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5",
+            "input": [
+                {"role": "user", "content": "run custom tool"},
+                {"type": "custom_tool_call", "call_id": "call_custom_1", "name": "my_tool", "input": "some input text"}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let tool_call = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find(|c| matches!(c, Content::ToolCall { name, .. } if name == "my_tool"))
+            .expect("custom_tool_call should map to ToolCall");
+        if let Content::ToolCall {
+            id,
+            name,
+            arguments,
+            call_id: _,
+        } = tool_call
+        {
+            assert_eq!(id, "call_custom_1");
+            assert_eq!(name, "my_tool");
+            assert_eq!(arguments["input"], "some input text");
+        }
+    }
+
+    #[test]
+    fn test_decode_codex_opaque_items_preserved() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "tool_search_call", "call_id": "ts_1", "query": "find tools"},
+                {"type": "agent_message", "content": "agent response"},
+                {"type": "compaction", "id": "comp_1", "summary": "compacted"}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let opaque = ir
+            .extensions
+            .get("codex_opaque_items")
+            .and_then(|v| v.as_array())
+            .expect("codex_opaque_items should be in extensions");
+        assert_eq!(opaque.len(), 3, "should have 3 opaque items");
+        assert_eq!(opaque[0]["type"], "tool_search_call");
+        assert_eq!(opaque[1]["type"], "agent_message");
+        assert_eq!(opaque[2]["type"], "compaction");
+    }
+
+    #[test]
+    fn test_encode_codex_opaque_items_replayed() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "compaction", "id": "comp_1", "summary": "compacted"}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let (re, _) = codec.encode_request(&ir).unwrap();
+        let input = re["input"].as_array().unwrap();
+        let compaction = input
+            .iter()
+            .find(|i| i["type"] == "compaction")
+            .expect("compaction item should be replayed in encode");
+        assert_eq!(compaction["id"], "comp_1");
+    }
+
+    #[test]
+    fn test_decode_client_metadata_passthrough() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "client_metadata": {"session_id": "abc123", "version": "1.0"}
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let extra = ir
+            .extensions
+            .get("responses_extra")
+            .and_then(|v| v.as_object())
+            .expect("responses_extra should exist");
+        assert!(
+            extra.contains_key("client_metadata"),
+            "client_metadata should be in responses_extra"
+        );
+        assert_eq!(extra["client_metadata"]["session_id"], "abc123");
+    }
+
+    #[test]
+    fn test_decode_reasoning_summary() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "reasoning": {"effort": "high", "summary": "auto"}
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let thinking = ir.params.thinking.as_ref().expect("thinking should be set");
+        assert_eq!(thinking.summary.as_deref(), Some("auto"));
+        // reasoning_full should also be stored for same-protocol replay
+        let re_full = ir
+            .extensions
+            .get("reasoning_full")
+            .expect("reasoning_full should be in extensions");
+        assert_eq!(re_full["summary"], "auto");
+    }
+
+    #[test]
+    fn test_encode_reasoning_summary() {
+        let codec = ResponsesCodec::new();
+        let ir = tiygate_core::IrRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            ingress_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::AnthropicMessages,
+                "messages",
+                "2023-06-01",
+            ),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: "hi".to_string(),
+                    annotations: None,
+                }],
+            }],
+            tools: vec![],
+            params: tiygate_core::GenerationParams {
+                thinking: Some(tiygate_core::ThinkingConfig {
+                    effort: Some(tiygate_core::ThinkingEffort::High),
+                    summary: Some("auto".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            stream: false,
+            response_format: None,
+            metadata: None,
+            extensions: Default::default(),
+        };
+        let (body, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(
+            body["reasoning"]["summary"], "auto",
+            "summary should be written to body"
+        );
+    }
+
+    #[test]
+    fn test_encode_reasoning_full_replay() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "reasoning": {"effort": "medium", "summary": "auto", "generate_summary": "detailed"}
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let (re, _) = codec.encode_request(&ir).unwrap();
+        // Same-protocol replay should use the full reasoning object
+        assert_eq!(re["reasoning"]["effort"], "medium");
+        assert_eq!(re["reasoning"]["summary"], "auto");
+        assert_eq!(re["reasoning"]["generate_summary"], "detailed");
+    }
+
+    #[test]
+    fn test_stream_decoder_codex_local_shell_call_finish_reason() {
+        let mut dec = ResponsesStreamDecoder::new();
+        // Simulate a Codex streaming response with a local_shell_call item
+        dec.feed(r#"data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress"}}"#).unwrap();
+        dec.feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"local_shell_call","call_id":"call_shell_1","action":{"command":["ls"]}}}"#).unwrap();
+        let parts = dec.feed(r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#).unwrap();
+        // The finish reason should be ToolCalls because saw_function_call was set
+        let has_tool_calls_finish = parts.iter().any(|p| {
+            matches!(
+                p,
+                StreamPart::Finish {
+                    reason: FinishReason::ToolCalls
+                }
+            )
+        });
+        assert!(
+            has_tool_calls_finish,
+            "Codex local_shell_call stream should produce FinishReason::ToolCalls, got: {:?}",
+            parts
+        );
     }
 }
