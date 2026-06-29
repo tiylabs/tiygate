@@ -3,6 +3,8 @@ mod config;
 mod sidecar;
 
 use std::sync::Mutex;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -97,68 +99,21 @@ pub fn run() {
             // Build the system tray icon with a context menu. The tray
             // allows the user to show/hide the window and quit the app
             // outright. Closing the window only hides it; the app keeps
-            // running in the tray.
-            let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
-            let hide_item = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "退出 TiyGate", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
+            // running in the tray. Menu events are registered globally
+            // once; the tray itself may be rebuilt later on macOS if the
+            // system status item disappears after SystemUIServer restarts
+            // or display/sleep transitions.
+            // Register the tray menu handler once. Tauri menu events are
+            // global, so this handler may also see future app/window menu
+            // ids; unrecognized ids are ignored by handle_tray_menu_event.
+            handle.on_menu_event(|app, event| {
+                handle_tray_menu_event(app, event.id().as_ref());
+            });
 
-            // Load the dedicated tray icon (a monochrome template PNG
-            // derived from webui/public/icon-round.svg). On macOS it is
-            // registered as a *template image* so the system automatically
-            // adapts it to dark/light menu-bar appearance. Template images
-            // must be pure-black pixels with an alpha channel; the system
-            // handles inversion. The PNG is embedded at compile time via
-            // `include_bytes!` so no filesystem access is needed at runtime.
-            let tray_icon =
-                tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon-template.png"))
-                    .map_err(|e| anyhow::anyhow!("failed to load tray icon: {e}"))?;
+            build_main_tray(&handle)?;
 
-            TrayIconBuilder::with_id("main-tray")
-                .icon(tray_icon)
-                .icon_as_template(true)
-                .tooltip("TiyGate")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                    "hide" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.hide();
-                        }
-                    }
-                    "quit" => {
-                        shutdown_sidecar(app);
-                        app.exit(0);
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    // Double-click (macOS) / left-click (Windows) toggles
-                    // the main window visibility.
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                    }
-                })
-                .build(app)?;
+            #[cfg(target_os = "macos")]
+            start_tray_watchdog(handle.clone());
 
             // The webview loads frontendDist (tauri://localhost) which
             // has Tauri IPC. The frontend uses Tauri commands to get
@@ -209,11 +164,147 @@ pub fn run() {
     // Handle application-level exit events (Cmd+Q, dock quit, etc.).
     // These do NOT trigger WindowEvent::CloseRequested, so the sidecar
     // must be cleaned up here as well.
-    app.run(|app_handle, event| {
-        if let tauri::RunEvent::Exit = event {
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::Exit => {
             shutdown_sidecar(app_handle);
         }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Resumed | tauri::RunEvent::Reopen { .. } => {
+            repair_main_tray(app_handle);
+        }
+        _ => {}
     });
+}
+
+/// Create the main tray icon. This is intentionally reusable because
+/// macOS can occasionally drop an `NSStatusItem` while the process keeps
+/// running, for example after SystemUIServer restarts or display/sleep
+/// transitions.
+fn build_main_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "退出 TiyGate", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
+
+    // Load the dedicated tray icon (a monochrome template PNG derived
+    // from webui/public/icon-round.svg). On macOS it is registered as a
+    // template image so the system automatically adapts it to dark/light
+    // menu-bar appearance. The PNG is embedded at compile time via
+    // `include_bytes!` so no filesystem access is needed at runtime.
+    let tray_icon = load_tray_icon()?;
+
+    TrayIconBuilder::with_id("main-tray")
+        .icon(tray_icon)
+        .icon_as_template(true)
+        .tooltip("TiyGate")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            // Double-click (macOS) / left-click (Windows) toggles the
+            // main window visibility.
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
+                    if window.is_visible().unwrap_or(false) {
+                        let _ = window.hide();
+                    } else {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+fn handle_tray_menu_event(app: &tauri::AppHandle, id: &str) {
+    match id {
+        "show" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+        "hide" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+        }
+        "quit" => {
+            shutdown_sidecar(app);
+            app.exit(0);
+        }
+        _ => {}
+    }
+}
+
+fn load_tray_icon() -> tauri::Result<tauri::image::Image<'static>> {
+    tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon-template.png"))
+}
+
+#[cfg(target_os = "macos")]
+fn repair_main_tray(app: &tauri::AppHandle) {
+    if tray_needs_rebuild(app) {
+        tracing::warn!("main tray icon is missing; rebuilding macOS status item");
+
+        if let Some(old_tray) = app.remove_tray_by_id("main-tray") {
+            // Force the stale NSStatusItem wrapper to be released before
+            // creating a replacement with the same id.
+            drop(old_tray);
+        }
+
+        if let Err(e) = build_main_tray(app) {
+            tracing::warn!("failed to rebuild main tray icon: {e}");
+        }
+    } else if let Some(tray) = app.tray_by_id("main-tray") {
+        if let Err(e) =
+            load_tray_icon().and_then(|icon| tray.set_icon_with_as_template(Some(icon), true))
+        {
+            tracing::warn!("failed to refresh main tray icon: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_tray_watchdog(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+
+        loop {
+            interval.tick().await;
+
+            repair_main_tray(&app);
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn tray_needs_rebuild(app: &tauri::AppHandle) -> bool {
+    let Some(tray) = app.tray_by_id("main-tray") else {
+        return true;
+    };
+
+    match tray.rect() {
+        Ok(Some(rect)) => tray_rect_is_empty(rect),
+        Ok(None) => true,
+        Err(e) => {
+            tracing::warn!("failed to read main tray icon rect: {e}");
+            true
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn tray_rect_is_empty(rect: tauri::Rect) -> bool {
+    let size = rect.size.to_physical::<u32>(1.0);
+    size.width == 0 || size.height == 0
 }
 
 /// Shut down the sidecar process if it is still running. Safe to call
