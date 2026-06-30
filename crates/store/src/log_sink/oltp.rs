@@ -2377,10 +2377,10 @@ pub async fn aggregate_by_target(
                 COALESCE(SUM(cache_read_tokens), 0) AS crt, \
                 COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
                 COALESCE(SUM(total_tokens), 0) AS tt, \
-                AVG(ttfb_ms)::double precision AS alat, \
+                AVG(ttfb_ms) AS alat, \
                 CASE WHEN SUM(stream_duration_ms) > 0 \
                      THEN SUM(completion_tokens) * 1000.0 / SUM(stream_duration_ms) \
-                     ELSE NULL END::double precision AS atps \
+                     ELSE NULL END AS atps \
          FROM request_logs \
          WHERE ts >= $1 AND ts < $2 \
          GROUP BY resolved_provider, resolved_model \
@@ -3200,6 +3200,82 @@ mod tests {
             .expect("agg");
         assert!(!by_provider.is_empty());
         assert_eq!(by_provider[0].bucket, "unknown");
+    }
+
+    #[tokio::test]
+    async fn aggregate_by_target_returns_latency_and_throughput_on_sqlite() {
+        // Regression test: the query previously used PostgreSQL-only
+        // `::double precision` casts which SQLite rejects. This test
+        // locks in SQLite portability and verifies the f64 columns.
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        // Event 1: ttfb_ms = 50, completion_tokens = 20, stream_duration = 1000ms.
+        let mut ev1 = dummy_request_event();
+        ev1.request_id = "req-tgt-1".to_string();
+        ev1.ttfb_ms = Some(50);
+        ev1.tokens = Some(tiygate_core::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            total_tokens: 30,
+            ..Default::default()
+        });
+        sink.write_request_event(&ev1).await.expect("write ev1");
+        sink.update_request_stream_duration("req-tgt-1", 1000)
+            .await
+            .expect("update stream dur 1");
+
+        // Event 2: same target, ttfb_ms = 100, no stream_duration (non-stream).
+        let mut ev2 = dummy_request_event();
+        ev2.request_id = "req-tgt-2".to_string();
+        ev2.ttfb_ms = Some(100);
+        ev2.tokens = Some(tiygate_core::Usage {
+            prompt_tokens: 5,
+            completion_tokens: 30,
+            total_tokens: 35,
+            ..Default::default()
+        });
+        sink.write_request_event(&ev2).await.expect("write ev2");
+
+        let now = Utc::now().to_rfc3339();
+        let earlier = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let by_target = aggregate_by_target(&pool, &earlier, &now)
+            .await
+            .expect("agg by target");
+
+        assert_eq!(by_target.len(), 1);
+        let b = &by_target[0];
+        assert_eq!(b.bucket, "openai / gpt-4o");
+        assert_eq!(b.count, 2);
+        // AVG(50, 100) = 75.0
+        assert_eq!(b.avg_latency_ms, Some(75.0));
+        // (20 + 30) * 1000.0 / 1000 = 50.0
+        assert_eq!(b.avg_throughput_tps, Some(50.0));
+    }
+
+    #[tokio::test]
+    async fn aggregate_by_target_null_ttfb_yields_none_latency() {
+        // When all rows have NULL ttfb_ms, avg_latency_ms should be None
+        // and throughput should be None when stream_duration_ms is also NULL.
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        let mut ev = dummy_request_event();
+        ev.request_id = "req-tgt-null".to_string();
+        ev.ttfb_ms = None;
+        sink.write_request_event(&ev).await.expect("write");
+
+        let now = Utc::now().to_rfc3339();
+        let earlier = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let by_target = aggregate_by_target(&pool, &earlier, &now)
+            .await
+            .expect("agg by target");
+
+        assert_eq!(by_target.len(), 1);
+        assert_eq!(by_target[0].avg_latency_ms, None);
+        assert_eq!(by_target[0].avg_throughput_tps, None);
     }
 
     #[tokio::test]
