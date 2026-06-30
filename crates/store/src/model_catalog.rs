@@ -697,10 +697,44 @@ fn collapse_separators(s: &str) -> String {
 fn canonical_model_id_str(id: &str) -> String {
     match id.split_once('/') {
         Some((prefix, rest)) if !prefix.is_empty() && !rest.is_empty() => {
-            format!("{}/{}", normalized_lab_id(prefix), rest)
+            let lab = normalized_lab_id(prefix);
+            // If the prefix is a recognized lab, strip it — the model
+            // suffix is the canonical id (e.g. "openai/gpt-image-2" →
+            // "gpt-image-2", "zai/glm-5.2" → "glm-5.2"). This ensures
+            // the same model from different providers (one with prefix,
+            // one without) merges into one catalog entry.
+            if is_known_lab(&lab) {
+                rest.to_string()
+            } else {
+                format!("{lab}/{rest}")
+            }
         }
         _ => id.to_string(),
     }
+}
+
+/// Whether a string is a recognized lab id (i.e. it appears as a value
+/// in the `normalized_lab_id` mapping). Used to decide whether to strip
+/// a `prefix/model` prefix during canonicalization.
+fn is_known_lab(lab: &str) -> bool {
+    matches!(
+        lab,
+        "anthropic"
+            | "deepseek"
+            | "google"
+            | "meta"
+            | "minimax"
+            | "moonshotai"
+            | "openai"
+            | "tencent"
+            | "xai"
+            | "zhipuai"
+            | "mistralai"
+            | "cohere"
+            | "alibaba"
+            | "amazon"
+            | "microsoft"
+    )
 }
 
 /// Normalize models.dev provider/lab aliases to one canonical lab id.
@@ -826,7 +860,8 @@ mod tests {
             limit: None,
             cost: None,
         };
-        assert_eq!(canonical_model_id(&model), "zhipuai/glm-test");
+        // Known lab prefix "zai" → "zhipuai" is stripped, suffix is canonical
+        assert_eq!(canonical_model_id(&model), "glm-test");
     }
 
     #[test]
