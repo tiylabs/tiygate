@@ -218,7 +218,6 @@ impl EndpointCodec for ImagesGenerationsCodec {
             PassThroughPolicy::Convert
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +390,6 @@ impl EndpointCodec for ImagesEditsCodec {
             PassThroughPolicy::Convert
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -716,11 +714,7 @@ mod tests {
     #[test]
     fn test_stream_encoder_error() {
         let mut enc = ImagesStreamEncoder::new();
-        let frame = enc.encode_error(
-            "test error",
-            ErrorClass::RateLimited,
-            Some("test_code"),
-        );
+        let frame = enc.encode_error("test error", ErrorClass::RateLimited, Some("test_code"));
         let s = String::from_utf8(frame).unwrap();
         assert!(s.contains("\"type\":\"error\""));
         assert!(s.contains("test error"));

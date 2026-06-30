@@ -909,10 +909,7 @@ pub fn classify_upstream_error(
         if lower.contains("timeout") || lower.contains("deadline") {
             return ErrorClass::DeadlineExceeded;
         }
-        if lower.contains("not_found")
-            || lower.contains("model_not_found")
-            || lower == "404"
-        {
+        if lower.contains("not_found") || lower.contains("model_not_found") || lower == "404" {
             return ErrorClass::ModelNotFound;
         }
     }

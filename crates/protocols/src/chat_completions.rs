@@ -540,7 +540,6 @@ impl EndpointCodec for ChatCompletionsCodec {
         }
     }
 
-
     fn encode_request(
         &self,
         ir: &IrRequest,
@@ -1927,11 +1926,8 @@ mod tests {
     #[test]
     fn test_stream_encoder_error_frame() {
         let mut encoder = ChatCompletionsStreamEncoder::new();
-        let err_bytes = encoder.encode_error(
-            "rate limit exceeded",
-            ErrorClass::RateLimited,
-            Some("429"),
-        );
+        let err_bytes =
+            encoder.encode_error("rate limit exceeded", ErrorClass::RateLimited, Some("429"));
         let err_str = String::from_utf8_lossy(&err_bytes);
         // Must contain "error" — protocol-native error frame
         assert!(err_str.contains("error"));

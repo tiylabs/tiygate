@@ -1165,7 +1165,6 @@ impl EndpointCodec for ResponsesCodec {
             tiygate_core::PassThroughPolicy::Convert
         }
     }
-
 }
 
 pub struct ResponsesStreamEncoder {

@@ -388,9 +388,9 @@ impl StreamCaptureGuard {
         // `request_logs.error_class` accurately instead of
         // hardcoding "transient".
         let upstream_error_class = self.accum.lock().ok().and_then(|a| {
-            a.upstream_error.as_ref().map(|e| {
-                e.class.to_request_class().as_str().to_string()
-            })
+            a.upstream_error
+                .as_ref()
+                .map(|e| e.class.to_request_class().as_str().to_string())
         });
         Some((
             telemetry,
@@ -479,28 +479,41 @@ pub(super) struct StreamTranscode {
     pub encoder: Box<dyn tiygate_core::StreamEncoder>,
 }
 
-/// Lightweight scan of verbatim upstream SSE bytes for error frames.
+/// Lightweight scan of verbatim upstream SSE bytes for error frames and
+/// terminal signals.
 ///
 /// In the verbatim (same-protocol) streaming path the gateway forwards
 /// upstream bytes without parsing them. This function performs a cheap
-/// detection pass to find `data:` lines whose JSON payload contains a
-/// top-level `"error"` key — the shape used by OpenAI, Anthropic, and
-/// Google when embedding an error frame inside an HTTP 200 SSE stream
-/// (e.g. `service_unavailable_error`, `overloaded_error`).
+/// detection pass for two things:
 ///
-/// When an error frame is found, the details are recorded in the
-/// `UsageAccumulator` so downstream observers (capture guard, telemetry)
-/// can mark the request as failed despite the HTTP 200 status.
+/// 1. **Error frames** — `data:` lines whose JSON payload contains a
+///    top-level `"error"` key — the shape used by OpenAI, Anthropic, and
+///    Google when embedding an error frame inside an HTTP 200 SSE stream
+///    (e.g. `service_unavailable_error`, `overloaded_error`).
+///
+/// 2. **Terminal signals** — `data: [DONE]` or `data:` lines whose JSON
+///    payload has a `"type"` field indicating a terminal event
+///    (`response.completed`, `response.failed`, `response.incomplete`)
+///    or an `event:` line naming a terminal event (`message_stop`).
+///    When detected, `upstream_terminal` is set on the accumulator so
+///    the gateway knows the upstream already closed the stream and must
+///    not synthesize an additional end frame.
 ///
 /// The scan is deliberately conservative: it only parses `data:` lines
-/// that contain the byte substring `"error"`, and only treats a payload
-/// as an error when the parsed JSON has a top-level `"error"` object.
-/// Normal response chunks that merely mention "error" in content text
-/// are not affected because their JSON will not have a top-level
-/// `"error"` key.
-fn detect_verbatim_error(bytes: &[u8], accum: &Arc<std::sync::Mutex<UsageAccumulator>>) {
-    // Quick gate: skip the parse entirely if `"error"` is not present.
-    if !bytes.windows(7).any(|w| w == b"\"error\"") {
+/// that contain the byte substring `"error"` for error detection, and
+/// only checks for terminal markers on lines that contain `[DONE]`,
+/// `"type"`, or `event:`. Normal response chunks that merely mention
+/// "error" in content text are not affected because their JSON will not
+/// have a top-level `"error"` key.
+fn detect_verbatim_signals(bytes: &[u8], accum: &Arc<std::sync::Mutex<UsageAccumulator>>) {
+    // Quick gate: skip the scan entirely if neither `"error"` nor
+    // `[DONE]` nor `"type"` nor `event:` is present. This avoids the
+    // per-line loop for the common case of pure content deltas.
+    let has_error = bytes.windows(7).any(|w| w == b"\"error\"");
+    let has_done = bytes.windows(6).any(|w| w == b"[DONE]");
+    let has_type = bytes.windows(6).any(|w| w == b"\"type\"");
+    let has_event = bytes.windows(6).any(|w| w == b"event:");
+    if !has_error && !has_done && !has_type && !has_event {
         return;
     }
     // Best-effort UTF-8 conversion for scanning SSE line prefixes.
@@ -510,30 +523,86 @@ fn detect_verbatim_error(bytes: &[u8], accum: &Arc<std::sync::Mutex<UsageAccumul
     };
     for line in text.lines() {
         let trimmed = line.trim();
-        // SSE data lines look like `data: { ... }` or `data:{ ... }`.
-        let json_str = if let Some(rest) = trimmed.strip_prefix("data:") {
-            rest.trim()
-        } else if trimmed.starts_with("event:") {
-            // Anthropic uses `event: error\ndata: {...}` — the error
-            // payload is on the following `data:` line, which will be
-            // picked up in the next iteration. Skip the event marker.
-            continue;
-        } else {
-            continue;
-        };
-        if json_str.is_empty() || json_str == "[DONE]" {
-            continue;
-        }
-        // Only attempt JSON parse if this line contains `"error"`.
-        if !json_str.contains("\"error\"") {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-            if let Some(error) = value.get("error") {
-                let message = error["message"].as_str().unwrap_or("upstream stream error");
-                let code = error["type"].as_str().or_else(|| error["code"].as_str());
+
+        // --- Terminal signal detection on `event:` lines ---
+        // Anthropic uses `event: message_stop` as its terminal event.
+        if let Some(ev) = trimmed.strip_prefix("event:") {
+            let ev = ev.trim();
+            if ev == "message_stop" {
                 if let Ok(mut a) = accum.lock() {
-                    a.set_upstream_error(message, code);
+                    a.set_upstream_terminal();
+                }
+            }
+            // `event: error` is handled by the `data:` line that follows.
+            continue;
+        }
+
+        // SSE data lines look like `data: { ... }` or `data:{ ... }`.
+        let json_str = match trimmed.strip_prefix("data:") {
+            Some(rest) => rest.trim(),
+            None => continue,
+        };
+
+        // --- Terminal signal: `[DONE]` ---
+        if json_str == "[DONE]" {
+            if let Ok(mut a) = accum.lock() {
+                a.set_upstream_terminal();
+            }
+            continue;
+        }
+        if json_str.is_empty() {
+            continue;
+        }
+
+        // --- Terminal signal: JSON `type` field ---
+        // Responses protocol: `response.completed`, `response.failed`,
+        // `response.incomplete` are terminal events. We check for
+        // `"type"` presence before JSON parsing to stay cheap.
+        if has_type && json_str.contains("\"type\"") {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(t) = value["type"].as_str() {
+                    if matches!(
+                        t,
+                        "response.completed"
+                            | "response.failed"
+                            | "response.incomplete"
+                            | "message_stop"
+                    ) {
+                        if let Ok(mut a) = accum.lock() {
+                            a.set_upstream_terminal();
+                        }
+                    }
+                }
+                // --- Error frame detection ---
+                // Only treat as error when the parsed JSON has a
+                // top-level `"error"` object or a nested
+                // `response.error` (Responses protocol's
+                // `response.failed` event). Normal chunks that
+                // mention "error" in content text are not affected.
+                if has_error && json_str.contains("\"error\"") {
+                    let error = value
+                        .get("error")
+                        .or_else(|| value.get("response").and_then(|r| r.get("error")));
+                    if let Some(error) = error {
+                        let message = error["message"].as_str().unwrap_or("upstream stream error");
+                        let code = error["type"].as_str().or_else(|| error["code"].as_str());
+                        if let Ok(mut a) = accum.lock() {
+                            a.set_upstream_error(message, code);
+                        }
+                    }
+                }
+            }
+        } else if has_error && json_str.contains("\"error\"") {
+            // --- Error frame detection (no `"type"` field) ---
+            // Some providers embed `{"error": {...}}` without a `"type"`
+            // wrapper. Parse only when `"error"` is present.
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(error) = value.get("error") {
+                    let message = error["message"].as_str().unwrap_or("upstream stream error");
+                    let code = error["type"].as_str().or_else(|| error["code"].as_str());
+                    if let Ok(mut a) = accum.lock() {
+                        a.set_upstream_error(message, code);
+                    }
                 }
             }
         }
@@ -720,6 +789,22 @@ pub(super) fn drive_upstream_stream(
                                                 // the capture guard /
                                                 // telemetry can mark the
                                                 // request as failed.
+                                                // An Error part is a terminal
+                                                // signal in some protocols
+                                                // (e.g. `response.failed`),
+                                                // but we do NOT set
+                                                // `saw_terminal` here because
+                                                // `decoder.finish()` must
+                                                // NOT be called on error
+                                                // streams (some decoders
+                                                // fabricate a success
+                                                // terminator from buffered
+                                                // state). Instead, the EOF
+                                                // path uses `!saw_terminal`
+                                                // to decide whether to
+                                                // emit `encode_done()`,
+                                                // matching the verbatim
+                                                // path's behavior.
                                                 if let tiygate_core::ir::StreamPart::Error {
                                                     message,
                                                     class,
@@ -780,7 +865,7 @@ pub(super) fn drive_upstream_stream(
                                 // status. The scan is cheap: a byte
                                 // substring search for `"error"` gates the
                                 // more expensive JSON parse.
-                                detect_verbatim_error(&bytes, &accum);
+                                detect_verbatim_signals(&bytes, &accum);
                                 capture_guard.append_client(&bytes);
                                 yield Ok(bytes);
                             }
@@ -937,6 +1022,9 @@ pub(super) fn drive_upstream_stream(
                                 // (a pure terminator with no success
                                 // semantics, e.g. `data: [DONE]`) so the
                                 // SDK closes the stream cleanly.
+                                // This matches the verbatim path: an
+                                // error without a terminal signal still
+                                // gets an end marker.
                                 if !saw_terminal {
                                     let has_upstream_error = accum
                                         .lock()
@@ -971,15 +1059,18 @@ pub(super) fn drive_upstream_stream(
                                 //
                                 // Exception: when the upstream delivered an
                                 // error frame (detected via
-                                // `detect_verbatim_error`) but no natural
-                                // terminator, emit the protocol-native end
+                                // `detect_verbatim_signals`) but no terminal
+                                // signal, emit the protocol-native end
                                 // marker so the client SDK does not time out
-                                // waiting for it.
-                                let has_upstream_error = accum
+                                // waiting for it. When a terminal signal
+                                // was already sent (e.g. `response.failed`,
+                                // `[DONE]`, `message_stop`), the stream is
+                                // already closed and no end marker is needed.
+                                let (has_upstream_error, has_terminal) = accum
                                     .lock()
-                                    .map(|a| a.upstream_error.is_some())
-                                    .unwrap_or(false);
-                                if has_upstream_error && !end_marker.is_empty() {
+                                    .map(|a| (a.upstream_error.is_some(), a.upstream_terminal))
+                                    .unwrap_or((false, false));
+                                if has_upstream_error && !has_terminal && !end_marker.is_empty() {
                                     capture_guard.append_client(&end_marker);
                                     yield Ok(Bytes::from(end_marker.clone()));
                                 }
@@ -1277,26 +1368,27 @@ mod tests {
         let acc = accum.lock().unwrap();
         assert!(acc.truncated.is_none());
     }
-
-    // --- detect_verbatim_error tests ---
+    // --- detect_verbatim_signals tests ---
 
     #[test]
-    fn detect_verbatim_error_openai_style() {
+    fn detect_verbatim_signals_openai_style_error() {
         let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
         let bytes = b"data: {\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"Service unavailable\"}}\n\n";
-        detect_verbatim_error(bytes, &accum);
+        detect_verbatim_signals(bytes, &accum);
         let acc = accum.lock().unwrap();
         let err = acc.upstream_error.as_ref().expect("error should be set");
         assert_eq!(err.message, "Service unavailable");
         assert_eq!(err.code.as_deref(), Some("service_unavailable_error"));
+        // Error frame without a terminal `type` → no terminal signal.
+        assert!(!acc.upstream_terminal);
     }
 
     #[test]
-    fn detect_verbatim_error_anthropic_style() {
+    fn detect_verbatim_signals_anthropic_style_error() {
         let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
         // Anthropic uses event: error + data: {...}
         let bytes = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
-        detect_verbatim_error(bytes, &accum);
+        detect_verbatim_signals(bytes, &accum);
         let acc = accum.lock().unwrap();
         let err = acc.upstream_error.as_ref().expect("error should be set");
         assert_eq!(err.message, "Overloaded");
@@ -1304,36 +1396,128 @@ mod tests {
     }
 
     #[test]
-    fn detect_verbatim_error_normal_chunk_not_flagged() {
+    fn detect_verbatim_signals_normal_chunk_not_flagged() {
         let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
         // A normal chunk that contains "error" in content text but not
         // as a top-level key.
         let bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"An error occurred\"}}]}\n\n";
-        detect_verbatim_error(bytes, &accum);
+        detect_verbatim_signals(bytes, &accum);
         let acc = accum.lock().unwrap();
         assert!(acc.upstream_error.is_none(), "should not flag normal chunk");
+        assert!(!acc.upstream_terminal);
     }
 
     #[test]
-    fn detect_verbatim_error_no_error_key_skipped() {
+    fn detect_verbatim_signals_no_error_key_skipped() {
         let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
         let bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
-        detect_verbatim_error(bytes, &accum);
+        detect_verbatim_signals(bytes, &accum);
         let acc = accum.lock().unwrap();
         assert!(acc.upstream_error.is_none());
     }
 
     #[test]
-    fn detect_verbatim_error_first_error_wins() {
+    fn detect_verbatim_signals_first_error_wins() {
         let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
         let bytes1 = b"data: {\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"First error\"}}\n\n";
         let bytes2 =
             b"data: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"Second error\"}}\n\n";
-        detect_verbatim_error(bytes1, &accum);
-        detect_verbatim_error(bytes2, &accum);
+        detect_verbatim_signals(bytes1, &accum);
+        detect_verbatim_signals(bytes2, &accum);
         let acc = accum.lock().unwrap();
         let err = acc.upstream_error.as_ref().expect("error should be set");
         assert_eq!(err.message, "First error");
+    }
+
+    // --- terminal signal detection tests ---
+
+    #[test]
+    fn detect_verbatim_signals_done_marker_sets_terminal() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: [DONE]\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(acc.upstream_terminal, "[DONE] must set upstream_terminal");
+        assert!(acc.upstream_error.is_none());
+    }
+
+    #[test]
+    fn detect_verbatim_signals_response_failed_sets_terminal() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}}\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(
+            acc.upstream_terminal,
+            "response.failed must set upstream_terminal"
+        );
+        // Error should also be recorded since `\"error\"` is present.
+        assert!(acc.upstream_error.is_some());
+    }
+
+    #[test]
+    fn detect_verbatim_signals_response_completed_sets_terminal() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(
+            acc.upstream_terminal,
+            "response.completed must set upstream_terminal"
+        );
+        assert!(acc.upstream_error.is_none());
+    }
+
+    #[test]
+    fn detect_verbatim_signals_response_incomplete_sets_terminal() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r1\",\"status\":\"incomplete\"}}\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(
+            acc.upstream_terminal,
+            "response.incomplete must set upstream_terminal"
+        );
+    }
+
+    #[test]
+    fn detect_verbatim_signals_anthropic_message_stop_sets_terminal() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(
+            acc.upstream_terminal,
+            "message_stop event must set upstream_terminal"
+        );
+    }
+
+    #[test]
+    fn detect_verbatim_signals_non_terminal_type_not_flagged() {
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(
+            !acc.upstream_terminal,
+            "non-terminal type must not set upstream_terminal"
+        );
+    }
+
+    #[test]
+    fn detect_verbatim_signals_error_without_terminal_no_terminal_flag() {
+        // An error frame WITHOUT a terminal `type` (e.g. bare `{"error":...}}`)
+        // must set upstream_error but NOT upstream_terminal — the gateway
+        // still needs to synthesize an end frame.
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(acc.upstream_error.is_some(), "error should be set");
+        assert!(
+            !acc.upstream_terminal,
+            "bare error without terminal type must not set upstream_terminal"
+        );
     }
 
     #[tokio::test]

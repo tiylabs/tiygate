@@ -300,7 +300,8 @@ pub(super) async fn handle_chat_completions(
         scope
     };
     let (_permit, scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
+    let mut scope =
+        enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
 
     // Phase 4 §4.6: api key resolution + quota enforcement. The
     // resolved `api_key` is bound to the scope so the terminal
@@ -853,7 +854,8 @@ pub(super) async fn handle_responses(
     // for audit / replay (§8 #3 / #8).
     scope.set_envelope(raw_env.clone());
     let (_permit, scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
+    let mut scope =
+        enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
     // Bind the api key id so the terminal RequestEvent attributes the
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
@@ -1041,7 +1043,8 @@ pub(super) async fn handle_gemini_generate(
     let body_size = serde_json::to_string(&body)
         .map(|s| s.len() as u64)
         .unwrap_or(0);
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
+    let mut scope =
+        enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
     // Bind the api key id so the terminal RequestEvent attributes the
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
@@ -1213,7 +1216,8 @@ pub(super) async fn handle_images_generations(
     );
     scope.set_envelope(raw_env.clone());
     let (_permit, scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
+    let mut scope =
+        enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
@@ -1428,7 +1432,13 @@ pub(super) async fn handle_images_edits(
     );
     scope.set_envelope(raw_env.clone());
     let (_permit, scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body.len() as u64, codec.id().suite)?;
+    let mut scope = enforce_body_limit_or_log(
+        &state,
+        scope,
+        content_type,
+        body.len() as u64,
+        codec.id().suite,
+    )?;
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());

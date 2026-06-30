@@ -199,7 +199,6 @@ impl EndpointCodec for EmbeddingsCodec {
     fn stream_decoder(&self) -> Box<dyn StreamDecoder> {
         Box::new(EmbeddingsStreamDecoder)
     }
-
 }
 
 pub struct EmbeddingsStreamEncoder;

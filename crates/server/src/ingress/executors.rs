@@ -286,7 +286,10 @@ pub(super) async fn execute_upstream(
                 format!("Upstream {}: {}", status, error_body),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
@@ -309,7 +312,8 @@ pub(super) async fn execute_upstream(
         let end_marker = end_enc.encode_done();
         let error_marker = err_enc.encode_error(
             "upstream stream truncated by gateway",
-            tiygate_core::ErrorClass::DeadlineExceeded, None,
+            tiygate_core::ErrorClass::DeadlineExceeded,
+            None,
         );
 
         let forwarded_resp_headers = forwarded_resp_headers_for_capture(
@@ -443,7 +447,10 @@ pub(super) async fn execute_upstream(
                 ),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(c) = response_body["error"]["code"]
                 .as_str()
                 .or_else(|| response_body["error"]["type"].as_str())
@@ -734,7 +741,10 @@ pub(super) async fn execute_messages_upstream(
                 format!("Upstream {}: {}", status, error_body),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
@@ -753,7 +763,8 @@ pub(super) async fn execute_messages_upstream(
         let end_marker = end_enc.encode_done();
         let error_marker = err_enc.encode_error(
             "upstream stream truncated by gateway",
-            tiygate_core::ErrorClass::DeadlineExceeded, None,
+            tiygate_core::ErrorClass::DeadlineExceeded,
+            None,
         );
 
         let forwarded_resp_headers = forwarded_resp_headers_for_capture(
@@ -867,7 +878,10 @@ pub(super) async fn execute_messages_upstream(
                 ),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(c) = response_body["error"]["code"]
                 .as_str()
                 .or_else(|| response_body["error"]["type"].as_str())
@@ -1203,7 +1217,10 @@ pub(super) async fn execute_embeddings_upstream(
             ),
         );
         app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+        app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+            Some(status.as_u16()),
+            None,
+        ));
         if let Some(c) = response_body["error"]["code"]
             .as_str()
             .or_else(|| response_body["error"]["type"].as_str())
@@ -1427,7 +1444,10 @@ pub(super) async fn execute_responses_upstream(
                 format!("Upstream {}: {}", status, error_body),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
@@ -1440,7 +1460,8 @@ pub(super) async fn execute_responses_upstream(
         let end_marker = end_enc.encode_done();
         let error_marker = err_enc.encode_error(
             "upstream stream truncated by gateway",
-            tiygate_core::ErrorClass::DeadlineExceeded, None,
+            tiygate_core::ErrorClass::DeadlineExceeded,
+            None,
         );
 
         let mut response = drive_upstream_stream(
@@ -1559,7 +1580,10 @@ pub(super) async fn execute_responses_upstream(
             format!("Upstream {}: {}", status, response_body),
         );
         app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+        app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+            Some(status.as_u16()),
+            None,
+        ));
         if let Some(c) = response_body["error"]["code"]
             .as_str()
             .or_else(|| response_body["error"]["type"].as_str())
@@ -1844,7 +1868,10 @@ pub(super) async fn execute_gemini_upstream(
                 format!("Upstream {}: {}", status, error_body),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
@@ -1857,7 +1884,8 @@ pub(super) async fn execute_gemini_upstream(
         let end_marker = end_enc.encode_done();
         let error_marker = err_enc.encode_error(
             "upstream stream truncated by gateway",
-            tiygate_core::ErrorClass::DeadlineExceeded, None,
+            tiygate_core::ErrorClass::DeadlineExceeded,
+            None,
         );
 
         let mut response = drive_upstream_stream(
@@ -1976,7 +2004,10 @@ pub(super) async fn execute_gemini_upstream(
             format!("Upstream {}: {}", status, response_body),
         );
         app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+        app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+            Some(status.as_u16()),
+            None,
+        ));
         if let Some(c) = response_body["error"]["code"]
             .as_str()
             .or_else(|| response_body["error"]["type"].as_str())
@@ -2223,7 +2254,10 @@ pub(super) async fn execute_images_generations_upstream(
                 format!("Upstream {status}: {error_body}"),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
@@ -2239,7 +2273,8 @@ pub(super) async fn execute_images_generations_upstream(
         let end_marker = end_enc.encode_done();
         let error_marker = err_enc.encode_error(
             "upstream stream truncated by gateway",
-            tiygate_core::ErrorClass::DeadlineExceeded, None,
+            tiygate_core::ErrorClass::DeadlineExceeded,
+            None,
         );
 
         let forwarded_resp_headers = forwarded_resp_headers_for_capture(
@@ -2364,7 +2399,10 @@ pub(super) async fn execute_images_generations_upstream(
                 ),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(c) = response_body["error"]["code"]
                 .as_str()
                 .or_else(|| response_body["error"]["type"].as_str())
@@ -2569,7 +2607,10 @@ pub(super) async fn execute_images_edits_upstream(
                 format!("Upstream {status}: {error_body}"),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
@@ -2587,7 +2628,8 @@ pub(super) async fn execute_images_edits_upstream(
         let end_marker = end_enc.encode_done();
         let error_marker = err_enc.encode_error(
             "upstream stream truncated by gateway",
-            tiygate_core::ErrorClass::DeadlineExceeded, None,
+            tiygate_core::ErrorClass::DeadlineExceeded,
+            None,
         );
 
         let forwarded_resp_headers = forwarded_resp_headers_for_capture(
@@ -2705,7 +2747,10 @@ pub(super) async fn execute_images_edits_upstream(
                 ),
             );
             app_err.upstream_status = Some(status.as_u16());
-                    app_err = app_err.with_class(tiygate_core::classify_upstream_error(Some(status.as_u16()), None));
+            app_err = app_err.with_class(tiygate_core::classify_upstream_error(
+                Some(status.as_u16()),
+                None,
+            ));
             if let Some(c) = response_body["error"]["code"]
                 .as_str()
                 .or_else(|| response_body["error"]["type"].as_str())

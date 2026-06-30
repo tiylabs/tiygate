@@ -1050,10 +1050,7 @@ impl AppError {
 
     /// Attach the ingress protocol suite, enabling protocol-native
     /// error body generation in `into_response()`.
-    pub(crate) fn with_protocol_suite(
-        mut self,
-        suite: tiygate_core::ProtocolSuite,
-    ) -> Self {
+    pub(crate) fn with_protocol_suite(mut self, suite: tiygate_core::ProtocolSuite) -> Self {
         self.protocol_suite = Some(suite);
         self
     }

@@ -606,6 +606,12 @@ pub struct UsageAccumulator {
     /// holds the error details so downstream observers (capture guard,
     /// telemetry) can record the failure.
     pub upstream_error: Option<UpstreamStreamError>,
+    /// Whether the upstream delivered a genuine terminal signal in-band
+    /// (e.g. `data: [DONE]`, `response.completed`, `response.failed`,
+    /// `response.incomplete`, `event: message_stop`). When `true`, the
+    /// gateway must NOT synthesize an additional end frame on EOF —
+    /// the upstream already closed the stream with a terminal event.
+    pub upstream_terminal: bool,
 }
 
 impl UsageAccumulator {
@@ -651,6 +657,15 @@ impl UsageAccumulator {
                 class,
             });
         }
+    }
+
+    /// Record that the upstream delivered a genuine terminal signal
+    /// in-band (e.g. `data: [DONE]`, `response.completed`,
+    /// `response.failed`, `response.incomplete`, `message_stop`).
+    /// Idempotent — once set, stays set for the lifetime of the
+    /// accumulator.
+    pub fn set_upstream_terminal(&mut self) {
+        self.upstream_terminal = true;
     }
 
     /// Estimate usage from accumulated characters.

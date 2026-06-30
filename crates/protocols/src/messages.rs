@@ -921,7 +921,6 @@ impl EndpointCodec for MessagesCodec {
             tiygate_core::PassThroughPolicy::Convert
         }
     }
-
 }
 
 // --- Stream Encoder (Anthropic SSE) ---

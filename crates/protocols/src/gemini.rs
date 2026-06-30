@@ -1169,7 +1169,6 @@ impl EndpointCodec for GeminiCodec {
             tiygate_core::PassThroughPolicy::Convert
         }
     }
-
 }
 
 pub struct GeminiStreamEncoder;
