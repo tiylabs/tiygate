@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error.type field no longer returns "gateway_error";  
   clients see protocol-native types (e.g. "rate_limit_error",  
   "overloaded_error", "RESOURCE_EXHAUSTED"). The non-standard  
-  error.source and error.upstream_status fields are removed.  
+  error.source and error.upstream_status fields are removed.
+  
   ---------
 
 
@@ -100,6 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TIYGATE_REQUIRE_API_KEY=false or seed API keys to restore  
   pass-through behavior
 
+  ---------
 
 ### :sparkles: New Features
 - [`0ac7de0`](https://github.com/tiylabs/tiygate/commit/0ac7de0c67686031df9fa1607059919f797839ae) - ✨ Ship complete TiyGate AI gateway — multi-protocol transcoding, admin console, and CI/CD *(commit by [@jorben](https://github.com/jorben))*
