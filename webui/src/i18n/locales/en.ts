@@ -719,6 +719,7 @@ const en = {
       title: "Upstream Tuning",
       streamIdleTimeout: "Stream Idle Timeout",
       streamTotalTimeout: "Stream Total Timeout",
+      ttfbTimeout: "TTFB Timeout",
       tcpKeepalive: "TCP Keepalive",
       poolIdleTimeout: "Pool Idle Timeout",
       tcpNodelay: "TCP No-Delay",

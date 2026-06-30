@@ -59,6 +59,7 @@ const KEYS = {
   ingressRequireApiKey: "gateway.ingress.require_api_key",
   upstreamIdleTimeout: "gateway.upstream.stream_idle_timeout_secs",
   upstreamTotalTimeout: "gateway.upstream.stream_total_timeout_secs",
+  upstreamTtfbTimeout: "gateway.upstream.ttfb_timeout_secs",
   upstreamTcpKeepalive: "gateway.upstream.tcp_keepalive_secs",
   upstreamPoolIdleTimeout: "gateway.upstream.pool_idle_timeout_secs",
   upstreamTcpNodelay: "gateway.upstream.tcp_nodelay",
@@ -676,6 +677,18 @@ export default function SettingsPage() {
               value={getField(KEYS.upstreamTotalTimeout, "0")}
               onChange={(e) =>
                 updateField(KEYS.upstreamTotalTimeout, e.target.value)
+              }
+            />
+          </Field>
+          <Field
+            label={t("settings.upstream.ttfbTimeout")}
+            hint={t("settings.upstream.secondsHint")}
+          >
+            <Input
+              type="number"
+              value={getField(KEYS.upstreamTtfbTimeout, "120")}
+              onChange={(e) =>
+                updateField(KEYS.upstreamTtfbTimeout, e.target.value)
               }
             />
           </Field>
