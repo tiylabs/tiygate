@@ -170,7 +170,12 @@ pub fn run() {
         }
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Resumed | tauri::RunEvent::Reopen { .. } => {
-            repair_main_tray(app_handle);
+            // Only repair tray on genuine resume/reopen after startup.
+            // During the first 5 seconds the tray is still initializing
+            // and rebuilding it can crash the app.
+            if app_start_time().elapsed() >= std::time::Duration::from_secs(5) {
+                repair_main_tray(app_handle);
+            }
         }
         _ => {}
     });
@@ -285,18 +290,37 @@ fn start_tray_watchdog(app: tauri::AppHandle) {
     });
 }
 
+/// Track the app start time so the tray watchdog can skip rebuilds
+/// during the initial startup grace period (first 5 seconds).
+#[cfg(target_os = "macos")]
+fn app_start_time() -> std::time::Instant {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
 #[cfg(target_os = "macos")]
 fn tray_needs_rebuild(app: &tauri::AppHandle) -> bool {
+    // Skip rebuilds during the first 5 seconds after launch — macOS
+    // NSStatusItem may report empty/None rect before the menu bar has
+    // finished laying out the item, and rebuilding during this window
+    // can cause a race condition that crashes the app.
+    if app_start_time().elapsed() < std::time::Duration::from_secs(5) {
+        return false;
+    }
+
     let Some(tray) = app.tray_by_id("main-tray") else {
         return true;
     };
 
     match tray.rect() {
         Ok(Some(rect)) => tray_rect_is_empty(rect),
-        Ok(None) => true,
+        Ok(None) => {
+            tracing::debug!("tray rect is None — likely still initializing; skipping rebuild");
+            false
+        }
         Err(e) => {
             tracing::warn!("failed to read main tray icon rect: {e}");
-            true
+            false
         }
     }
 }
