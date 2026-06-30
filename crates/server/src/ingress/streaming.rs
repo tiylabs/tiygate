@@ -207,7 +207,8 @@ pub(super) struct StreamCapture {
 /// The response body stream may be dropped by hyper when the downstream
 /// client disconnects. Code placed at the tail of `async_stream::stream!`
 /// is skipped in that case, so this guard owns the accumulated bytes and
-/// sends a best-effort capture from `Drop` with `client_disconnect`.
+/// only falls back to `client_disconnect` when no upstream terminal or
+/// error signal was observed.
 struct StreamCaptureGuard {
     inner: Arc<std::sync::Mutex<StreamCaptureState>>,
     accum: Arc<std::sync::Mutex<UsageAccumulator>>,
@@ -328,6 +329,29 @@ impl StreamCaptureGuard {
         }
     }
 
+    /// Returns `Some(client_disconnect)` only when no upstream terminal,
+    /// error, or gateway-side truncation signal has already been recorded.
+    fn drop_fallback_reason(&self) -> Option<TruncationReason> {
+        let state = self.inner.lock().ok();
+        let completed = state
+            .as_ref()
+            .map(|s| s.upstream_completed)
+            .unwrap_or(false);
+        let last_reason = state.as_ref().and_then(|s| s.last_reason);
+        let accum = self.accum.lock().ok();
+        let saw_upstream_terminal = accum.as_ref().map(|a| a.upstream_terminal).unwrap_or(false);
+        let saw_upstream_error = accum
+            .as_ref()
+            .map(|a| a.upstream_error.is_some())
+            .unwrap_or(false);
+
+        if completed || last_reason.is_some() || saw_upstream_terminal || saw_upstream_error {
+            None
+        } else {
+            Some(TruncationReason::ClientDisconnect)
+        }
+    }
+
     /// Mark finalized and fire-and-forget the capture via `tokio::spawn`.
     /// Use this **before** the final `yield` / `break` in the stream loop
     /// so that a client disconnect immediately after the last frame does
@@ -417,18 +441,7 @@ impl StreamCaptureGuard {
 
 impl Drop for StreamCaptureGuard {
     fn drop(&mut self) {
-        let disconnect_reason = {
-            let state = self.inner.lock().ok();
-            let completed = state
-                .as_ref()
-                .map(|s| s.upstream_completed)
-                .unwrap_or(false);
-            if completed {
-                None // upstream delivered a natural end — not a client disconnect
-            } else {
-                Some(TruncationReason::ClientDisconnect)
-            }
-        };
+        let disconnect_reason = self.drop_fallback_reason();
         let Some((telemetry, capture)) = self.take_capture(disconnect_reason) else {
             return;
         };
@@ -1329,6 +1342,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_capture_guard_upstream_terminal_drop_is_clean() {
+        let bus = Arc::new(CapturingBus::default());
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        {
+            let guard =
+                StreamCaptureGuard::new(Some(sample_stream_capture(bus.clone())), accum.clone());
+            guard.append_upstream(b"data: [DONE]\n\n");
+            guard.append_client(b"data: [DONE]\n\n");
+            {
+                let mut a = accum.lock().unwrap();
+                a.set_upstream_terminal();
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bus.captures.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop capture send should complete");
+
+        let captures = bus.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1);
+        let capture = &captures[0];
+        assert_eq!(capture.truncation_reason, None);
+        drop(captures);
+
+        let acc = accum.lock().unwrap();
+        assert!(acc.truncated.is_none());
+        assert!(acc.upstream_terminal);
+    }
+
+    #[tokio::test]
+    async fn stream_capture_guard_upstream_error_drop_is_clean() {
+        let bus = Arc::new(CapturingBus::default());
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        {
+            let guard =
+                StreamCaptureGuard::new(Some(sample_stream_capture(bus.clone())), accum.clone());
+            guard.append_upstream(b"data: {\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"Service unavailable\"}}\n\n");
+            guard.append_client(b"data: {\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"Service unavailable\"}}\n\n");
+            {
+                let mut a = accum.lock().unwrap();
+                a.set_upstream_error("Service unavailable", Some("service_unavailable_error"));
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bus.captures.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop capture send should complete");
+
+        let captures = bus.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1);
+        let capture = &captures[0];
+        assert_eq!(capture.truncation_reason, None);
+        assert!(capture.upstream_error.as_deref().is_some());
+        drop(captures);
+
+        let acc = accum.lock().unwrap();
+        assert!(acc.truncated.is_none());
+        assert!(acc.upstream_error.is_some());
+    }
+
+    #[tokio::test]
     async fn stream_capture_guard_upstream_completed_drop_is_clean() {
         let bus = Arc::new(CapturingBus::default());
         let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
@@ -1368,6 +1454,7 @@ mod tests {
         let acc = accum.lock().unwrap();
         assert!(acc.truncated.is_none());
     }
+
     // --- detect_verbatim_signals tests ---
 
     #[test]
