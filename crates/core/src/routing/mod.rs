@@ -786,3 +786,94 @@ pub fn classify_error(error: &crate::Error) -> ErrorClassification {
         http_status: None,
     }
 }
+
+/// Classify an error using structured fields (HTTP status + error code)
+/// instead of substring matching on the message text. Used by the
+/// fallback layer when `AppError` carries `upstream_status` and/or
+/// `upstream_error_code` from the upstream response.
+///
+/// Falls back to `Transient` when neither field yields a match, which
+/// is safe because the caller only invokes this when at least one
+/// structured field is `Some`.
+pub fn classify_structured(
+    upstream_status: Option<u16>,
+    upstream_code: Option<&str>,
+) -> ErrorClassification {
+    // 1. HTTP status takes priority for well-known codes.
+    if let Some(status) = upstream_status {
+        match status {
+            429 => {
+                return ErrorClassification {
+                    class: RequestErrorClass::RateLimited,
+                    fallback_class: ErrorClass::RateLimited,
+                    retry_after: None,
+                    http_status: Some(429),
+                }
+            }
+            401 | 403 => {
+                return ErrorClassification {
+                    class: RequestErrorClass::UpstreamAuth,
+                    fallback_class: ErrorClass::Auth,
+                    retry_after: None,
+                    http_status: Some(status),
+                }
+            }
+            400 | 422 => {
+                return ErrorClassification {
+                    class: RequestErrorClass::BadRequest,
+                    fallback_class: ErrorClass::BadRequest,
+                    retry_after: None,
+                    http_status: Some(status),
+                }
+            }
+            _ if status >= 500 => {} // fall through to code check
+            _ => {}
+        }
+    }
+
+    // 2. Structured error code substring match (provider-native codes
+    //    vary wildly, so we do case-insensitive substring scanning).
+    if let Some(code) = upstream_code {
+        let lower = code.to_lowercase();
+        if lower.contains("rate_limit") || lower == "429" {
+            return ErrorClassification {
+                class: RequestErrorClass::RateLimited,
+                fallback_class: ErrorClass::RateLimited,
+                retry_after: None,
+                http_status: Some(429),
+            };
+        }
+        if lower.contains("auth") || lower == "401" || lower == "403" {
+            return ErrorClassification {
+                class: RequestErrorClass::UpstreamAuth,
+                fallback_class: ErrorClass::Auth,
+                retry_after: None,
+                http_status: None,
+            };
+        }
+        if lower.contains("bad_request") || lower == "400" {
+            return ErrorClassification {
+                class: RequestErrorClass::BadRequest,
+                fallback_class: ErrorClass::BadRequest,
+                retry_after: None,
+                http_status: None,
+            };
+        }
+        if lower.contains("overloaded") || lower.contains("service_unavailable") {
+            return ErrorClassification {
+                class: RequestErrorClass::Transient,
+                fallback_class: ErrorClass::Transient,
+                retry_after: None,
+                http_status: None,
+            };
+        }
+    }
+
+    // 3. Default: transient (5xx, timeout, transport)
+    ErrorClassification {
+        class: RequestErrorClass::Transient,
+        fallback_class: ErrorClass::Transient,
+        retry_after: None,
+        http_status: upstream_status,
+    }
+}

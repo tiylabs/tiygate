@@ -196,15 +196,18 @@ pub(super) fn enforce_auth(
     match api_key.outcome {
         KeyLookupOutcome::Authenticated => Ok(()),
         KeyLookupOutcome::NoCredential => Err((
-            AppError::new(StatusCode::UNAUTHORIZED, "missing api key".to_string()),
+            AppError::new(StatusCode::UNAUTHORIZED, "missing api key".to_string())
+                .with_code("auth_missing"),
             RequestErrorClass::AuthMissing,
         )),
         KeyLookupOutcome::UnknownCredential => Err((
-            AppError::new(StatusCode::UNAUTHORIZED, "invalid api key".to_string()),
+            AppError::new(StatusCode::UNAUTHORIZED, "invalid api key".to_string())
+                .with_code("auth_invalid"),
             RequestErrorClass::AuthInvalid,
         )),
         KeyLookupOutcome::DisabledCredential => Err((
-            AppError::new(StatusCode::FORBIDDEN, "api key disabled".to_string()),
+            AppError::new(StatusCode::FORBIDDEN, "api key disabled".to_string())
+                .with_code("auth_disabled"),
             RequestErrorClass::AuthDisabled,
         )),
     }

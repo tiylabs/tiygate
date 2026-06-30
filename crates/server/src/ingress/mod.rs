@@ -1010,6 +1010,11 @@ pub struct AppError {
     retry_after_header: Option<String>,
     /// Original upstream HTTP status for error source distinction.
     upstream_status: Option<u16>,
+    /// Structured error code extracted from upstream `error.code` /
+    /// `error.type`, or a gateway-defined semantic code. Serialized to
+    /// the client JSON as `error.code` so clients can switch on it
+    /// instead of substring-matching `message`.
+    upstream_error_code: Option<String>,
     /// Upstream RateLimit-* headers to passthrough on the error response.
     rate_limit_headers: Vec<(&'static str, String)>,
 }
@@ -1021,8 +1026,23 @@ impl AppError {
             message,
             retry_after_header: None,
             upstream_status: None,
+            upstream_error_code: None,
             rate_limit_headers: Vec::new(),
         }
+    }
+
+    /// Attach a structured error code (e.g. `"rate_limited"`,
+    /// `"upstream_error"`, or a provider-native code like `"429"`).
+    pub(crate) fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.upstream_error_code = Some(code.into());
+        self
+    }
+
+    /// Public accessor for the structured error code, if any.
+    /// Used by the fallback classifier to pick `classify_structured`
+    /// over substring matching.
+    pub(crate) fn error_code(&self) -> Option<&str> {
+        self.upstream_error_code.as_deref()
     }
 
     /// Attach a Retry-After value (seconds).
@@ -1063,6 +1083,10 @@ impl IntoResponse for AppError {
 
         if let Some(us) = self.upstream_status {
             body["error"]["upstream_status"] = serde_json::json!(us);
+        }
+
+        if let Some(ref code) = self.upstream_error_code {
+            body["error"]["code"] = serde_json::json!(code);
         }
 
         let mut response = (self.status, Json(body)).into_response();

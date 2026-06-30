@@ -1147,10 +1147,14 @@ impl StreamEncoder for MessagesStreamEncoder {
                 ));
                 out
             }
-            StreamPart::Error { message, code: _ } => {
+            StreamPart::Error { message, code } => {
+                let mut err = json!({"type": "gateway_error", "message": message});
+                if let Some(c) = code {
+                    err["code"] = json!(c);
+                }
                 format!(
                     "event: error\ndata: {}\n\n",
-                    json!({"type": "error", "error": {"type": "gateway_error", "message": message}})
+                    json!({"type": "error", "error": err})
                 )
             }
         };
@@ -1158,10 +1162,14 @@ impl StreamEncoder for MessagesStreamEncoder {
         Ok(event.into_bytes())
     }
 
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
+    fn encode_error(&mut self, message: &str, code: Option<&str>) -> Vec<u8> {
+        let mut err = json!({"type": "gateway_error", "message": message});
+        if let Some(c) = code {
+            err["code"] = json!(c);
+        }
         format!(
             "event: error\ndata: {}\n\n",
-            json!({"type": "error", "error": {"type": "gateway_error", "message": message}})
+            json!({"type": "error", "error": err})
         )
         .into_bytes()
     }
@@ -1814,6 +1822,8 @@ mod tests {
         // Must contain "error" — protocol-native error frame
         assert!(err_str.contains("error"));
         assert!(err_str.contains("overloaded"));
+        // code must be transparently passed through to the wire
+        assert!(err_str.contains("\"code\":\"529\""));
     }
 
     #[test]

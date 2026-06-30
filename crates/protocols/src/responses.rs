@@ -772,13 +772,11 @@ impl EndpointCodec for ResponsesCodec {
                                 // `function_call_output` input item. Preserve
                                 // them regardless of the IR message role so
                                 // prior function calls have matching outputs.
-                                tool_outputs_json.push(
-                                    responses_function_call_output(
-                                        tool_call_id,
-                                        content,
-                                        id.as_deref(),
-                                    ),
-                                );
+                                tool_outputs_json.push(responses_function_call_output(
+                                    tool_call_id,
+                                    content,
+                                    id.as_deref(),
+                                ));
                             }
                             Content::Refusal { text, .. } => {
                                 text_parts.push(json!({"type": "input_text", "text": text}));
@@ -1568,16 +1566,24 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 out.push_str("data: [DONE]\n\n");
                 out
             }
-            StreamPart::Error { message, .. } => self.event(
-                json!({"type": "error", "error": {"message": message, "type": "gateway_error"}}),
-            ),
+            StreamPart::Error { message, code } => {
+                let mut err = json!({"message": message, "type": "gateway_error"});
+                if let Some(c) = code {
+                    err["code"] = json!(c);
+                }
+                self.event(json!({"type": "error", "error": err}))
+            }
         };
         Ok(chunk.into_bytes())
     }
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
+    fn encode_error(&mut self, message: &str, code: Option<&str>) -> Vec<u8> {
+        let mut err = json!({"message": message, "type": "gateway_error"});
+        if let Some(c) = code {
+            err["code"] = json!(c);
+        }
         format!(
             "data: {}\n\ndata: [DONE]\n\n",
-            json!({"type": "error", "error": {"message": message, "type": "gateway_error"}})
+            json!({"type": "error", "error": err})
         )
         .into_bytes()
     }
@@ -2278,6 +2284,8 @@ mod tests {
         let s = String::from_utf8_lossy(&err);
         assert!(s.contains("error"));
         assert!(s.contains("overloaded"));
+        // code must be transparently passed through to the wire
+        assert!(s.contains("\"code\":\"529\""));
     }
 
     #[test]

@@ -168,6 +168,7 @@ pub(super) async fn acquire_permit(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway overloaded, queue full".to_string(),
         )
+        .with_code("gateway_overloaded")
         .with_retry_after(5));
     }
 
@@ -182,11 +183,13 @@ pub(super) async fn acquire_permit(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway overloaded".to_string(),
         )
+        .with_code("gateway_overloaded")
         .with_retry_after(5)),
         Err(_) => Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway too busy, try again later".to_string(),
         )
+        .with_code("gateway_overloaded")
         .with_retry_after(5)),
     }
 }
@@ -313,6 +316,7 @@ pub(super) async fn handle_chat_completions(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_code("rate_limited")
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -332,7 +336,8 @@ pub(super) async fn handle_chat_completions(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_code("bad_request");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
@@ -355,7 +360,8 @@ pub(super) async fn handle_chat_completions(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_code("model_not_found");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
@@ -483,6 +489,7 @@ pub(super) async fn handle_messages(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_code("rate_limited")
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -499,7 +506,8 @@ pub(super) async fn handle_messages(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_code("bad_request");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
@@ -520,7 +528,8 @@ pub(super) async fn handle_messages(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_code("model_not_found");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
@@ -643,6 +652,7 @@ pub(super) async fn handle_embeddings(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_code("rate_limited")
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -712,7 +722,8 @@ pub(super) async fn handle_embeddings(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_code("bad_request");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
@@ -731,7 +742,8 @@ pub(super) async fn handle_embeddings(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_code("model_not_found");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
@@ -857,6 +869,7 @@ pub(super) async fn handle_responses(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_code("rate_limited")
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -873,7 +886,8 @@ pub(super) async fn handle_responses(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_code("bad_request");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
@@ -893,7 +907,8 @@ pub(super) async fn handle_responses(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_code("model_not_found");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
@@ -1003,7 +1018,8 @@ pub(super) async fn handle_gemini_generate(
             let app_err = AppError::new(
                 StatusCode::BAD_REQUEST,
                 format!("Invalid Gemini path capture: {capture:?}"),
-            );
+            )
+            .with_code("bad_request");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::BadRequest,
@@ -1041,6 +1057,7 @@ pub(super) async fn handle_gemini_generate(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_code("rate_limited")
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -1065,7 +1082,8 @@ pub(super) async fn handle_gemini_generate(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_code("bad_request");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
@@ -1085,7 +1103,8 @@ pub(super) async fn handle_gemini_generate(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_code("model_not_found");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
@@ -1207,6 +1226,7 @@ pub(super) async fn handle_images_generations(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_code("rate_limited")
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -1225,7 +1245,8 @@ pub(super) async fn handle_images_generations(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_code("bad_request");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
@@ -1246,7 +1267,8 @@ pub(super) async fn handle_images_generations(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_code("model_not_found");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
@@ -1419,6 +1441,7 @@ pub(super) async fn handle_images_edits(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_code("rate_limited")
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -1436,7 +1459,8 @@ pub(super) async fn handle_images_edits(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_code("model_not_found");
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,

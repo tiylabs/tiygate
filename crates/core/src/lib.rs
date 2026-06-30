@@ -44,10 +44,10 @@ pub use provider::{
     AuthApplier, AuthMode, Executor, Provider, ProviderMetadata, ProviderRegistration,
 };
 pub use routing::{
-    classify_error, CooldownStrategy, DefaultFallbackPolicy, ErrorClass, ErrorClassification,
-    FallbackDecision, FallbackPolicy, HealthRegistry, LatencyStrategy, PriorityStrategy,
-    RetryPolicy, RouteEntry, RoutingStrategyName, RoutingTable, RoutingTarget, RoutingTargetHealth,
-    Strategy, WeightedStrategy,
+    classify_error, classify_structured, CooldownStrategy, DefaultFallbackPolicy, ErrorClass,
+    ErrorClassification, FallbackDecision, FallbackPolicy, HealthRegistry, LatencyStrategy,
+    PriorityStrategy, RetryPolicy, RouteEntry, RoutingStrategyName, RoutingTable, RoutingTarget,
+    RoutingTargetHealth, Strategy, WeightedStrategy,
 };
 pub use telemetry::{
     ErrorTier, EventSink, ExchangeCapture, MicroUsd, PipelineEvent, PriceProvider,

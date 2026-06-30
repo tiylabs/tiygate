@@ -317,6 +317,45 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_structured() {
+        // HTTP status 429 → RateLimited
+        let c = classify_structured(Some(429), None);
+        assert_eq!(c.fallback_class, ErrorClass::RateLimited);
+        assert_eq!(c.class, RequestErrorClass::RateLimited);
+
+        // HTTP status 401 → Auth
+        let c = classify_structured(Some(401), None);
+        assert_eq!(c.fallback_class, ErrorClass::Auth);
+        assert_eq!(c.class, RequestErrorClass::UpstreamAuth);
+
+        // HTTP status 400 → BadRequest
+        let c = classify_structured(Some(400), None);
+        assert_eq!(c.fallback_class, ErrorClass::BadRequest);
+        assert_eq!(c.class, RequestErrorClass::BadRequest);
+
+        // HTTP status 500 + no code → Transient
+        let c = classify_structured(Some(500), None);
+        assert_eq!(c.fallback_class, ErrorClass::Transient);
+        assert_eq!(c.class, RequestErrorClass::Transient);
+
+        // Code "rate_limit_exceeded" with no status → RateLimited
+        let c = classify_structured(None, Some("rate_limit_exceeded"));
+        assert_eq!(c.fallback_class, ErrorClass::RateLimited);
+
+        // Code "overloaded_error" → Transient
+        let c = classify_structured(None, Some("overloaded_error"));
+        assert_eq!(c.fallback_class, ErrorClass::Transient);
+
+        // Code "authentication_error" → Auth
+        let c = classify_structured(None, Some("authentication_error"));
+        assert_eq!(c.fallback_class, ErrorClass::Auth);
+
+        // No status, no code → Transient fallback
+        let c = classify_structured(None, None);
+        assert_eq!(c.fallback_class, ErrorClass::Transient);
+    }
+
+    #[test]
     fn test_fallback_policy_bytes_emitted() {
         let policy = DefaultFallbackPolicy::with_defaults();
         let target = RoutingTarget {

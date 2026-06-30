@@ -188,10 +188,12 @@ impl StreamEncoder for EmbeddingsStreamEncoder {
     fn encode_part(&mut self, _part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
         Ok(Vec::new())
     }
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
-        json!({"error": {"message": message}})
-            .to_string()
-            .into_bytes()
+    fn encode_error(&mut self, message: &str, code: Option<&str>) -> Vec<u8> {
+        let mut err = json!({"message": message});
+        if let Some(c) = code {
+            err["code"] = json!(c);
+        }
+        json!({"error": err}).to_string().into_bytes()
     }
     fn encode_done(&mut self) -> Vec<u8> {
         b"data: [DONE]\n\n".to_vec()

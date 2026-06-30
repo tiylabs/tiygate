@@ -1180,34 +1180,25 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                 )
             }
             StreamPart::ResponseCompleted { .. } => "data: [DONE]\n\n".to_string(),
-            StreamPart::Error { message, code: _ } => {
+            StreamPart::Error { message, code } => {
                 // Protocol-native error frame
-                format!(
-                    "data: {}\n\n",
-                    json!({
-                        "error": {
-                            "message": message,
-                            "type": "gateway_error",
-                        }
-                    })
-                )
+                let mut err = json!({"message": message, "type": "gateway_error"});
+                if let Some(c) = code {
+                    err["code"] = json!(c);
+                }
+                format!("data: {}\n\n", json!({"error": err}))
             }
         };
 
         Ok(chunk.into_bytes())
     }
 
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
-        format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            json!({
-                "error": {
-                    "message": message,
-                    "type": "gateway_error",
-                }
-            })
-        )
-        .into_bytes()
+    fn encode_error(&mut self, message: &str, code: Option<&str>) -> Vec<u8> {
+        let mut err = json!({"message": message, "type": "gateway_error"});
+        if let Some(c) = code {
+            err["code"] = json!(c);
+        }
+        format!("data: {}\n\ndata: [DONE]\n\n", json!({"error": err})).into_bytes()
     }
 
     fn encode_done(&mut self) -> Vec<u8> {
@@ -1465,10 +1456,9 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                         let total = usage["total_tokens"]
                             .as_u64()
                             .unwrap_or(raw_prompt + completion);
-                        let cache_read =
-                            usage["prompt_tokens_details"]["cached_tokens"].as_u64();
-                        let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
-                            .as_u64();
+                        let cache_read = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+                        let reasoning =
+                            usage["completion_tokens_details"]["reasoning_tokens"].as_u64();
                         // OpenAI's prompt_tokens includes cache; the IR convention
                         // keeps prompt_tokens cache-free. Subtract to avoid double
                         // counting on re-encode.
@@ -1903,6 +1893,8 @@ mod tests {
         // Must contain "error" — protocol-native error frame
         assert!(err_str.contains("error"));
         assert!(err_str.contains("rate limit exceeded"));
+        // code must be transparently passed through to the wire
+        assert!(err_str.contains("\"code\":\"429\""));
     }
 
     #[test]
@@ -2365,10 +2357,7 @@ mod tests {
             .feed(r#"data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"}}],"usage":null}"#)
             .unwrap();
         let has_usage = parts.iter().any(|p| matches!(p, StreamPart::Usage { .. }));
-        assert!(
-            !has_usage,
-            "null usage must not produce StreamPart::Usage"
-        );
+        assert!(!has_usage, "null usage must not produce StreamPart::Usage");
 
         // 2. finish chunk 带 `"usage": null` — 仍不应产出 Usage
         let parts = dec

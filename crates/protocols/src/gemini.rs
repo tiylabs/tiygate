@@ -1225,10 +1225,13 @@ impl StreamEncoder for GeminiStreamEncoder {
                     json!({"candidates": [{"finishReason": fr}]})
                 )
             }
-            StreamPart::Error { message, .. } => format!(
-                "data: {}\n\n",
-                json!({"error": {"message": message, "status": "INTERNAL"}})
-            ),
+            StreamPart::Error { message, code } => {
+                let status = code.as_deref().unwrap_or("INTERNAL");
+                format!(
+                    "data: {}\n\n",
+                    json!({"error": {"message": message, "status": status}})
+                )
+            }
             StreamPart::ResponseStarted { id } => {
                 format!("data: {}\n\n", json!({"responseId": id}))
             }
@@ -1238,10 +1241,11 @@ impl StreamEncoder for GeminiStreamEncoder {
         };
         Ok(chunk.into_bytes())
     }
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
+    fn encode_error(&mut self, message: &str, code: Option<&str>) -> Vec<u8> {
+        let status = code.unwrap_or("INTERNAL");
         format!(
             "data: {}\n\n",
-            json!({"error": {"message": message, "status": "INTERNAL"}})
+            json!({"error": {"message": message, "status": status}})
         )
         .into_bytes()
     }
@@ -1547,6 +1551,9 @@ mod tests {
         let s = String::from_utf8_lossy(&err);
         assert!(s.contains("error"));
         assert!(s.contains("rate limit"));
+        // code must replace hardcoded INTERNAL
+        assert!(s.contains("\"status\":\"429\""));
+        assert!(!s.contains("\"status\":\"INTERNAL\""));
     }
 
     #[test]

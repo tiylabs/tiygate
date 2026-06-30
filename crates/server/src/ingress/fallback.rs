@@ -141,7 +141,8 @@ where
             let app_err = AppError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "request deadline exceeded".to_string(),
-            );
+            )
+            .with_code("deadline_exceeded");
             return FallbackOutcome::Failed {
                 error: app_err,
                 error_class: RequestErrorClass::DeadlineExceeded,
@@ -240,9 +241,17 @@ where
                 state.health.record_failure(&health_key);
                 state.health.record_latency_ms(&health_key, hop_elapsed_ms);
 
-                // Classify the error
-                let core_err = tiygate_core::Error::Routing(app_err.message.clone());
-                let classification = classify_error(&core_err);
+                // Classify the error — prefer structured fields when
+                // available (HTTP status + error code from upstream),
+                // fall back to substring matching on the message.
+                let classification = if app_err.upstream_status.is_some()
+                    || app_err.error_code().is_some()
+                {
+                    tiygate_core::classify_structured(app_err.upstream_status, app_err.error_code())
+                } else {
+                    let core_err = tiygate_core::Error::Routing(app_err.message.clone());
+                    classify_error(&core_err)
+                };
 
                 // Telemetry: HopFailure
                 state
@@ -281,6 +290,7 @@ where
                 }
 
                 // Decide next action
+                let core_err = tiygate_core::Error::Routing(app_err.message.clone());
                 let decision =
                     fallback.classify(&core_err, target, attempt, max_attempts, bytes_emitted);
 
@@ -336,6 +346,7 @@ where
             StatusCode::BAD_GATEWAY,
             "all upstream targets exhausted".to_string(),
         )
+        .with_code("upstream_exhausted")
     });
     FallbackOutcome::Exhausted { error: final_err }
 }
