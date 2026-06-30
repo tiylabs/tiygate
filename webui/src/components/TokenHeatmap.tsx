@@ -226,21 +226,37 @@ export function TokenHeatmap({ data, spanDays = 365, isLoading }: TokenHeatmapPr
 
       {/* Heatmap grid — GitHub-style contribution graph */}
       <div style={{ overflowX: "auto" }}>
-        {/* Month labels */}
-        <div style={{ display: "flex", gap: "0px", marginBottom: "4px" }}>
+        {/*
+         * Month labels share the same 14px column grid as the cells so that the
+         * first month's label lines up with its first column (instead of being
+         * squeezed to two lines when the container width is narrow).
+         */}
+        <div
+          style={{
+            display: "grid",
+            gridAutoFlow: "column",
+            gridAutoColumns: "11px",
+            columnGap: "3px",
+            marginBottom: "4px",
+          }}
+        >
           {months.map((m, i) => {
             const nextCol = i + 1 < months.length ? months[i + 1].col : columns;
             const span = nextCol - m.col;
-            const width = span * 14 - 3;
+            const cellGap = 3;
+            const width = span * 11 + (span - 1) * cellGap;
+            const colsBefore = i === 0 ? m.col : 0;
             return (
               <span
                 key={`${m.label}-${m.col}`}
                 style={{
-                  flexShrink: 0,
+                  gridColumnStart: m.col - colsBefore + 1,
+                  gridColumnEnd: `span ${span}`,
+                  marginLeft: i === 0 ? `${colsBefore * 11 + colsBefore * cellGap}px` : 0,
                   width: `${width}px`,
-                  marginLeft: i === 0 ? `${m.col * 14}px` : "3px",
                   fontSize: "10px",
                   lineHeight: 1,
+                  whiteSpace: "nowrap",
                   color: "var(--color-text-subtle)",
                 }}
               >
