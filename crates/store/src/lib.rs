@@ -21,6 +21,7 @@ pub mod db;
 pub mod encryption;
 pub mod keys;
 pub mod log_sink;
+pub mod model_catalog;
 pub mod models;
 pub mod retention;
 pub mod settings_keys;

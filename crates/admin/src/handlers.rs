@@ -61,6 +61,11 @@ pub fn router() -> Router<AdminState> {
                 .patch(update_api_key_quota),
         )
         .route("/admin/v1/provider-catalog", get(list_provider_catalog))
+        .route("/admin/v1/model-catalog", get(get_model_catalog))
+        .route(
+            "/admin/v1/model-catalog/refresh",
+            post(refresh_model_catalog),
+        )
         .route("/admin/v1/stats/by-model", get(stats_by_model))
         .route("/admin/v1/stats/by-provider", get(stats_by_provider))
         .route("/admin/v1/stats/by-api-key", get(stats_by_api_key))
@@ -427,6 +432,55 @@ async fn delete_provider(
     )
     .await;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// ---- model catalog ----
+
+#[derive(Debug, Serialize)]
+struct ModelCatalogStatus {
+    source: String,
+    checksum: String,
+    generated_at_unix: i64,
+    provider_count: usize,
+    model_count: usize,
+}
+
+async fn get_model_catalog(State(state): State<AdminState>) -> Result<Response, AdminError> {
+    let catalog = state
+        .model_catalog
+        .as_ref()
+        .ok_or_else(|| AdminError::NotFound("model catalog not available".to_string()))?;
+    let version = catalog.current_version();
+    Ok(Json(ModelCatalogStatus {
+        source: version.source,
+        checksum: version.checksum,
+        generated_at_unix: version.generated_at_unix,
+        provider_count: version.provider_count,
+        model_count: version.model_count,
+    })
+    .into_response())
+}
+
+async fn refresh_model_catalog(State(state): State<AdminState>) -> Result<Response, AdminError> {
+    let catalog = state
+        .model_catalog
+        .as_ref()
+        .ok_or_else(|| AdminError::NotFound("model catalog not available".to_string()))?;
+    let version = catalog
+        .refresh_async()
+        .await
+        .map_err(|e| AdminError::Internal(format!("model catalog refresh failed: {e}")))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ModelCatalogStatus {
+            source: version.source,
+            checksum: version.checksum,
+            generated_at_unix: version.generated_at_unix,
+            provider_count: version.provider_count,
+            model_count: version.model_count,
+        }),
+    )
+        .into_response())
 }
 
 // ---- provider catalog (server-side registered providers) ----

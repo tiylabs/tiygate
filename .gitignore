@@ -45,6 +45,12 @@ data/
 logs/
 *.log
 
+# models.dev baseline snapshot — committed once as the embedded
+# build-time baseline; subsequent updates are fetched at runtime.
+# Use `git update-index --assume-unchanged` after fresh clones that
+# update the snapshot locally.
+crates/store/data/models_dev_api.json
+
 # Coverage / profiling
 coverage/
 *.profraw
