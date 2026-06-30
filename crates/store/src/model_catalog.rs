@@ -59,6 +59,7 @@ pub struct ModelPricing {
 pub enum PricingSourceKind {
     Official,
     OpenRouterFallback,
+    AggregatorFallback,
 }
 
 /// Metadata attached to a canonical model id.
@@ -565,8 +566,10 @@ fn pricing_from_candidate(candidate: &CandidateModel) -> Option<ModelPricing> {
         source_provider: candidate.provider_id.clone(),
         source_kind: if candidate.is_official {
             PricingSourceKind::Official
-        } else {
+        } else if candidate.is_openrouter {
             PricingSourceKind::OpenRouterFallback
+        } else {
+            PricingSourceKind::AggregatorFallback
         },
     })
 }
@@ -1151,7 +1154,7 @@ mod tests {
             .and_then(|m| m.pricing.as_ref())
             .expect("fallback pricing should exist");
         assert_eq!(pricing.source_provider, "some-aggregator");
-        assert_eq!(pricing.source_kind, PricingSourceKind::OpenRouterFallback);
+        assert_eq!(pricing.source_kind, PricingSourceKind::AggregatorFallback);
         assert_eq!(pricing.input_token_usd_per_million, Some(99.0));
     }
 
