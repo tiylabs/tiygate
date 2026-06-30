@@ -2377,9 +2377,9 @@ pub async fn aggregate_by_target(
                 COALESCE(SUM(cache_read_tokens), 0) AS crt, \
                 COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
                 COALESCE(SUM(total_tokens), 0) AS tt, \
-                AVG(ttfb_ms) AS alat, \
+                CAST(AVG(ttfb_ms) AS DOUBLE PRECISION) AS alat, \
                 CASE WHEN SUM(stream_duration_ms) > 0 \
-                     THEN SUM(completion_tokens) * 1000.0 / SUM(stream_duration_ms) \
+                     THEN CAST(SUM(completion_tokens) * 1000.0 / SUM(stream_duration_ms) AS DOUBLE PRECISION) \
                      ELSE NULL END AS atps \
          FROM request_logs \
          WHERE ts >= $1 AND ts < $2 \
@@ -3276,6 +3276,123 @@ mod tests {
         assert_eq!(by_target.len(), 1);
         assert_eq!(by_target[0].avg_latency_ms, None);
         assert_eq!(by_target[0].avg_throughput_tps, None);
+    }
+
+    /// Helper: open a PG pool from `TIYGATE_TEST_PG_URL`, run migrations,
+    /// and return the pool.  Returns `None` when the env-var is unset so
+    /// callers can skip gracefully.
+    async fn pg_pool_if_available() -> Option<DbPool> {
+        let url = std::env::var("TIYGATE_TEST_PG_URL").ok()?;
+        let pool = db::open_pool(&url).await.expect("pg pool");
+        db::run_migrations(&pool).await.expect("pg migrate");
+        Some(pool)
+    }
+
+    /// Clean up rows inserted by a PG test so runs are idempotent.
+    async fn pg_cleanup(pool: &DbPool, request_ids: &[&str]) {
+        for id in request_ids {
+            let _ = sqlx::query("DELETE FROM request_logs WHERE request_id = $1")
+                .bind(*id)
+                .execute(pool.any())
+                .await;
+            let _ = sqlx::query("DELETE FROM request_payloads WHERE request_id = $1")
+                .bind(*id)
+                .execute(pool.any())
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn aggregate_by_target_returns_latency_and_throughput_on_pg() {
+        // Regression: PG AVG() returns numeric; CAST(... AS DOUBLE PRECISION)
+        // must be present so sqlx::Any can decode the column as f64.
+        let Some(pool) = pg_pool_if_available().await else {
+            eprintln!("TIYGATE_TEST_PG_URL not set – skipping PG test");
+            return;
+        };
+        let ids = ["req-pg-tgt-1", "req-pg-tgt-2"];
+        pg_cleanup(&pool, &ids).await;
+
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        let mut ev1 = dummy_request_event();
+        ev1.request_id = ids[0].to_string();
+        ev1.ttfb_ms = Some(50);
+        ev1.tokens = Some(tiygate_core::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            total_tokens: 30,
+            ..Default::default()
+        });
+        sink.write_request_event(&ev1).await.expect("write ev1");
+        sink.update_request_stream_duration(ids[0], 1000)
+            .await
+            .expect("update stream dur 1");
+
+        let mut ev2 = dummy_request_event();
+        ev2.request_id = ids[1].to_string();
+        ev2.ttfb_ms = Some(100);
+        ev2.tokens = Some(tiygate_core::Usage {
+            prompt_tokens: 5,
+            completion_tokens: 30,
+            total_tokens: 35,
+            ..Default::default()
+        });
+        sink.write_request_event(&ev2).await.expect("write ev2");
+
+        let now = Utc::now().to_rfc3339();
+        let earlier = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let by_target = aggregate_by_target(&pool, &earlier, &now)
+            .await
+            .expect("agg by target on pg");
+
+        // Find the bucket that matches our test data (PG may have leftover rows).
+        let b = by_target
+            .iter()
+            .find(|r| r.bucket == "openai / gpt-4o")
+            .expect("expected openai / gpt-4o bucket");
+        assert!(b.count >= 2);
+        assert_eq!(b.avg_latency_ms, Some(75.0));
+        assert_eq!(b.avg_throughput_tps, Some(50.0));
+
+        pg_cleanup(&pool, &ids).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn aggregate_by_target_null_ttfb_yields_none_latency_on_pg() {
+        let Some(pool) = pg_pool_if_available().await else {
+            eprintln!("TIYGATE_TEST_PG_URL not set – skipping PG test");
+            return;
+        };
+        let ids = ["req-pg-tgt-null"];
+        pg_cleanup(&pool, &ids).await;
+
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        let mut ev = dummy_request_event();
+        ev.request_id = ids[0].to_string();
+        ev.ttfb_ms = None;
+        sink.write_request_event(&ev).await.expect("write");
+
+        let now = Utc::now().to_rfc3339();
+        let earlier = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let by_target = aggregate_by_target(&pool, &earlier, &now)
+            .await
+            .expect("agg by target on pg");
+
+        let b = by_target
+            .iter()
+            .find(|r| r.bucket == "openai / gpt-4o")
+            .expect("expected openai / gpt-4o bucket");
+        // ttfb_ms was NULL → AVG should be NULL → None
+        // (If other rows exist in the PG DB with non-null ttfb, this assert
+        // would need adjustment; we clean up beforehand so this should hold.)
+        assert_eq!(b.avg_latency_ms, None);
+        assert_eq!(b.avg_throughput_tps, None);
+
+        pg_cleanup(&pool, &ids).await;
     }
 
     #[tokio::test]
