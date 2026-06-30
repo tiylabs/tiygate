@@ -511,8 +511,16 @@ impl<'a> Drop for RequestScope<'a> {
             self.egress.as_ref(),
             status,
             Some(error_class),
-            None,
-            Some(500u16),
+            if self.waiting_upstream {
+                Some("client disconnected while awaiting upstream")
+            } else {
+                Some("handler dropped without terminal event")
+            },
+            Some(if self.waiting_upstream {
+                499u16
+            } else {
+                500u16
+            }),
             false,
             None,
             latency_ms,

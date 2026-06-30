@@ -505,6 +505,12 @@ async fn bootstrap_settings(store: &Arc<DbConfigStore>, cfg: &ServerConfig) {
     .await;
     let _ = ensure_setting(
         store,
+        sk::UPSTREAM_TTFB_TIMEOUT_SECS,
+        &cfg.upstream_ttfb_timeout_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
         sk::UPSTREAM_TCP_KEEPALIVE_SECS,
         &cfg.upstream_tcp_keepalive_secs.to_string(),
     )

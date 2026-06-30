@@ -60,7 +60,7 @@ Settings 页面分为五个卡片:
 | 卡片 | 控制内容 | 种子 env |
 | --- | --- | --- |
 | **路由与入口** | 默认路由策略、请求体上限、多模态请求体上限、最大并发、队列深度、获取超时、raw-envelope 捕获媒体类型 | `TIYGATE_ROUTING_STRATEGY`、`TIYGATE_MAX_BODY_BYTES`、`TIYGATE_MAX_MULTIMODAL_BODY_BYTES`、`TIYGATE_MAX_INFLIGHT`、`TIYGATE_RAW_ENVELOPE_CAPTURE_MEDIA` |
-| **上游** | 流式 idle / total 超时、TCP keepalive、连接池 idle 超时、TCP nodelay | `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_TCP_KEEPALIVE_SECS`、`TIYGATE_UPSTREAM_POOL_IDLE_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_TCP_NODELAY` |
+| **上游** | 流式 idle / total / TTFB 超时、TCP keepalive、连接池 idle 超时、TCP nodelay | `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_TTFB_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_TCP_KEEPALIVE_SECS`、`TIYGATE_UPSTREAM_POOL_IDLE_TIMEOUT_SECS`、`TIYGATE_UPSTREAM_TCP_NODELAY` |
 | **Header 转发** | 请求 / 响应 header 黑名单(逗号分隔) | `TIYGATE_FORWARD_REQUEST_HEADER_DENY`、`TIYGATE_FORWARD_RESPONSE_HEADER_DENY` |
 | **Payload 归档** | S3 兼容对象存储归档完整请求/响应 payload(开关、端点、region、bucket、凭证、prefix、force-path-style、扫描间隔、批次大小、并发、超时、最大重试) | `TIYGATE_PAYLOAD_ARCHIVE_*` 系列 |
 | **后台任务** | 日志保留间隔与天数、epoch 轮询间隔、token 统计间隔与回看天数 | `TIYGATE_LOG_RETENTION_*`、`TIYGATE_EPOCH_POLL_INTERVAL_SECS`、`TIYGATE_TOKEN_STATS_*` |

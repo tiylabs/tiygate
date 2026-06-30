@@ -141,6 +141,14 @@ pub struct ServerConfig {
     /// the stream with a protocol-native error frame. Set to 0 to
     /// disable the total budget entirely. Default: 0 (disabled).
     pub upstream_stream_total_timeout_secs: u64,
+    /// Time-to-first-byte timeout for upstream streaming requests,
+    /// in seconds. When non-zero, the streaming branch wraps
+    /// `client.execute()` in `tokio::time::timeout` so a
+    /// non-responsive upstream (no response headers within this
+    /// window) is bounded independently of the streaming idle
+    /// timer. Set to 0 to disable. Default: 120s. Set via
+    /// `TIYGATE_UPSTREAM_TTFB_TIMEOUT_SECS`.
+    pub upstream_ttfb_timeout_secs: u64,
     /// TCP keepalive probe interval for the shared upstream HTTP
     /// client, in seconds. Enables OS-level TCP keepalive so half-dead
     /// connections (silently reaped by a peer or middlebox) are
@@ -207,6 +215,7 @@ impl Default for ServerConfig {
             // operator opts in to a wall-clock cap explicitly.
             upstream_stream_idle_timeout_secs: 120,
             upstream_stream_total_timeout_secs: 0,
+            upstream_ttfb_timeout_secs: 120,
             upstream_tcp_keepalive_secs: 60,
             upstream_pool_idle_timeout_secs: 90,
             upstream_tcp_nodelay: true,
@@ -267,6 +276,11 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS") {
             if let Ok(n) = v.parse() {
                 cfg.upstream_stream_total_timeout_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("TIYGATE_UPSTREAM_TTFB_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse() {
+                cfg.upstream_ttfb_timeout_secs = n;
             }
         }
         if let Ok(v) = std::env::var("TIYGATE_UPSTREAM_TCP_KEEPALIVE_SECS") {

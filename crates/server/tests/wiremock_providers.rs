@@ -1953,3 +1953,126 @@ async fn test_require_api_key_disabled_allows_anonymous() {
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+/// Regression: when the upstream does not return response headers
+/// within the TTFB timeout, the streaming branch must return 504
+/// (Gateway Timeout) with a `DeadlineExceeded` error class instead
+/// of hanging indefinitely. Before the fix, the streaming branch had
+/// no TTFB protection — `client.execute().await` could block forever.
+#[tokio::test]
+async fn test_streaming_ttfb_timeout_returns_504() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    // The upstream delays 3s before sending response headers. With
+    // `upstream_ttfb_timeout_secs = 1`, the gateway should time out
+    // after ~1s and return 504.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_delay(std::time::Duration::from_secs(3))
+                .set_body_string("data: {\"choices\":[]}\n\ndata: [DONE]\n\n"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let mut server_config = ServerConfig::default();
+    server_config.require_api_key = false;
+    server_config.upstream_ttfb_timeout_secs = 1;
+    let app = build_test_app_with_config(mock_server.uri(), "gpt-4o", server_config);
+
+    let body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let response = app.oneshot(request).await.unwrap();
+    let elapsed = start.elapsed();
+
+    // Must return 504, not 200 or 500.
+    assert_eq!(
+        response.status(),
+        StatusCode::GATEWAY_TIMEOUT,
+        "expected 504 Gateway Timeout, got {}",
+        response.status()
+    );
+
+    // Must time out after ~1s, not wait for the 3s upstream delay.
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "TTFB timeout should fire after ~1s, took {:?}",
+        elapsed
+    );
+
+    // The error body should contain a server_error type (OpenAI
+    // protocol-native mapping for DeadlineExceeded).
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    assert!(
+        body_str.contains("error"),
+        "expected error body, got: {body_str}"
+    );
+}
+
+/// Regression: when `upstream_ttfb_timeout_secs = 0` (disabled), the
+/// streaming branch must behave as before — no TTFB timeout is applied.
+/// This ensures backward compatibility when the setting is not configured.
+#[tokio::test]
+async fn test_streaming_ttfb_timeout_disabled_when_zero() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    // A small delay that would NOT trigger a 1s TTFB timeout, but
+    // confirms the path works when ttfb_timeout is 0 (disabled).
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let mut server_config = ServerConfig::default();
+    server_config.require_api_key = false;
+    server_config.upstream_ttfb_timeout_secs = 0; // disabled
+    let app = build_test_app_with_config(mock_server.uri(), "gpt-4o", server_config);
+
+    let body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    assert!(
+        body_str.contains("data: [DONE]"),
+        "expected stream to complete normally, got: {body_str}"
+    );
+}

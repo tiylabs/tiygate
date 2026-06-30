@@ -56,6 +56,12 @@ pub const INGRESS_REQUIRE_API_KEY: &str = "gateway.ingress.require_api_key";
 // --- Upstream ---
 pub const UPSTREAM_STREAM_IDLE_TIMEOUT_SECS: &str = "gateway.upstream.stream_idle_timeout_secs";
 pub const UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS: &str = "gateway.upstream.stream_total_timeout_secs";
+/// Time-to-first-byte timeout for upstream streaming requests, in
+/// seconds. When non-zero, the streaming branch wraps
+/// `client.execute()` in `tokio::time::timeout` so a non-responsive
+/// upstream (no response headers) is bounded independently of the
+/// streaming idle timer. Set to 0 to disable. Default: 120s.
+pub const UPSTREAM_TTFB_TIMEOUT_SECS: &str = "gateway.upstream.ttfb_timeout_secs";
 pub const UPSTREAM_TCP_KEEPALIVE_SECS: &str = "gateway.upstream.tcp_keepalive_secs";
 pub const UPSTREAM_POOL_IDLE_TIMEOUT_SECS: &str = "gateway.upstream.pool_idle_timeout_secs";
 pub const UPSTREAM_TCP_NODELAY: &str = "gateway.upstream.tcp_nodelay";
@@ -97,6 +103,7 @@ pub const PLAIN_KEYS: &[&str] = &[
     INGRESS_REQUIRE_API_KEY,
     UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
     UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS,
+    UPSTREAM_TTFB_TIMEOUT_SECS,
     UPSTREAM_TCP_KEEPALIVE_SECS,
     UPSTREAM_POOL_IDLE_TIMEOUT_SECS,
     UPSTREAM_TCP_NODELAY,

@@ -101,6 +101,9 @@ pub struct RuntimeTunables {
     pub upstream_stream_idle_timeout_secs: u64,
     /// Total wall-clock timeout (seconds) for upstream streaming.
     pub upstream_stream_total_timeout_secs: u64,
+    /// TTFB timeout (seconds) for upstream streaming — wraps
+    /// `client.execute()` in `tokio::time::timeout`. 0 = disabled.
+    pub upstream_ttfb_timeout_secs: u64,
     /// Shared reqwest connection pool. Rebuilt when TCP keepalive,
     /// pool idle timeout, or tcp_nodelay settings change. The
     /// rebuild is debounced by the tunables reloader so frequent
@@ -332,6 +335,7 @@ fn build_data_plane_router(
         acquire_timeout: Duration::from_secs(server_config.acquire_timeout_secs),
         upstream_stream_idle_timeout_secs: server_config.upstream_stream_idle_timeout_secs,
         upstream_stream_total_timeout_secs: server_config.upstream_stream_total_timeout_secs,
+        upstream_ttfb_timeout_secs: server_config.upstream_ttfb_timeout_secs,
         http_client: build_http_client(server_config),
     };
     let state = AppState {
@@ -499,6 +503,12 @@ pub(crate) fn spawn_tunables_reloader(
                 current_t.upstream_stream_total_timeout_secs,
             )
             .await;
+            let upstream_ttfb_timeout_secs = sk::get_u64(
+                store.as_ref(),
+                sk::UPSTREAM_TTFB_TIMEOUT_SECS,
+                current_t.upstream_ttfb_timeout_secs,
+            )
+            .await;
             // Read upstream TCP/connection-pool settings. The
             // http_client is rebuilt only when one of these three
             // values changes, to avoid churning the connection pool
@@ -540,6 +550,7 @@ pub(crate) fn spawn_tunables_reloader(
                 acquire_timeout,
                 upstream_stream_idle_timeout_secs,
                 upstream_stream_total_timeout_secs,
+                upstream_ttfb_timeout_secs,
                 http_client,
             });
             tracing::debug!(epoch = current, "tunables reloaded from settings");

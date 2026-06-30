@@ -32,6 +32,54 @@ use super::{apply_provider_auth, AppError, AppState};
 /// global `request_read_timeout` (which defaults to 30s for chat).
 const IMAGES_NONSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Execute a reqwest request with an optional TTFB (time-to-first-byte)
+/// timeout. When `ttfb_timeout_secs` is non-zero, the `client.execute()`
+/// call is wrapped in `tokio::time::timeout` so a non-responsive upstream
+/// (no response headers within the window) is bounded independently of
+/// the streaming idle timer. When zero, the timeout is disabled and the
+/// call behaves as a plain `client.execute().await`.
+///
+/// This is used **only** in streaming branches — non-streaming branches
+/// already set `.timeout()` on the `RequestBuilder` which covers the
+/// entire request lifecycle.
+async fn execute_with_ttfb_timeout(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    ttfb_timeout_secs: u64,
+) -> Result<reqwest::Response, AppError> {
+    if ttfb_timeout_secs > 0 {
+        match tokio::time::timeout(
+            Duration::from_secs(ttfb_timeout_secs),
+            client.execute(request),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| {
+                AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"))
+            }),
+            Err(_) => {
+                let mut err = AppError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream TTFB timeout".to_string(),
+                )
+                .with_class(tiygate_core::ErrorClass::DeadlineExceeded);
+                // Set upstream_status=504 so the fallback classifier's
+                // `classify_structured` path maps 504 → DeadlineExceeded
+                // (rather than falling through to `classify_error` which
+                // does not recognize timeout messages and would default
+                // to Transient).
+                err.upstream_status = Some(504);
+                Err(err)
+            }
+        }
+    } else {
+        client
+            .execute(request)
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))
+    }
+}
+
 /// Check whether an HTTP 200 non-streaming response body is actually
 /// an error response (top-level `"error"` key). Some providers return
 /// HTTP 200 with `{"error": {...}}` instead of a proper non-2xx status
@@ -244,9 +292,12 @@ pub(super) async fn execute_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let response = client.execute(egress_req).await.map_err(|e| {
-            AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
-        })?;
+        let response = execute_with_ttfb_timeout(
+            client,
+            egress_req,
+            state.tunables().upstream_ttfb_timeout_secs,
+        )
+        .await?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
 
         // Extract Retry-After for passthrough
@@ -704,9 +755,12 @@ pub(super) async fn execute_messages_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let response = client.execute(egress_req).await.map_err(|e| {
-            AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
-        })?;
+        let response = execute_with_ttfb_timeout(
+            client,
+            egress_req,
+            state.tunables().upstream_ttfb_timeout_secs,
+        )
+        .await?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
 
         let retry_after = extract_retry_after(response.headers());
@@ -1406,12 +1460,13 @@ pub(super) async fn execute_responses_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let response = state
-            .tunables()
-            .http_client
-            .execute(egress_req)
-            .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let tunables = state.tunables();
+        let response = execute_with_ttfb_timeout(
+            &tunables.http_client,
+            egress_req,
+            tunables.upstream_ttfb_timeout_secs,
+        )
+        .await?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
@@ -1830,12 +1885,13 @@ pub(super) async fn execute_gemini_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let response = state
-            .tunables()
-            .http_client
-            .execute(egress_req)
-            .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let tunables = state.tunables();
+        let response = execute_with_ttfb_timeout(
+            &tunables.http_client,
+            egress_req,
+            tunables.upstream_ttfb_timeout_secs,
+        )
+        .await?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
@@ -2214,10 +2270,12 @@ pub(super) async fn execute_images_generations_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let response = client
-            .execute(egress_req)
-            .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let response = execute_with_ttfb_timeout(
+            client,
+            egress_req,
+            state.tunables().upstream_ttfb_timeout_secs,
+        )
+        .await?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
 
         let retry_after = extract_retry_after(response.headers());
@@ -2567,10 +2625,12 @@ pub(super) async fn execute_images_edits_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let response = client
-            .execute(egress_req)
-            .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let response = execute_with_ttfb_timeout(
+            client,
+            egress_req,
+            state.tunables().upstream_ttfb_timeout_secs,
+        )
+        .await?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
 
         let retry_after = extract_retry_after(response.headers());
