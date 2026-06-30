@@ -10,6 +10,7 @@ import type {
   ImportSelection,
   OAuthStartResponse,
   OAuthTokenResponse,
+  ModelCatalogStatus,
   Provider,
   ProviderCatalogEntry,
   ProviderDeleteImpact,
@@ -49,6 +50,13 @@ export const providersApi = {
 // ---- provider catalog (server-side registered providers) ----
 export const providerCatalogApi = {
   list: () => apiRequest<ProviderCatalogEntry[]>("/provider-catalog"),
+};
+
+// ---- model catalog ----
+export const modelCatalogApi = {
+  status: () => apiRequest<ModelCatalogStatus>("/model-catalog"),
+  refresh: () =>
+    apiRequest<ModelCatalogStatus>("/model-catalog/refresh", { method: "POST" }),
 };
 
 // ---- routes ----

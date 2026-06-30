@@ -34,10 +34,15 @@ flate2 = "1"
 bytes.workspace = true
 reqwest.workspace = true
 url.workspace = true
+futures.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
 serial_test.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true

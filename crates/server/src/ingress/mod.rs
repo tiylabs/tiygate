@@ -144,6 +144,10 @@ pub struct AppState {
     /// Per-request `Redactor` instance. Configurable so future
     /// env-var-driven extensions remain test-friendly.
     pub redactor: Arc<tiygate_core::redaction::Redactor>,
+    /// Optional model catalog snapshot store. When present the
+    /// `/v1/models` endpoints can enrich route cards with metadata
+    /// from models.dev without blocking the request path.
+    pub model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
     /// Hot-reloadable runtime tunables. The epoch-poll task
     /// publishes a new `Arc<RuntimeTunables>` here after
     /// `store.refresh()` when settings change; the data plane
@@ -230,6 +234,7 @@ pub fn router_with_telemetry(
         quota,
         embedding_cache,
         None,
+        None,
     )
 }
 
@@ -247,6 +252,7 @@ pub fn router_with_telemetry_full(
     quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
     embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
     db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
+    model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
 ) -> Router {
     build_data_plane_router(
         config,
@@ -256,6 +262,7 @@ pub fn router_with_telemetry_full(
         quota,
         embedding_cache,
         db_store,
+        model_catalog,
     )
 }
 
@@ -304,6 +311,7 @@ fn build_http_client_from_params(
 /// Internal builder kept separate from the public `router_with_telemetry_full`
 /// so we can also expose the bare `Router<AppState>` for tests and inspection
 /// harnesses.
+#[allow(clippy::too_many_arguments)]
 fn build_data_plane_router(
     config: ConfigStore,
     health: Arc<HealthRegistry>,
@@ -312,6 +320,7 @@ fn build_data_plane_router(
     quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
     embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
     db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
+    model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
 ) -> Router {
     let semaphore = Arc::new(Semaphore::new(server_config.max_inflight_requests));
     // Clone the db_store before it is moved into AppState so we can
@@ -345,6 +354,7 @@ fn build_data_plane_router(
         quota,
         embedding_cache,
         redactor: Arc::new(tiygate_core::redaction::Redactor::with_defaults()),
+        model_catalog,
         tunables: Arc::new(arc_swap::ArcSwap::from_pointee(tunables)),
         oauth_manager: crate::oauth_manager::OAuthTokenManager::new(
             db_store,

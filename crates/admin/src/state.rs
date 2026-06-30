@@ -28,6 +28,8 @@ pub struct AdminState {
     /// Optional S3-compatible payload archive reader used by replay
     /// requests when the DB row has already been archived.
     pub payload_archive: Option<Arc<dyn PayloadArchiveClient>>,
+    /// Optional model catalog snapshot store used for status reads.
+    pub model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
     /// In-memory store of OAuth 2.0 authorization-code flow
     /// state. The `start` handler mints a `state` nonce, the
     /// `callback` handler validates the incoming `state` query
@@ -76,6 +78,7 @@ impl AdminState {
             health,
             quota: None,
             payload_archive: None,
+            model_catalog: None,
             oauth_pending: Arc::new(Mutex::new(HashMap::new())),
             bf_limiter: Arc::new(InMemoryBruteForceLimiter::new(BruteForceConfig::default())),
         }
@@ -91,6 +94,15 @@ impl AdminState {
     /// Attach a payload archive client for replay reads.
     pub fn with_payload_archive(mut self, archive: Option<Arc<dyn PayloadArchiveClient>>) -> Self {
         self.payload_archive = archive;
+        self
+    }
+
+    /// Attach a model catalog store for status reads.
+    pub fn with_model_catalog(
+        mut self,
+        catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
+    ) -> Self {
+        self.model_catalog = catalog;
         self
     }
 

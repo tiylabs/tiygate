@@ -772,13 +772,11 @@ impl EndpointCodec for ResponsesCodec {
                                 // `function_call_output` input item. Preserve
                                 // them regardless of the IR message role so
                                 // prior function calls have matching outputs.
-                                tool_outputs_json.push(
-                                    responses_function_call_output(
-                                        tool_call_id,
-                                        content,
-                                        id.as_deref(),
-                                    ),
-                                );
+                                tool_outputs_json.push(responses_function_call_output(
+                                    tool_call_id,
+                                    content,
+                                    id.as_deref(),
+                                ));
                             }
                             Content::Refusal { text, .. } => {
                                 text_parts.push(json!({"type": "input_text", "text": text}));

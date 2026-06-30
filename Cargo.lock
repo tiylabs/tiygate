@@ -5727,6 +5727,7 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -5936,6 +5937,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flate2",
+ "futures",
  "hex",
  "hkdf",
  "hmac",
@@ -5956,6 +5958,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "wiremock",
  "zeroize",
 ]
 

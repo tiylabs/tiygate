@@ -43,15 +43,19 @@ export interface ProviderDeleteImpact {
   routes: ProviderDeleteImpactRoute[];
 }
 
-/** One entry of the server-side provider catalog
- *  (`GET /admin/v1/provider-catalog`). Reflects the providers actually
- *  registered/compiled into the gateway binary, so the set changes with
- *  feature flags rather than a hardcoded frontend list. */
 export interface ProviderCatalogEntry {
   id: string;
   display_name: string;
   default_base_url: string;
   auth_mode: string;
+}
+
+export interface ModelCatalogStatus {
+  source: string;
+  checksum: string;
+  generated_at_unix: number;
+  provider_count: number;
+  model_count: number;
 }
 
 /** Per-route routing strategy. Mirrors `tiygate_core::routing::RoutingStrategyName`

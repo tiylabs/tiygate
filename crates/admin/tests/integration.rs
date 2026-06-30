@@ -1252,3 +1252,90 @@ async fn settings_audit_redacts_encrypted_keys() {
         "expected redaction marker, got {snap_str}"
     );
 }
+
+#[tokio::test]
+async fn model_catalog_status_returns_not_found_when_disabled() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/v1/model-catalog")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn model_catalog_status_returns_version_when_enabled() {
+    let (_router, store, pool) = boot_no_auth().await;
+    let catalog = tiygate_store::model_catalog::ModelCatalog::from_models_dev_json(
+        r#"{"openai":{"id":"openai","name":"OpenAI","models":{"gpt-4o":{"id":"gpt-4o","name":"GPT-4o"}}}}"#,
+        "test",
+    )
+    .expect("catalog");
+    let catalog_store = Arc::new(tiygate_store::model_catalog::ModelCatalogStore::new(
+        catalog,
+    ));
+    let state = AdminState::new(store, pool, None).with_model_catalog(Some(catalog_store));
+    let router = tiygate_admin::build_router_with_auth(state, false);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/v1/model-catalog")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["source"], json!("test"));
+    assert_eq!(body["provider_count"], json!(1));
+    assert_eq!(body["model_count"], json!(1));
+    assert!(body["checksum"].as_str().unwrap().len() >= 32);
+}
+
+#[tokio::test]
+async fn model_catalog_manual_refresh_returns_new_version() {
+    let (_router, store, pool) = boot_no_auth().await;
+    let initial = tiygate_store::model_catalog::ModelCatalog::from_models_dev_json(
+        r#"{"openai":{"id":"openai","models":{"gpt-4o":{"id":"gpt-4o","name":"Old"}}}}"#,
+        "initial",
+    )
+    .expect("initial catalog");
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"openai":{"id":"openai","models":{"gpt-4o":{"id":"gpt-4o","name":"New"}}}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let catalog_store = Arc::new(
+        tiygate_store::model_catalog::ModelCatalogStore::new_with_source_url(initial, server.uri()),
+    );
+    let state = AdminState::new(store, pool, None).with_model_catalog(Some(catalog_store));
+    let router = tiygate_admin::build_router_with_auth(state, false);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/v1/model-catalog/refresh")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["source"], json!(server.uri()));
+    assert_eq!(body["model_count"], json!(1));
+}

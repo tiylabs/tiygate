@@ -1465,10 +1465,9 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                         let total = usage["total_tokens"]
                             .as_u64()
                             .unwrap_or(raw_prompt + completion);
-                        let cache_read =
-                            usage["prompt_tokens_details"]["cached_tokens"].as_u64();
-                        let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
-                            .as_u64();
+                        let cache_read = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+                        let reasoning =
+                            usage["completion_tokens_details"]["reasoning_tokens"].as_u64();
                         // OpenAI's prompt_tokens includes cache; the IR convention
                         // keeps prompt_tokens cache-free. Subtract to avoid double
                         // counting on re-encode.
@@ -2365,10 +2364,7 @@ mod tests {
             .feed(r#"data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"}}],"usage":null}"#)
             .unwrap();
         let has_usage = parts.iter().any(|p| matches!(p, StreamPart::Usage { .. }));
-        assert!(
-            !has_usage,
-            "null usage must not produce StreamPart::Usage"
-        );
+        assert!(!has_usage, "null usage must not produce StreamPart::Usage");
 
         // 2. finish chunk 带 `"usage": null` — 仍不应产出 Usage
         let parts = dec

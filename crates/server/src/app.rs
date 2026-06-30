@@ -40,6 +40,13 @@ pub struct App {
     pub embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
     /// Quota counter (only when the control plane is active).
     pub quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
+    /// Model catalog snapshot store used to enrich `/v1/models`.
+    #[allow(dead_code)]
+    pub model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
+    /// Handle for the model-catalog background refresh task. None
+    /// when the control plane is disabled.
+    #[allow(dead_code)]
+    pub model_catalog_refresh: Option<tiygate_store::model_catalog::ModelCatalogRefreshHandle>,
     /// Handle for the data-plane config-epoch polling task. None
     /// when the control plane is disabled.
     #[allow(dead_code)]
@@ -153,7 +160,11 @@ impl App {
             None => (None, None),
         };
 
-        // Spawn the epoch polling task and the log retention
+        let model_catalog = Some(tiygate_store::model_catalog::ModelCatalogStore::load_embedded()?);
+        let model_catalog_refresh = match (&control_plane, &model_catalog) {
+            (Some(_), Some(store)) => Some(store.spawn_refresh()),
+            _ => None,
+        };
         // task when the control plane is active. The epoch poll
         // rewrites the DbConfigStore's inner ConfigStore on every
         // admin write, so the data plane sees changes within
@@ -199,6 +210,8 @@ impl App {
             sqlite_maintenance,
             payload_archive: payload_archive_handle,
             payload_archive_client,
+            model_catalog,
+            model_catalog_refresh,
         })
     }
 
@@ -224,6 +237,7 @@ impl App {
             #[cfg(not(feature = "cache"))]
             None,
             db_store,
+            self.model_catalog.clone(),
         );
         if let Some(cp) = &self.control_plane {
             // Mount the admin router under `/admin`. Phase 4 splits
@@ -243,6 +257,7 @@ impl App {
                         )
                         .with_quota(self.quota.clone())
                         .with_payload_archive(self.payload_archive_client.clone())
+                        .with_model_catalog(self.model_catalog.clone())
                         .with_bf_limiter(bf_limiter);
                         let admin = tiygate_admin::build_router(admin_state);
                         router = router.merge(admin);
