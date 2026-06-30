@@ -393,9 +393,14 @@ fn build_catalog(value: Value, source: &str, raw: &str) -> Result<ModelCatalog, 
         }
         let is_openrouter = provider.id == "openrouter";
         for model in provider.models.values() {
+            // Use fingerprint as the grouping key so that variants
+            // like "claude-sonnet-4.6" and "claude-sonnet-4-6" merge
+            // into one candidate list. The original id is preserved
+            // on the SourceModel for display purposes.
             let canonical_id = canonical_model_id(model);
+            let fingerprint = model_fingerprint(&canonical_id);
             candidates
-                .entry(canonical_id)
+                .entry(fingerprint)
                 .or_default()
                 .push(CandidateModel {
                     provider_id: provider.id.clone(),
@@ -459,10 +464,21 @@ fn build_catalog(value: Value, source: &str, raw: &str) -> Result<ModelCatalog, 
     })
 }
 
-fn build_model_metadata(canonical_id: &str, entries: &[CandidateModel]) -> Option<ModelMetadata> {
+fn build_model_metadata(fingerprint: &str, entries: &[CandidateModel]) -> Option<ModelMetadata> {
     let preferred = choose_metadata_candidate(entries)?;
     let pricing_candidate = choose_pricing_candidate(entries);
     let lab_id = normalized_lab_id_from_model_or_provider(&preferred.model, &preferred.provider_id);
+
+    // Use the official provider's original model id as the catalog id
+    // when available; otherwise fall back to the preferred candidate's
+    // id or the fingerprint. This preserves human-readable ids like
+    // "claude-sonnet-4-6" instead of the fingerprint "claude-sonnet-46".
+    let official_entry = entries.iter().find(|e| e.is_official);
+    let catalog_id = official_entry
+        .or(Some(preferred))
+        .map(|e| canonical_model_id_str(&e.model.id))
+        .unwrap_or_else(|| fingerprint.to_string());
+
     let limit = preferred.model.limit.as_ref();
     let mut metadata = Map::new();
     if let Some(knowledge) = &preferred.model.knowledge {
@@ -479,13 +495,13 @@ fn build_model_metadata(canonical_id: &str, entries: &[CandidateModel]) -> Optio
     }
 
     Some(ModelMetadata {
-        id: canonical_id.to_string(),
+        id: catalog_id.clone(),
         lab_id,
         display_name: preferred
             .model
             .name
             .clone()
-            .unwrap_or_else(|| canonical_id.to_string()),
+            .unwrap_or_else(|| catalog_id.clone()),
         family: preferred.model.family.clone(),
         context_window: limit.and_then(|l| l.context),
         max_input_tokens: limit.and_then(|l| l.input.or(l.context)),
@@ -756,11 +772,6 @@ fn canonical_model_id_str(id: &str) -> String {
     match id.split_once('/') {
         Some((prefix, rest)) if !prefix.is_empty() && !rest.is_empty() => {
             let lab = normalized_lab_id(prefix);
-            // If the prefix is a recognized lab, strip it — the model
-            // suffix is the canonical id (e.g. "openai/gpt-image-2" →
-            // "gpt-image-2", "zai/glm-5.2" → "glm-5.2"). This ensures
-            // the same model from different providers (one with prefix,
-            // one without) merges into one catalog entry.
             if is_known_lab(&lab) {
                 rest.to_string()
             } else {
