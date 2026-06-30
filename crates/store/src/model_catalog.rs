@@ -510,14 +510,23 @@ fn choose_metadata_candidate(entries: &[CandidateModel]) -> Option<&CandidateMod
 }
 
 fn choose_pricing_candidate(entries: &[CandidateModel]) -> Option<&CandidateModel> {
+    // 1. Prefer official or OpenRouter pricing
+    let official_or_or = entries
+        .iter()
+        .filter(|c| c.model.cost.is_some())
+        .filter(|c| c.is_official || c.is_openrouter)
+        .max_by_key(|c| {
+            let s = if c.is_official { 3 } else { 2 };
+            (s, metadata_score(&c.model))
+        });
+    if official_or_or.is_some() {
+        return official_or_or;
+    }
+    // 2. Fallback: any provider with cost data (labeled as fallback)
     entries
         .iter()
-        .filter(|candidate| candidate.model.cost.is_some())
-        .filter(|candidate| candidate.is_official || candidate.is_openrouter)
-        .max_by_key(|candidate| {
-            let source_score = if candidate.is_official { 3 } else { 2 };
-            (source_score, metadata_score(&candidate.model))
-        })
+        .filter(|c| c.model.cost.is_some())
+        .max_by_key(|c| (1, metadata_score(&c.model)))
 }
 
 fn metadata_score(model: &SourceModel) -> usize {
@@ -594,12 +603,53 @@ fn capabilities_from_model(model: &SourceModel) -> Map<String, Value> {
 }
 
 fn normalized_lab_id_from_model_or_provider(model: &SourceModel, provider_id: &str) -> String {
+    // 1. If model id has a lab prefix (e.g. "openai/gpt-4o"), use it
     if let Some(prefix) = model.id.split('/').next() {
         if model.id.contains('/') && !prefix.is_empty() {
             return normalized_lab_id(prefix);
         }
     }
+    // 2. Try to infer lab from model id prefix (e.g. "doubao-" → bytedance)
+    if let Some(lab) = infer_lab_from_model_id(&model.id) {
+        return lab;
+    }
+    // 3. Fall back to provider id
     normalized_lab_id(provider_id)
+}
+
+/// Infer the lab from a model id's naming prefix. This covers models
+/// whose official provider is not in models.dev but whose model id
+/// follows a recognizable naming convention (e.g. "doubao-xxx" → bytedance).
+fn infer_lab_from_model_id(id: &str) -> Option<String> {
+    let lower = id.to_lowercase();
+    let prefixes: &[(&str, &str)] = &[
+        ("doubao", "bytedance"),
+        ("glm-", "zhipuai"),
+        ("kimi-", "moonshotai"),
+        ("claude-", "anthropic"),
+        ("gpt-", "openai"),
+        ("gpt-image", "openai"),
+        ("chatgpt-", "openai"),
+        ("gemini-", "google"),
+        ("o1", "openai"),
+        ("o3", "openai"),
+        ("o4", "openai"),
+        ("deepseek", "deepseek"),
+        ("minimax", "minimax"),
+        ("qwen", "alibaba"),
+        ("yi-", "01ai"),
+        ("llama-", "meta"),
+        ("mistral-", "mistralai"),
+        ("codestral", "mistralai"),
+        ("hy3", "tencent"),
+        ("hy-", "tencent"),
+    ];
+    for (prefix, lab) in prefixes {
+        if lower.starts_with(prefix) {
+            return Some(lab.to_string());
+        }
+    }
+    None
 }
 
 fn canonical_model_id(model: &SourceModel) -> String {
@@ -1074,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn non_official_non_openrouter_cost_is_ignored() {
+    fn non_official_cost_used_as_fallback_when_no_official_or_openrouter() {
         let raw = json!({
             "some-aggregator": {
                 "id": "some-aggregator",
@@ -1089,10 +1139,15 @@ mod tests {
             }
         });
         let catalog = build_catalog(raw.clone(), "test", &raw.to_string()).expect("catalog");
-        assert!(catalog
-            .get_model("acme/model-a")
+        // When no official or OpenRouter pricing exists, aggregator cost
+        // is used as fallback (labeled OpenRouterFallback).
+        let pricing = catalog
+            .get_model("model-a")
             .and_then(|m| m.pricing.as_ref())
-            .is_none());
+            .expect("fallback pricing should exist");
+        assert_eq!(pricing.source_provider, "some-aggregator");
+        assert_eq!(pricing.source_kind, PricingSourceKind::OpenRouterFallback);
+        assert_eq!(pricing.input_token_usd_per_million, Some(99.0));
     }
 
     #[test]
