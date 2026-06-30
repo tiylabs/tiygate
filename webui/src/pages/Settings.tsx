@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useBlocker } from "react-router-dom";
-import { Save, RotateCcw } from "lucide-react";
-import { settingsApi } from "@/api/resources";
+import { Save, RotateCcw, RefreshCw } from "lucide-react";
+import { settingsApi, modelCatalogApi } from "@/api/resources";
 import type { Settings } from "@/api/types";
 import {
   Alert,
@@ -745,6 +745,9 @@ export default function SettingsPage() {
         </CardBody>
       </Card>
 
+      {/* Model catalog */}
+      <ModelCatalogSection />
+
       {/* Unsaved-changes navigation confirmation */}
       <ConfirmDialog
         open={blocker.state === "blocked"}
@@ -758,5 +761,82 @@ export default function SettingsPage() {
         onConfirm={() => blocker.proceed?.()}
       />
     </div>
+  );
+}
+
+function ModelCatalogSection() {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const toast = useToast();
+
+  const modelCatalog = useQuery({
+    queryKey: ["model-catalog", "status"],
+    queryFn: modelCatalogApi.status,
+    staleTime: 5 * 60_000,
+  });
+
+  const refreshCatalog = useMutation({
+    mutationFn: modelCatalogApi.refresh,
+    onSuccess: () => {
+      toast.success(
+        t("settings.modelCatalogRefreshed", "Model catalog refreshed"),
+      );
+      qc.invalidateQueries({ queryKey: ["model-catalog", "status"] });
+    },
+    onError: (e: Error) => {
+      toast.error(e.message);
+    },
+  });
+
+  return (
+    <Card>
+      <CardHeader
+        title={t("settings.modelCatalog", "Model catalog")}
+        description={
+          modelCatalog.data
+            ? `${modelCatalog.data.provider_count} providers · ${modelCatalog.data.model_count} models`
+            : t("settings.modelCatalogLoading", "Loading catalog status")
+        }
+        action={
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => refreshCatalog.mutate()}
+            disabled={refreshCatalog.isPending}
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${refreshCatalog.isPending ? "animate-spin" : ""}`}
+            />
+            {t("common.refresh", "Refresh")}
+          </Button>
+        }
+      />
+      <CardBody className="grid gap-4 sm:grid-cols-3">
+        <Field label={t("settings.catalogChecksum", "Checksum")}>
+          <Input
+            readOnly
+            value={modelCatalog.isLoading ? "…" : modelCatalog.data?.checksum ?? "—"}
+          />
+        </Field>
+        <Field label={t("settings.catalogGeneratedAt", "Generated at")}>
+          <Input
+            readOnly
+            value={
+              modelCatalog.data?.generated_at_unix
+                ? new Date(
+                    modelCatalog.data.generated_at_unix * 1000,
+                  ).toLocaleString()
+                : "—"
+            }
+          />
+        </Field>
+        <Field label={t("settings.catalogSource", "Source")}>
+          <Input
+            readOnly
+            value={modelCatalog.data?.source ?? "models.dev"}
+          />
+        </Field>
+      </CardBody>
+    </Card>
   );
 }

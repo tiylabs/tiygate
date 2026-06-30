@@ -160,11 +160,29 @@ impl ModelCatalog {
 
     pub fn get_model(&self, id: &str) -> Option<&ModelMetadata> {
         let canonical = canonical_model_id_str(id);
-        self.models.get(&canonical).or_else(|| {
-            self.models
-                .values()
-                .find(|m| m.id.eq_ignore_ascii_case(&canonical))
-        })
+        self.models
+            .get(&canonical)
+            .or_else(|| {
+                self.models
+                    .values()
+                    .find(|m| m.id.eq_ignore_ascii_case(&canonical))
+            })
+            .or_else(|| {
+                // Fallback: if the id has a lab prefix (e.g. "openai/gpt-image-2"),
+                // try matching the suffix after the last '/' against catalog entries
+                // that lack the prefix (e.g. "gpt-image-2").
+                match canonical.rsplit_once('/') {
+                    Some((_, suffix)) if !suffix.is_empty() => {
+                        self.models.get(suffix).or_else(|| {
+                            self.models
+                                .values()
+                                .find(|m| m.id.eq_ignore_ascii_case(suffix))
+                        })
+                    }
+                    None => None,
+                    Some(_) => None,
+                }
+            })
     }
 
     pub fn list_models(&self) -> impl Iterator<Item = &ModelMetadata> {
