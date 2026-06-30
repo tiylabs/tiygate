@@ -105,7 +105,15 @@ pub enum StreamPart {
     /// An error occurred during streaming.
     Error {
         message: String,
-        code: Option<String>,
+        /// Normalized error class for protocol-native error type mapping.
+        #[serde(default)]
+        class: crate::routing::ErrorClass,
+        /// Original upstream error code (e.g. `insufficient_quota`,
+        /// `overloaded_error`), preserved for debugging passthrough.
+        /// Not mapped to protocol-native `error.type`; emitted as
+        /// `error.code` in protocols that support it (OpenAI).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream_code: Option<String>,
     },
 }
 
@@ -567,8 +575,12 @@ pub struct UpstreamStreamError {
     /// Human-readable error message extracted from the error frame.
     pub message: String,
     /// Protocol-specific error code/type (e.g. `service_unavailable_error`,
-    /// `overloaded_error`, `429`).
+    /// `overloaded_error`, `429`), preserved for debugging passthrough.
     pub code: Option<String>,
+    /// Normalized error class derived from the upstream code via
+    /// `classify_upstream_error`. Used to drive protocol-native
+    /// error type mapping and fallback decisions.
+    pub class: crate::routing::ErrorClass,
 }
 
 /// Accumulates usage from streaming responses for billing when the
@@ -632,9 +644,11 @@ impl UsageAccumulator {
     /// cause is preserved.
     pub fn set_upstream_error(&mut self, message: &str, code: Option<&str>) {
         if self.upstream_error.is_none() {
+            let class = crate::routing::classify_upstream_error(None, code);
             self.upstream_error = Some(UpstreamStreamError {
                 message: message.to_string(),
                 code: code.map(String::from),
+                class,
             });
         }
     }

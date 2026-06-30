@@ -142,7 +142,7 @@ where
                 StatusCode::GATEWAY_TIMEOUT,
                 "request deadline exceeded".to_string(),
             )
-            .with_code("deadline_exceeded");
+            .with_class(tiygate_core::ErrorClass::DeadlineExceeded);
             return FallbackOutcome::Failed {
                 error: app_err,
                 error_class: RequestErrorClass::DeadlineExceeded,
@@ -245,9 +245,12 @@ where
                 // available (HTTP status + error code from upstream),
                 // fall back to substring matching on the message.
                 let classification = if app_err.upstream_status.is_some()
-                    || app_err.error_code().is_some()
+                    || app_err.upstream_error_code().is_some()
                 {
-                    tiygate_core::classify_structured(app_err.upstream_status, app_err.error_code())
+                    tiygate_core::classify_structured(
+                        app_err.upstream_status,
+                        app_err.upstream_error_code(),
+                    )
                 } else {
                     let core_err = tiygate_core::Error::Routing(app_err.message.clone());
                     classify_error(&core_err)
@@ -346,7 +349,7 @@ where
             StatusCode::BAD_GATEWAY,
             "all upstream targets exhausted".to_string(),
         )
-        .with_code("upstream_exhausted")
+        .with_class(tiygate_core::ErrorClass::UpstreamExhausted)
     });
     FallbackOutcome::Exhausted { error: final_err }
 }

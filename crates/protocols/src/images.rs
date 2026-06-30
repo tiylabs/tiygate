@@ -19,9 +19,28 @@ use http::HeaderMap;
 use serde_json::{json, Value};
 
 use tiygate_core::{
-    EndpointCapabilities, EndpointCodec, Error, IrRequest, IrResponse, PassThroughPolicy,
-    ProtocolEndpoint, ProtocolSuite, RawEnvelope, StreamDecoder, StreamEncoder, StreamPart,
+    EndpointCapabilities, EndpointCodec, Error, ErrorClass, IrRequest, IrResponse,
+    PassThroughPolicy, ProtocolEndpoint, ProtocolSuite, RawEnvelope, StreamDecoder, StreamEncoder,
+    StreamPart,
 };
+
+/// Map an `ErrorClass` to the OpenAI-native `error.type` string.
+fn error_type_for_class(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Transient => "server_error",
+        ErrorClass::RateLimited => "rate_limit_error",
+        ErrorClass::Auth => "authentication_error",
+        ErrorClass::BadRequest => "invalid_request_error",
+        ErrorClass::LossyOrCapability => "invalid_request_error",
+        ErrorClass::ModelNotFound => "not_found_error",
+        ErrorClass::DeadlineExceeded => "server_error",
+        ErrorClass::UpstreamExhausted => "server_error",
+        ErrorClass::AuthMissing => "authentication_error",
+        ErrorClass::AuthInvalid => "authentication_error",
+        ErrorClass::AuthDisabled => "permission_error",
+        ErrorClass::Overloaded => "overloaded_error",
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ImagesGenerationsCodec
@@ -199,6 +218,7 @@ impl EndpointCodec for ImagesGenerationsCodec {
             PassThroughPolicy::Convert
         }
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +391,7 @@ impl EndpointCodec for ImagesEditsCodec {
             PassThroughPolicy::Convert
         }
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -423,18 +444,31 @@ impl StreamEncoder for ImagesStreamEncoder {
                 }
                 Ok(format!("data: {}\n\n", Value::Object(payload)).into_bytes())
             }
-            StreamPart::Error { message, code } => Ok(self.encode_error(message, code.as_deref())),
+            StreamPart::Error {
+                message,
+                class,
+                upstream_code,
+            } => Ok(self.encode_error(message, *class, upstream_code.as_deref())),
             _ => Ok(Vec::new()),
         }
     }
 
-    fn encode_error(&mut self, message: &str, code: Option<&str>) -> Vec<u8> {
+    fn encode_error(
+        &mut self,
+        message: &str,
+        class: ErrorClass,
+        upstream_code: Option<&str>,
+    ) -> Vec<u8> {
+        let mut error_obj = json!({
+            "message": message,
+            "type": error_type_for_class(class),
+        });
+        if let Some(c) = upstream_code {
+            error_obj["code"] = json!(c);
+        }
         let payload = json!({
             "type": "error",
-            "error": {
-                "message": message,
-                "code": code.unwrap_or("upstream_error"),
-            },
+            "error": error_obj,
         });
         format!("data: {}\n\n", payload).into_bytes()
     }
@@ -510,13 +544,15 @@ impl StreamDecoder for ImagesStreamDecoder {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error")
                     .to_string();
+                let code = value
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|v| v.as_str());
+                let class = tiygate_core::classify_upstream_error(None, code);
                 Ok(vec![StreamPart::Error {
                     message: msg,
-                    code: value
-                        .get("error")
-                        .and_then(|e| e.get("code"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                    class,
+                    upstream_code: code.map(String::from),
                 }])
             }
             _ => Ok(Vec::new()),
@@ -680,11 +716,16 @@ mod tests {
     #[test]
     fn test_stream_encoder_error() {
         let mut enc = ImagesStreamEncoder::new();
-        let frame = enc.encode_error("test error", Some("test_code"));
+        let frame = enc.encode_error(
+            "test error",
+            ErrorClass::RateLimited,
+            Some("test_code"),
+        );
         let s = String::from_utf8(frame).unwrap();
         assert!(s.contains("\"type\":\"error\""));
         assert!(s.contains("test error"));
         assert!(s.contains("test_code"));
+        assert!(s.contains("\"type\":\"rate_limit_error\""));
     }
 
     #[test]

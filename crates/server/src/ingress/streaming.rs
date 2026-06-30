@@ -388,27 +388,8 @@ impl StreamCaptureGuard {
         // `request_logs.error_class` accurately instead of
         // hardcoding "transient".
         let upstream_error_class = self.accum.lock().ok().and_then(|a| {
-            a.upstream_error.as_ref().and_then(|e| {
-                match e.code.as_deref() {
-                    // Gateway-synthesized codes
-                    Some("upstream_timeout") => Some("deadline_exceeded"),
-                    Some("upstream_error") => Some("transient"),
-                    Some("transcode_error") => Some("lossy_or_capability"),
-                    _ => {
-                        // Provider-native codes: substring match
-                        let lower = e.code.as_deref().unwrap_or("").to_lowercase();
-                        if lower.contains("rate_limit") || lower == "429" {
-                            Some("rate_limited")
-                        } else if lower.contains("auth") {
-                            Some("upstream_auth")
-                        } else {
-                            // overloaded, service_unavailable, and
-                            // everything else → transient
-                            Some("transient")
-                        }
-                    }
-                }
-                .map(String::from)
+            a.upstream_error.as_ref().map(|e| {
+                e.class.to_request_class().as_str().to_string()
             })
         });
         Some((
@@ -739,17 +720,24 @@ pub(super) fn drive_upstream_stream(
                                                 // the capture guard /
                                                 // telemetry can mark the
                                                 // request as failed.
-                                                if let tiygate_core::ir::StreamPart::Error { message, code } = part {
+                                                if let tiygate_core::ir::StreamPart::Error {
+                                                    message,
+                                                    class,
+                                                    upstream_code,
+                                                } = part
+                                                {
                                                     if let Ok(mut a) = accum.lock() {
-                                                        a.set_upstream_error(message, code.as_deref());
+                                                        a.set_upstream_error(message, upstream_code.as_deref());
                                                     }
+                                                    // Use the class from the decoded error frame
+                                                    let _ = class; // class is used via encode_part
                                                 }
                                                 match tc.encoder.encode_part(part) {
                                                     Ok(b) => out.extend_from_slice(&b),
                                                     Err(e) => {
                                                         let ef = tc.encoder.encode_error(
                                                             &format!("transcode encode error: {e}"),
-                                                            Some("transcode_error"),
+                                                            tiygate_core::ErrorClass::LossyOrCapability, None,
                                                         );
                                                         out.extend_from_slice(&ef);
                                                     }
@@ -759,7 +747,7 @@ pub(super) fn drive_upstream_stream(
                                         Err(e) => {
                                             let ef = tc.encoder.encode_error(
                                                 &format!("transcode decode error: {e}"),
-                                                Some("transcode_error"),
+                                                tiygate_core::ErrorClass::LossyOrCapability, None,
                                             );
                                             out.extend_from_slice(&ef);
                                         }
@@ -846,7 +834,7 @@ pub(super) fn drive_upstream_stream(
                             if let Some(tc) = transcode.as_mut() {
                                 let ef = tc.encoder.encode_error(
                                     "upstream stream truncated by gateway",
-                                    Some("upstream_error"),
+                                    tiygate_core::ErrorClass::Transient, None,
                                 );
                                 if !ef.is_empty() {
                                     capture_guard.append_client(&ef);
@@ -1024,7 +1012,7 @@ pub(super) fn drive_upstream_stream(
                     if let Some(tc) = transcode.as_mut() {
                         let ef = tc.encoder.encode_error(
                             "upstream stream idle timeout",
-                            Some("upstream_timeout"),
+                            tiygate_core::ErrorClass::DeadlineExceeded, None,
                         );
                         if !ef.is_empty() {
                             capture_guard.append_client(&ef);
@@ -1060,7 +1048,7 @@ pub(super) fn drive_upstream_stream(
                     if let Some(tc) = transcode.as_mut() {
                         let ef = tc.encoder.encode_error(
                             "upstream stream exceeded gateway total budget",
-                            Some("upstream_timeout"),
+                            tiygate_core::ErrorClass::DeadlineExceeded, None,
                         );
                         if !ef.is_empty() {
                             capture_guard.append_client(&ef);
