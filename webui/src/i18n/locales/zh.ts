@@ -689,6 +689,7 @@ const zh: Translation = {
       title: "上游调优",
       streamIdleTimeout: "流空闲超时",
       streamTotalTimeout: "流总超时",
+      ttfbTimeout: "TTFB 超时",
       tcpKeepalive: "TCP Keepalive",
       poolIdleTimeout: "连接池空闲超时",
       tcpNodelay: "TCP No-Delay",
