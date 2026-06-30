@@ -160,6 +160,7 @@ impl ModelCatalog {
 
     pub fn get_model(&self, id: &str) -> Option<&ModelMetadata> {
         let canonical = canonical_model_id_str(id);
+        // 1. Exact match on canonical id
         self.models
             .get(&canonical)
             .or_else(|| {
@@ -168,9 +169,7 @@ impl ModelCatalog {
                     .find(|m| m.id.eq_ignore_ascii_case(&canonical))
             })
             .or_else(|| {
-                // Fallback: if the id has a lab prefix (e.g. "openai/gpt-image-2"),
-                // try matching the suffix after the last '/' against catalog entries
-                // that lack the prefix (e.g. "gpt-image-2").
+                // 2. Suffix match: strip lab prefix (e.g. "openai/gpt-image-2" → "gpt-image-2")
                 match canonical.rsplit_once('/') {
                     Some((_, suffix)) if !suffix.is_empty() => {
                         self.models.get(suffix).or_else(|| {
@@ -182,6 +181,17 @@ impl ModelCatalog {
                     None => None,
                     Some(_) => None,
                 }
+            })
+            .or_else(|| {
+                // 3. Fingerprint match: normalize separators, strip suffixes,
+                // lowercase — handles variants like "MiniMax-M3" vs "minimax-m3",
+                // "glm-5.2" vs "glm-5-2", "kimi-k2.6" vs "kimi-k-2-6",
+                // "claude-opus-4.6" vs "claude-opus-4-6",
+                // "deepseek-v4-flash-free" vs "deepseek-v4-flash"
+                let target = model_fingerprint(&canonical);
+                self.models
+                    .values()
+                    .find(|m| model_fingerprint(&m.id) == target)
             })
     }
 
@@ -596,6 +606,94 @@ fn canonical_model_id(model: &SourceModel) -> String {
     canonical_model_id_str(&model.id)
 }
 
+/// Produce a normalized fingerprint for fuzzy model id matching.
+///
+/// Handles common variations across providers:
+/// - Strip lab/org prefixes (`openai/gpt-image-2` → `gpt-image-2`)
+/// - Strip provider path segments (`accounts/fireworks/models/glm-5p2` → `glm-5p2`)
+/// - Strip `:suffix` tags (`kimi-k2:thinking` → `kimi-k2`)
+/// - Strip `-free` / `:free` suffixes (`deepseek-v4-flash-free` → `deepseek-v4-flash`)
+/// - Lowercase
+/// - Normalize `.` ↔ `-` between alphanumeric segments
+///   (`glm-5.2` ↔ `glm-5-2`, `claude-opus-4.6` ↔ `claude-opus-4-6`)
+/// - Collapse `k-2-6` ↔ `k2.6` ↔ `k2-6`
+///   (`kimi-k2.6` ↔ `kimi-k-2-6`)
+fn model_fingerprint(id: &str) -> String {
+    // Take the last path segment after any '/'.
+    let base = id.rsplit('/').next().unwrap_or(id);
+
+    // Strip `:tag` suffix (e.g. ":thinking", ":free", ":1t").
+    let base = base.split(':').next().unwrap_or(base);
+
+    // Strip known decorative suffixes.
+    let base = strip_decorative_suffix(base);
+
+    // Lowercase.
+    let lower = base.to_lowercase();
+
+    // Normalize separators: treat '.' and '-' between alphanumeric chars as
+    // interchangeable. We replace '.' with '-' first, then collapse patterns
+    // like "k-2" → "k2" when the surrounding chars are alnum.
+    let normalized = lower.replace('.', "-");
+    collapse_separators(&normalized)
+}
+
+/// Remove trailing decorative suffixes like `-free`, `-latest`, `-turbo`,
+/// `-fast`, `-highspeed`, `-thinking`, `-her`, `-tee`, `-fp8`, `-6bit`,
+/// `-lightning`, `-cheaper` that some providers append.
+fn strip_decorative_suffix(s: &str) -> &str {
+    const SUFFIXES: &[&str] = &[
+        "-free",
+        "-latest",
+        "-turbo",
+        "-fast",
+        "-highspeed",
+        "-thinking",
+        "-her",
+        "-tee",
+        "-fp8",
+        "-6bit",
+        "-lightning",
+        "-cheaper",
+        "-preview",
+        "-0711",
+        "-0905",
+    ];
+    for suffix in SUFFIXES {
+        if s.ends_with(suffix) {
+            return &s[..s.len() - suffix.len()];
+        }
+    }
+    s
+}
+
+/// Collapse redundant separators: `k-2-6` → `k2-6` → eventually `k26`.
+/// More precisely, we remove '-' when it sits between a letter and a digit,
+/// so `kimi-k-2-6` → `kimi-k26` and `kimi-k2.6` → `kimi-k26`.
+fn collapse_separators(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '-' && i > 0 && i + 1 < chars.len() {
+            let prev = chars[i - 1];
+            let next = chars[i + 1];
+            // Collapse '-' between letter and digit: "k-2" → "k2"
+            if (prev.is_ascii_alphabetic() && next.is_ascii_digit())
+                || (prev.is_ascii_digit() && next.is_ascii_alphabetic())
+            {
+                // skip the '-'
+                i += 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 fn canonical_model_id_str(id: &str) -> String {
     match id.split_once('/') {
         Some((prefix, rest)) if !prefix.is_empty() && !rest.is_empty() => {
@@ -777,6 +875,78 @@ mod tests {
         let refreshed = store.get_model("gpt-4o").expect("refreshed model");
         assert_eq!(refreshed.display_name, "New");
         assert_eq!(refreshed.context_window, Some(42));
+    }
+
+    #[test]
+    fn fingerprint_matches_user_variants() {
+        // minimax-m3 vs MiniMax-M3
+        assert_eq!(
+            model_fingerprint("minimax-m3"),
+            model_fingerprint("MiniMax-M3")
+        );
+        // glm-5.2 vs glm-5-2
+        assert_eq!(model_fingerprint("glm-5.2"), model_fingerprint("glm-5-2"));
+        // kimi-k2.6 vs kimi-k-2-6
+        assert_eq!(
+            model_fingerprint("kimi-k2.6"),
+            model_fingerprint("kimi-k-2-6")
+        );
+        // claude-opus-4-6 vs claude-opus-4.6
+        assert_eq!(
+            model_fingerprint("claude-opus-4-6"),
+            model_fingerprint("claude-opus-4.6")
+        );
+        // deepseek-v4-flash vs deepseek-v4-flash-free vs deepseek-v4-flash:free
+        assert_eq!(
+            model_fingerprint("deepseek-v4-flash"),
+            model_fingerprint("deepseek-v4-flash-free")
+        );
+        assert_eq!(
+            model_fingerprint("deepseek-v4-flash"),
+            model_fingerprint("deepseek-v4-flash:free")
+        );
+        // Prefixed ids should also match
+        assert_eq!(
+            model_fingerprint("openai/gpt-image-2"),
+            model_fingerprint("gpt-image-2")
+        );
+    }
+
+    #[test]
+    fn get_model_matches_fuzzy_variants() {
+        let raw = json!({
+            "minimax": {
+                "id": "minimax",
+                "name": "MiniMax",
+                "models": {
+                    "MiniMax-M3": {
+                        "id": "MiniMax-M3",
+                        "name": "MiniMax M3",
+                        "cost": {"input": 1.0, "output": 2.0}
+                    }
+                }
+            },
+            "zhipuai": {
+                "id": "zhipuai",
+                "name": "Zhipu AI",
+                "models": {
+                    "glm-5.2": {
+                        "id": "glm-5.2",
+                        "name": "GLM 5.2",
+                        "cost": {"input": 0.5, "output": 1.0}
+                    }
+                }
+            }
+        });
+        let catalog = build_catalog(raw.clone(), "test", &raw.to_string()).expect("catalog");
+
+        // minimax-m3 should match MiniMax-M3
+        let m = catalog.get_model("minimax-m3").expect("minimax-m3");
+        assert_eq!(m.display_name, "MiniMax M3");
+
+        // glm-5-2 should match glm-5.2
+        let m = catalog.get_model("glm-5-2").expect("glm-5-2");
+        assert_eq!(m.display_name, "GLM 5.2");
     }
 
     #[test]
