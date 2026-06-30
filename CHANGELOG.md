@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-06-30
+### :boom: BREAKING CHANGES
+- due to [`d202df8`](https://github.com/tiylabs/tiygate/commit/d202df88fea7adb51a3c6619b4a7fa4d8fc300e6) - ✨ pass structured error code through to client responses *(PR [#18](https://github.com/tiylabs/tiygate/pull/18) by [@HayWolf](https://github.com/HayWolf))*:
+
+  error.type field no longer returns "gateway_error";  
+  clients see protocol-native types (e.g. "rate_limit_error",  
+  "overloaded_error", "RESOURCE_EXHAUSTED"). The non-standard  
+  error.source and error.upstream_status fields are removed.
+  
+  ---------
+
+
+### :sparkles: New Features
+- [`eed5228`](https://github.com/tiylabs/tiygate/commit/eed5228d4d8846469a21a0d1e53d40f6339d71b2) - **protocols**: ✨ Preserve encrypted reasoning content across multi-turn replay *(PR [#14](https://github.com/tiylabs/tiygate/pull/14) by [@jorben](https://github.com/jorben))*
+- [`e973d71`](https://github.com/tiylabs/tiygate/commit/e973d71cf939f0340e7b72c7440b3c2209399681) - **server**: ✨ add per-hop request attempt logging and fix Anthropic output_config field placement *(PR [#17](https://github.com/tiylabs/tiygate/pull/17) by [@jorben](https://github.com/jorben))*
+- [`d202df8`](https://github.com/tiylabs/tiygate/commit/d202df88fea7adb51a3c6619b4a7fa4d8fc300e6) - **core**: ✨ pass structured error code through to client responses *(PR [#18](https://github.com/tiylabs/tiygate/pull/18) by [@HayWolf](https://github.com/HayWolf))*
+- [`cfc089d`](https://github.com/tiylabs/tiygate/commit/cfc089d95cee6e8be10c7121247107cd0f7396c7) - **models**: ✨ Add models.dev catalog with embedded baseline and runtime refresh *(PR [#20](https://github.com/tiylabs/tiygate/pull/20) by [@jorben](https://github.com/jorben))*
+
+### :bug: Bug Fixes
+- [`f9337e5`](https://github.com/tiylabs/tiygate/commit/f9337e502e22f70aafa674651cb1bc9269be4ef6) - **desktop**: 🐛 Restore missing tray icon *(PR [#16](https://github.com/tiylabs/tiygate/pull/16) by [@jorben](https://github.com/jorben))*
+- [`1286a84`](https://github.com/tiylabs/tiygate/commit/1286a84fc81ebf4f3458e3b5daa591dbeb0f1857) - **streaming**: 🐛 skip end frame when upstream already sent terminal signal *(PR [#19](https://github.com/tiylabs/tiygate/pull/19) by [@jorben](https://github.com/jorben))*
+- [`a3a3e9a`](https://github.com/tiylabs/tiygate/commit/a3a3e9a80afba806e1ef662b1d6c9936078f72bf) - **ingress**: 🐛 add upstream_ttfb_timeout to bound streaming TTFB phase *(PR [#22](https://github.com/tiylabs/tiygate/pull/22) by [@jorben](https://github.com/jorben))*
+
+
 ## [0.1.7] - 2026-06-26
 ### :sparkles: New Features
 - [`db90c48`](https://github.com/tiylabs/tiygate/commit/db90c48fef0e15a8be809165eed8eaffbe169570) - **auth**: ✨ Implement OAuth 2.0 support for Codex/Claude/xAI providers *(PR [#11](https://github.com/tiylabs/tiygate/pull/11) by [@HayWolf](https://github.com/HayWolf))*
@@ -77,6 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TIYGATE_REQUIRE_API_KEY=false or seed API keys to restore  
   pass-through behavior
 
+  ---------
 
 ### :sparkles: New Features
 - [`0ac7de0`](https://github.com/tiylabs/tiygate/commit/0ac7de0c67686031df9fa1607059919f797839ae) - ✨ Ship complete TiyGate AI gateway — multi-protocol transcoding, admin console, and CI/CD *(commit by [@jorben](https://github.com/jorben))*
@@ -145,3 +170,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.5]: https://github.com/tiylabs/tiygate/compare/0.1.4...0.1.5
 [0.1.6]: https://github.com/tiylabs/tiygate/compare/0.1.5...0.1.6
 [0.1.7]: https://github.com/tiylabs/tiygate/compare/0.1.6...0.1.7
+[0.1.8]: https://github.com/tiylabs/tiygate/compare/0.1.7...0.1.8
