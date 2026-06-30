@@ -434,10 +434,17 @@ impl HealthRegistry {
     }
 }
 
-/// Error classification for fallback decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Error classification for fallback decisions and protocol-native
+/// error type mapping. This enum is the canonical intermediate
+/// representation between opaque upstream error codes and the
+/// protocol-native `error.type` / `error.status` fields emitted to
+/// the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
+    // --- Upstream error classification (existing) ---
     /// Transient error (5xx, timeout, transport) — may retry/transfer.
+    #[default]
     Transient,
     /// Rate limited (429) — transfer to different target, apply cooling.
     RateLimited,
@@ -447,6 +454,22 @@ pub enum ErrorClass {
     BadRequest,
     /// Capability mismatch (lossy conversion or unsupported feature).
     LossyOrCapability,
+
+    // --- Gateway-originated error classification (new) ---
+    /// No route found for the requested virtual model (404).
+    ModelNotFound,
+    /// Gateway deadline exceeded / timeout (504).
+    DeadlineExceeded,
+    /// All upstream targets exhausted without success (502).
+    UpstreamExhausted,
+    /// Inbound API key missing when `require_api_key` is on (401).
+    AuthMissing,
+    /// Inbound API key did not match any active key (401).
+    AuthInvalid,
+    /// Inbound API key matched a disabled / revoked key (403).
+    AuthDisabled,
+    /// Gateway is overloaded / queue full (503).
+    Overloaded,
 }
 
 impl ErrorClass {
@@ -459,6 +482,31 @@ impl ErrorClass {
             Self::Auth => RequestErrorClass::UpstreamAuth,
             Self::BadRequest => RequestErrorClass::BadRequest,
             Self::LossyOrCapability => RequestErrorClass::LossyOrCapability,
+            Self::ModelNotFound => RequestErrorClass::RouteNotFound,
+            Self::DeadlineExceeded => RequestErrorClass::DeadlineExceeded,
+            Self::UpstreamExhausted => RequestErrorClass::UpstreamExhausted,
+            Self::AuthMissing => RequestErrorClass::AuthMissing,
+            Self::AuthInvalid => RequestErrorClass::AuthInvalid,
+            Self::AuthDisabled => RequestErrorClass::AuthDisabled,
+            Self::Overloaded => RequestErrorClass::InternalError,
+        }
+    }
+
+    /// Map this class to the canonical HTTP status code.
+    pub fn http_status(self) -> u16 {
+        match self {
+            Self::Transient => 502,
+            Self::RateLimited => 429,
+            Self::Auth => 401,
+            Self::BadRequest => 400,
+            Self::LossyOrCapability => 400,
+            Self::ModelNotFound => 404,
+            Self::DeadlineExceeded => 504,
+            Self::UpstreamExhausted => 502,
+            Self::AuthMissing => 401,
+            Self::AuthInvalid => 401,
+            Self::AuthDisabled => 403,
+            Self::Overloaded => 503,
         }
     }
 }
@@ -726,9 +774,19 @@ impl FallbackPolicy for DefaultFallbackPolicy {
                 // Don't retry same account; TryNext will skip same-account targets
                 FallbackDecision::TryNext
             }
-            ErrorClass::BadRequest | ErrorClass::LossyOrCapability => {
-                // Fail immediately
+            ErrorClass::BadRequest
+            | ErrorClass::LossyOrCapability
+            | ErrorClass::ModelNotFound
+            | ErrorClass::AuthMissing
+            | ErrorClass::AuthInvalid
+            | ErrorClass::AuthDisabled
+            | ErrorClass::UpstreamExhausted => {
+                // Fail immediately — retrying won't help
                 FallbackDecision::Fail
+            }
+            ErrorClass::DeadlineExceeded | ErrorClass::Overloaded => {
+                // Retryable with backoff — try next target
+                FallbackDecision::TryNext
             }
         }
     }
@@ -784,5 +842,102 @@ pub fn classify_error(error: &crate::Error) -> ErrorClassification {
         fallback_class: ErrorClass::Transient,
         retry_after: None,
         http_status: None,
+    }
+}
+
+/// Classify an upstream error into an `ErrorClass` using structured
+/// fields (HTTP status + error code). This is the single source of
+/// truth for upstream error normalization.
+///
+/// Classification priority:
+/// 1. HTTP status exact match for well-known codes.
+/// 2. Error code substring match (case-insensitive) for provider-native codes.
+/// 3. Default: `Transient`.
+pub fn classify_upstream_error(
+    upstream_status: Option<u16>,
+    upstream_code: Option<&str>,
+) -> ErrorClass {
+    // 1. HTTP status takes priority for well-known codes.
+    if let Some(status) = upstream_status {
+        match status {
+            429 => return ErrorClass::RateLimited,
+            401 | 403 => return ErrorClass::Auth,
+            400 | 422 => return ErrorClass::BadRequest,
+            404 => return ErrorClass::ModelNotFound,
+            503 => return ErrorClass::Overloaded,
+            504 => return ErrorClass::DeadlineExceeded,
+            _ if status >= 500 => {} // fall through to code check
+            _ => {}
+        }
+    }
+
+    // 2. Error code substring match (case-insensitive). Provider-native
+    //    codes vary wildly, so we do case-insensitive substring scanning.
+    if let Some(code) = upstream_code {
+        let lower = code.to_lowercase();
+        if lower.contains("rate_limit")
+            || lower.contains("quota")
+            || lower == "429"
+            || lower == "resource_exhausted"
+        {
+            return ErrorClass::RateLimited;
+        }
+        if lower.contains("auth")
+            || lower == "401"
+            || lower == "403"
+            || lower.contains("invalid_api_key")
+            || lower.contains("permission")
+            || lower.contains("unauthenticated")
+        {
+            return ErrorClass::Auth;
+        }
+        if lower.contains("bad_request")
+            || lower == "400"
+            || lower.contains("invalid_argument")
+            || lower.contains("invalid_request")
+        {
+            return ErrorClass::BadRequest;
+        }
+        if lower.contains("overloaded")
+            || lower.contains("service_unavailable")
+            || lower == "529"
+            || lower == "503"
+            || lower == "unavailable"
+        {
+            return ErrorClass::Overloaded;
+        }
+        if lower.contains("timeout") || lower.contains("deadline") {
+            return ErrorClass::DeadlineExceeded;
+        }
+        if lower.contains("not_found")
+            || lower.contains("model_not_found")
+            || lower == "404"
+        {
+            return ErrorClass::ModelNotFound;
+        }
+    }
+
+    // 3. Default: transient (5xx, timeout, transport)
+    ErrorClass::Transient
+}
+
+/// Classify an error using structured fields (HTTP status + error code)
+/// instead of substring matching on the message text. Used by the
+/// fallback layer when `AppError` carries `upstream_status` and/or
+/// `upstream_error_code` from the upstream response.
+///
+/// Delegates to `classify_upstream_error` for the `ErrorClass` and
+/// maps it to the full `ErrorClassification` with the corresponding
+/// `RequestErrorClass` and HTTP status.
+pub fn classify_structured(
+    upstream_status: Option<u16>,
+    upstream_code: Option<&str>,
+) -> ErrorClassification {
+    let fallback_class = classify_upstream_error(upstream_status, upstream_code);
+    ErrorClassification {
+        class: fallback_class.to_request_class(),
+        fallback_class,
+        retry_after: None,
+        http_status: upstream_status,
     }
 }

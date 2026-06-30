@@ -378,6 +378,14 @@ pub struct ExchangeCapture {
     /// request as failed despite the 200 status. `None` for clean
     /// streams and non-stream exchanges.
     pub upstream_error: Option<String>,
+    /// When `upstream_error` is set, this carries the canonical
+    /// `RequestErrorClass` string (e.g. `"transient"`,
+    /// `"rate_limited"`, `"deadline_exceeded"`) derived from the
+    /// upstream error code. The OLTP sink uses this to populate
+    /// `request_logs.error_class` instead of hardcoding
+    /// `"transient"`. `None` for clean streams and non-stream
+    /// exchanges.
+    pub upstream_error_class: Option<String>,
 }
 
 /// The telemetry bus — decouples event production from consumption.

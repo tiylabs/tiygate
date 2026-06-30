@@ -6,10 +6,28 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use tiygate_core::{
-    Content, EndpointCapabilities, EndpointCodec, FinishReason, IrRequest, IrResponse, Message,
-    ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder, StreamPart,
-    Usage,
+    Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
+    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder,
+    StreamPart, Usage,
 };
+
+/// Map an `ErrorClass` to the OpenAI-native `error.type` string.
+fn error_type_for_class(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Transient => "server_error",
+        ErrorClass::RateLimited => "rate_limit_error",
+        ErrorClass::Auth => "authentication_error",
+        ErrorClass::BadRequest => "invalid_request_error",
+        ErrorClass::LossyOrCapability => "invalid_request_error",
+        ErrorClass::ModelNotFound => "not_found_error",
+        ErrorClass::DeadlineExceeded => "server_error",
+        ErrorClass::UpstreamExhausted => "server_error",
+        ErrorClass::AuthMissing => "authentication_error",
+        ErrorClass::AuthInvalid => "authentication_error",
+        ErrorClass::AuthDisabled => "permission_error",
+        ErrorClass::Overloaded => "overloaded_error",
+    }
+}
 
 pub struct EmbeddingsCodec {
     id: ProtocolEndpoint,
@@ -181,6 +199,7 @@ impl EndpointCodec for EmbeddingsCodec {
     fn stream_decoder(&self) -> Box<dyn StreamDecoder> {
         Box::new(EmbeddingsStreamDecoder)
     }
+
 }
 
 pub struct EmbeddingsStreamEncoder;
@@ -188,10 +207,17 @@ impl StreamEncoder for EmbeddingsStreamEncoder {
     fn encode_part(&mut self, _part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
         Ok(Vec::new())
     }
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
-        json!({"error": {"message": message}})
-            .to_string()
-            .into_bytes()
+    fn encode_error(
+        &mut self,
+        message: &str,
+        class: ErrorClass,
+        upstream_code: Option<&str>,
+    ) -> Vec<u8> {
+        let mut err = json!({"message": message, "type": error_type_for_class(class)});
+        if let Some(c) = upstream_code {
+            err["code"] = json!(c);
+        }
+        json!({"error": err}).to_string().into_bytes()
     }
     fn encode_done(&mut self) -> Vec<u8> {
         b"data: [DONE]\n\n".to_vec()

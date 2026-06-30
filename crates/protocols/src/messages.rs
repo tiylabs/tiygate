@@ -7,10 +7,28 @@ use http::HeaderMap;
 use serde_json::{json, Value};
 
 use tiygate_core::{
-    Content, EndpointCapabilities, EndpointCodec, FinishReason, IrRequest, IrResponse, Message,
-    ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder, StreamPart,
-    Tool, Usage,
+    Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
+    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder,
+    StreamPart, Tool, Usage,
 };
+
+/// Map an `ErrorClass` to the Anthropic-native `error.type` string.
+fn error_type_for_class(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Transient => "api_error",
+        ErrorClass::RateLimited => "rate_limit_error",
+        ErrorClass::Auth => "authentication_error",
+        ErrorClass::BadRequest => "invalid_request_error",
+        ErrorClass::LossyOrCapability => "invalid_request_error",
+        ErrorClass::ModelNotFound => "not_found_error",
+        ErrorClass::DeadlineExceeded => "timeout_error",
+        ErrorClass::UpstreamExhausted => "overloaded_error",
+        ErrorClass::AuthMissing => "authentication_error",
+        ErrorClass::AuthInvalid => "authentication_error",
+        ErrorClass::AuthDisabled => "permission_error",
+        ErrorClass::Overloaded => "overloaded_error",
+    }
+}
 
 /// Flatten an Anthropic `tool_result.content` value into a plain string.
 ///
@@ -903,6 +921,7 @@ impl EndpointCodec for MessagesCodec {
             tiygate_core::PassThroughPolicy::Convert
         }
     }
+
 }
 
 // --- Stream Encoder (Anthropic SSE) ---
@@ -1147,10 +1166,15 @@ impl StreamEncoder for MessagesStreamEncoder {
                 ));
                 out
             }
-            StreamPart::Error { message, code: _ } => {
+            StreamPart::Error {
+                message,
+                class,
+                upstream_code: _,
+            } => {
+                let err = json!({"type": error_type_for_class(*class), "message": message});
                 format!(
                     "event: error\ndata: {}\n\n",
-                    json!({"type": "error", "error": {"type": "gateway_error", "message": message}})
+                    json!({"type": "error", "error": err})
                 )
             }
         };
@@ -1158,10 +1182,16 @@ impl StreamEncoder for MessagesStreamEncoder {
         Ok(event.into_bytes())
     }
 
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
+    fn encode_error(
+        &mut self,
+        message: &str,
+        class: ErrorClass,
+        _upstream_code: Option<&str>,
+    ) -> Vec<u8> {
+        let err = json!({"type": error_type_for_class(class), "message": message});
         format!(
             "event: error\ndata: {}\n\n",
-            json!({"type": "error", "error": {"type": "gateway_error", "message": message}})
+            json!({"type": "error", "error": err})
         )
         .into_bytes()
     }
@@ -1483,12 +1513,15 @@ impl StreamDecoder for MessagesStreamDecoder {
                 });
             }
             Some("error") => {
+                let code = event["error"]["type"].as_str();
+                let class = tiygate_core::classify_upstream_error(None, code);
                 parts.push(StreamPart::Error {
                     message: event["error"]["message"]
                         .as_str()
                         .unwrap_or("Unknown error")
                         .to_string(),
-                    code: event["error"]["type"].as_str().map(String::from),
+                    class,
+                    upstream_code: code.map(String::from),
                 });
             }
             Some(_other) => {
@@ -1809,11 +1842,14 @@ mod tests {
     #[test]
     fn test_stream_encoder_error_frame() {
         let mut encoder = MessagesStreamEncoder::new();
-        let err_bytes = encoder.encode_error("overloaded", Some("529"));
+        let err_bytes = encoder.encode_error("overloaded", ErrorClass::Overloaded, None);
         let err_str = String::from_utf8_lossy(&err_bytes);
         // Must contain "error" — protocol-native error frame
         assert!(err_str.contains("error"));
         assert!(err_str.contains("overloaded"));
+        // type must be Anthropic-native overloaded_error, not gateway_error
+        assert!(err_str.contains("\"type\":\"overloaded_error\""));
+        assert!(!err_str.contains("gateway_error"));
     }
 
     #[test]
@@ -1844,7 +1880,8 @@ mod tests {
             },
             StreamPart::Error {
                 message: "err".to_string(),
-                code: Some("500".to_string()),
+                class: ErrorClass::Transient,
+                upstream_code: Some("500".to_string()),
             },
             StreamPart::ResponseCompleted {
                 id: "r1".to_string(),

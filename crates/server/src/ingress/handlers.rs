@@ -168,6 +168,7 @@ pub(super) async fn acquire_permit(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway overloaded, queue full".to_string(),
         )
+        .with_class(tiygate_core::ErrorClass::Overloaded)
         .with_retry_after(5));
     }
 
@@ -182,11 +183,13 @@ pub(super) async fn acquire_permit(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway overloaded".to_string(),
         )
+        .with_class(tiygate_core::ErrorClass::Overloaded)
         .with_retry_after(5)),
         Err(_) => Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway too busy, try again later".to_string(),
         )
+        .with_class(tiygate_core::ErrorClass::Overloaded)
         .with_retry_after(5)),
     }
 }
@@ -214,6 +217,7 @@ fn emit_early_error(scope: crate::ingress::observability::RequestScope<'_>, err:
 async fn acquire_or_log<'a>(
     state: &'a AppState,
     scope: crate::ingress::observability::RequestScope<'a>,
+    suite: tiygate_core::ProtocolSuite,
 ) -> Result<
     (
         tokio::sync::OwnedSemaphorePermit,
@@ -225,7 +229,7 @@ async fn acquire_or_log<'a>(
         Ok(permit) => Ok((permit, scope)),
         Err(err) => {
             emit_early_error(scope, &err);
-            Err(err)
+            Err(err.with_protocol_suite(suite))
         }
     }
 }
@@ -235,12 +239,13 @@ fn enforce_body_limit_or_log<'a>(
     scope: crate::ingress::observability::RequestScope<'a>,
     content_type: Option<&str>,
     body_size: u64,
+    suite: tiygate_core::ProtocolSuite,
 ) -> Result<crate::ingress::observability::RequestScope<'a>, AppError> {
     match enforce_body_limit(state, content_type, body_size) {
         Ok(()) => Ok(scope),
         Err(err) => {
             emit_early_error(scope, &err);
-            Err(err)
+            Err(err.with_protocol_suite(suite))
         }
     }
 }
@@ -294,8 +299,8 @@ pub(super) async fn handle_chat_completions(
         scope.set_envelope(raw_env.clone());
         scope
     };
-    let (_permit, scope) = acquire_or_log(&state, scope).await?;
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size)?;
+    let (_permit, scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
 
     // Phase 4 §4.6: api key resolution + quota enforcement. The
     // resolved `api_key` is bound to the scope so the terminal
@@ -304,7 +309,7 @@ pub(super) async fn handle_chat_completions(
     scope.set_api_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
-        return Err(err);
+        return Err(err.with_protocol_suite(codec.id().suite));
     }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
@@ -313,6 +318,7 @@ pub(super) async fn handle_chat_completions(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_class(tiygate_core::ErrorClass::RateLimited)
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -320,7 +326,7 @@ pub(super) async fn handle_chat_completions(
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     }
 
@@ -332,14 +338,15 @@ pub(super) async fn handle_chat_completions(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_class(tiygate_core::ErrorClass::BadRequest);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -355,14 +362,15 @@ pub(super) async fn handle_chat_completions(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_class(tiygate_core::ErrorClass::ModelNotFound);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -413,7 +421,7 @@ pub(super) async fn handle_chat_completions(
         FallbackOutcome::Failed { error, error_class } => {
             let http_status = error.http_status().as_u16();
             scope.emit_error(error_class, Some(&error.message), Some(http_status));
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
         FallbackOutcome::Exhausted { error } => {
             let http_status = error.http_status().as_u16();
@@ -422,7 +430,7 @@ pub(super) async fn handle_chat_completions(
                 Some(&error.message),
                 Some(http_status),
             );
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
     }
 }
@@ -464,7 +472,7 @@ pub(super) async fn handle_messages(
         scope.set_envelope(raw_env.clone());
         scope
     };
-    let (_permit, mut scope) = acquire_or_log(&state, scope).await?;
+    let (_permit, mut scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
 
     // Phase 4 §4.6: api key resolution + quota enforcement (parity
     // with the chat-completions path). The resolved `api_key` is
@@ -474,7 +482,7 @@ pub(super) async fn handle_messages(
     scope.set_api_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
-        return Err(err);
+        return Err(err.with_protocol_suite(codec.id().suite));
     }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
@@ -483,6 +491,7 @@ pub(super) async fn handle_messages(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_class(tiygate_core::ErrorClass::RateLimited)
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -490,7 +499,7 @@ pub(super) async fn handle_messages(
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     }
 
@@ -499,14 +508,15 @@ pub(super) async fn handle_messages(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_class(tiygate_core::ErrorClass::BadRequest);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
     let virtual_model = ir_request.model.clone();
@@ -520,14 +530,15 @@ pub(super) async fn handle_messages(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_class(tiygate_core::ErrorClass::ModelNotFound);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -570,7 +581,7 @@ pub(super) async fn handle_messages(
         FallbackOutcome::Failed { error, error_class } => {
             let http_status = error.http_status().as_u16();
             scope.emit_error(error_class, Some(&error.message), Some(http_status));
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
         FallbackOutcome::Exhausted { error } => {
             let http_status = error.http_status().as_u16();
@@ -579,7 +590,7 @@ pub(super) async fn handle_messages(
                 Some(&error.message),
                 Some(http_status),
             );
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
     }
 }
@@ -624,7 +635,7 @@ pub(super) async fn handle_embeddings(
     // Persist the redacted envelope on the terminal RequestEvent
     // for audit / replay (§8 #3 / #8).
     scope.set_envelope(raw_env.clone());
-    let (_permit, mut scope) = acquire_or_log(&state, scope).await?;
+    let (_permit, mut scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
 
     // Phase 4 §4.6: api key resolution + quota enforcement, parity
     // with the chat/messages/responses/gemini handlers. Embedding
@@ -634,7 +645,7 @@ pub(super) async fn handle_embeddings(
     scope.set_api_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
-        return Err(err);
+        return Err(err.with_protocol_suite(codec.id().suite));
     }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
@@ -643,6 +654,7 @@ pub(super) async fn handle_embeddings(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_class(tiygate_core::ErrorClass::RateLimited)
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -650,7 +662,7 @@ pub(super) async fn handle_embeddings(
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     }
 
@@ -712,14 +724,15 @@ pub(super) async fn handle_embeddings(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_class(tiygate_core::ErrorClass::BadRequest);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -731,14 +744,15 @@ pub(super) async fn handle_embeddings(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_class(tiygate_core::ErrorClass::ModelNotFound);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -775,7 +789,7 @@ pub(super) async fn handle_embeddings(
         FallbackOutcome::Failed { error, error_class } => {
             let http_status = error.http_status().as_u16();
             scope.emit_error(error_class, Some(&error.message), Some(http_status));
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
         FallbackOutcome::Exhausted { error } => {
             let http_status = error.http_status().as_u16();
@@ -784,7 +798,7 @@ pub(super) async fn handle_embeddings(
                 Some(&error.message),
                 Some(http_status),
             );
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
     }
 }
@@ -838,15 +852,15 @@ pub(super) async fn handle_responses(
     // Persist the redacted envelope on the terminal RequestEvent
     // for audit / replay (§8 #3 / #8).
     scope.set_envelope(raw_env.clone());
-    let (_permit, scope) = acquire_or_log(&state, scope).await?;
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size)?;
+    let (_permit, scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
     // Bind the api key id so the terminal RequestEvent attributes the
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
-        return Err(err);
+        return Err(err.with_protocol_suite(codec.id().suite));
     }
     // Phase 4 §4.6: quota enforcement on the request hot path.
     // Parity with the chat-completions / anthropic-messages paths.
@@ -857,6 +871,7 @@ pub(super) async fn handle_responses(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_class(tiygate_core::ErrorClass::RateLimited)
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -864,7 +879,7 @@ pub(super) async fn handle_responses(
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     }
 
@@ -873,14 +888,15 @@ pub(super) async fn handle_responses(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_class(tiygate_core::ErrorClass::BadRequest);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -893,14 +909,15 @@ pub(super) async fn handle_responses(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_class(tiygate_core::ErrorClass::ModelNotFound);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -942,7 +959,7 @@ pub(super) async fn handle_responses(
         FallbackOutcome::Failed { error, error_class } => {
             let http_status = error.http_status().as_u16();
             scope.emit_error(error_class, Some(&error.message), Some(http_status));
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
         FallbackOutcome::Exhausted { error } => {
             let http_status = error.http_status().as_u16();
@@ -951,7 +968,7 @@ pub(super) async fn handle_responses(
                 Some(&error.message),
                 Some(http_status),
             );
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
     }
 }
@@ -1003,34 +1020,35 @@ pub(super) async fn handle_gemini_generate(
             let app_err = AppError::new(
                 StatusCode::BAD_REQUEST,
                 format!("Invalid Gemini path capture: {capture:?}"),
-            );
+            )
+            .with_class(tiygate_core::ErrorClass::BadRequest);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::BadRequest,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
     let is_gemini_stream = method == "streamGenerateContent";
     let model = model.to_string();
     scope.set_virtual_model(model.clone());
-    let (_permit, scope) = acquire_or_log(&state, scope).await?;
+    let (_permit, scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
     let content_type = headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
     let body_size = serde_json::to_string(&body)
         .map(|s| s.len() as u64)
         .unwrap_or(0);
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size)?;
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
     // Bind the api key id so the terminal RequestEvent attributes the
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
-        return Err(err);
+        return Err(err.with_protocol_suite(codec.id().suite));
     }
     // Phase 4 §4.6: quota enforcement on the request hot path.
     // Parity with the chat-completions / anthropic-messages paths.
@@ -1041,6 +1059,7 @@ pub(super) async fn handle_gemini_generate(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_class(tiygate_core::ErrorClass::RateLimited)
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -1048,7 +1067,7 @@ pub(super) async fn handle_gemini_generate(
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     }
 
@@ -1065,14 +1084,15 @@ pub(super) async fn handle_gemini_generate(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_class(tiygate_core::ErrorClass::BadRequest);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -1085,14 +1105,15 @@ pub(super) async fn handle_gemini_generate(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_class(tiygate_core::ErrorClass::ModelNotFound);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -1134,7 +1155,7 @@ pub(super) async fn handle_gemini_generate(
         FallbackOutcome::Failed { error, error_class } => {
             let http_status = error.http_status().as_u16();
             scope.emit_error(error_class, Some(&error.message), Some(http_status));
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
         FallbackOutcome::Exhausted { error } => {
             let http_status = error.http_status().as_u16();
@@ -1143,7 +1164,7 @@ pub(super) async fn handle_gemini_generate(
                 Some(&error.message),
                 Some(http_status),
             );
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
     }
 }
@@ -1191,14 +1212,14 @@ pub(super) async fn handle_images_generations(
         started,
     );
     scope.set_envelope(raw_env.clone());
-    let (_permit, scope) = acquire_or_log(&state, scope).await?;
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size)?;
+    let (_permit, scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
-        return Err(err);
+        return Err(err.with_protocol_suite(codec.id().suite));
     }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
@@ -1207,6 +1228,7 @@ pub(super) async fn handle_images_generations(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_class(tiygate_core::ErrorClass::RateLimited)
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -1214,7 +1236,7 @@ pub(super) async fn handle_images_generations(
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     }
 
@@ -1225,14 +1247,15 @@ pub(super) async fn handle_images_generations(
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
-            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"))
+                .with_class(tiygate_core::ErrorClass::BadRequest);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::DecodeError,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -1246,14 +1269,15 @@ pub(super) async fn handle_images_generations(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_class(tiygate_core::ErrorClass::ModelNotFound);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -1299,7 +1323,7 @@ pub(super) async fn handle_images_generations(
         FallbackOutcome::Failed { error, error_class } => {
             let http_status = error.http_status().as_u16();
             scope.emit_error(error_class, Some(&error.message), Some(http_status));
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
         FallbackOutcome::Exhausted { error } => {
             let http_status = error.http_status().as_u16();
@@ -1308,7 +1332,7 @@ pub(super) async fn handle_images_generations(
                 Some(&error.message),
                 Some(http_status),
             );
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
     }
 }
@@ -1403,14 +1427,14 @@ pub(super) async fn handle_images_edits(
         started,
     );
     scope.set_envelope(raw_env.clone());
-    let (_permit, scope) = acquire_or_log(&state, scope).await?;
-    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body.len() as u64)?;
+    let (_permit, scope) = acquire_or_log(&state, scope, codec.id().suite).await?;
+    let mut scope = enforce_body_limit_or_log(&state, scope, content_type, body.len() as u64, codec.id().suite)?;
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
-        return Err(err);
+        return Err(err.with_protocol_suite(codec.id().suite));
     }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
@@ -1419,6 +1443,7 @@ pub(super) async fn handle_images_edits(
         crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
             let app_err =
                 AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_class(tiygate_core::ErrorClass::RateLimited)
                     .with_retry_after(retry_after.as_secs().max(1));
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
@@ -1426,7 +1451,7 @@ pub(super) async fn handle_images_edits(
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     }
 
@@ -1436,14 +1461,15 @@ pub(super) async fn handle_images_edits(
             let app_err = AppError::new(
                 StatusCode::NOT_FOUND,
                 format!("No route found for model: {virtual_model}"),
-            );
+            )
+            .with_class(tiygate_core::ErrorClass::ModelNotFound);
             let http_status = app_err.http_status().as_u16();
             scope.emit_error(
                 RequestErrorClass::RouteNotFound,
                 Some(&app_err.message),
                 Some(http_status),
             );
-            return Err(app_err);
+            return Err(app_err.with_protocol_suite(codec.id().suite));
         }
     };
 
@@ -1485,7 +1511,7 @@ pub(super) async fn handle_images_edits(
         FallbackOutcome::Failed { error, error_class } => {
             let http_status = error.http_status().as_u16();
             scope.emit_error(error_class, Some(&error.message), Some(http_status));
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
         FallbackOutcome::Exhausted { error } => {
             let http_status = error.http_status().as_u16();
@@ -1494,7 +1520,7 @@ pub(super) async fn handle_images_edits(
                 Some(&error.message),
                 Some(http_status),
             );
-            Err(error)
+            Err(error.with_protocol_suite(codec.id().suite))
         }
     }
 }

@@ -414,8 +414,12 @@ impl EventSink for OltpSink {
         // `update_request_truncation` so it is order-independent
         // with `write_request_event`.
         if let Some(error_source) = &capture.upstream_error {
+            let error_class = capture
+                .upstream_error_class
+                .as_deref()
+                .unwrap_or("transient");
             if let Err(e) = self
-                .update_request_failure(&capture.request_id, "transient", error_source)
+                .update_request_failure(&capture.request_id, error_class, error_source)
                 .await
             {
                 warn!(
@@ -3520,6 +3524,7 @@ mod tests {
             truncation_reason: None,
             stream_duration_ms: None,
             upstream_error: None,
+            upstream_error_class: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -3579,6 +3584,7 @@ mod tests {
             truncation_reason: None,
             stream_duration_ms: None,
             upstream_error: None,
+            upstream_error_class: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -4088,6 +4094,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             truncation_reason: None,
             stream_duration_ms: None,
             upstream_error: None,
+                    upstream_error_class: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -4143,6 +4150,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             truncation_reason: None,
             stream_duration_ms: None,
             upstream_error: None,
+            upstream_error_class: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -4193,6 +4201,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             truncation_reason: None,
             stream_duration_ms: None,
             upstream_error: None,
+            upstream_error_class: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -4236,6 +4245,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             truncation_reason: None,
             stream_duration_ms: None,
             upstream_error: None,
+            upstream_error_class: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
         let count: i64 =
@@ -4288,6 +4298,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             truncation_reason: Some("idle".to_string()),
             stream_duration_ms: None,
             upstream_error: None,
+            upstream_error_class: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -4334,6 +4345,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             truncation_reason: Some("upstream_error".to_string()),
             stream_duration_ms: None,
             upstream_error: None,
+            upstream_error_class: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -4388,6 +4400,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             truncation_reason: Some("client_disconnect".to_string()),
             stream_duration_ms: None,
             upstream_error: None,
+            upstream_error_class: None,
         };
         sink.write_capture(&capture).await.expect("write capture");
 
@@ -4441,6 +4454,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             upstream_error: Some(
                 "Service unavailable (service_unavailable_error)".to_string(),
             ),
+            upstream_error_class: Some("transient".to_string()),
         };
         sink.write_capture(&capture).await.expect("write capture");
 

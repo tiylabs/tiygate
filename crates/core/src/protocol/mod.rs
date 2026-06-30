@@ -12,6 +12,7 @@ use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ir::{IrRequest, IrResponse, RawEnvelope, StreamPart};
+use crate::routing::ErrorClass;
 
 /// A protocol suite — the broad family of protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -248,7 +249,16 @@ pub trait StreamEncoder: Send {
     /// Encode a single stream part into protocol-specific bytes.
     fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, crate::Error>;
     /// Encode an error into the protocol's native error frame.
-    fn encode_error(&mut self, message: &str, code: Option<&str>) -> Vec<u8>;
+    ///
+    /// `class` drives the protocol-native `error.type` / `error.status`
+    /// field; `upstream_code` is optionally emitted as `error.code`
+    /// for debugging in protocols that support it (OpenAI).
+    fn encode_error(
+        &mut self,
+        message: &str,
+        class: ErrorClass,
+        upstream_code: Option<&str>,
+    ) -> Vec<u8>;
     /// Encode a stream-completion signal.
     fn encode_done(&mut self) -> Vec<u8>;
 }

@@ -5,10 +5,29 @@ use http::HeaderMap;
 use serde_json::{json, Value};
 
 use tiygate_core::{
-    Content, EndpointCapabilities, EndpointCodec, FinishReason, IrRequest, IrResponse, Message,
-    ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder, StreamPart,
-    Tool, Usage,
+    Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
+    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder,
+    StreamPart, Tool, Usage,
 };
+
+/// Map an `ErrorClass` to the Google Gemini-native `error.status` string
+/// (google.rpc.Code enum name).
+fn error_status_for_class(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Transient => "INTERNAL",
+        ErrorClass::RateLimited => "RESOURCE_EXHAUSTED",
+        ErrorClass::Auth => "UNAUTHENTICATED",
+        ErrorClass::BadRequest => "INVALID_ARGUMENT",
+        ErrorClass::LossyOrCapability => "FAILED_PRECONDITION",
+        ErrorClass::ModelNotFound => "NOT_FOUND",
+        ErrorClass::DeadlineExceeded => "DEADLINE_EXCEEDED",
+        ErrorClass::UpstreamExhausted => "UNAVAILABLE",
+        ErrorClass::AuthMissing => "UNAUTHENTICATED",
+        ErrorClass::AuthInvalid => "UNAUTHENTICATED",
+        ErrorClass::AuthDisabled => "PERMISSION_DENIED",
+        ErrorClass::Overloaded => "UNAVAILABLE",
+    }
+}
 
 /// Maximum value for Gemini's `thinkingBudget` field (0–24576).
 const GEMINI_THINKING_BUDGET_MAX: u32 = 24576;
@@ -1150,6 +1169,7 @@ impl EndpointCodec for GeminiCodec {
             tiygate_core::PassThroughPolicy::Convert
         }
     }
+
 }
 
 pub struct GeminiStreamEncoder;
@@ -1225,10 +1245,17 @@ impl StreamEncoder for GeminiStreamEncoder {
                     json!({"candidates": [{"finishReason": fr}]})
                 )
             }
-            StreamPart::Error { message, .. } => format!(
-                "data: {}\n\n",
-                json!({"error": {"message": message, "status": "INTERNAL"}})
-            ),
+            StreamPart::Error {
+                message,
+                class,
+                upstream_code: _,
+            } => {
+                let status = error_status_for_class(*class);
+                format!(
+                    "data: {}\n\n",
+                    json!({"error": {"message": message, "status": status}})
+                )
+            }
             StreamPart::ResponseStarted { id } => {
                 format!("data: {}\n\n", json!({"responseId": id}))
             }
@@ -1238,10 +1265,16 @@ impl StreamEncoder for GeminiStreamEncoder {
         };
         Ok(chunk.into_bytes())
     }
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
+    fn encode_error(
+        &mut self,
+        message: &str,
+        class: ErrorClass,
+        _upstream_code: Option<&str>,
+    ) -> Vec<u8> {
+        let status = error_status_for_class(class);
         format!(
             "data: {}\n\n",
-            json!({"error": {"message": message, "status": "INTERNAL"}})
+            json!({"error": {"message": message, "status": status}})
         )
         .into_bytes()
     }
@@ -1321,12 +1354,15 @@ impl StreamDecoder for GeminiStreamDecoder {
             }
         }
         if event.get("error").is_some() {
+            let code = event["error"]["status"].as_str();
+            let class = tiygate_core::classify_upstream_error(None, code);
             parts.push(StreamPart::Error {
                 message: event["error"]["message"]
                     .as_str()
                     .unwrap_or("Unknown")
                     .to_string(),
-                code: event["error"]["status"].as_str().map(String::from),
+                class,
+                upstream_code: code.map(String::from),
             });
             return Ok(parts);
         }
@@ -1543,10 +1579,14 @@ mod tests {
     #[test]
     fn test_stream_encoder_error_frame() {
         let mut encoder = GeminiStreamEncoder;
-        let err = encoder.encode_error("rate limit", Some("429"));
+        let err = encoder.encode_error("rate limit", ErrorClass::RateLimited, None);
         let s = String::from_utf8_lossy(&err);
         assert!(s.contains("error"));
         assert!(s.contains("rate limit"));
+        // status must be the Gemini-native RESOURCE_EXHAUSTED, not "429"
+        assert!(s.contains("\"status\":\"RESOURCE_EXHAUSTED\""));
+        assert!(!s.contains("\"status\":\"429\""));
+        assert!(!s.contains("\"status\":\"INTERNAL\""));
     }
 
     #[test]
@@ -1577,7 +1617,8 @@ mod tests {
             },
             StreamPart::Error {
                 message: "e".to_string(),
-                code: Some("500".to_string()),
+                class: ErrorClass::Transient,
+                upstream_code: Some("500".to_string()),
             },
             StreamPart::ResponseCompleted {
                 id: "r1".to_string(),
