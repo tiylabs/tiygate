@@ -226,11 +226,16 @@ fn test_stream_encoder_done_marker() {
 #[test]
 fn test_stream_encoder_error_frame() {
     let mut enc = tiygate_protocols::images::ImagesStreamEncoder::new();
-    let frame = enc.encode_error("test error", Some("test_code"));
+    let frame = enc.encode_error(
+        "test error",
+        tiygate_core::ErrorClass::RateLimited,
+        Some("test_code"),
+    );
     let s = String::from_utf8(frame).unwrap();
     assert!(s.contains("\"type\":\"error\""));
     assert!(s.contains("test error"));
     assert!(s.contains("test_code"));
+    assert!(s.contains("\"type\":\"rate_limit_error\""));
 }
 
 #[test]

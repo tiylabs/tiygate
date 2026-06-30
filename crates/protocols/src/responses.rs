@@ -6,10 +6,29 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tiygate_core::{
-    Content, EndpointCapabilities, EndpointCodec, FinishReason, IrRequest, IrResponse, Message,
-    ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder, StreamPart,
-    Tool, Usage,
+    Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
+    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder,
+    StreamPart, Tool, Usage,
 };
+
+/// Map an `ErrorClass` to the OpenAI Responses-native `error.type` string.
+/// Uses the same mapping as ChatCompletions (both are OpenAI family).
+fn error_type_for_class(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Transient => "server_error",
+        ErrorClass::RateLimited => "rate_limit_error",
+        ErrorClass::Auth => "authentication_error",
+        ErrorClass::BadRequest => "invalid_request_error",
+        ErrorClass::LossyOrCapability => "invalid_request_error",
+        ErrorClass::ModelNotFound => "not_found_error",
+        ErrorClass::DeadlineExceeded => "server_error",
+        ErrorClass::UpstreamExhausted => "server_error",
+        ErrorClass::AuthMissing => "authentication_error",
+        ErrorClass::AuthInvalid => "authentication_error",
+        ErrorClass::AuthDisabled => "permission_error",
+        ErrorClass::Overloaded => "overloaded_error",
+    }
+}
 
 pub struct ResponsesCodec {
     id: ProtocolEndpoint,
@@ -1566,16 +1585,33 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 out.push_str("data: [DONE]\n\n");
                 out
             }
-            StreamPart::Error { message, .. } => self.event(
-                json!({"type": "error", "error": {"message": message, "type": "gateway_error"}}),
-            ),
+            StreamPart::Error {
+                message,
+                class,
+                upstream_code,
+            } => {
+                let mut err = json!({"message": message, "type": error_type_for_class(*class)});
+                if let Some(c) = upstream_code {
+                    err["code"] = json!(c);
+                }
+                self.event(json!({"type": "error", "error": err}))
+            }
         };
         Ok(chunk.into_bytes())
     }
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
+    fn encode_error(
+        &mut self,
+        message: &str,
+        class: ErrorClass,
+        upstream_code: Option<&str>,
+    ) -> Vec<u8> {
+        let mut err = json!({"message": message, "type": error_type_for_class(class)});
+        if let Some(c) = upstream_code {
+            err["code"] = json!(c);
+        }
         format!(
             "data: {}\n\ndata: [DONE]\n\n",
-            json!({"type": "error", "error": {"message": message, "type": "gateway_error"}})
+            json!({"type": "error", "error": err})
         )
         .into_bytes()
     }
@@ -1864,9 +1900,12 @@ impl StreamDecoder for ResponsesStreamDecoder {
                 } else {
                     &event["response"]["error"]
                 };
+                let code = err["type"].as_str();
+                let class = tiygate_core::classify_upstream_error(None, code);
                 parts.push(StreamPart::Error {
                     message: err["message"].as_str().unwrap_or("Unknown").to_string(),
-                    code: err["type"].as_str().map(String::from),
+                    class,
+                    upstream_code: code.map(String::from),
                 });
             }
             Some("response.incomplete") => {
@@ -2272,10 +2311,12 @@ mod tests {
     #[test]
     fn test_stream_encoder_error_frame() {
         let mut encoder = ResponsesStreamEncoder::new();
-        let err = encoder.encode_error("overloaded", Some("529"));
+        let err = encoder.encode_error("overloaded", ErrorClass::Overloaded, None);
         let s = String::from_utf8_lossy(&err);
         assert!(s.contains("error"));
         assert!(s.contains("overloaded"));
+        assert!(s.contains("\"type\":\"overloaded_error\""));
+        assert!(!s.contains("gateway_error"));
     }
 
     #[test]

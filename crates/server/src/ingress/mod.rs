@@ -1016,10 +1016,22 @@ mod streaming_helper_tests {
 pub struct AppError {
     status: StatusCode,
     message: String,
+    /// Normalized error class for protocol-native error type mapping
+    /// and fallback classification. Defaults to `Transient` when not
+    /// explicitly set via `with_class()`.
+    error_class: tiygate_core::ErrorClass,
+    /// The ingress protocol suite, used to generate protocol-native
+    /// error response bodies in `into_response()`. When `None`, falls
+    /// back to a generic OpenAI-style error body.
+    protocol_suite: Option<tiygate_core::ProtocolSuite>,
     /// Passthrough Retry-After header value from upstream.
     retry_after_header: Option<String>,
     /// Original upstream HTTP status for error source distinction.
     upstream_status: Option<u16>,
+    /// Original upstream error code (e.g. `insufficient_quota`,
+    /// `overloaded_error`), preserved for debugging passthrough as
+    /// `error.code` in protocols that support it.
+    upstream_error_code: Option<String>,
     /// Upstream RateLimit-* headers to passthrough on the error response.
     rate_limit_headers: Vec<(&'static str, String)>,
 }
@@ -1029,10 +1041,44 @@ impl AppError {
         Self {
             status,
             message,
+            error_class: tiygate_core::ErrorClass::Transient,
+            protocol_suite: None,
             retry_after_header: None,
             upstream_status: None,
+            upstream_error_code: None,
             rate_limit_headers: Vec::new(),
         }
+    }
+
+    /// Attach a normalized error class. This drives both the
+    /// protocol-native `error.type` / `error.status` field in the
+    /// response body and the fallback classifier's retry/stop decision.
+    pub(crate) fn with_class(mut self, class: tiygate_core::ErrorClass) -> Self {
+        self.error_class = class;
+        self
+    }
+
+    /// Attach the ingress protocol suite, enabling protocol-native
+    /// error body generation in `into_response()`.
+    pub(crate) fn with_protocol_suite(mut self, suite: tiygate_core::ProtocolSuite) -> Self {
+        self.protocol_suite = Some(suite);
+        self
+    }
+
+    /// Attach an upstream-native error code (e.g. `insufficient_quota`)
+    /// for debugging passthrough as `error.code` in protocols that
+    /// support it (OpenAI). Also influences fallback classification
+    /// when `error_class` has not been explicitly set via `with_class()`.
+    pub(crate) fn with_upstream_code(mut self, code: impl Into<String>) -> Self {
+        self.upstream_error_code = Some(code.into());
+        self
+    }
+
+    /// Public accessor for the upstream error code, if any.
+    /// Used by the fallback classifier to pick `classify_structured`
+    /// over substring matching.
+    pub(crate) fn upstream_error_code(&self) -> Option<&str> {
+        self.upstream_error_code.as_deref()
     }
 
     /// Attach a Retry-After value (seconds).
@@ -1057,23 +1103,28 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let error_source = if self.upstream_status.is_some() {
-            "upstream"
+        // Generate protocol-native error body when the protocol suite
+        // is known; otherwise fall back to a generic OpenAI-style body.
+        let body = if let Some(suite) = self.protocol_suite {
+            tiygate_protocols::error_body::encode_error_body_for_suite(
+                suite,
+                &self.message,
+                self.error_class,
+                self.status.as_u16(),
+                self.upstream_error_code.as_deref(),
+            )
         } else {
-            "gateway"
-        };
-
-        let mut body = serde_json::json!({
-            "error": {
+            // Fallback: generic OpenAI-style error body.
+            let mut err = serde_json::json!({
                 "message": self.message,
-                "type": "gateway_error",
-                "source": error_source,
+                "type": "server_error",
+                "param": null,
+            });
+            if let Some(ref code) = self.upstream_error_code {
+                err["code"] = serde_json::json!(code);
             }
-        });
-
-        if let Some(us) = self.upstream_status {
-            body["error"]["upstream_status"] = serde_json::json!(us);
-        }
+            serde_json::json!({"error": err})
+        };
 
         let mut response = (self.status, Json(body)).into_response();
 

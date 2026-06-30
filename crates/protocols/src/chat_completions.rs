@@ -7,10 +7,31 @@ use http::HeaderMap;
 use serde_json::{json, Value};
 
 use tiygate_core::{
-    Content, EndpointCapabilities, EndpointCodec, FinishReason, IrRequest, IrResponse, Message,
-    ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder, StreamPart,
-    Tool, Usage,
+    Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
+    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder,
+    StreamPart, Tool, Usage,
 };
+
+/// Map an `ErrorClass` to the OpenAI-native `error.type` string.
+///
+/// This mapping table is shared by `encode_part` (streaming error frames)
+/// and `encode_error_body` (non-streaming error responses).
+fn error_type_for_class(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Transient => "server_error",
+        ErrorClass::RateLimited => "rate_limit_error",
+        ErrorClass::Auth => "authentication_error",
+        ErrorClass::BadRequest => "invalid_request_error",
+        ErrorClass::LossyOrCapability => "invalid_request_error",
+        ErrorClass::ModelNotFound => "not_found_error",
+        ErrorClass::DeadlineExceeded => "server_error",
+        ErrorClass::UpstreamExhausted => "server_error",
+        ErrorClass::AuthMissing => "authentication_error",
+        ErrorClass::AuthInvalid => "authentication_error",
+        ErrorClass::AuthDisabled => "permission_error",
+        ErrorClass::Overloaded => "overloaded_error",
+    }
+}
 
 /// Chat Completions protocol identity.
 pub const CHAT_COMPLETIONS_ID: ProtocolEndpoint = ProtocolEndpoint {
@@ -1180,34 +1201,34 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                 )
             }
             StreamPart::ResponseCompleted { .. } => "data: [DONE]\n\n".to_string(),
-            StreamPart::Error { message, code: _ } => {
+            StreamPart::Error {
+                message,
+                class,
+                upstream_code,
+            } => {
                 // Protocol-native error frame
-                format!(
-                    "data: {}\n\n",
-                    json!({
-                        "error": {
-                            "message": message,
-                            "type": "gateway_error",
-                        }
-                    })
-                )
+                let mut err = json!({"message": message, "type": error_type_for_class(*class)});
+                if let Some(c) = upstream_code {
+                    err["code"] = json!(c);
+                }
+                format!("data: {}\n\n", json!({"error": err}))
             }
         };
 
         Ok(chunk.into_bytes())
     }
 
-    fn encode_error(&mut self, message: &str, _code: Option<&str>) -> Vec<u8> {
-        format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            json!({
-                "error": {
-                    "message": message,
-                    "type": "gateway_error",
-                }
-            })
-        )
-        .into_bytes()
+    fn encode_error(
+        &mut self,
+        message: &str,
+        class: ErrorClass,
+        upstream_code: Option<&str>,
+    ) -> Vec<u8> {
+        let mut err = json!({"message": message, "type": error_type_for_class(class)});
+        if let Some(c) = upstream_code {
+            err["code"] = json!(c);
+        }
+        format!("data: {}\n\ndata: [DONE]\n\n", json!({"error": err})).into_bytes()
     }
 
     fn encode_done(&mut self) -> Vec<u8> {
@@ -1315,12 +1336,16 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
 
                 // Handle error (can appear in any chunk)
                 if let Some(error) = chunk.get("error") {
+                    let code = error["code"].as_str().or_else(|| error["type"].as_str());
+                    let upstream_code = code.map(String::from);
+                    let class = tiygate_core::classify_upstream_error(None, code);
                     parts.push(StreamPart::Error {
                         message: error["message"]
                             .as_str()
                             .unwrap_or("Unknown error")
                             .to_string(),
-                        code: error["code"].as_str().map(String::from),
+                        class,
+                        upstream_code,
                     });
                     return Ok(parts);
                 }
@@ -1495,12 +1520,16 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
             }
             Some("error") => {
                 let error = &chunk["error"];
+                let code = error["code"].as_str().or_else(|| error["type"].as_str());
+                let upstream_code = code.map(String::from);
+                let class = tiygate_core::classify_upstream_error(None, code);
                 parts.push(StreamPart::Error {
                     message: error["message"]
                         .as_str()
                         .unwrap_or("Unknown error")
                         .to_string(),
-                    code: error["code"].as_str().map(String::from),
+                    class,
+                    upstream_code,
                 });
             }
             Some(_other) => {
@@ -1897,11 +1926,17 @@ mod tests {
     #[test]
     fn test_stream_encoder_error_frame() {
         let mut encoder = ChatCompletionsStreamEncoder::new();
-        let err_bytes = encoder.encode_error("rate limit exceeded", Some("429"));
+        let err_bytes =
+            encoder.encode_error("rate limit exceeded", ErrorClass::RateLimited, Some("429"));
         let err_str = String::from_utf8_lossy(&err_bytes);
         // Must contain "error" — protocol-native error frame
         assert!(err_str.contains("error"));
         assert!(err_str.contains("rate limit exceeded"));
+        // type must be the OpenAI-native rate_limit_error, not gateway_error
+        assert!(err_str.contains("\"type\":\"rate_limit_error\""));
+        assert!(!err_str.contains("gateway_error"));
+        // upstream code is transparently passed through to error.code
+        assert!(err_str.contains("\"code\":\"429\""));
     }
 
     #[test]
@@ -1934,7 +1969,8 @@ mod tests {
             },
             StreamPart::Error {
                 message: "err".to_string(),
-                code: Some("500".to_string()),
+                class: ErrorClass::Transient,
+                upstream_code: Some("500".to_string()),
             },
             StreamPart::ResponseCompleted {
                 id: "r1".to_string(),
@@ -2083,9 +2119,14 @@ mod tests {
         let parts = decoder.feed(line).unwrap();
         assert_eq!(parts.len(), 1);
         match &parts[0] {
-            StreamPart::Error { message, code } => {
+            StreamPart::Error {
+                message,
+                class,
+                upstream_code,
+            } => {
                 assert!(message.contains("rate limit"));
-                assert_eq!(code.as_deref(), Some("429"));
+                assert_eq!(*class, ErrorClass::RateLimited);
+                assert_eq!(upstream_code.as_deref(), Some("429"));
             }
             other => panic!("expected Error, got {:?}", other),
         }

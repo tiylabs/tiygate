@@ -6,6 +6,7 @@
 
 pub mod chat_completions;
 pub mod embeddings;
+pub mod error_body;
 pub mod gemini;
 pub mod images;
 pub mod messages;
