@@ -510,23 +510,28 @@ fn choose_metadata_candidate(entries: &[CandidateModel]) -> Option<&CandidateMod
 }
 
 fn choose_pricing_candidate(entries: &[CandidateModel]) -> Option<&CandidateModel> {
-    // 1. Prefer official or OpenRouter pricing
-    let official_or_or = entries
+    // Priority: official → openrouter → any remaining with cost data
+    let with_cost: Vec<&CandidateModel> =
+        entries.iter().filter(|c| c.model.cost.is_some()).collect();
+
+    // 1. Official
+    if let Some(best) = with_cost
         .iter()
-        .filter(|c| c.model.cost.is_some())
-        .filter(|c| c.is_official || c.is_openrouter)
-        .max_by_key(|c| {
-            let s = if c.is_official { 3 } else { 2 };
-            (s, metadata_score(&c.model))
-        });
-    if official_or_or.is_some() {
-        return official_or_or;
+        .filter(|c| c.is_official)
+        .max_by_key(|c| metadata_score(&c.model))
+    {
+        return Some(best);
     }
-    // 2. Fallback: any provider with cost data (labeled as fallback)
-    entries
+    // 2. OpenRouter
+    if let Some(best) = with_cost
         .iter()
-        .filter(|c| c.model.cost.is_some())
-        .max_by_key(|c| (1, metadata_score(&c.model)))
+        .filter(|c| c.is_openrouter)
+        .max_by_key(|c| metadata_score(&c.model))
+    {
+        return Some(best);
+    }
+    // 3. Any remaining provider with cost data
+    with_cost.first().copied()
 }
 
 fn metadata_score(model: &SourceModel) -> usize {
