@@ -276,7 +276,14 @@ fn build_http_client(server_config: &ServerConfig) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .pool_max_idle_per_host(32)
-        .tcp_nodelay(server_config.upstream_tcp_nodelay);
+        .tcp_nodelay(server_config.upstream_tcp_nodelay)
+        // Disable automatic redirect following. reqwest's default policy
+        // follows up to 10 redirects and silently strips sensitive headers
+        // (Authorization, x-api-key, etc.) on cross-origin redirects
+        // (scheme, host, or port changes). For an AI gateway this causes
+        // 401 failures when an upstream or reverse proxy redirects HTTP→HTTPS.
+        // Disabling redirects surfaces the 3xx to the caller instead.
+        .redirect(reqwest::redirect::Policy::none());
     if server_config.upstream_tcp_keepalive_secs > 0 {
         builder = builder.tcp_keepalive(Duration::from_secs(
             server_config.upstream_tcp_keepalive_secs,
@@ -301,7 +308,8 @@ fn build_http_client_from_params(
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .pool_max_idle_per_host(32)
-        .tcp_nodelay(tcp_nodelay);
+        .tcp_nodelay(tcp_nodelay)
+        .redirect(reqwest::redirect::Policy::none());
     if tcp_keepalive_secs > 0 {
         builder = builder.tcp_keepalive(Duration::from_secs(tcp_keepalive_secs));
     }
