@@ -712,24 +712,20 @@ fn model_fingerprint(id: &str) -> String {
     collapse_separators(&normalized)
 }
 
-/// Remove trailing decorative suffixes like `-free`, `-latest`, `-turbo`,
-/// `-fast`, `-highspeed`, `-thinking`, `-her`, `-tee`, `-fp8`, `-6bit`,
-/// `-lightning`, `-cheaper` that some providers append.
+/// Remove trailing decorative suffixes like `-free`, `-latest`, `-tee`,
+/// `-fp8`, `-6bit` that some providers append. Suffixes like `-turbo`,
+/// `-fast`, `-thinking`, `-preview`, `-highspeed`, `-her`, `-lightning`,
+/// `-cheaper` are **not** stripped because they are part of legitimate model
+/// names (e.g. `gpt-3.5-turbo`, `gemini-2.0-flash`, `kimi-k2-thinking`,
+/// `claude-opus-4-6-preview`, `qwen-plus-highspeed`, `llama-her`,
+/// `gpt-4o-lightning`, `deepseek-chat-cheaper`).
 fn strip_decorative_suffix(s: &str) -> &str {
     const SUFFIXES: &[&str] = &[
         "-free",
         "-latest",
-        "-turbo",
-        "-fast",
-        "-highspeed",
-        "-thinking",
-        "-her",
         "-tee",
         "-fp8",
         "-6bit",
-        "-lightning",
-        "-cheaper",
-        "-preview",
         "-0711",
         "-0905",
     ];

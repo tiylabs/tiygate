@@ -463,7 +463,154 @@ Content-Type: application/json
    - 可选字段：直接**不返回**该字段，不要写 `null`（除 `error.param` 等明确 nullable 字段）。
 6. **字符串 ID 大小写**：存储原始大小写；查询路径不区分大小写但返回原始 ID。
 
-## 9. 不在本协议范围内的事项
+## 9. 模型目录（Model Catalog）
+
+`/v1/models` 端点返回的模型元数据由 `crates/store/src/model_catalog.rs` 中的模型目录模块提供。该模块从 [models.dev](https://models.dev/api.json) 拉取多厂商模型清单，经过规范化处理后作为 `/v1/models` 响应的数据源。
+
+### 9.1 双层架构
+
+模型目录采用两层设计，保证启动可用性与数据新鲜度：
+
+- **嵌入式基线快照**：在编译期通过 `build.rs` 将 models.dev JSON 快照嵌入二进制（`OUT_DIR/models_dev_api.generated.json`），进程启动时立即可用，无需网络请求。同时嵌入一份精简摘要（`models_catalog.generated.json`，schema `tiygate.model_catalog.summary.v1`），用于 Admin 控制台快速展示 lab/provider 列表。
+- **运行时刷新**：`ModelCatalogStore` 在启动后立即尝试从 `https://models.dev/api.json` 拉取最新数据，成功则原子替换当前快照；失败时保留嵌入式基线继续服务，并在后续周期重试。
+
+读取侧使用 `arc_swap::ArcSwap` 实现无锁快照读取，刷新侧由 `tokio::sync::Mutex` 保护，确保启动预热、定时周期、手动 Admin 刷新三者不会并发重建。
+
+### 9.2 刷新机制
+
+| 参数 | 值 | 说明 |
+|------|------|------|
+| 默认数据源 | `https://models.dev/api.json` | 可通过 `new_with_source_url` 覆盖 |
+| 默认刷新间隔 | 24 小时 | `DEFAULT_REFRESH_INTERVAL` |
+| 启动行为 | 立即预热一次 | 失败仅 warn 日志，不阻塞启动 |
+| 刷新失败 | 保留前一份快照 | 不降级为空列表 |
+| 并发控制 | `async Mutex` | 同一时刻仅一个刷新任务在执行 |
+
+`spawn_refresh` 返回 `ModelCatalogRefreshHandle`，调用 `stop()` 可优雅终止后台刷新任务。
+
+### 9.3 数据模型
+
+目录的核心数据结构：
+
+| 结构体 | 说明 |
+|------|------|
+| `ModelCatalog` | 不可变快照，包含 `version`、`labs`（`BTreeMap<String, LabCatalog>`）、`models`（`BTreeMap<String, ModelMetadata>`） |
+| `CatalogVersion` | 版本与来源信息：`source`（如 `embedded:models.dev/api.json` 或实际 URL）、`checksum`（原始 JSON 的 SHA-256）、`generated_at_unix`、`provider_count`、`model_count` |
+| `LabCatalog` | 按规范化的 lab 分组的模型集合：`id`、`display_name`、`official_provider_aliases`、`canonical_models` |
+| `ModelMetadata` | 单个模型的规范化元数据，见下表 |
+
+`ModelMetadata` 字段及到 `/v1/models` 扩展字段的映射：
+
+| `ModelMetadata` 字段 | 对应 `/v1/models` 扩展字段 | 说明 |
+|------|------|------|
+| `id` | `id` | 规范化后的模型 ID（优先使用 official provider 的原始 ID） |
+| `lab_id` | `owned_by` | 规范化后的 lab ID（如 `anthropic`、`openai`、`zhipuai`） |
+| `display_name` | `display_name` | 人类可读展示名 |
+| `family` | `family` | 模型家族（`claude`、`gpt`、`glm` 等） |
+| `context_window` | `context_window` | 总上下文窗口 |
+| `max_input_tokens` | `max_input_tokens` + `input_token_limit` | 同时写入两个字段以兼容 Gemini 客��端 |
+| `max_output_tokens` | `max_output_tokens` + `output_token_limit` | 同时写入两个字段以兼容 Gemini 客户端 |
+| `capabilities` | `capabilities` | 能力位图对象，见 §9.4 |
+| `modalities` | `modalities` | 输入/输出模态（`{ "input": [...], "output": [...] }`） |
+| `pricing` | `pricing` | 定价信息，见 §9.5 |
+| `metadata` | `metadata` | 附加元数据：`knowledge_cutoff`、`release_date`、`last_updated`、`open_weights` |
+
+`to_model_extensions()` 方法将上述字段转换为 `/v1/models` 扩展区 JSON，遵循"未知即不返回"原则——空值字段不会被序列化为 `null`，而是直接省略。`status` 固定写入 `"active"`。
+
+### 9.4 能力位图（capabilities）
+
+`capabilities_from_model()` 将 models.dev 的原始布尔标志映射为 §4.2 中定义的 `capabilities` 对象：
+
+| models.dev 原始字段 | 映射到的 capabilities 字段 |
+|------|------|
+| `tool_call` | `tools`、`function_calling`、`tool_choice` |
+| `reasoning` | `reasoning` |
+| `structured_output` | `structured_outputs`、`json_mode` |
+| `temperature` | `temperature` |
+| `attachment` | `file_search` |
+| `modalities.input` 含 `image` | `vision` |
+| `modalities.input` 含 `audio` | `audio_input` |
+| `modalities.input` 含 `video` | `video_input` |
+| `modalities.output` 含 `audio` | `audio_output` |
+| `modalities.output` 含 `image` | `image_generation` |
+| `modalities.output` 含 `video` | `video_generation` |
+| `modalities.output` 含 `embedding` | `embeddings` |
+| （固定） | `streaming: true`、`system_messages: true` |
+
+未在 models.dev 中出现的 capabilities 字段（如 `pdf_input`、`parallel_tool_calls`、`thinking`、`web_search`、`computer_use`、`prompt_caching`、`logprobs` 等）不会被 catalog 填充，由其他数据源或运行时推断补充。
+
+### 9.5 定价来源优先级
+
+当同一模型在多个 provider 侧出现时，定价信息按以下优先级选取：
+
+1. **Official**（`PricingSourceKind::Official`）：模型所属 lab 的官方 provider（如 `anthropic`、`openai`、`zhipuai`、`tencent-tokenhub` 等）。
+2. **OpenRouter fallback**（`PricingSourceKind::OpenRouterFallback`）：官方无定价时，使用 OpenRouter 的定价。
+3. **Aggregator fallback**（`PricingSourceKind::AggregatorFallback`）：以上均无时，使用任意带 cost 数据的聚合器定价。
+
+`ModelPricing` 结构体映射到 §4.3 的 `pricing` 字段，额外包含 `source_provider`（定价来源 provider ID）和 `source_kind`（定价来源类型枚举，序列化为 `snake_case`）。`cached_write_token_usd_per_million` 对应 models.dev 的 `cost.cache_write`。
+
+> **注意**：当前 catalog 的定价模型为平铺单价，不支持 §4.5 的 `segments` 阶梯定价。阶梯定价由其他数据源或手动配置补充。
+
+### 9.6 模型 ID 匹配
+
+`get_model(id)` 按 4 级策略依次匹配，命中即返回：
+
+1. **精确匹配**：对查询 ID 做 `canonical_model_id_str` 规范化后，在 `models` map 中精确查找（大小写不敏感回退）。
+2. **去前缀匹配**：若查询 ID 含 `/`（如 `openai/gpt-image-2`），取最后一段在 map 中查找。
+3. **指纹匹配**：对查询 ID 和候选 ID 计算 `model_fingerprint`，做模糊匹配。
+
+`model_fingerprint` 的规范化规则：
+
+- 取最后一段路径（`a/b/c` → `c`）
+- 去掉 `:tag` 后缀（`kimi-k2:thinking` → `kimi-k2`）
+- 去掉装饰性后缀（`-free`、`-latest`、`-tee`、`-fp8`、`-6bit` 等）。注意：`-turbo`、`-fast`、`-thinking`、`-preview`、`-highspeed`、`-her`、`-lightning`、`-cheaper` 等属于正常模型命名，**不**会被剥离
+- 转小写
+- `.` 与 `-` 互换（`glm-5.2` ↔ `glm-5-2`）
+- 折叠字母与数字之间的 `-`（`kimi-k-2-6` → `kimi-k26`，`kimi-k2.6` → `kimi-k26`）
+
+这保证了 `minimax-m3` ↔ `MiniMax-M3`、`glm-5-2` ↔ `glm-5.2`、`deepseek-v4-flash-free` ↔ `deepseek-v4-flash` 等变体能命中同一模型。
+
+### 9.7 Lab / Provider 规范化
+
+`normalized_lab_id()` 将 models.dev 的 provider 别名归一为标准 lab ID：
+
+| models.dev provider ID | 规范化 lab ID |
+|------|------|
+| `zhipuai`、`zai`、`zhipu`、`zhipuai-coding-plan` | `zhipuai` |
+| `minimax`、`minimax-cn`、`minimax-coding-plan` | `minimax` |
+| `tencent-tokenhub`、`tencent-coding-plan`、`tencent` | `tencent` |
+| `google-vertex` | `google` |
+| `google-vertex-anthropic` | `anthropic` |
+| `*-coding-plan`（其他） | 去掉 `-coding-plan` 后缀 |
+
+`is_official_provider_alias()` 判断一个 provider 是否为官方直连源（而非聚合器），当前包括 `anthropic`、`deepseek`、`google`、`google-vertex`、`minimax`、`minimax-cn`、`moonshotai`、`openai`、`tencent-tokenhub`、`xai`、`zhipuai`。
+
+当 models.dev 中未收录某 provider 但模型 ID 遵循可识别的命名前缀时（如 `doubao-` → `bytedance`、`glm-` → `zhipuai`、`kimi-` → `moonshotai`），`infer_lab_from_model_id()` 会从模型 ID 前缀推断 lab 归属。
+
+### 9.8 构建流程
+
+`build_catalog()` 将 models.dev 原始 JSON 转换为 `ModelCatalog` 的步骤：
+
+1. 解析 JSON 根对象为 `SourceProvider` 集合。
+2. 对每个 provider 的每个模型，计算 `canonical_model_id` 和 `model_fingerprint`，以 fingerprint 为分组键聚合到 `candidates` map 中（使跨 provider 的同名模型变体合并为同一候选组）。
+3. 对每个候选组，调用 `build_model_metadata()` 选择最佳元数据候选和最佳定价候选：
+   - 元数据候选优先级：official（score 3）> 非 official 非 openrouter 聚合器（score 2）> openrouter（score 1）；同级内按 `metadata_score`（name/family/limit/cost/modalities 各 +1）排序。
+   - 定价候选优先级：official > openrouter > any-with-cost。
+   - 模型 ID 优先使用 official provider 的原始 ID（保留人类可读形式如 `claude-sonnet-4-6`，而非指纹 `claude-sonnet-46`）。
+4. 按 lab 分组模型，构建 `LabCatalog`。
+5. 计算原始 JSON 的 SHA-256 作为 `checksum`，生成 `CatalogVersion`。
+
+### 9.9 错误处理
+
+`CatalogError` 枚举覆盖三种失败场景：
+
+| 变体 | 触发条件 | 影响 |
+|------|------|------|
+| `Json` | models.dev JSON 解析失败 | 嵌入式基线加载失败会 panic（编译期数据损坏）；运行时刷新失败保留旧快照 |
+| `Http` | HTTP 请求失败或非 2xx 状态码 | 保留旧快照，24h 后重试 |
+| `InvalidRoot` | JSON 根不是对象 | 同上 |
+
+## 10. 不在本协议范围内的事项
 
 - 鉴权机制（OAuth/JWT/Service Key 等）的具体格式：本协议只要求 `Authorization: Bearer <token>`。
 - 配额与计费策略：归属到 `quota.md` / `admin-api.md`。
