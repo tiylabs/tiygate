@@ -300,7 +300,7 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
 /// block or the refresh token is empty — in that case the data plane
 /// will fall through to the static key path (which will also fail,
 /// but with a clearer error).
-fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfig> {
+pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfig> {
     let oauth_meta = provider.metadata_json.get("oauth")?;
 
     let token_url = oauth_meta

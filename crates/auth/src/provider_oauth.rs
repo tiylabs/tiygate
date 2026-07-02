@@ -385,6 +385,15 @@ impl OAuthTokenCache {
         }
     }
 
+    /// Returns a process-global shared `OAuthTokenCache`. All callers
+    /// — data plane, admin plane, background tasks — share the same
+    /// in-memory token cache so an access token refreshed by one
+    /// subsystem is immediately available to all others.
+    pub fn global() -> &'static OAuthTokenCache {
+        static GLOBAL: std::sync::OnceLock<OAuthTokenCache> = std::sync::OnceLock::new();
+        GLOBAL.get_or_init(OAuthTokenCache::new)
+    }
+
     fn tokens(&self) -> &DashMap<String, CachedToken> {
         self.tokens.get_or_init(DashMap::new)
     }

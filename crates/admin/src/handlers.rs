@@ -157,7 +157,56 @@ async fn list_provider_models(
         .map_err(|e| AdminError::Internal(format!("http client build: {e}")))?;
 
     let mut req = client.get(&url);
-    if !api_key.is_empty() {
+
+    // For OAuth-mode providers, obtain an access token via the
+    // process-global OAuthTokenCache instead of using a static API
+    // key (which is empty for OAuth providers).
+    if matches!(provider.auth_mode, tiygate_store::models::AuthMode::OAuth) {
+        let cache = tiygate_auth::provider_oauth::OAuthTokenCache::global();
+        // Build the OAuth target config from the provider's
+        // metadata + decrypted refresh token.
+        if let Some(oauth_config) =
+            tiygate_store::config_store::build_oauth_target_config(&provider)
+        {
+            // The cache is keyed by "{provider_id}:{label}".
+            // Model discovery is not tied to a specific route
+            // target, so we use a synthetic label.
+            let label = "__model_discovery__";
+            cache.seed(&id, label, &oauth_config.refresh_token);
+
+            let mut headers = reqwest::header::HeaderMap::new();
+            match cache
+                .apply(&mut headers, &id, label, &oauth_config, &client)
+                .await
+            {
+                Ok(()) => {
+                    // Merge the injected headers into the reqwest
+                    // request builder.
+                    for (name, value) in headers.iter() {
+                        if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+                            req = req.header(name.as_str(), v);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = %id,
+                        error = %e,
+                        "OAuth token refresh failed for model discovery; \
+                         returning empty list"
+                    );
+                    return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
+                }
+            }
+        } else {
+            tracing::warn!(
+                provider = %id,
+                "OAuth provider missing OAuth config for model discovery; \
+                 returning empty list"
+            );
+            return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
+        }
+    } else if !api_key.is_empty() {
         req = req.bearer_auth(&api_key);
     }
 

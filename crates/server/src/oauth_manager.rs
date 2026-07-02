@@ -32,7 +32,7 @@ use tracing::warn;
 /// `Arc`-shared).
 #[derive(Clone)]
 pub struct OAuthTokenManager {
-    cache: Arc<OAuthTokenCache>,
+    cache: &'static OAuthTokenCache,
     store: Option<Arc<DbConfigStore>>,
     http_client: reqwest::Client,
 }
@@ -45,7 +45,7 @@ impl OAuthTokenManager {
     /// - `http_client`: shared reqwest client for token refresh calls.
     pub fn new(store: Option<Arc<DbConfigStore>>, http_client: reqwest::Client) -> Self {
         Self {
-            cache: Arc::new(OAuthTokenCache::new()),
+            cache: OAuthTokenCache::global(),
             store,
             http_client,
         }
