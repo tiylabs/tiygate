@@ -192,7 +192,8 @@ const en = {
     unsupportedVendor: "Vendor not supported",
     oauthPanel: {
       title: "OAuth authorization",
-      saveFirst: "Save the provider first, then start the authorization flow here.",
+      saveFirst:
+        "Save the provider first, then start the authorization flow here.",
       notConnected: "Not authorized yet",
       connected: "Authorized",
       start: "Start flow",
@@ -202,7 +203,8 @@ const en = {
       copyUrl: "Copy",
       callbackHint:
         "After completing login authorization in the browser, paste the callback URL or authorization code below and complete authorization",
-      callbackUrlPlaceholder: "http://127.0.0.1:56121/callback?code=…&state=…  or paste the authorization code",
+      callbackUrlPlaceholder:
+        "http://127.0.0.1:56121/callback?code=…&state=…  or paste the authorization code",
       submitCallback: "Complete authorization",
     },
     apiKey: "API key",
@@ -233,6 +235,7 @@ const en = {
     addTarget: "Add target",
     provider: "Provider",
     model: "Model",
+    modelLoading: "Loading models…",
     weight: "Weight",
     priority: "Priority",
     orderHint: "Top rows get the highest weight. Drag to reorder.",
@@ -334,9 +337,11 @@ const en = {
     callbackError: "OAuth authorization failed.",
     callbackHint:
       "After completing login authorization in the browser, paste the callback URL or authorization code below and complete authorization",
-    callbackUrlPlaceholder: "http://127.0.0.1:56121/callback?code=…&state=…  or paste the authorization code",
+    callbackUrlPlaceholder:
+      "http://127.0.0.1:56121/callback?code=…&state=…  or paste the authorization code",
     submitCallback: "Complete authorization",
-    callbackUrlInvalid: "Could not parse code and state from the input. Make sure you copied the full redirect URL or the authorization code.",
+    callbackUrlInvalid:
+      "Could not parse code and state from the input. Make sure you copied the full redirect URL or the authorization code.",
   },
   requests: {
     title: "Request Logs",

@@ -31,6 +31,7 @@ import {
   Badge,
   Button,
   Card,
+  Combobox,
   ConfirmDialog,
   Dialog,
   EmptyState,
@@ -284,7 +285,10 @@ export default function RoutesPage() {
     return true;
   }
 
-  function commitTargetInsert(from: number, insertIndex: number): number | null {
+  function commitTargetInsert(
+    from: number,
+    insertIndex: number,
+  ): number | null {
     // `insertIndex` is a position in the original array while the dragged row
     // still occupies `from`. Inserting after the source shifts the final index
     // left by one after the source row is removed.
@@ -361,10 +365,7 @@ export default function RoutesPage() {
     resetTargetDrag();
   }
 
-  function handleTargetPointerDown(
-    e: PointerEvent<HTMLElement>,
-    idx: number,
-  ) {
+  function handleTargetPointerDown(e: PointerEvent<HTMLElement>, idx: number) {
     if (e.button !== 0) return;
     e.stopPropagation();
     e.currentTarget.focus({ preventScroll: true });
@@ -472,6 +473,43 @@ export default function RoutesPage() {
     return m;
   }, [providers]);
 
+  // Session-level model cache: provider_id → model list. Persists across
+  // target row edits within the same modal session but is not shared across
+  // modal open/close cycles.
+  const modelCacheRef = useRef<
+    Map<string, { models: string[]; loaded: boolean }>
+  >(new Map());
+  const [loadingModelsFor, setLoadingModelsFor] = useState<string | null>(null);
+  // Bump to force re-render after the cache is updated.
+  const [modelCacheVersion, setModelCacheVersion] = useState(0);
+
+  const fetchModels = useCallback(async (providerId: string) => {
+    if (!providerId) return;
+    const cached = modelCacheRef.current.get(providerId);
+    if (cached?.loaded) return;
+    setLoadingModelsFor(providerId);
+    try {
+      const resp = await providersApi.models(providerId);
+      const models = resp.models.map((m) => m.id);
+      modelCacheRef.current.set(providerId, { models, loaded: true });
+    } catch {
+      // Silent degradation — the Combobox still works as a plain input.
+      modelCacheRef.current.set(providerId, { models: [], loaded: true });
+    } finally {
+      setLoadingModelsFor(null);
+      setModelCacheVersion((v) => v + 1);
+    }
+  }, []);
+
+  const getModelOptions = useCallback(
+    (providerId: string) =>
+      (modelCacheRef.current.get(providerId)?.models ?? []).map((id) => ({
+        value: id,
+        label: id,
+      })),
+    [modelCacheVersion],
+  );
+
   // Strategy picker: empty value → inherit gateway default.
   const strategyOptions = useMemo(
     () => [
@@ -505,7 +543,11 @@ export default function RoutesPage() {
       <PageHeader
         title={t("routes.title")}
         action={
-          <Button variant="primary" icon={<Plus size={16} />} onClick={openCreate}>
+          <Button
+            variant="primary"
+            icon={<Plus size={16} />}
+            onClick={openCreate}
+          >
             {t("routes.add")}
           </Button>
         }
@@ -540,7 +582,10 @@ export default function RoutesPage() {
             />
           ) : (
             <Table
-              maxHeight={["max-h-[calc(100vh-14rem)]", "lg:max-h-[calc(100vh-10rem)]"]}
+              maxHeight={[
+                "max-h-[calc(100vh-14rem)]",
+                "lg:max-h-[calc(100vh-10rem)]",
+              ]}
               tableClassName="min-w-max border-separate border-spacing-0"
               containerRef={scrollRef}
             >
@@ -593,7 +638,10 @@ export default function RoutesPage() {
                         >
                           {r.virtual_model}
                         </span>
-                        <Tooltip content={t("routes.copyVirtualModel")} side="top">
+                        <Tooltip
+                          content={t("routes.copyVirtualModel")}
+                          side="top"
+                        >
                           <CopyValueButton value={r.virtual_model} />
                         </Tooltip>
                       </div>
@@ -720,10 +768,7 @@ export default function RoutesPage() {
             />
           </Field>
 
-          <Field
-            label={t("routes.strategy")}
-            hint={t("routes.strategyHint")}
-          >
+          <Field label={t("routes.strategy")} hint={t("routes.strategyHint")}>
             <Select
               value={form.routing_strategy}
               onValueChange={(v) =>
@@ -752,17 +797,14 @@ export default function RoutesPage() {
                 onClick={() =>
                   setForm((f) => ({
                     ...f,
-                    targets: [
-                      ...f.targets,
-                      createFormTarget(),
-                    ],
+                    targets: [...f.targets, createFormTarget()],
                   }))
                 }
               >
                 {t("routes.addTarget")}
               </Button>
             </div>
-            <div className="overflow-hidden rounded-md border border-border">
+            <div className="overflow-x-hidden rounded-md border border-border">
               <span
                 className="sr-only"
                 role="status"
@@ -787,7 +829,10 @@ export default function RoutesPage() {
                 const enabled = isTargetEnabled(tg);
                 const isDragging = dragPreview?.from === idx;
                 const isNoopInsert = dragPreview
-                  ? isNoopTargetInsert(dragPreview.from, dragPreview.insertIndex)
+                  ? isNoopTargetInsert(
+                      dragPreview.from,
+                      dragPreview.insertIndex,
+                    )
                   : false;
                 const showInsertBefore =
                   !isNoopInsert && shouldShowInsertBefore(idx);
@@ -838,24 +883,39 @@ export default function RoutesPage() {
                     <div className="col-start-2 grid min-w-0 gap-2 sm:contents">
                       <Select
                         value={tg.provider_id}
-                        onValueChange={(v) => updateTarget(idx, { provider_id: v })}
+                        onValueChange={(v) =>
+                          updateTarget(idx, { provider_id: v })
+                        }
                         ariaLabel={t("routes.provider")}
                         options={providerOptions}
                         triggerTitle={
                           tg.provider_id
-                            ? (providerLabelById.get(tg.provider_id) ?? tg.provider_id)
+                            ? (providerLabelById.get(tg.provider_id) ??
+                              tg.provider_id)
                             : undefined
                         }
                       />
-                      <Input
+                      <Combobox
                         value={tg.model_id}
                         placeholder={t("routes.model")}
-                        onChange={(e) => updateTarget(idx, { model_id: e.target.value })}
+                        aria-label={
+                          loadingModelsFor === tg.provider_id
+                            ? t("routes.modelLoading")
+                            : t("routes.model")
+                        }
+                        options={getModelOptions(tg.provider_id)}
+                        loading={loadingModelsFor === tg.provider_id}
+                        onChange={(v) => updateTarget(idx, { model_id: v })}
+                        onFocus={() => {
+                          if (tg.provider_id) void fetchModels(tg.provider_id);
+                        }}
                       />
                       <div className="flex items-center justify-center">
                         <Switch
                           checked={enabled}
-                          onCheckedChange={(v) => updateTarget(idx, { enabled: v })}
+                          onCheckedChange={(v) =>
+                            updateTarget(idx, { enabled: v })
+                          }
                           aria-label={t("routes.targetEnabled", {
                             index: idx + 1,
                           })}
@@ -1038,23 +1098,26 @@ function TargetBadges({
       {shown.map((tg, i) => {
         const enabled = isTargetEnabled(tg);
         return (
-        <Badge
-          key={i}
-          tone={enabled ? "primary" : "neutral"}
-          className={cn(!enabled && "opacity-50")}
-          title={`${resolveProvider(tg.provider_id) ?? tg.provider_id} → ${tg.model_id}`}
-        >
-          <span className="truncate font-medium">
-            {resolveProvider(tg.provider_id) ?? tg.provider_id}
-          </span>
-          <span aria-hidden="true" className="text-text-subtle">
-            {" "}
-            →
-          </span>
-          <span className="truncate font-mono text-[11px]" title={tg.model_id}>
-            {tg.model_id}
-          </span>
-        </Badge>
+          <Badge
+            key={i}
+            tone={enabled ? "primary" : "neutral"}
+            className={cn(!enabled && "opacity-50")}
+            title={`${resolveProvider(tg.provider_id) ?? tg.provider_id} → ${tg.model_id}`}
+          >
+            <span className="truncate font-medium">
+              {resolveProvider(tg.provider_id) ?? tg.provider_id}
+            </span>
+            <span aria-hidden="true" className="text-text-subtle">
+              {" "}
+              →
+            </span>
+            <span
+              className="truncate font-mono text-[11px]"
+              title={tg.model_id}
+            >
+              {tg.model_id}
+            </span>
+          </Badge>
         );
       })}
       {hiddenCount > 0 && (

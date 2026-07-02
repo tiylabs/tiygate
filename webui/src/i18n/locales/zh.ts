@@ -196,8 +196,10 @@ const zh: Translation = {
       authorizeUrl: "授权 URL",
       openUrl: "打开",
       copyUrl: "复制",
-      callbackHint: "在浏览器中完成登录授权后粘贴回调URL或授权码到下方输入框并完成授权",
-      callbackUrlPlaceholder: "http://127.0.0.1:56121/callback?code=…&state=…  或粘贴授权码",
+      callbackHint:
+        "在浏览器中完成登录授权后粘贴回调URL或授权码到下方输入框并完成授权",
+      callbackUrlPlaceholder:
+        "http://127.0.0.1:56121/callback?code=…&state=…  或粘贴授权码",
       submitCallback: "完成授权",
     },
     apiKey: "API 密钥",
@@ -228,6 +230,7 @@ const zh: Translation = {
     addTarget: "新增目标",
     provider: "供应商",
     model: "模型",
+    modelLoading: "加载模型列表中…",
     weight: "权重",
     priority: "优先级",
     orderHint: "越靠上的目标权重越高，拖拽调整顺序。",
@@ -323,10 +326,13 @@ const zh: Translation = {
     urlCopied: "授权 URL 已复制。",
     callbackSuccess: "已为 {{provider}} 完成 OAuth 授权。",
     callbackError: "OAuth 授权失败。",
-    callbackHint: "在浏览器中完成登录授权后粘贴回调URL或授权码到下方输入框并完成授权",
-    callbackUrlPlaceholder: "http://127.0.0.1:56121/callback?code=…&state=…  或粘贴授权码",
+    callbackHint:
+      "在浏览器中完成登录授权后粘贴回调URL或授权码到下方输入框并完成授权",
+    callbackUrlPlaceholder:
+      "http://127.0.0.1:56121/callback?code=…&state=…  或粘贴授权码",
     submitCallback: "完成授权",
-    callbackUrlInvalid: "无法从输入中解析 code 和 state，请确认复制了完整的重定向 URL 或授权码。",
+    callbackUrlInvalid:
+      "无法从输入中解析 code 和 state，请确认复制了完整的重定向 URL 或授权码。",
   },
   requests: {
     title: "请求日志",

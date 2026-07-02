@@ -15,6 +15,7 @@ import type {
   ProviderCatalogEntry,
   ProviderDeleteImpact,
   ProviderInput,
+  ProviderModelsResponse,
   QuotaSpec,
   RequestFilterOptions,
   RequestListResponse,
@@ -45,6 +46,8 @@ export const providersApi = {
       method: "DELETE",
       allowEmpty: true,
     }),
+  models: (id: string) =>
+    apiRequest<ProviderModelsResponse>(`/providers/${id}/models`),
 };
 
 // ---- provider catalog (server-side registered providers) ----
@@ -56,7 +59,9 @@ export const providerCatalogApi = {
 export const modelCatalogApi = {
   status: () => apiRequest<ModelCatalogStatus>("/model-catalog"),
   refresh: () =>
-    apiRequest<ModelCatalogStatus>("/model-catalog/refresh", { method: "POST" }),
+    apiRequest<ModelCatalogStatus>("/model-catalog/refresh", {
+      method: "POST",
+    }),
 };
 
 // ---- routes ----

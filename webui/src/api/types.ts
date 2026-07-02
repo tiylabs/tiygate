@@ -45,6 +45,14 @@ export interface ProviderDeleteImpact {
   routes: ProviderDeleteImpactRoute[];
 }
 
+export interface ProviderModelEntry {
+  id: string;
+}
+
+export interface ProviderModelsResponse {
+  models: ProviderModelEntry[];
+}
+
 export interface ProviderCatalogEntry {
   id: string;
   display_name: string;
@@ -64,10 +72,7 @@ export interface ModelCatalogStatus {
  *  (snake_case). `undefined`/absent means the route inherits the gateway-wide
  *  default strategy. */
 export type RoutingStrategyName =
-  | "weighted"
-  | "priority"
-  | "cooldown"
-  | "latency";
+  "weighted" | "priority" | "cooldown" | "latency";
 
 export interface RouteTarget {
   provider_id: string;

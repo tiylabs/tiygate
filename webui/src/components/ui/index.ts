@@ -3,6 +3,8 @@ export type { ButtonVariant, ButtonSize } from "./button";
 export { Badge } from "./badge";
 export type { BadgeTone } from "./badge";
 export { Input, Textarea, PasswordInput } from "./input";
+export { Combobox } from "./combobox";
+export type { ComboboxOption, ComboboxProps } from "./combobox";
 export { Label, Field } from "./field";
 export { Card, CardHeader, CardBody, Metric } from "./card";
 export { Table, Thead, Th, Td, Tr, useStickyTableScroll } from "./table";
