@@ -721,13 +721,7 @@ fn model_fingerprint(id: &str) -> String {
 /// `gpt-4o-lightning`, `deepseek-chat-cheaper`).
 fn strip_decorative_suffix(s: &str) -> &str {
     const SUFFIXES: &[&str] = &[
-        "-free",
-        "-latest",
-        "-tee",
-        "-fp8",
-        "-6bit",
-        "-0711",
-        "-0905",
+        "-free", "-latest", "-tee", "-fp8", "-6bit", "-0711", "-0905",
     ];
     for suffix in SUFFIXES {
         if s.ends_with(suffix) {

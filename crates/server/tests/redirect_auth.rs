@@ -101,20 +101,18 @@ async fn test_cross_origin_redirect_does_not_strip_authorization() {
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/chat/completions"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-redirected",
-                "object": "chat.completion",
-                "created": 1700000000,
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "Hello from target!"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-            })),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-redirected",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello from target!"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
         // Give it a name so we can assert on it independently.
         .named("target-server-b")
         .mount(&target_server)
@@ -190,21 +188,22 @@ async fn test_same_origin_redirect_not_followed() {
     // The redirect target path on the same server.
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/v1/chat/completions"))
-        .and(wiremock::matchers::header("authorization", "Bearer sk-test"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-same-origin",
-                "object": "chat.completion",
-                "created": 1700000000,
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "Hello!"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-            })),
-        )
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer sk-test",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-same-origin",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello!"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
         .named("same-origin-target")
         .mount(&mock_server)
         .await;
@@ -251,21 +250,22 @@ async fn test_no_redirect_happy_path_preserves_auth() {
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/chat/completions"))
-        .and(wiremock::matchers::header("authorization", "Bearer sk-test"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-happy",
-                "object": "chat.completion",
-                "created": 1700000000,
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "Hello!"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-            })),
-        )
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer sk-test",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-happy",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello!"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
         .mount(&mock_server)
         .await;
 
@@ -273,5 +273,8 @@ async fn test_no_redirect_happy_path_preserves_auth() {
     let (status, body) = send_chat_request(app).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Hello!"), "Body should contain response: {body}");
+    assert!(
+        body.contains("Hello!"),
+        "Body should contain response: {body}"
+    );
 }
