@@ -178,6 +178,7 @@ const zh: Translation = {
     vendorLoading: "正在加载厂商…",
     vendorLoadError: "无法获取厂商列表",
     apiBase: "API 地址",
+    modelsEndpoint: "模型列表地址（选填）",
     authMode: "鉴权方式",
     authModes: {
       staticKey: "静态Key",

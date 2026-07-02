@@ -633,7 +633,7 @@ impl DbConfigStore {
 
     pub async fn get_provider(&self, id: &str) -> Result<Option<Provider>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, name, vendor, api_base, encrypted_api_key, auth_mode, \
+            "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
                     encrypted_oauth_meta, metadata_json, enabled, \
                     created_at, updated_at FROM providers WHERE id = $1",
         )
@@ -654,6 +654,7 @@ impl DbConfigStore {
         name: &str,
         vendor: &str,
         api_base: &str,
+        models_endpoint: &str,
         api_key_plain: Option<&str>,
         auth_mode: AuthMode,
         oauth_meta_plain: Option<&str>,
@@ -694,11 +695,12 @@ impl DbConfigStore {
             .unwrap_or_else(|| now.clone());
 
         sqlx::query(
-            "INSERT INTO providers (id, name, vendor, api_base, encrypted_api_key, auth_mode, \
+            "INSERT INTO providers (id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
              encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              ON CONFLICT(id) DO UPDATE SET \
                 name=excluded.name, vendor=excluded.vendor, api_base=excluded.api_base, \
+                models_endpoint=excluded.models_endpoint, \
                 encrypted_api_key=excluded.encrypted_api_key, auth_mode=excluded.auth_mode, \
                 encrypted_oauth_meta=excluded.encrypted_oauth_meta, metadata_json=excluded.metadata_json, \
                 enabled=excluded.enabled, updated_at=excluded.updated_at",
@@ -707,6 +709,7 @@ impl DbConfigStore {
         .bind(name)
         .bind(vendor)
         .bind(api_base)
+        .bind(models_endpoint)
         .bind(&encrypted_api_key)
         .bind(auth_mode.as_str())
         .bind(&encrypted_oauth_meta)
@@ -871,7 +874,7 @@ impl DbConfigStore {
 
     async fn load_providers(&self) -> Result<Vec<Provider>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, name, vendor, api_base, encrypted_api_key, auth_mode, \
+            "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
                     encrypted_oauth_meta, metadata_json, enabled, \
                     created_at, updated_at FROM providers",
         )
@@ -1265,11 +1268,12 @@ impl DbConfigStore {
             // the operator's explicit "overwrite" selection takes
             // effect.
             sqlx::query(
-                "INSERT INTO providers (id, name, vendor, api_base, encrypted_api_key, auth_mode, \
+                "INSERT INTO providers (id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
                  encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
                  ON CONFLICT(id) DO UPDATE SET \
                     name=excluded.name, vendor=excluded.vendor, api_base=excluded.api_base, \
+                    models_endpoint=excluded.models_endpoint, \
                     encrypted_api_key=excluded.encrypted_api_key, auth_mode=excluded.auth_mode, \
                     encrypted_oauth_meta=excluded.encrypted_oauth_meta, \
                     metadata_json=excluded.metadata_json, \
@@ -1279,6 +1283,7 @@ impl DbConfigStore {
             .bind(&p.name)
             .bind(&p.vendor)
             .bind(&p.api_base)
+            .bind(&p.models_endpoint)
             .bind(&enc_api_key)
             .bind(p.auth_mode.as_str())
             .bind(&enc_oauth_meta)
@@ -1591,6 +1596,7 @@ fn row_to_provider(row: sqlx::any::AnyRow) -> Result<Provider, StoreError> {
         name: row.get("name"),
         vendor: row.get("vendor"),
         api_base: row.get("api_base"),
+        models_endpoint: row.get("models_endpoint"),
         encrypted_api_key: row.get("encrypted_api_key"),
         auth_mode,
         encrypted_oauth_meta: row.get("encrypted_oauth_meta"),
@@ -1719,6 +1725,7 @@ mod tests {
             name: "Unregistered Provider".to_string(),
             vendor: "unregistered-openai-compatible".to_string(),
             api_base: "https://example.test/root".to_string(),
+            models_endpoint: String::new(),
             encrypted_api_key: "sk-test".to_string(),
             auth_mode: AuthMode::ApiKey,
             encrypted_oauth_meta: String::new(),
@@ -1773,6 +1780,7 @@ mod tests {
             name: "p".to_string(),
             vendor: "openai".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
+            models_endpoint: String::new(),
             encrypted_api_key: "sk-test".to_string(),
             auth_mode: AuthMode::ApiKey,
             encrypted_oauth_meta: String::new(),
@@ -1841,6 +1849,7 @@ mod tests {
             name: "p".to_string(),
             vendor: "openai".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
+            models_endpoint: String::new(),
             encrypted_api_key: "sk-test".to_string(),
             auth_mode: AuthMode::ApiKey,
             encrypted_oauth_meta: String::new(),
@@ -1951,6 +1960,7 @@ mod tests {
                 "OAuth OpenAI",
                 "openai",
                 "https://api.openai.com/v1",
+                "",
                 None,
                 AuthMode::OAuth,
                 Some(&meta_str),
@@ -1980,6 +1990,7 @@ mod tests {
                 "Provider 1",
                 "openai",
                 "https://api.openai.com/v1",
+                "",
                 Some("sk-test"),
                 AuthMode::ApiKey,
                 None,
@@ -2035,6 +2046,7 @@ mod tests {
                 "Existing",
                 "openai",
                 "https://api.openai.com/v1",
+                "",
                 Some("sk-old"),
                 AuthMode::ApiKey,
                 None,
@@ -2055,6 +2067,7 @@ mod tests {
                     name: "Existing (from export)".into(),
                     vendor: "openai".into(),
                     api_base: "https://api.openai.com/v1".into(),
+                    models_endpoint: String::new(),
                     encrypted_api_key: "sk-exported".into(),
                     auth_mode: AuthMode::ApiKey,
                     encrypted_oauth_meta: String::new(),
@@ -2070,6 +2083,7 @@ mod tests {
                     name: "New".into(),
                     vendor: "anthropic".into(),
                     api_base: "https://api.anthropic.com".into(),
+                    models_endpoint: String::new(),
                     encrypted_api_key: "sk-new".into(),
                     auth_mode: AuthMode::ApiKey,
                     encrypted_oauth_meta: String::new(),
@@ -2132,6 +2146,7 @@ mod tests {
                 "Encrypted Provider",
                 "openai",
                 "https://api.openai.com/v1",
+                "",
                 Some("sk-secret-value"),
                 AuthMode::ApiKey,
                 None,
@@ -2254,6 +2269,7 @@ mod tests {
                 "Original",
                 "openai",
                 "https://api.openai.com/v1",
+                "",
                 Some("sk-old"),
                 AuthMode::ApiKey,
                 None,
@@ -2273,6 +2289,7 @@ mod tests {
                 name: "Overwritten".into(),
                 vendor: "openai".into(),
                 api_base: "https://api.openai.com/v1".into(),
+                models_endpoint: String::new(),
                 encrypted_api_key: "sk-new".into(),
                 auth_mode: AuthMode::ApiKey,
                 encrypted_oauth_meta: String::new(),
@@ -2322,6 +2339,7 @@ mod tests {
                 name: "X".into(),
                 vendor: "openai".into(),
                 api_base: "https://api.openai.com/v1".into(),
+                models_endpoint: String::new(),
                 encrypted_api_key: "sk-x".into(),
                 auth_mode: AuthMode::ApiKey,
                 encrypted_oauth_meta: String::new(),

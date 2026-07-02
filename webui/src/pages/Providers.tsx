@@ -98,6 +98,7 @@ interface FormState {
   name: string;
   vendor: string;
   api_base: string;
+  models_endpoint: string;
   api_key: string;
   auth_mode: string;
   enabled: boolean;
@@ -115,6 +116,7 @@ function emptyForm(): FormState {
     name: "",
     vendor: "openai",
     api_base: "",
+    models_endpoint: "",
     api_key: "",
     auth_mode: "api_key",
     enabled: true,
@@ -341,6 +343,7 @@ export default function Providers() {
       name: p.name,
       vendor: p.vendor,
       api_base: p.api_base,
+      models_endpoint: p.models_endpoint,
       api_key: "",
       auth_mode: p.auth_mode,
       enabled: p.enabled,
@@ -383,6 +386,7 @@ export default function Providers() {
       name: form.name,
       vendor: form.vendor,
       api_base: form.api_base,
+      models_endpoint: form.models_endpoint,
       auth_mode: form.auth_mode,
       enabled: form.enabled,
     };
@@ -676,6 +680,37 @@ export default function Providers() {
                     setForm((prev) => ({
                       ...prev,
                       api_base: entry.default_base_url,
+                    }));
+                  }
+                }
+              }}
+            />
+          </Field>
+          <Field label={t("providers.modelsEndpoint")}>
+            <Input
+              value={form.models_endpoint}
+              onChange={(e) =>
+                setForm({ ...form, models_endpoint: e.target.value })
+              }
+              placeholder={(() => {
+                const base =
+                  form.api_base ||
+                  catalog?.find((e) => e.id === form.vendor)
+                    ?.default_base_url ||
+                  "";
+                return base ? base + "/models" : "";
+              })()}
+              onKeyDown={(e) => {
+                if (e.key === "Tab" && !form.models_endpoint) {
+                  const base =
+                    form.api_base ||
+                    catalog?.find((el) => el.id === form.vendor)?.default_base_url ||
+                    "";
+                  if (base) {
+                    e.preventDefault();
+                    setForm((prev) => ({
+                      ...prev,
+                      models_endpoint: base + "/models",
                     }));
                   }
                 }

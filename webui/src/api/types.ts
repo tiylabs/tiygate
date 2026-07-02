@@ -6,6 +6,7 @@ export interface Provider {
   name: string;
   vendor: string;
   api_base: string;
+  models_endpoint: string;
   auth_mode: string;
   encrypted_api_key: string;
   encrypted_oauth_meta: string;
@@ -20,6 +21,7 @@ export interface ProviderInput {
   name: string;
   vendor: string;
   api_base: string;
+  models_endpoint?: string;
   api_key?: string;
   auth_mode?: string;
   oauth_meta?: string;
@@ -327,6 +329,7 @@ export interface ExportProvider {
   name: string;
   vendor: string;
   api_base: string;
+  models_endpoint: string;
   encrypted_api_key: string;
   auth_mode: string;
   encrypted_oauth_meta: string;

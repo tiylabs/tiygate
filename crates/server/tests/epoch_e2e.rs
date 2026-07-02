@@ -60,6 +60,7 @@ async fn data_plane_sees_admin_writes_via_epoch_poll() {
             "OpenAI",
             "openai",
             "https://api.openai.com/v1",
+            "",
             Some("sk-test"),
             AuthMode::ApiKey,
             None,

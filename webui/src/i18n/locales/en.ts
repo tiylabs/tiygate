@@ -182,6 +182,7 @@ const en = {
     vendorLoading: "Loading vendors…",
     vendorLoadError: "Failed to load vendors",
     apiBase: "API base",
+    modelsEndpoint: "Models endpoint (optional)",
     authMode: "Auth mode",
     authModes: {
       staticKey: "Static Key",

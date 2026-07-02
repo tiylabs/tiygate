@@ -44,6 +44,10 @@ pub struct Provider {
     pub name: String,
     pub vendor: String,
     pub api_base: String,
+    /// Optional model-discovery endpoint (e.g. `GET /v1/models`).
+    /// Backward-compatible: empty string means "not configured".
+    #[serde(default)]
+    pub models_endpoint: String,
     /// Encrypted API key (or empty). Set at upsert time; the
     /// `DbConfigStore` populates `api_key_cleartext` on read.
     pub encrypted_api_key: String,
