@@ -42,9 +42,11 @@ export interface ComboboxProps extends Omit<
  * - Values not in `options` are accepted (free input).
  * - Click outside or blur closes the dropdown.
  * - `loading` shows a spinner inside the input.
- * - The dropdown list is rendered via a Portal at `document.body` level
- *   with `fixed` positioning so it is never clipped by ancestor
- *   `overflow` containers (e.g. Dialog scroll areas).
+ * - The dropdown list is rendered via a Portal. When the Combobox is
+ *   inside a Radix Dialog, the portal mounts inside the dialog's own
+ *   content node (so Radix's scroll-lock treats it as in-bounds and
+ *   mouse-wheel/trackpad scrolling works); otherwise it falls back to
+ *   `document.body` with fixed positioning.
  */
 export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(
   function Combobox(
@@ -64,6 +66,18 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(
     const containerRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
     const listRef = useRef<HTMLDivElement>(null);
+    // Portal target: prefer mounting the dropdown panel as a real DOM
+    // descendant of the nearest Radix Dialog/AlertDialog content node
+    // (if the Combobox is rendered inside one). Radix's Dialog wraps
+    // its content in a `RemoveScroll` scroll-lock that only recognizes
+    // elements contained within the dialog content's DOM subtree as
+    // "inside" — a portal mounted directly on `document.body` sits
+    // outside that subtree and gets its wheel/touch scroll silently
+    // cancelled by the lock. Mounting inside the dialog content makes
+    // the panel a genuine descendant so scroll-lock treats it as
+    // in-bounds and never blocks it. Falls back to `document.body`
+    // when there is no enclosing dialog (e.g. a plain page field).
+    const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
     // Flag: while true, blur events should NOT close the dropdown because
     // a suggestion click is in progress. This is necessary because the
     // dropdown is rendered in a Portal at document.body, so the input
@@ -84,6 +98,13 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(
           inputRef.current;
     }, [ref]);
 
+    // Resolve the portal target once, when the dropdown opens.
+    useLayoutEffect(() => {
+      if (!open) return;
+      const dialogContent = inputRef.current?.closest('[role="dialog"]');
+      setPortalTarget((dialogContent as HTMLElement | null) ?? document.body);
+    }, [open]);
+
     const filtered = open
       ? options.filter((opt) => {
           const v = (value as string) ?? "";
@@ -99,26 +120,26 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(
     }, [filtered.length]);
 
     // Compute dropdown position relative to the input element whenever
-    // the dropdown opens. The panel is fixed-positioned in a portal so
-    // it is immune to ancestor overflow clipping.
-    useLayoutEffect(() => {
-      if (!open || !inputRef.current) return;
+    // the dropdown opens. When mounted inside a Dialog's content (which
+    // has a CSS `transform` for centering), that ancestor establishes a
+    // new containing block — so `position: fixed` no longer resolves
+    // against the viewport for our portaled child. We use `position:
+    // absolute` and translate the input's viewport-relative rect into
+    // the portal target's local coordinate space in that case; when
+    // falling back to `document.body` (no transformed ancestor),
+    // `position: fixed` with raw viewport coordinates still works.
+    const computePanelStyle = useCallback(() => {
+      if (!inputRef.current) return;
       const rect = inputRef.current.getBoundingClientRect();
-      setPanelStyle({
-        position: "fixed",
-        top: rect.bottom + 4,
-        left: rect.left,
-        width: rect.width,
-      });
-    }, [open]);
-
-    // Recompute on scroll/resize while open (the input may move with
-    // the scroll container).
-    useEffect(() => {
-      if (!open) return;
-      function update() {
-        if (!inputRef.current) return;
-        const rect = inputRef.current.getBoundingClientRect();
+      if (portalTarget && portalTarget !== document.body) {
+        const parentRect = portalTarget.getBoundingClientRect();
+        setPanelStyle({
+          position: "absolute",
+          top: rect.bottom - parentRect.top + 4,
+          left: rect.left - parentRect.left,
+          width: rect.width,
+        });
+      } else {
         setPanelStyle({
           position: "fixed",
           top: rect.bottom + 4,
@@ -126,13 +147,24 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(
           width: rect.width,
         });
       }
-      window.addEventListener("scroll", update, true);
-      window.addEventListener("resize", update);
+    }, [portalTarget]);
+
+    useLayoutEffect(() => {
+      if (!open) return;
+      computePanelStyle();
+    }, [open, computePanelStyle]);
+
+    // Recompute on scroll/resize while open (the input may move with
+    // the scroll container).
+    useEffect(() => {
+      if (!open) return;
+      window.addEventListener("scroll", computePanelStyle, true);
+      window.addEventListener("resize", computePanelStyle);
       return () => {
-        window.removeEventListener("scroll", update, true);
-        window.removeEventListener("resize", update);
+        window.removeEventListener("scroll", computePanelStyle, true);
+        window.removeEventListener("resize", computePanelStyle);
       };
-    }, [open]);
+    }, [open, computePanelStyle]);
 
     // Close on click outside.
     useEffect(() => {
@@ -161,6 +193,28 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(
         item.scrollIntoView({ block: "nearest" });
       }
     }, [highlighted, open]);
+
+    // Prevent wheel/touch scroll events from bubbling to `document`,
+    // where Radix Dialog's scroll-lock (react-remove-scroll) listens
+    // natively and blocks scrolling on anything outside the Dialog's
+    // own content (the portal panel is a document.body sibling, not a
+    // DOM descendant of the Dialog content, so it would otherwise be
+    // treated as "outside" and have its scroll cancelled). A real
+    // native listener (not a React synthetic one) guarantees the
+    // native event never reaches `document`, regardless of React's
+    // internal event-delegation target for portaled nodes.
+    useEffect(() => {
+      if (!open) return;
+      const node = listRef.current;
+      if (!node) return;
+      const stop = (e: Event) => e.stopPropagation();
+      node.addEventListener("wheel", stop, { passive: true });
+      node.addEventListener("touchmove", stop, { passive: true });
+      return () => {
+        node.removeEventListener("wheel", stop);
+        node.removeEventListener("touchmove", stop);
+      };
+    }, [open]);
 
     const selectOption = useCallback(
       (opt: ComboboxOption) => {
@@ -247,7 +301,7 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(
         )}
         {open &&
           filtered.length > 0 &&
-          typeof document !== "undefined" &&
+          portalTarget &&
           createPortal(
             <DismissableLayerBranch>
               <div
@@ -280,7 +334,7 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(
                 ))}
               </div>
             </DismissableLayerBranch>,
-            document.body,
+            portalTarget,
           )}
       </div>
     );
