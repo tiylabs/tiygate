@@ -68,6 +68,40 @@ export interface ModelCatalogStatus {
   model_count: number;
 }
 
+export type PricingSourceKind =
+  | "official"
+  | "openrouter_fallback"
+  | "aggregator_fallback";
+
+export interface ModelPricing {
+  currency: string;
+  input_token_usd_per_million?: number | null;
+  output_token_usd_per_million?: number | null;
+  cached_input_token_usd_per_million?: number | null;
+  cached_write_token_usd_per_million?: number | null;
+  source_provider: string;
+  source_kind: PricingSourceKind;
+}
+
+export interface ModelMetadata {
+  id: string;
+  lab_id: string;
+  display_name: string;
+  family?: string | null;
+  context_window?: number | null;
+  max_input_tokens?: number | null;
+  max_output_tokens?: number | null;
+  capabilities?: Record<string, unknown>;
+  modalities?: unknown;
+  pricing?: ModelPricing | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ModelCatalogResolveRequest {
+  virtual_model: string;
+  target_model_id?: string;
+}
+
 /** Per-route routing strategy. Mirrors `tiygate_core::routing::RoutingStrategyName`
  *  (snake_case). `undefined`/absent means the route inherits the gateway-wide
  *  default strategy. */
@@ -91,6 +125,7 @@ export interface Route {
   virtual_model: string;
   targets: RouteTarget[];
   routing_strategy?: RoutingStrategyName | null;
+  model_metadata?: ModelMetadata | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -101,6 +136,7 @@ export interface RouteInput {
   virtual_model: string;
   targets: RouteTarget[];
   routing_strategy?: RoutingStrategyName | null;
+  model_metadata?: ModelMetadata | null;
   enabled?: boolean;
 }
 
@@ -359,6 +395,7 @@ export interface ExportRoute {
   virtual_model: string;
   targets: ExportRouteTarget[];
   routing_strategy?: RoutingStrategyName | null;
+  model_metadata?: ModelMetadata | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;

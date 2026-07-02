@@ -26,6 +26,7 @@ use tiygate_core::routing::{RouteEntry, RoutingTable, RoutingTarget};
 use crate::db::DbPool;
 use crate::encryption::KeyEncryption;
 use crate::keys;
+use crate::model_catalog::ModelMetadata;
 use crate::models::{
     ApiKey, ApiKeyStatus, AuthMode, ConfigEpoch, ConfigExport, ConfigSnapshot, ExportSetting,
     ImportReport, ImportSelection, Provider, Route, RouteTarget,
@@ -751,7 +752,7 @@ impl DbConfigStore {
         }
 
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, routing_strategy, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at \
              FROM routes",
         )
         .fetch_all(&mut *tx)
@@ -899,7 +900,7 @@ impl DbConfigStore {
             .fetch_one(self.pool.any())
             .await?;
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, routing_strategy, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at \
              FROM routes ORDER BY created_at DESC LIMIT $1 OFFSET $2",
         )
         .bind(limit as i64)
@@ -915,7 +916,7 @@ impl DbConfigStore {
 
     pub async fn get_route(&self, id: &str) -> Result<Option<Route>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, routing_strategy, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at \
              FROM routes WHERE id = $1",
         )
         .bind(id)
@@ -930,6 +931,7 @@ impl DbConfigStore {
         virtual_model: &str,
         targets: &[RouteTarget],
         routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
+        model_metadata: Option<&ModelMetadata>,
         enabled: bool,
     ) -> Result<Route, StoreError> {
         if targets.is_empty() {
@@ -945,20 +947,23 @@ impl DbConfigStore {
             .unwrap_or_else(|| now.clone());
         let targets_json = serde_json::to_string(targets)?;
         let strategy_str = routing_strategy.map(|s| s.as_str());
+        let model_metadata_json = serialize_model_metadata(model_metadata)?;
         let enabled_int: i32 = if enabled { 1 } else { 0 };
 
         sqlx::query(
-            "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, enabled, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+            "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT(id) DO UPDATE SET \
                 virtual_model=excluded.virtual_model, targets_json=excluded.targets_json, \
                 routing_strategy=excluded.routing_strategy, \
+                model_metadata_json=excluded.model_metadata_json, \
                 enabled=excluded.enabled, updated_at=excluded.updated_at",
         )
         .bind(id)
         .bind(virtual_model)
         .bind(&targets_json)
         .bind(strategy_str)
+        .bind(&model_metadata_json)
         .bind(enabled_int)
         .bind(&created_at)
         .bind(&now)
@@ -985,7 +990,7 @@ impl DbConfigStore {
 
     async fn load_routes(&self) -> Result<Vec<Route>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, routing_strategy, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at \
              FROM routes",
         )
         .fetch_all(self.pool.any())
@@ -1303,22 +1308,25 @@ impl DbConfigStore {
             }
             let targets_json = serde_json::to_string(&r.targets)?;
             let strategy_str = r.routing_strategy.map(|s| s.as_str());
+            let model_metadata_json = serialize_model_metadata(r.model_metadata.as_ref())?;
             let enabled_int: i32 = if r.enabled { 1 } else { 0 };
             let created_at = r.created_at.to_rfc3339();
             let updated_at = chrono::Utc::now().to_rfc3339();
             sqlx::query(
-                "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, enabled, \
+                "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, \
                  created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                  ON CONFLICT(id) DO UPDATE SET \
                     virtual_model=excluded.virtual_model, targets_json=excluded.targets_json, \
                     routing_strategy=excluded.routing_strategy, \
+                    model_metadata_json=excluded.model_metadata_json, \
                     enabled=excluded.enabled, updated_at=excluded.updated_at",
             )
             .bind(&r.id)
             .bind(&r.virtual_model)
             .bind(&targets_json)
             .bind(strategy_str)
+            .bind(&model_metadata_json)
             .bind(enabled_int)
             .bind(&created_at)
             .bind(&updated_at)
@@ -1638,9 +1646,30 @@ fn populate_provider_oauth_cleartext(
     }
 }
 
+fn serialize_model_metadata(metadata: Option<&ModelMetadata>) -> Result<String, StoreError> {
+    match metadata {
+        Some(metadata) => Ok(serde_json::to_string(metadata)?),
+        None => Ok("{}".to_string()),
+    }
+}
+
+fn deserialize_model_metadata(raw: &str) -> Result<Option<ModelMetadata>, StoreError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed)?;
+    match value {
+        serde_json::Value::Object(map) if map.is_empty() => Ok(None),
+        other => Ok(Some(serde_json::from_value(other)?)),
+    }
+}
+
 fn row_to_route(row: sqlx::any::AnyRow) -> Result<Route, StoreError> {
     let targets_str: String = row.get("targets_json");
     let targets: Vec<RouteTarget> = serde_json::from_str(&targets_str)?;
+    let model_metadata_str: String = row.get("model_metadata_json");
+    let model_metadata = deserialize_model_metadata(&model_metadata_str)?;
     let enabled_int: i32 = row.get("enabled");
     // `routing_strategy` is a nullable TEXT column. Unknown / unparsable
     // tokens are treated as `None` (inherit the gateway default) rather
@@ -1654,6 +1683,7 @@ fn row_to_route(row: sqlx::any::AnyRow) -> Result<Route, StoreError> {
         virtual_model: row.get("virtual_model"),
         targets,
         routing_strategy,
+        model_metadata,
         enabled: enabled_int != 0,
         created_at: parse_dt(row.get("created_at"))?,
         updated_at: parse_dt(row.get("updated_at"))?,
@@ -1749,6 +1779,7 @@ mod tests {
                 api_base_override: None,
             }],
             routing_strategy: None,
+            model_metadata: None,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -1815,6 +1846,7 @@ mod tests {
             virtual_model: "vm".to_string(),
             targets: vec![target_disabled, target_enabled],
             routing_strategy: None,
+            model_metadata: None,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -1873,6 +1905,7 @@ mod tests {
                 api_base_override: None,
             }],
             routing_strategy: None,
+            model_metadata: None,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -1981,6 +2014,92 @@ mod tests {
         );
     }
 
+    fn test_model_metadata(id: &str) -> ModelMetadata {
+        ModelMetadata {
+            id: id.to_string(),
+            lab_id: "test-lab".to_string(),
+            display_name: "Saved Test Model".to_string(),
+            family: Some("test-family".to_string()),
+            context_window: Some(12345),
+            max_input_tokens: Some(12000),
+            max_output_tokens: Some(345),
+            capabilities: serde_json::Map::new(),
+            modalities: None,
+            pricing: None,
+            metadata: serde_json::Map::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_model_metadata_round_trips_through_crud_and_export_import() {
+        let store = boot_store(None).await;
+        store
+            .upsert_provider(
+                "p-meta",
+                "Provider Meta",
+                "openai",
+                "https://example.test/v1",
+                "",
+                None,
+                AuthMode::None,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("provider");
+        let metadata = test_model_metadata("virtual/meta");
+        let route = store
+            .upsert_route(
+                "r-meta",
+                "virtual/meta",
+                &[RouteTarget {
+                    provider_id: "p-meta".to_string(),
+                    model_id: "upstream-meta".to_string(),
+                    weight: 1.0,
+                    enabled: true,
+                    account_label: None,
+                    api_key_override: None,
+                    api_base_override: None,
+                }],
+                None,
+                Some(&metadata),
+                true,
+            )
+            .await
+            .expect("route");
+        assert_eq!(
+            route.model_metadata.as_ref().unwrap().display_name,
+            "Saved Test Model"
+        );
+
+        let bundle = store.export_config().await.expect("export");
+        assert_eq!(
+            bundle.routes[0].model_metadata.as_ref().unwrap().lab_id,
+            "test-lab"
+        );
+
+        let target = boot_store(None).await;
+        let selection = ImportSelection {
+            providers: vec!["p-meta".to_string()],
+            routes: vec!["r-meta".to_string()],
+            ..Default::default()
+        };
+        target
+            .import_config(&bundle, "", &selection)
+            .await
+            .expect("import");
+        let imported = target
+            .get_route("r-meta")
+            .await
+            .expect("get")
+            .expect("route");
+        assert_eq!(
+            imported.model_metadata.as_ref().unwrap().context_window,
+            Some(12345)
+        );
+    }
+
     #[tokio::test]
     async fn export_config_returns_all_entities_and_clears_cleartext() {
         let store = boot_store(None).await;
@@ -2012,6 +2131,7 @@ mod tests {
                     api_key_override: None,
                     api_base_override: None,
                 }],
+                None,
                 None,
                 true,
             )

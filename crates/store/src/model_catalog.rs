@@ -724,8 +724,8 @@ fn strip_decorative_suffix(s: &str) -> &str {
         "-free", "-latest", "-tee", "-fp8", "-6bit", "-0711", "-0905",
     ];
     for suffix in SUFFIXES {
-        if s.ends_with(suffix) {
-            return &s[..s.len() - suffix.len()];
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            return stripped;
         }
     }
     s

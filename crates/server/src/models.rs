@@ -176,6 +176,7 @@ impl IntoResponse for ModelsError {
 /// from the first routing target's `provider_id`.
 fn collect_models(state: &AppState) -> Vec<Model> {
     let config = state.current_config();
+    let snapshot = config.snapshot();
     let catalog = state.model_catalog.as_ref().map(|s| s.snapshot());
     config
         .routing_table
@@ -189,7 +190,14 @@ fn collect_models(state: &AppState) -> Vec<Model> {
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| DEFAULT_OWNED_BY.to_string());
             let mut model = Model::new(virtual_model.clone(), owned_by);
-            if let Some(catalog) = &catalog {
+            if let Some(meta) = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.routes.get(virtual_model))
+                .and_then(|route| route.model_metadata.as_ref())
+            {
+                model.extensions = meta.to_model_extensions();
+                model.owned_by = meta.lab_id.clone();
+            } else if let Some(catalog) = &catalog {
                 if let Some(meta) = catalog.get_model(virtual_model) {
                     model.extensions = meta.to_model_extensions();
                     model.owned_by = meta.lab_id.clone();

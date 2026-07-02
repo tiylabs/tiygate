@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use tiygate_store::archive::{gzip_decompress, sha256_hex, PayloadArchiveManifest};
 use tiygate_store::config_store::StoreError;
+use tiygate_store::model_catalog::ModelMetadata;
 use tiygate_store::models::{
     AuthMode, ConfigExport, ImportSelection, Provider, Route, RouteTarget,
 };
@@ -62,6 +63,10 @@ pub fn router() -> Router<AdminState> {
         )
         .route("/admin/v1/provider-catalog", get(list_provider_catalog))
         .route("/admin/v1/model-catalog", get(get_model_catalog))
+        .route(
+            "/admin/v1/model-catalog/resolve",
+            post(resolve_model_catalog_metadata),
+        )
         .route(
             "/admin/v1/model-catalog/refresh",
             post(refresh_model_catalog),
@@ -361,6 +366,7 @@ fn route_snapshot(r: &Route) -> serde_json::Value {
         "virtual_model": r.virtual_model,
         "targets": r.targets,
         "routing_strategy": r.routing_strategy,
+        "model_metadata": r.model_metadata,
         "enabled": r.enabled,
     })
 }
@@ -713,6 +719,40 @@ async fn refresh_model_catalog(State(state): State<AdminState>) -> Result<Respon
         .into_response())
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelCatalogResolveRequest {
+    virtual_model: String,
+    #[serde(default)]
+    target_model_id: Option<String>,
+}
+
+async fn resolve_model_catalog_metadata(
+    State(state): State<AdminState>,
+    Json(req): Json<ModelCatalogResolveRequest>,
+) -> Result<Response, AdminError> {
+    let catalog = state
+        .model_catalog
+        .as_ref()
+        .ok_or_else(|| AdminError::NotFound("model catalog disabled".into()))?
+        .snapshot();
+    if let Some(meta) = catalog.get_model(&req.virtual_model) {
+        return Ok(Json(meta.clone()).into_response());
+    }
+    if let Some(target_model_id) = req
+        .target_model_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        if let Some(meta) = catalog.get_model(target_model_id) {
+            return Ok(Json(meta.clone()).into_response());
+        }
+    }
+    Err(AdminError::NotFound(format!(
+        "model metadata for {}",
+        req.virtual_model
+    )))
+}
+
 // ---- provider catalog (server-side registered providers) ----
 
 /// One entry of the server-side provider catalog. Unlike
@@ -776,6 +816,8 @@ struct RouteRequest {
     targets: Vec<RouteTarget>,
     #[serde(default)]
     routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
+    #[serde(default)]
+    model_metadata: Option<ModelMetadata>,
     enabled: Option<bool>,
 }
 
@@ -786,6 +828,8 @@ struct RouteView {
     targets: Vec<RouteTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_metadata: Option<ModelMetadata>,
     enabled: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -798,6 +842,7 @@ impl From<Route> for RouteView {
             virtual_model: r.virtual_model,
             targets: r.targets,
             routing_strategy: r.routing_strategy,
+            model_metadata: r.model_metadata,
             enabled: r.enabled,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -853,6 +898,7 @@ async fn create_route(
             &req.virtual_model,
             &req.targets,
             req.routing_strategy,
+            req.model_metadata.as_ref(),
             req.enabled.unwrap_or(true),
         )
         .await?;
@@ -888,6 +934,7 @@ async fn update_route(
             &req.virtual_model,
             &req.targets,
             req.routing_strategy,
+            req.model_metadata.as_ref(),
             req.enabled.unwrap_or(true),
         )
         .await?;

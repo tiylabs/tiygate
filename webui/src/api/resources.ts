@@ -10,7 +10,9 @@ import type {
   ImportSelection,
   OAuthStartResponse,
   OAuthTokenResponse,
+  ModelCatalogResolveRequest,
   ModelCatalogStatus,
+  ModelMetadata,
   Provider,
   ProviderCatalogEntry,
   ProviderDeleteImpact,
@@ -58,6 +60,11 @@ export const providerCatalogApi = {
 // ---- model catalog ----
 export const modelCatalogApi = {
   status: () => apiRequest<ModelCatalogStatus>("/model-catalog"),
+  resolve: (body: ModelCatalogResolveRequest) =>
+    apiRequest<ModelMetadata>("/model-catalog/resolve", {
+      method: "POST",
+      body,
+    }),
   refresh: () =>
     apiRequest<ModelCatalogStatus>("/model-catalog/refresh", {
       method: "POST",

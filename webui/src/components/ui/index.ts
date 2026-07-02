@@ -27,6 +27,7 @@ export { Tooltip, TooltipProvider } from "./tooltip";
 export { Select } from "./select";
 export type { SelectOption } from "./select";
 export { Switch } from "./switch";
+export { JsonEditor } from "./json-editor";
 export { JsonViewer } from "./json-viewer";
 export { ToastProvider, useToast } from "./toast";
 export type { ToastTone } from "./toast";

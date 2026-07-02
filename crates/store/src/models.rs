@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model_catalog::ModelMetadata;
+
 /// Authentication mode for a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +124,10 @@ pub struct Route {
     /// route inherits the gateway-wide default (`ServerConfig.routing_strategy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
+    /// Optional persisted metadata for the client-facing virtual model card.
+    /// When absent, `/v1/models` falls back to the runtime model catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_metadata: Option<ModelMetadata>,
     pub enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,

@@ -1342,3 +1342,45 @@ async fn model_catalog_manual_refresh_returns_new_version() {
     assert_eq!(body["source"], json!(server.uri()));
     assert_eq!(body["model_count"], json!(1));
 }
+
+#[tokio::test]
+async fn model_catalog_resolve_prefers_virtual_model_then_target_fallback() {
+    let (_router, store, pool) = boot_no_auth().await;
+    let catalog = tiygate_store::model_catalog::ModelCatalog::from_models_dev_json(
+        r#"{"openai":{"id":"openai","name":"OpenAI","models":{"openai/virtual":{"id":"openai/virtual","name":"Virtual Name"},"openai/target":{"id":"openai/target","name":"Target Name"}}}}"#,
+        "test",
+    )
+    .expect("catalog");
+    let catalog_store = Arc::new(tiygate_store::model_catalog::ModelCatalogStore::new(
+        catalog,
+    ));
+    let state = AdminState::new(store, pool, None).with_model_catalog(Some(catalog_store));
+    let router = tiygate_admin::build_router_with_auth(state, false);
+
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/model-catalog/resolve",
+            json!({"virtual_model":"openai/virtual","target_model_id":"openai/target"}),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(meta["display_name"], json!("Virtual Name"));
+
+    let resp = router
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/model-catalog/resolve",
+            json!({"virtual_model":"missing","target_model_id":"openai/target"}),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(meta["display_name"], json!("Target Name"));
+}

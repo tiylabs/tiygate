@@ -1,0 +1,1 @@
+ALTER TABLE routes ADD COLUMN IF NOT EXISTS model_metadata_json TEXT NOT NULL DEFAULT '{}';

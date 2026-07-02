@@ -15,13 +15,20 @@ import {
   Check,
   Copy,
   GripVertical,
+  IdCard,
   Pencil,
   Plus,
   Trash2,
   X,
 } from "lucide-react";
-import { providersApi, routesApi, type RouteFilter } from "@/api/resources";
+import {
+  modelCatalogApi,
+  providersApi,
+  routesApi,
+  type RouteFilter,
+} from "@/api/resources";
 import type {
+  ModelMetadata,
   Route,
   RouteInput,
   RouteTarget,
@@ -38,6 +45,7 @@ import {
   ErrorBox,
   Field,
   Input,
+  JsonEditor,
   Label,
   Alert,
   RowActions,
@@ -66,7 +74,15 @@ interface FormState {
   virtual_model: string;
   targets: FormTarget[];
   routing_strategy: RoutingStrategyName | "";
+  model_metadata: ModelMetadata | null;
   enabled: boolean;
+}
+
+interface MetadataJsonState {
+  capabilities: string;
+  modalities: string;
+  pricing: string;
+  metadata: string;
 }
 
 const DEFAULT_PAGE_SIZE = 50;
@@ -98,8 +114,55 @@ const STRATEGY_OPTIONS: RoutingStrategyName[] = [
   "latency",
 ];
 
+const METADATA_JSON_KEYS = [
+  "capabilities",
+  "modalities",
+  "pricing",
+  "metadata",
+] as const;
+type MetadataJsonKey = (typeof METADATA_JSON_KEYS)[number];
+
 function isTargetEnabled(tg: RouteTarget): boolean {
   return tg.enabled ?? true;
+}
+
+function emptyMetadata(id: string): ModelMetadata {
+  return {
+    id,
+    lab_id: "self",
+    display_name: id,
+    capabilities: {},
+    metadata: {},
+  };
+}
+
+function formatJson(value: unknown, fallback: unknown): string {
+  return JSON.stringify(value ?? fallback, null, 2);
+}
+
+function metadataJsonState(metadata: ModelMetadata | null): MetadataJsonState {
+  return {
+    capabilities: formatJson(metadata?.capabilities, {}),
+    modalities: formatJson(metadata?.modalities, null),
+    pricing: formatJson(metadata?.pricing, null),
+    metadata: formatJson(metadata?.metadata, {}),
+  };
+}
+
+function parseJsonField<T>(raw: string, fallback: T, label: string): T {
+  const trimmed = raw.trim();
+  if (!trimmed) return fallback;
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    throw new Error(`${label} must be valid JSON.`);
+  }
+}
+
+function parseOptionalNumber(raw: string): number | null {
+  if (!raw.trim()) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
 }
 
 function emptyForm(): FormState {
@@ -107,6 +170,7 @@ function emptyForm(): FormState {
     virtual_model: "",
     targets: [createFormTarget()],
     routing_strategy: "",
+    model_metadata: null,
     enabled: true,
   };
 }
@@ -147,6 +211,12 @@ export default function RoutesPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Route | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm());
+  const [metadataPanelOpen, setMetadataPanelOpen] = useState(false);
+  const [metadataJson, setMetadataJson] = useState<MetadataJsonState>(
+    metadataJsonState(null),
+  );
+  const [activeMetadataJsonKey, setActiveMetadataJsonKey] =
+    useState<MetadataJsonKey>("capabilities");
   const [formError, setFormError] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Route | null>(null);
   // Pointer-driven reorder preview state. The underlying target array is not
@@ -188,6 +258,24 @@ export default function RoutesPage() {
     onError: (e: Error) => setFormError(e.message),
   });
 
+  const resolveMetadataMutation = useMutation({
+    mutationFn: () =>
+      modelCatalogApi.resolve({
+        virtual_model: form.virtual_model,
+        target_model_id: form.targets.find((tg) => tg.model_id)?.model_id,
+      }),
+    onSuccess: (metadata) => {
+      setForm((f) => ({ ...f, model_metadata: metadata }));
+      setMetadataJson(metadataJsonState(metadata));
+      setMetadataPanelOpen(true);
+      toast.success(t("routes.metadataInitialized"));
+    },
+    onError: (e: Error) => {
+      setMetadataPanelOpen(true);
+      toast.error(t("routes.metadataInitFailed"), e.message);
+    },
+  });
+
   const deleteMutation = useMutation({
     mutationFn: routesApi.remove,
     onSuccess: () => {
@@ -212,6 +300,7 @@ export default function RoutesPage() {
           enabled: tg.enabled ?? true,
         })),
         routing_strategy: r.routing_strategy ?? undefined,
+        model_metadata: r.model_metadata ?? null,
         enabled: false,
       };
       return routesApi.create(body);
@@ -232,6 +321,8 @@ export default function RoutesPage() {
     resetTargetDrag();
     setEditing(null);
     setForm(emptyForm());
+    setMetadataJson(metadataJsonState(null));
+    setMetadataPanelOpen(false);
     setFormError(null);
     setModalOpen(true);
   }
@@ -252,8 +343,11 @@ export default function RoutesPage() {
           )
         : [createFormTarget()],
       routing_strategy: r.routing_strategy ?? "",
+      model_metadata: r.model_metadata ?? null,
       enabled: r.enabled,
     });
+    setMetadataJson(metadataJsonState(r.model_metadata ?? null));
+    setMetadataPanelOpen(Boolean(r.model_metadata));
     setFormError(null);
     setModalOpen(true);
   }
@@ -447,10 +541,56 @@ export default function RoutesPage() {
       setFormError(t("routes.validationError"));
       return;
     }
+    let modelMetadata = form.model_metadata;
+    if (modelMetadata) {
+      try {
+        const metadataId =
+          modelMetadata.id.trim() || form.virtual_model.trim();
+        if (
+          !metadataId ||
+          !modelMetadata.lab_id.trim() ||
+          !modelMetadata.display_name.trim()
+        ) {
+          setFormError(t("routes.metadataRequired"));
+          return;
+        }
+        modelMetadata = {
+          ...modelMetadata,
+          id: metadataId,
+          lab_id: modelMetadata.lab_id.trim(),
+          display_name: modelMetadata.display_name.trim(),
+          family: modelMetadata.family?.trim() || null,
+          capabilities: parseJsonField<Record<string, unknown>>(
+            metadataJson.capabilities,
+            {},
+            t("routes.metadataCapabilities"),
+          ),
+          modalities: parseJsonField<unknown>(
+            metadataJson.modalities,
+            null,
+            t("routes.metadataModalities"),
+          ),
+          pricing: parseJsonField<ModelMetadata["pricing"]>(
+            metadataJson.pricing,
+            null,
+            t("routes.metadataPricing"),
+          ),
+          metadata: parseJsonField<Record<string, unknown>>(
+            metadataJson.metadata,
+            {},
+            t("routes.metadataExtra"),
+          ),
+        };
+      } catch (e) {
+        setFormError(e instanceof Error ? e.message : t("routes.metadataJsonInvalid"));
+        return;
+      }
+    }
     const body: RouteInput = {
       virtual_model: form.virtual_model,
       targets,
       routing_strategy: form.routing_strategy || undefined,
+      model_metadata: modelMetadata,
       enabled: form.enabled,
     };
     saveMutation.mutate({ id: editing?.id, body });
@@ -519,6 +659,18 @@ export default function RoutesPage() {
         label: t(`routes.strategyOptions.${s}`),
       })),
     ],
+    [t],
+  );
+  const metadataJsonTabs = useMemo(
+    () =>
+      METADATA_JSON_KEYS.map((key) => ({
+        key,
+        label: t(
+          key === "metadata"
+            ? "routes.metadataExtra"
+            : `routes.metadata${key[0].toUpperCase()}${key.slice(1)}`,
+        ),
+      })),
     [t],
   );
 
@@ -759,14 +911,240 @@ export default function RoutesPage() {
         <div className="space-y-4">
           {formError ? <ErrorBox message={formError} /> : null}
           <Field label={t("routes.virtualModel")} required>
-            <Input
-              value={form.virtual_model}
-              onChange={(e) =>
-                setForm({ ...form, virtual_model: e.target.value })
-              }
-              placeholder="gpt-4o"
-            />
+            <div className="flex gap-2">
+              <Input
+                value={form.virtual_model}
+                onChange={(e) =>
+                  setForm({ ...form, virtual_model: e.target.value })
+                }
+                placeholder="gpt-4o"
+              />
+              <Button
+                variant="secondary"
+                className="h-9 w-9 px-0"
+                icon={<IdCard size={14} />}
+                loading={resolveMetadataMutation.isPending}
+                aria-label={t("routes.metadata")}
+                title={t("routes.metadata")}
+                onClick={() => {
+                  if (form.model_metadata) {
+                    setMetadataPanelOpen((open) => !open);
+                    return;
+                  }
+                  if (!form.virtual_model.trim()) {
+                    setFormError(t("routes.validationError"));
+                    return;
+                  }
+                  resolveMetadataMutation.mutate();
+                }}
+              />
+            </div>
           </Field>
+
+          {metadataPanelOpen ? (
+            <div className="space-y-3 rounded-lg border border-border bg-surface-muted/30 p-3">
+              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+                <div className="min-w-0 pr-2">
+                  <Label>{t("routes.metadata")}</Label>
+                  <p className="mt-0.5 max-w-[42rem] text-xs leading-5 text-text-subtle">
+                    {t("routes.metadataHint")}
+                  </p>
+                </div>
+                <div className="flex shrink-0 justify-end gap-2 whitespace-nowrap">
+                  {form.model_metadata ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        setForm((f) => ({ ...f, model_metadata: null }))
+                      }
+                    >
+                      {t("routes.clearMetadata")}
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+              {form.model_metadata ? (
+                <div className="space-y-3">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Field label={t("routes.metadataLabId")} required>
+                      <Input
+                        value={form.model_metadata.lab_id}
+                        onChange={(e) =>
+                          setForm((f) => ({
+                            ...f,
+                            model_metadata: f.model_metadata
+                              ? { ...f.model_metadata, lab_id: e.target.value }
+                              : f.model_metadata,
+                          }))
+                        }
+                      />
+                    </Field>
+                    <Field label={t("routes.metadataDisplayName")} required>
+                      <Input
+                        value={form.model_metadata.display_name}
+                        onChange={(e) =>
+                          setForm((f) => ({
+                            ...f,
+                            model_metadata: f.model_metadata
+                              ? {
+                                  ...f.model_metadata,
+                                  display_name: e.target.value,
+                                }
+                              : f.model_metadata,
+                          }))
+                        }
+                      />
+                    </Field>
+                    <Field label={t("routes.metadataFamily")}>
+                      <Input
+                        value={form.model_metadata.family ?? ""}
+                        onChange={(e) =>
+                          setForm((f) => ({
+                            ...f,
+                            model_metadata: f.model_metadata
+                              ? {
+                                  ...f.model_metadata,
+                                  family: e.target.value || null,
+                                }
+                              : f.model_metadata,
+                          }))
+                        }
+                      />
+                    </Field>
+                    <Field label={t("routes.metadataContextWindow")}>
+                      <Input
+                        type="number"
+                        value={form.model_metadata.context_window ?? ""}
+                        onChange={(e) =>
+                          setForm((f) => ({
+                            ...f,
+                            model_metadata: f.model_metadata
+                              ? {
+                                  ...f.model_metadata,
+                                  context_window: parseOptionalNumber(
+                                    e.target.value,
+                                  ),
+                                }
+                              : f.model_metadata,
+                          }))
+                        }
+                      />
+                    </Field>
+                    <Field label={t("routes.metadataMaxInputTokens")}>
+                      <Input
+                        type="number"
+                        value={form.model_metadata.max_input_tokens ?? ""}
+                        onChange={(e) =>
+                          setForm((f) => ({
+                            ...f,
+                            model_metadata: f.model_metadata
+                              ? {
+                                  ...f.model_metadata,
+                                  max_input_tokens: parseOptionalNumber(
+                                    e.target.value,
+                                  ),
+                                }
+                              : f.model_metadata,
+                          }))
+                        }
+                      />
+                    </Field>
+                    <Field label={t("routes.metadataMaxOutputTokens")}>
+                      <Input
+                        type="number"
+                        value={form.model_metadata.max_output_tokens ?? ""}
+                        onChange={(e) =>
+                          setForm((f) => ({
+                            ...f,
+                            model_metadata: f.model_metadata
+                              ? {
+                                  ...f.model_metadata,
+                                  max_output_tokens: parseOptionalNumber(
+                                    e.target.value,
+                                  ),
+                                }
+                              : f.model_metadata,
+                          }))
+                        }
+                      />
+                    </Field>
+                  </div>
+                  <div className="space-y-2 rounded-md border border-border bg-surface p-2">
+                    <div
+                      className="flex flex-wrap gap-1 border-b border-border pb-2"
+                      role="tablist"
+                      aria-label={t("routes.metadataJsonFields")}
+                    >
+                      {metadataJsonTabs.map((tab) => (
+                        <button
+                          key={tab.key}
+                          type="button"
+                          role="tab"
+                          aria-selected={activeMetadataJsonKey === tab.key}
+                          className={cn(
+                            "rounded-sm px-2.5 py-1 text-xs font-medium transition-colors",
+                            activeMetadataJsonKey === tab.key
+                              ? "bg-primary text-primary-foreground"
+                              : "text-text-muted hover:bg-surface-muted hover:text-text",
+                          )}
+                          onClick={() => setActiveMetadataJsonKey(tab.key)}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
+                    </div>
+                    <div>
+                      <JsonEditor
+                        value={metadataJson[activeMetadataJsonKey]}
+                        copyLabel={t("common.copy")}
+                        copiedLabel={t("common.copied")}
+                        ariaLabel={
+                          metadataJsonTabs.find(
+                            (tab) => tab.key === activeMetadataJsonKey,
+                          )?.label ?? "JSON"
+                        }
+                        onChange={(value) =>
+                          setMetadataJson((json) => ({
+                            ...json,
+                            [activeMetadataJsonKey]: value,
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex justify-center gap-2 py-3">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    loading={resolveMetadataMutation.isPending}
+                    onClick={() => {
+                      if (!form.virtual_model.trim()) {
+                        setFormError(t("routes.validationError"));
+                        return;
+                      }
+                      resolveMetadataMutation.mutate();
+                    }}
+                  >
+                    {t("routes.initMetadata")}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => {
+                      const metadata = emptyMetadata(form.virtual_model.trim());
+                      setForm((f) => ({ ...f, model_metadata: metadata }));
+                      setMetadataJson(metadataJsonState(metadata));
+                    }}
+                  >
+                    {t("routes.manualMetadata")}
+                  </Button>
+                </div>
+              )}
+            </div>
+          ) : null}
 
           <Field label={t("routes.strategy")} hint={t("routes.strategyHint")}>
             <Select
