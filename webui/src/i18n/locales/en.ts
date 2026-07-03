@@ -491,6 +491,11 @@ const en = {
     userAgent: "User Agent",
     errorSource: "Error source",
     cost: "Cost",
+    costTotal: "Total cost",
+    costInput: "Input cost",
+    costOutput: "Output cost",
+    costCacheRead: "Cache read cost",
+    costCacheWrite: "Cache write cost",
     resolvedModel: "Resolved model",
   },
   audit: {

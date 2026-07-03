@@ -544,6 +544,7 @@ export default function RequestLogs() {
                   <Th>{t("requests.model")}</Th>
                   <Th>{t("requests.protocol")}</Th>
                   <Th>{t("requests.upstreamModel")}</Th>
+                  <Th className="text-right">{t("requests.cost")}</Th>
                   <Th className="text-right">{t("requests.tokens")}</Th>
                   <Th>{t("requests.cacheHit")}</Th>
                   <Th className="text-right">{t("requests.ttfb")}</Th>
@@ -602,6 +603,11 @@ export default function RequestLogs() {
                         model={r.resolved_model}
                         providerName={resolveProvider(r.resolved_provider)}
                       />
+                    </Td>
+                    <Td className="text-right tabular-nums">
+                      {r.cost != null
+                        ? `$${(r.cost / 1_000_000).toFixed(6)}`
+                        : "—"}
                     </Td>
                     <Td className="text-right tabular-nums">
                       {fmtTokens(r.total_tokens)}
@@ -821,13 +827,6 @@ export default function RequestLogs() {
                     value={detail.error_source}
                   />
                 )}
-                {detail?.cost != null && (
-                  <MetricCell
-                    label={t("requests.cost")}
-                    value={detail.cost.toFixed(6)}
-                    mono
-                  />
-                )}
                 {detail?.client_ip && (
                   <MetricCell
                     label={t("requests.clientIp")}
@@ -932,6 +931,43 @@ export default function RequestLogs() {
               </div>
             </DetailSection>
           </div>
+
+          {/* ── Area 3b: Cost ── */}
+          {detail?.cost != null && (
+            <div className="rounded-md border border-border bg-surface p-3">
+              <DetailSection title={t("requests.cost")}>
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="col-span-1 row-span-2 flex items-center">
+                    <MetricCell
+                      label={t("requests.costTotal")}
+                      value={`$${(detail.cost / 1_000_000).toFixed(6)}`}
+                      mono
+                    />
+                  </div>
+                  <MetricCell
+                    label={t("requests.costInput")}
+                    value={`$${((detail.input_cost ?? 0) / 1_000_000).toFixed(6)}`}
+                    mono
+                  />
+                  <MetricCell
+                    label={t("requests.costOutput")}
+                    value={`$${((detail.output_cost ?? 0) / 1_000_000).toFixed(6)}`}
+                    mono
+                  />
+                  <MetricCell
+                    label={t("requests.costCacheRead")}
+                    value={`$${((detail.cache_read_cost ?? 0) / 1_000_000).toFixed(6)}`}
+                    mono
+                  />
+                  <MetricCell
+                    label={t("requests.costCacheWrite")}
+                    value={`$${((detail.cache_write_cost ?? 0) / 1_000_000).toFixed(6)}`}
+                    mono
+                  />
+                </div>
+              </DetailSection>
+            </div>
+          )}
 
           {/* ── Area 4: Unified Payload Tabs ── */}
           {replayQuery.isLoading ? (

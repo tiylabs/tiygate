@@ -255,6 +255,10 @@ export interface RequestLogEntry {
   cache_write_tokens?: number | null;
   total_tokens?: number | null;
   cost?: number | null;
+  input_cost?: number | null;
+  output_cost?: number | null;
+  cache_read_cost?: number | null;
+  cache_write_cost?: number | null;
   api_key_id?: string | null;
   client_ip?: string | null;
   user_agent?: string | null;

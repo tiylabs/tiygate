@@ -479,6 +479,11 @@ const zh: Translation = {
     userAgent: "User Agent",
     errorSource: "错误来源",
     cost: "费用",
+    costTotal: "总费用",
+    costInput: "输入费用",
+    costOutput: "输出费用",
+    costCacheRead: "缓存读取费用",
+    costCacheWrite: "缓存写入费用",
     resolvedModel: "解析后模型",
   },
   audit: {
