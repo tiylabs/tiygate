@@ -1707,10 +1707,20 @@ impl CostBreakdown {
 ///
 /// `USD/1M tokens × tokens = micro-USD` (1 micro-USD = 1e-6 USD), so
 /// the multiplication is direct — no unit conversion is needed.
+///
+/// `reasoning_tokens` is accepted for API symmetry but intentionally
+/// NOT added to the output-cost base. In the IR convention shared by
+/// OpenAI (chat completions + responses) and Anthropic (messages),
+/// `completion_tokens` already includes `reasoning_tokens` — the
+/// latter is a subset breakdown, not an additive component. Adding it
+/// back here would double-count reasoning output. Gemini's
+/// `candidatesTokenCount` excludes `thoughtsTokenCount`, so thoughts
+/// are not billed under output cost; that is a pre-existing protocols
+/// layer discrepancy tracked separately.
 fn compute_cost_micro_usd(
     prompt_tokens: u64,
     completion_tokens: u64,
-    reasoning_tokens: Option<u64>,
+    _reasoning_tokens: Option<u64>,
     cache_read_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
     pricing: &ModelPricing,
@@ -1728,9 +1738,10 @@ fn compute_cost_micro_usd(
     if let Some(price) = pricing.input_token_usd_per_million {
         bd.input_cost = (prompt_tokens as f64 * price).round() as u64;
     }
+    // completion_tokens already includes reasoning_tokens for OpenAI
+    // and Anthropic; do NOT add reasoning_tokens here.
     if let Some(price) = pricing.output_token_usd_per_million {
-        let output = completion_tokens + reasoning_tokens.unwrap_or(0);
-        bd.output_cost = (output as f64 * price).round() as u64;
+        bd.output_cost = (completion_tokens as f64 * price).round() as u64;
     }
     if let Some(price) = pricing.cached_input_token_usd_per_million {
         if let Some(tokens) = cache_read_tokens {
