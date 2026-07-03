@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-07-03
+### :sparkles: New Features
+- [`454ac5f`](https://github.com/tiylabs/tiygate/commit/454ac5fdbae900a3891c7faeeac504d4d26719e8) - **admin,webui**: ✨ add route target model auto-discovery with searchable dropdown *(PR [#28](https://github.com/tiylabs/tiygate/pull/28) by [@jorben](https://github.com/jorben))*
+- [`a60cc7e`](https://github.com/tiylabs/tiygate/commit/a60cc7e7d5dc66ccc39a147a43813b5177ab0f56) - **routes**: ✨ add virtual model metadata *(PR [#30](https://github.com/tiylabs/tiygate/pull/30) by [@HayWolf](https://github.com/HayWolf))*
+
+### :bug: Bug Fixes
+- [`ac44de1`](https://github.com/tiylabs/tiygate/commit/ac44de15615381e46b86e8d836e87c1d480a1426) - **store**: 🐛 cast AVG and throughput queries to DOUBLE PRECISION for PostgreSQL *(PR [#24](https://github.com/tiylabs/tiygate/pull/24) by [@HayWolf](https://github.com/HayWolf))*
+- [`1bd9ccd`](https://github.com/tiylabs/tiygate/commit/1bd9ccd737f0135b2cc6020b69166ed4f57fe7fc) - **ingress**: 🐛 disable upstream redirect following to prevent Authorization header stripping *(PR [#27](https://github.com/tiylabs/tiygate/pull/27) by [@jorben](https://github.com/jorben))*
+  - :arrow_lower_right: *fixes issue [#26](https://github.com/tiylabs/tiygate/issues/26) opened by [@2niuhe](https://github.com/2niuhe)*
+- [`2981fd7`](https://github.com/tiylabs/tiygate/commit/2981fd735ed49c9dcde165f53e235d3d3dcd455c) - **ui**: 🐛 make Combobox dropdown scrollable inside Radix Dialog *(PR [#29](https://github.com/tiylabs/tiygate/pull/29) by [@jorben](https://github.com/jorben))*
+
+
 ## [0.1.8] - 2026-06-30
 ### :boom: BREAKING CHANGES
 - due to [`d202df8`](https://github.com/tiylabs/tiygate/commit/d202df88fea7adb51a3c6619b4a7fa4d8fc300e6) - ✨ pass structured error code through to client responses *(PR [#18](https://github.com/tiylabs/tiygate/pull/18) by [@HayWolf](https://github.com/HayWolf))*:
@@ -171,3 +183,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.6]: https://github.com/tiylabs/tiygate/compare/0.1.5...0.1.6
 [0.1.7]: https://github.com/tiylabs/tiygate/compare/0.1.6...0.1.7
 [0.1.8]: https://github.com/tiylabs/tiygate/compare/0.1.7...0.1.8
+[0.1.9]: https://github.com/tiylabs/tiygate/compare/0.1.8...0.1.9
