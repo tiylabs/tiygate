@@ -104,9 +104,9 @@ impl App {
         // control plane is absent we fall back to the stdout sink
         // so the data plane still emits useful structured logs.
         let sink: Arc<dyn EventSink> = match &control_plane {
-            Some(cp) => Arc::new(
-                OltpSink::new(cp.pool.clone()).with_config_store(cp.store.clone()),
-            ),
+            Some(cp) => {
+                Arc::new(OltpSink::new(cp.pool.clone()).with_config_store(cp.store.clone()))
+            }
             None => Arc::new(StdoutSink::new()),
         };
         let telemetry =

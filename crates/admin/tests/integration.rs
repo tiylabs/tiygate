@@ -570,7 +570,7 @@ async fn acceptance_3_stats_by_provider_endpoint() {
         latency_ms: LatencyBreakdown::default(),
         ttfb_ms: None,
         tokens: None,
-        cost: None,
+        cost: Some(42_000),
         api_key_id: Some("k1".to_string()),
         client_ip: None,
         user_agent: None,
@@ -594,6 +594,7 @@ async fn acceptance_3_stats_by_provider_endpoint() {
     let buckets = body["buckets"].as_array().unwrap();
     assert!(!buckets.is_empty());
     assert_eq!(buckets[0]["bucket"], "openai");
+    assert_eq!(buckets[0]["cost"], 42_000);
 }
 
 // ---- Acceptance #4: config and log are separate tables ----

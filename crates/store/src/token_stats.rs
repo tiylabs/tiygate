@@ -123,6 +123,7 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
                 COALESCE(SUM(prompt_tokens), 0) AS pt, \
                 COALESCE(SUM(completion_tokens), 0) AS ct, \
                 COALESCE(SUM(reasoning_tokens), 0) AS rt, \
+                COALESCE(SUM(cost), 0) AS tc, \
                 COALESCE(MAX(total_tokens), 0) AS peak_req, \
                 COALESCE(MAX(total_latency_ms), 0) AS longest_ms \
          FROM request_logs \
@@ -144,20 +145,22 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
         let prompt_tokens: i64 = r.get("pt");
         let completion_tokens: i64 = r.get("ct");
         let reasoning_tokens: i64 = r.get("rt");
+        let total_cost: i64 = r.get("tc");
         let peak_single_request: i64 = r.get("peak_req");
         let longest_task_ms: i64 = r.get("longest_ms");
 
         sqlx::query(
             "INSERT INTO token_daily_stats \
                 (day, request_count, total_tokens, prompt_tokens, completion_tokens, \
-                 reasoning_tokens, peak_single_request, longest_task_ms, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 reasoning_tokens, total_cost, peak_single_request, longest_task_ms, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT(day) DO UPDATE SET \
                 request_count = excluded.request_count, \
                 total_tokens = excluded.total_tokens, \
                 prompt_tokens = excluded.prompt_tokens, \
                 completion_tokens = excluded.completion_tokens, \
                 reasoning_tokens = excluded.reasoning_tokens, \
+                total_cost = excluded.total_cost, \
                 peak_single_request = excluded.peak_single_request, \
                 longest_task_ms = excluded.longest_task_ms, \
                 updated_at = excluded.updated_at",
@@ -168,6 +171,7 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
         .bind(prompt_tokens)
         .bind(completion_tokens)
         .bind(reasoning_tokens)
+        .bind(total_cost)
         .bind(peak_single_request)
         .bind(longest_task_ms)
         .bind(&updated_at)
@@ -211,6 +215,16 @@ pub async fn recompute_summary(pool: &DbPool) -> Result<(), sqlx::Error> {
             .fetch_one(pool.any())
             .await?;
 
+    let lifetime_cost: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(total_cost), 0) FROM token_daily_stats")
+            .fetch_one(pool.any())
+            .await?;
+
+    let peak_day_cost: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(total_cost), 0) FROM token_daily_stats")
+            .fetch_one(pool.any())
+            .await?;
+
     let (current_streak, longest_streak) = compute_streaks(pool, today).await?;
 
     sqlx::query(
@@ -218,14 +232,18 @@ pub async fn recompute_summary(pool: &DbPool) -> Result<(), sqlx::Error> {
             lifetime_tokens = $1, \
             peak_day_tokens = $2, \
             longest_task_ms = $3, \
-            current_streak = $4, \
-            longest_streak = $5, \
-            updated_at = $6 \
+            lifetime_cost = $4, \
+            peak_day_cost = $5, \
+            current_streak = $6, \
+            longest_streak = $7, \
+            updated_at = $8 \
          WHERE id = 1",
     )
     .bind(lifetime_tokens)
     .bind(peak_day_tokens)
     .bind(longest_task_ms)
+    .bind(lifetime_cost)
+    .bind(peak_day_cost)
     .bind(current_streak)
     .bind(longest_streak)
     .bind(&updated_at)
@@ -311,6 +329,7 @@ async fn compute_streaks(pool: &DbPool, today: NaiveDate) -> Result<(i64, i64), 
 pub struct TokenDayActivity {
     pub day: String,
     pub total_tokens: i64,
+    pub total_cost: i64,
     pub request_count: i64,
 }
 
@@ -320,7 +339,7 @@ pub async fn get_token_activity(
     days: u32,
 ) -> Result<Vec<TokenDayActivity>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT day, total_tokens, request_count \
+        "SELECT day, total_tokens, total_cost, request_count \
          FROM token_daily_stats \
          ORDER BY day DESC \
          LIMIT $1",
@@ -334,6 +353,7 @@ pub async fn get_token_activity(
         out.push(TokenDayActivity {
             day: r.get("day"),
             total_tokens: r.get("total_tokens"),
+            total_cost: r.get("total_cost"),
             request_count: r.get("request_count"),
         });
     }
@@ -347,6 +367,8 @@ pub async fn get_token_activity(
 pub struct TokenSummaryData {
     pub lifetime_tokens: i64,
     pub peak_day_tokens: i64,
+    pub lifetime_cost: i64,
+    pub peak_day_cost: i64,
     pub longest_task_ms: i64,
     pub current_streak: i64,
     pub longest_streak: i64,
@@ -356,8 +378,8 @@ pub struct TokenSummaryData {
 /// Fetch the pre-computed summary from the single-row table.
 pub async fn get_token_summary(pool: &DbPool) -> Result<TokenSummaryData, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT lifetime_tokens, peak_day_tokens, longest_task_ms, \
-                current_streak, longest_streak, updated_at \
+        "SELECT lifetime_tokens, peak_day_tokens, lifetime_cost, peak_day_cost, \
+                longest_task_ms, current_streak, longest_streak, updated_at \
          FROM token_summary WHERE id = 1",
     )
     .fetch_one(pool.any())
@@ -366,6 +388,8 @@ pub async fn get_token_summary(pool: &DbPool) -> Result<TokenSummaryData, sqlx::
     Ok(TokenSummaryData {
         lifetime_tokens: row.get("lifetime_tokens"),
         peak_day_tokens: row.get("peak_day_tokens"),
+        lifetime_cost: row.get("lifetime_cost"),
+        peak_day_cost: row.get("peak_day_cost"),
         longest_task_ms: row.get("longest_task_ms"),
         current_streak: row.get("current_streak"),
         longest_streak: row.get("longest_streak"),
@@ -382,7 +406,7 @@ pub async fn export_token_daily_stats(
 ) -> Result<Vec<ExportTokenDailyStat>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT day, request_count, total_tokens, prompt_tokens, \
-                completion_tokens, reasoning_tokens, peak_single_request, \
+                completion_tokens, reasoning_tokens, total_cost, peak_single_request, \
                 longest_task_ms \
          FROM token_daily_stats ORDER BY day",
     )
@@ -398,6 +422,7 @@ pub async fn export_token_daily_stats(
             prompt_tokens: r.get("prompt_tokens"),
             completion_tokens: r.get("completion_tokens"),
             reasoning_tokens: r.get("reasoning_tokens"),
+            total_cost: r.get("total_cost"),
             peak_single_request: r.get("peak_single_request"),
             longest_task_ms: r.get("longest_task_ms"),
         });
@@ -417,13 +442,20 @@ mod tests {
         Arc::new(pool)
     }
 
-    async fn insert_log(pool: &DbPool, request_id: &str, ts: &str, tokens: i64, latency_ms: i64) {
+    async fn insert_log(
+        pool: &DbPool,
+        request_id: &str,
+        ts: &str,
+        tokens: i64,
+        latency_ms: i64,
+        cost: Option<i64>,
+    ) {
         sqlx::query(
             "INSERT INTO request_logs \
                 (request_id, ts, virtual_model, ingress_protocol, status, \
                  total_latency_ms, upstream_latency_ms, queue_latency_ms, lossy, \
-                 total_tokens, prompt_tokens, completion_tokens) \
-             VALUES ($1, $2, 'gpt-4o', 'openai/chat-completions/v1', 'ok', $3, 0, 0, 0, $4, $5, $6)",
+                 total_tokens, prompt_tokens, completion_tokens, cost) \
+             VALUES ($1, $2, 'gpt-4o', 'openai/chat-completions/v1', 'ok', $3, 0, 0, 0, $4, $5, $6, $7)",
         )
         .bind(request_id)
         .bind(ts)
@@ -431,6 +463,7 @@ mod tests {
         .bind(tokens)
         .bind(tokens / 2)
         .bind(tokens / 2)
+        .bind(cost)
         .execute(pool.any())
         .await
         .expect("insert");
@@ -446,9 +479,17 @@ mod tests {
         let today_ts = format!("{}T10:00:00Z", today);
         let yesterday_ts = format!("{}T10:00:00Z", yesterday);
 
-        insert_log(pool.as_ref(), "req-1", &today_ts, 100, 5000).await;
-        insert_log(pool.as_ref(), "req-2", &today_ts, 200, 3000).await;
-        insert_log(pool.as_ref(), "req-3", &yesterday_ts, 150, 8000).await;
+        insert_log(pool.as_ref(), "req-1", &today_ts, 100, 5000, Some(100_000)).await;
+        insert_log(pool.as_ref(), "req-2", &today_ts, 200, 3000, Some(50_000)).await;
+        insert_log(
+            pool.as_ref(),
+            "req-3",
+            &yesterday_ts,
+            150,
+            8000,
+            Some(250_000),
+        )
+        .await;
 
         aggregate_once(pool.as_ref(), 30).await.expect("aggregate");
 
@@ -460,14 +501,18 @@ mod tests {
         // First day is yesterday (chronological order).
         assert_eq!(activity[0].day, yesterday.format("%Y-%m-%d").to_string());
         assert_eq!(activity[0].total_tokens, 150);
+        assert_eq!(activity[0].total_cost, 250_000);
         // Second day is today.
         assert_eq!(activity[1].day, today.format("%Y-%m-%d").to_string());
         assert_eq!(activity[1].total_tokens, 300);
+        assert_eq!(activity[1].total_cost, 150_000);
 
         // Check summary.
         let summary = get_token_summary(pool.as_ref()).await.expect("summary");
         assert_eq!(summary.lifetime_tokens, 450);
         assert_eq!(summary.peak_day_tokens, 300);
+        assert_eq!(summary.lifetime_cost, 400_000);
+        assert_eq!(summary.peak_day_cost, 250_000);
         assert_eq!(summary.longest_task_ms, 8000);
         assert_eq!(summary.current_streak, 2);
         assert_eq!(summary.longest_streak, 2);
@@ -480,7 +525,7 @@ mod tests {
         // Insert activity 3 days ago only (gap of 2 days).
         let three_ago = today - chrono::Duration::days(3);
         let ts = format!("{}T10:00:00Z", three_ago);
-        insert_log(pool.as_ref(), "req-old", &ts, 50, 1000).await;
+        insert_log(pool.as_ref(), "req-old", &ts, 50, 1000, None).await;
 
         aggregate_once(pool.as_ref(), 30).await.expect("aggregate");
 

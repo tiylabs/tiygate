@@ -21,7 +21,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { InstanceIndicator } from "@/components/InstanceIndicator";
 import { TokenSummaryBar } from "@/components/TokenSummaryBar";
 import { TokenHeatmap } from "@/components/TokenHeatmap";
-import { fmtTokens } from "@/lib/format";
+import { fmtTokens, fmtUsdFromMicros } from "@/lib/format";
 
 const numberFmt = new Intl.NumberFormat();
 
@@ -143,6 +143,7 @@ function StatsTableContent({
           <Th className="text-right">{t("dashboard.cacheTokens")}</Th>
           <Th className="text-right">{t("dashboard.completionTokens")}</Th>
           <Th className="text-right">{t("dashboard.tokens")}</Th>
+          <Th className="text-right">{t("dashboard.cost")}</Th>
           {showPerf && (
             <>
               <Th className="text-right">{t("dashboard.latency")}</Th>
@@ -183,6 +184,9 @@ function StatsTableContent({
             </Td>
             <Td className="text-right tabular-nums">
               {fmtTokens(b.total_tokens)}
+            </Td>
+            <Td className="text-right tabular-nums">
+              {fmtUsdFromMicros(b.cost)}
             </Td>
             {showPerf && (
               <>
@@ -295,6 +299,7 @@ export default function Dashboard() {
   const totalRequests = modelBuckets.reduce((s, b) => s + b.count, 0);
   const totalErrors = modelBuckets.reduce((s, b) => s + b.error_count, 0);
   const totalTokens = modelBuckets.reduce((s, b) => s + b.total_tokens, 0);
+  const totalCost = modelBuckets.reduce((s, b) => s + b.cost, 0);
   const errorRate = totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0;
 
   const targets = breakers.data?.targets ?? [];
@@ -331,8 +336,17 @@ export default function Dashboard() {
           )}
         </Card>
 
-        {/* Right: 2×2 summary cards — fill remaining width */}
-        <div className="flex-1 min-w-0">
+        {/* Non-ultrawide: only lifetime Token/cost stays beside the heatmap. */}
+        <div className="min-w-0 xl:flex-1 2xl:hidden">
+          <TokenSummaryBar
+            data={tokenSummary.data}
+            isLoading={tokenSummary.isLoading}
+            group="lifetime"
+          />
+        </div>
+
+        {/* Ultrawide: keep the existing full six-card summary layout. */}
+        <div className="hidden flex-1 min-w-0 2xl:block">
           <TokenSummaryBar
             data={tokenSummary.data}
             isLoading={tokenSummary.isLoading}
@@ -340,12 +354,20 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {/* Non-ultrawide: detail summary cards span the full row below token activity. */}
+      <TokenSummaryBar
+        data={tokenSummary.data}
+        isLoading={tokenSummary.isLoading}
+        group="details"
+        className="2xl:hidden"
+      />
+
       {/* Last 24 hours metrics */}
       <div className="space-y-4">
         <h2 className="text-sm font-medium text-text-subtle">
           {t("dashboard.last24hTitle", "Last 24 hours")}
         </h2>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
           <Metric
             label={t("dashboard.breakerStatus")}
             value={
@@ -371,6 +393,11 @@ export default function Dashboard() {
           <Metric
             label={t("dashboard.totalTokens")}
             value={byModel.isLoading ? "…" : fmtTokens(totalTokens)}
+            caption={t("dashboard.summaryCaption")}
+          />
+          <Metric
+            label={t("dashboard.totalCost")}
+            value={byModel.isLoading ? "…" : fmtUsdFromMicros(totalCost)}
             caption={t("dashboard.summaryCaption")}
           />
           <Metric

@@ -1441,14 +1441,15 @@ impl DbConfigStore {
             sqlx::query(
                 "INSERT INTO token_daily_stats \
                     (day, request_count, total_tokens, prompt_tokens, completion_tokens, \
-                     reasoning_tokens, peak_single_request, longest_task_ms, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                     reasoning_tokens, total_cost, peak_single_request, longest_task_ms, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
                  ON CONFLICT(day) DO UPDATE SET \
                     request_count = token_daily_stats.request_count + excluded.request_count, \
                     total_tokens = token_daily_stats.total_tokens + excluded.total_tokens, \
                     prompt_tokens = token_daily_stats.prompt_tokens + excluded.prompt_tokens, \
                     completion_tokens = token_daily_stats.completion_tokens + excluded.completion_tokens, \
                     reasoning_tokens = token_daily_stats.reasoning_tokens + excluded.reasoning_tokens, \
+                    total_cost = token_daily_stats.total_cost + excluded.total_cost, \
                     peak_single_request = MAX(token_daily_stats.peak_single_request, excluded.peak_single_request), \
                     longest_task_ms = MAX(token_daily_stats.longest_task_ms, excluded.longest_task_ms), \
                     updated_at = excluded.updated_at",
@@ -1459,6 +1460,7 @@ impl DbConfigStore {
             .bind(s.prompt_tokens)
             .bind(s.completion_tokens)
             .bind(s.reasoning_tokens)
+            .bind(s.total_cost)
             .bind(s.peak_single_request)
             .bind(s.longest_task_ms)
             .bind(&now)
@@ -2667,19 +2669,21 @@ mod tests {
         total_tokens: i64,
         peak: i64,
         longest_ms: i64,
+        total_cost: i64,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO token_daily_stats \
                 (day, request_count, total_tokens, prompt_tokens, completion_tokens, \
-                 reasoning_tokens, peak_single_request, longest_task_ms, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 reasoning_tokens, total_cost, peak_single_request, longest_task_ms, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT(day) DO UPDATE SET \
                 request_count = excluded.request_count, \
                 total_tokens = excluded.total_tokens, \
                 prompt_tokens = excluded.prompt_tokens, \
                 completion_tokens = excluded.completion_tokens, \
                 reasoning_tokens = excluded.reasoning_tokens, \
+                total_cost = excluded.total_cost, \
                 peak_single_request = excluded.peak_single_request, \
                 longest_task_ms = excluded.longest_task_ms, \
                 updated_at = excluded.updated_at",
@@ -2690,6 +2694,7 @@ mod tests {
         .bind(total_tokens / 2)
         .bind(total_tokens / 2)
         .bind(0i64)
+        .bind(total_cost)
         .bind(peak)
         .bind(longest_ms)
         .bind(&now)
@@ -2703,7 +2708,7 @@ mod tests {
         let store = boot_store(None).await;
         let today = chrono::Utc::now().date_naive();
         let day_str = today.format("%Y-%m-%d").to_string();
-        insert_daily_stat(&store.pool, &day_str, 5, 500, 200, 8000).await;
+        insert_daily_stat(&store.pool, &day_str, 5, 500, 200, 8000, 123_456).await;
 
         let bundle = store.export_config().await.expect("export");
         assert!(
@@ -2717,6 +2722,7 @@ mod tests {
             .expect("today's stat present");
         assert_eq!(row.request_count, 5);
         assert_eq!(row.total_tokens, 500);
+        assert_eq!(row.total_cost, 123_456);
         assert_eq!(row.peak_single_request, 200);
         assert_eq!(row.longest_task_ms, 8000);
     }
@@ -2727,7 +2733,7 @@ mod tests {
         let today = chrono::Utc::now().date_naive();
         let day_str = today.format("%Y-%m-%d").to_string();
         // Pre-populate with 100 tokens for today.
-        insert_daily_stat(&store.pool, &day_str, 1, 100, 50, 3000).await;
+        insert_daily_stat(&store.pool, &day_str, 1, 100, 50, 3000, 1_000).await;
 
         // Build a bundle that imports 200 more tokens for the same day.
         let bundle = ConfigExport {
@@ -2745,6 +2751,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 100,
                 reasoning_tokens: 0,
+                total_cost: 2_500,
                 peak_single_request: 150,
                 longest_task_ms: 5000,
             }],
@@ -2769,6 +2776,7 @@ mod tests {
             .find(|a| a.day == day_str)
             .expect("today row");
         assert_eq!(today_row.total_tokens, 300);
+        assert_eq!(today_row.total_cost, 3_500);
         assert_eq!(today_row.request_count, 3);
 
         // Verify peak and longest take MAX: max(50, 150) = 150, max(3000, 5000) = 5000.
@@ -2781,6 +2789,7 @@ mod tests {
             .expect("today row");
         assert_eq!(row.peak_single_request, 150);
         assert_eq!(row.longest_task_ms, 5000);
+        assert_eq!(row.total_cost, 3_500);
     }
 
     #[tokio::test]
@@ -2808,6 +2817,7 @@ mod tests {
                     prompt_tokens: 150,
                     completion_tokens: 150,
                     reasoning_tokens: 0,
+                    total_cost: 100_000,
                     peak_single_request: 200,
                     longest_task_ms: 4000,
                 },
@@ -2818,6 +2828,7 @@ mod tests {
                     prompt_tokens: 250,
                     completion_tokens: 250,
                     reasoning_tokens: 0,
+                    total_cost: 250_000,
                     peak_single_request: 350,
                     longest_task_ms: 6000,
                 },
@@ -2840,6 +2851,8 @@ mod tests {
         assert_eq!(summary.lifetime_tokens, 800);
         // peak day = max(300, 500) = 500
         assert_eq!(summary.peak_day_tokens, 500);
+        assert_eq!(summary.lifetime_cost, 350_000);
+        assert_eq!(summary.peak_day_cost, 250_000);
         // longest task = max(4000, 6000) = 6000
         assert_eq!(summary.longest_task_ms, 6000);
         // current streak = 2 (yesterday + today)

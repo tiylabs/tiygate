@@ -211,6 +211,8 @@ pub struct ExportTokenDailyStat {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub reasoning_tokens: i64,
+    #[serde(default)]
+    pub total_cost: i64,
     pub peak_single_request: i64,
     pub longest_task_ms: i64,
 }

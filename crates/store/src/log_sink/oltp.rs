@@ -2457,6 +2457,8 @@ pub struct StatsBucket {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
+    /// Total request cost in micro-USD for the bucket.
+    pub cost: u64,
     /// Average upstream TTFB (ms) across requests in the bucket that
     /// recorded a TTFB value. Only populated by `aggregate_by_target`;
     /// `None` for the other aggregate functions that don't select this
@@ -2487,7 +2489,8 @@ pub async fn aggregate_by_model(
                 COALESCE(SUM(reasoning_tokens), 0) AS rt, \
                 COALESCE(SUM(cache_read_tokens), 0) AS crt, \
                 COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
-                COALESCE(SUM(total_tokens), 0) AS tt \
+                COALESCE(SUM(total_tokens), 0) AS tt, \
+                COALESCE(SUM(cost), 0) AS cost \
          FROM request_logs \
          WHERE ts >= $1 AND ts < $2 \
          GROUP BY virtual_model \
@@ -2509,6 +2512,7 @@ pub async fn aggregate_by_model(
             cache_read_tokens: r.get::<i64, _>("crt") as u64,
             cache_write_tokens: r.get::<i64, _>("cwt") as u64,
             total_tokens: r.get::<i64, _>("tt") as u64,
+            cost: r.get::<i64, _>("cost") as u64,
             ..Default::default()
         });
     }
@@ -2529,7 +2533,8 @@ pub async fn aggregate_by_provider(
                 COALESCE(SUM(reasoning_tokens), 0) AS rt, \
                 COALESCE(SUM(cache_read_tokens), 0) AS crt, \
                 COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
-                COALESCE(SUM(total_tokens), 0) AS tt \
+                COALESCE(SUM(total_tokens), 0) AS tt, \
+                COALESCE(SUM(cost), 0) AS cost \
          FROM request_logs \
          WHERE ts >= $1 AND ts < $2 \
          GROUP BY provider \
@@ -2551,6 +2556,7 @@ pub async fn aggregate_by_provider(
             cache_read_tokens: r.get::<i64, _>("crt") as u64,
             cache_write_tokens: r.get::<i64, _>("cwt") as u64,
             total_tokens: r.get::<i64, _>("tt") as u64,
+            cost: r.get::<i64, _>("cost") as u64,
             ..Default::default()
         });
     }
@@ -2571,7 +2577,8 @@ pub async fn aggregate_by_api_key(
                 COALESCE(SUM(reasoning_tokens), 0) AS rt, \
                 COALESCE(SUM(cache_read_tokens), 0) AS crt, \
                 COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
-                COALESCE(SUM(total_tokens), 0) AS tt \
+                COALESCE(SUM(total_tokens), 0) AS tt, \
+                COALESCE(SUM(cost), 0) AS cost \
          FROM request_logs \
          WHERE ts >= $1 AND ts < $2 \
          GROUP BY api_key \
@@ -2593,6 +2600,7 @@ pub async fn aggregate_by_api_key(
             cache_read_tokens: r.get::<i64, _>("crt") as u64,
             cache_write_tokens: r.get::<i64, _>("cwt") as u64,
             total_tokens: r.get::<i64, _>("tt") as u64,
+            cost: r.get::<i64, _>("cost") as u64,
             ..Default::default()
         });
     }
@@ -2619,6 +2627,7 @@ pub async fn aggregate_by_target(
                 COALESCE(SUM(cache_read_tokens), 0) AS crt, \
                 COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
                 COALESCE(SUM(total_tokens), 0) AS tt, \
+                COALESCE(SUM(cost), 0) AS cost, \
                 CAST(AVG(ttfb_ms) AS DOUBLE PRECISION) AS alat, \
                 CASE WHEN SUM(stream_duration_ms) > 0 \
                      THEN CAST(SUM(completion_tokens) * 1000.0 / SUM(stream_duration_ms) AS DOUBLE PRECISION) \
@@ -2644,6 +2653,7 @@ pub async fn aggregate_by_target(
             cache_read_tokens: r.get::<i64, _>("crt") as u64,
             cache_write_tokens: r.get::<i64, _>("cwt") as u64,
             total_tokens: r.get::<i64, _>("tt") as u64,
+            cost: r.get::<i64, _>("cost") as u64,
             avg_latency_ms: r
                 .get::<Option<f64>, _>("alat")
                 .map(|v| (v * 10.0).round() / 10.0),
@@ -2776,12 +2786,8 @@ fn row_to_entry(row: &sqlx::any::AnyRow) -> RequestLogEntry {
             .map(|n| n as u64),
         total_tokens: row.get::<Option<i64>, _>("total_tokens").map(|n| n as u64),
         cost: row.get::<Option<i64>, _>("cost").map(|n| n as u64),
-        input_cost: row
-            .get::<Option<i64>, _>("input_cost")
-            .map(|n| n as u64),
-        output_cost: row
-            .get::<Option<i64>, _>("output_cost")
-            .map(|n| n as u64),
+        input_cost: row.get::<Option<i64>, _>("input_cost").map(|n| n as u64),
+        output_cost: row.get::<Option<i64>, _>("output_cost").map(|n| n as u64),
         cache_read_cost: row
             .get::<Option<i64>, _>("cache_read_cost")
             .map(|n| n as u64),
@@ -3301,7 +3307,7 @@ mod tests {
                 total_tokens: 30,
                 ..Default::default()
             }),
-            cost: None,
+            cost: Some(123_456),
             api_key_id: Some("key-1".to_string()),
             client_ip: Some("127.0.0.1".to_string()),
             user_agent: Some("test".to_string()),
@@ -3325,6 +3331,7 @@ mod tests {
         assert!(!by_model.is_empty());
         assert_eq!(by_model[0].bucket, "gpt-4o");
         assert_eq!(by_model[0].prompt_tokens, 10);
+        assert_eq!(by_model[0].cost, 123_456);
     }
 
     #[tokio::test]
