@@ -347,7 +347,7 @@ export default function RoutesPage() {
       enabled: r.enabled,
     });
     setMetadataJson(metadataJsonState(r.model_metadata ?? null));
-    setMetadataPanelOpen(Boolean(r.model_metadata));
+    setMetadataPanelOpen(false);
     setFormError(null);
     setModalOpen(true);
   }

@@ -886,11 +886,60 @@ async fn get_route(
     Ok(Json(RouteView::from(r)).into_response())
 }
 
+/// Best-effort initialization of virtual-model metadata for `create_route`
+/// and `update_route`. When the caller doesn't submit `model_metadata`,
+/// this mirrors the lookup behind `POST /admin/v1/model-catalog/resolve`:
+/// it first tries an exact match on `virtual_model` in the runtime model
+/// catalog, then falls back to the first configured target's `model_id`.
+///
+/// Failure to find a match — or the model catalog being disabled — is
+/// intentionally non-fatal: it only logs a `warn` and returns `None`, so
+/// `create_route`/`update_route` still succeed with metadata left unset
+/// (the data-plane `/v1/models` handler already falls back to the runtime
+/// catalog in that case).
+fn auto_resolve_model_metadata(
+    state: &AdminState,
+    virtual_model: &str,
+    targets: &[RouteTarget],
+) -> Option<ModelMetadata> {
+    let catalog = match state.model_catalog.as_ref() {
+        Some(c) => c.snapshot(),
+        None => {
+            tracing::warn!(
+                virtual_model,
+                "route model_metadata auto-init skipped: model catalog disabled"
+            );
+            return None;
+        }
+    };
+    if let Some(meta) = catalog.get_model(virtual_model) {
+        return Some(meta.clone());
+    }
+    if let Some(target_model_id) = targets
+        .iter()
+        .map(|t| t.model_id.as_str())
+        .find(|id| !id.trim().is_empty())
+    {
+        if let Some(meta) = catalog.get_model(target_model_id) {
+            return Some(meta.clone());
+        }
+    }
+    tracing::warn!(
+        virtual_model,
+        "route model_metadata auto-init skipped: no catalog match for virtual model or target"
+    );
+    None
+}
+
 async fn create_route(
     State(state): State<AdminState>,
     Json(req): Json<RouteRequest>,
 ) -> Result<Response, AdminError> {
     let id = req.id.unwrap_or_else(|| Uuid::now_v7().to_string());
+    let model_metadata = match req.model_metadata {
+        Some(m) => Some(m),
+        None => auto_resolve_model_metadata(&state, &req.virtual_model, &req.targets),
+    };
     let r = state
         .store
         .upsert_route(
@@ -898,7 +947,7 @@ async fn create_route(
             &req.virtual_model,
             &req.targets,
             req.routing_strategy,
-            req.model_metadata.as_ref(),
+            model_metadata.as_ref(),
             req.enabled.unwrap_or(true),
         )
         .await?;
@@ -927,6 +976,10 @@ async fn update_route(
         .ok()
         .flatten()
         .map(|r| route_snapshot(&r));
+    let model_metadata = match req.model_metadata {
+        Some(m) => Some(m),
+        None => auto_resolve_model_metadata(&state, &req.virtual_model, &req.targets),
+    };
     let r = state
         .store
         .upsert_route(
@@ -934,7 +987,7 @@ async fn update_route(
             &req.virtual_model,
             &req.targets,
             req.routing_strategy,
-            req.model_metadata.as_ref(),
+            model_metadata.as_ref(),
             req.enabled.unwrap_or(true),
         )
         .await?;

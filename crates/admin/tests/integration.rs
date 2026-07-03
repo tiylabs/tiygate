@@ -1384,3 +1384,67 @@ async fn model_catalog_resolve_prefers_virtual_model_then_target_fallback() {
     let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(meta["display_name"], json!("Target Name"));
 }
+
+/// Create/update should auto-initialize `model_metadata` from the model
+/// catalog when the caller omits it, without ever failing the request when
+/// no catalog match exists.
+#[tokio::test]
+async fn route_create_and_update_auto_initialize_model_metadata() {
+    let (_router, store, pool) = boot_no_auth().await;
+    let catalog = tiygate_store::model_catalog::ModelCatalog::from_models_dev_json(
+        r#"{"openai":{"id":"openai","name":"OpenAI","models":{"openai/gpt-4o":{"id":"openai/gpt-4o","name":"GPT-4o"}}}}"#,
+        "test",
+    )
+    .expect("catalog");
+    let catalog_store = Arc::new(tiygate_store::model_catalog::ModelCatalogStore::new(
+        catalog,
+    ));
+    let state = AdminState::new(store, pool, None).with_model_catalog(Some(catalog_store));
+    let router = tiygate_admin::build_router_with_auth(state, false);
+
+    create_test_provider(&router, "openai").await;
+
+    // No model_metadata is submitted; the target's model_id matches a
+    // catalog entry, so it should be auto-resolved and persisted.
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/routes",
+            json!({
+                "id": "route-auto-meta",
+                "virtual_model": "my-gpt-4o",
+                "targets": [{"provider_id": "openai", "model_id": "openai/gpt-4o", "weight": 1.0}],
+            }),
+        ))
+        .await
+        .expect("create response");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let route: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        route["model_metadata"]["display_name"],
+        json!("GPT-4o"),
+        "create_route should auto-init metadata from the target model id"
+    );
+
+    // Update without model_metadata and with a target that has no catalog
+    // match: the route should still update successfully, just without
+    // metadata (a warning is logged instead of failing the request).
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/admin/v1/routes/route-auto-meta",
+            json!({
+                "virtual_model": "my-gpt-4o",
+                "targets": [{"provider_id": "openai", "model_id": "unknown-model", "weight": 1.0}],
+            }),
+        ))
+        .await
+        .expect("update response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let route: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(route.get("model_metadata").is_none() || route["model_metadata"].is_null());
+}
