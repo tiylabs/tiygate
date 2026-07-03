@@ -27,7 +27,9 @@ use tiygate_core::redaction::Redactor;
 use tiygate_core::telemetry::{EventPayload, RequestErrorClass, RequestStatus};
 use tiygate_core::{EventSink, ExchangeCapture, PipelineEvent, RequestEvent};
 
+use crate::config_store::DbConfigStore;
 use crate::db::DbPool;
+use crate::model_catalog::ModelPricing;
 
 const DIMENSION_VIRTUAL_MODEL: &str = "virtual_model";
 const DIMENSION_RESOLVED_PROVIDER: &str = "resolved_provider";
@@ -66,6 +68,11 @@ pub struct OltpSink {
     /// background telemetry task before persistence. Defaults to the
     /// standard credential set.
     redactor: Redactor,
+    /// Optional config store used to look up route-level pricing so
+    /// that `cost` can be computed and persisted on the background
+    /// telemetry task. `None` when no control plane is attached (dev
+    /// / test); cost computation is silently skipped in that case.
+    config_store: Option<Arc<DbConfigStore>>,
 }
 
 impl OltpSink {
@@ -73,7 +80,15 @@ impl OltpSink {
         Self {
             pool,
             redactor: Redactor::with_defaults(),
+            config_store: None,
         }
+    }
+
+    /// Attach a config store so the sink can resolve route pricing and
+    /// compute per-request `cost` on the background telemetry task.
+    pub fn with_config_store(mut self, store: Arc<DbConfigStore>) -> Self {
+        self.config_store = Some(store);
+        self
     }
 }
 
@@ -232,6 +247,12 @@ impl EventSink for OltpSink {
         if let Err(e) = upsert_filter_dimensions(self.pool.as_ref(), &row.ts, &dimensions).await {
             warn!(error = %e, request_id = %event.request_id, "oltp sink: filter dimension upsert failed");
         }
+        // Best-effort cost computation: the RequestEvent carries the
+        // `virtual_model` dimension. If token usage was already written
+        // by `write_capture`, this call has everything needed to
+        // compute and persist `cost`. Idempotent with the call in
+        // `write_capture` via the `WHERE cost IS NULL` guard.
+        self.try_compute_cost(&event.request_id).await;
         Ok(())
     }
 
@@ -333,6 +354,14 @@ impl EventSink for OltpSink {
                 );
             }
         }
+
+        // Best-effort cost computation: now that token usage has been
+        // written back, attempt to compute and persist `cost` from the
+        // route's pricing. Also called from `write_request_event` so
+        // the second-arriving write (whichever it is) has both tokens
+        // and virtual_model available. The `WHERE cost IS NULL` guard
+        // makes the two calls idempotent.
+        self.try_compute_cost(&capture.request_id).await;
 
         // Mirror any gateway-side stream truncation reason onto the
         // request_logs row so the list view / status badge can surface
@@ -878,6 +907,110 @@ impl OltpSink {
         .execute(self.pool.any())
         .await?;
         Ok(())
+    }
+
+    /// Best-effort cost computation for a completed request. Reads the
+    /// row's `virtual_model` + token columns + current `cost`; if
+    /// `cost` is already set the call is a no-op. Otherwise resolves
+    /// the route's pricing from the config store, computes the cost in
+    /// micro-USD, and writes it back with a `WHERE cost IS NULL` guard
+    /// so concurrent calls (capture + RequestEvent) cannot double-write.
+    ///
+    /// All errors are logged and swallowed — cost computation is purely
+    /// best-effort and must never fail the telemetry write path.
+    async fn try_compute_cost(&self, request_id: &str) {
+        let Some(config_store) = &self.config_store else {
+            return;
+        };
+
+        let row = match sqlx::query(
+            "SELECT virtual_model, prompt_tokens, completion_tokens, \
+                    reasoning_tokens, cache_read_tokens, cache_write_tokens, cost \
+             FROM request_logs WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(self.pool.any())
+        .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return, // row not yet inserted
+            Err(e) => {
+                warn!(error = %e, request_id = %request_id, "oltp sink: cost read-back failed");
+                return;
+            }
+        };
+
+        // Already computed — nothing to do.
+        let existing_cost: Option<i64> = row.try_get("cost").ok().flatten();
+        if existing_cost.is_some() {
+            return;
+        }
+
+        let virtual_model: String = row.try_get("virtual_model").unwrap_or_default();
+        if virtual_model.is_empty() {
+            return;
+        }
+
+        let prompt_tokens: Option<i64> = row.try_get("prompt_tokens").ok().flatten();
+        let completion_tokens: Option<i64> = row.try_get("completion_tokens").ok().flatten();
+        let reasoning_tokens: Option<i64> = row.try_get("reasoning_tokens").ok().flatten();
+        let cache_read_tokens: Option<i64> = row.try_get("cache_read_tokens").ok().flatten();
+        let cache_write_tokens: Option<i64> = row.try_get("cache_write_tokens").ok().flatten();
+
+        // Need at least some token data to compute a cost.
+        if prompt_tokens.is_none()
+            && completion_tokens.is_none()
+            && reasoning_tokens.is_none()
+            && cache_read_tokens.is_none()
+            && cache_write_tokens.is_none()
+        {
+            return;
+        }
+
+        // Resolve route pricing from the config store snapshot.
+        let snapshot = config_store.snapshot();
+        let Some(config_snapshot) = snapshot.snapshot() else {
+            return;
+        };
+        let Some(route) = config_snapshot.routes.get(&virtual_model) else {
+            return;
+        };
+        let Some(model_metadata) = &route.model_metadata else {
+            return;
+        };
+        let Some(pricing) = &model_metadata.pricing else {
+            return;
+        };
+
+        let Some(bd) = compute_cost_micro_usd(
+            prompt_tokens.unwrap_or(0) as u64,
+            completion_tokens.unwrap_or(0) as u64,
+            reasoning_tokens.map(|n| n as u64),
+            cache_read_tokens.map(|n| n as u64),
+            cache_write_tokens.map(|n| n as u64),
+            pricing,
+        ) else {
+            return;
+        };
+
+        let total = bd.total();
+
+        if let Err(e) = sqlx::query(
+            "UPDATE request_logs SET cost = $2, input_cost = $3, output_cost = $4, \
+                    cache_read_cost = $5, cache_write_cost = $6 \
+             WHERE request_id = $1 AND cost IS NULL",
+        )
+        .bind(request_id)
+        .bind(total as i64)
+        .bind(bd.input_cost as i64)
+        .bind(bd.output_cost as i64)
+        .bind(bd.cache_read_cost as i64)
+        .bind(bd.cache_write_cost as i64)
+        .execute(self.pool.any())
+        .await
+        {
+            warn!(error = %e, request_id = %request_id, "oltp sink: cost write-back failed");
+        }
     }
 
     /// Redact a JSON body string (best-effort).
@@ -1543,6 +1676,76 @@ fn usage_is_empty(u: &Usage) -> bool {
         && u.cache_write_tokens.unwrap_or(0) == 0
 }
 
+/// Per-component cost breakdown in micro-USD (1 micro-USD = 1e-6 USD).
+/// Each field is the individual contribution of one pricing component;
+/// `total()` returns their sum. Components without a matching price
+/// or token count are zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CostBreakdown {
+    input_cost: u64,
+    output_cost: u64,
+    cache_read_cost: u64,
+    cache_write_cost: u64,
+}
+
+impl CostBreakdown {
+    /// Sum of all four components.
+    fn total(&self) -> u64 {
+        self.input_cost
+            .saturating_add(self.output_cost)
+            .saturating_add(self.cache_read_cost)
+            .saturating_add(self.cache_write_cost)
+    }
+}
+
+/// Compute the per-request cost in micro-USD from token counts and a
+/// route's pricing configuration. Each component is only included
+/// when both the token count and the corresponding price are present;
+/// missing prices or zero tokens contribute nothing. Returns `None`
+/// when the pricing has no price fields at all (no basis for
+/// computation).
+///
+/// `USD/1M tokens × tokens = micro-USD` (1 micro-USD = 1e-6 USD), so
+/// the multiplication is direct — no unit conversion is needed.
+fn compute_cost_micro_usd(
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    reasoning_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    pricing: &ModelPricing,
+) -> Option<CostBreakdown> {
+    let has_any_price = pricing.input_token_usd_per_million.is_some()
+        || pricing.output_token_usd_per_million.is_some()
+        || pricing.cached_input_token_usd_per_million.is_some()
+        || pricing.cached_write_token_usd_per_million.is_some();
+    if !has_any_price {
+        return None;
+    }
+
+    let mut bd = CostBreakdown::default();
+
+    if let Some(price) = pricing.input_token_usd_per_million {
+        bd.input_cost = (prompt_tokens as f64 * price).round() as u64;
+    }
+    if let Some(price) = pricing.output_token_usd_per_million {
+        let output = completion_tokens + reasoning_tokens.unwrap_or(0);
+        bd.output_cost = (output as f64 * price).round() as u64;
+    }
+    if let Some(price) = pricing.cached_input_token_usd_per_million {
+        if let Some(tokens) = cache_read_tokens {
+            bd.cache_read_cost = (tokens as f64 * price).round() as u64;
+        }
+    }
+    if let Some(price) = pricing.cached_write_token_usd_per_million {
+        if let Some(tokens) = cache_write_tokens {
+            bd.cache_write_cost = (tokens as f64 * price).round() as u64;
+        }
+    }
+
+    Some(bd)
+}
+
 /// Extract a structured [`Usage`] from a non-streaming upstream JSON
 /// response body. Mirrors the protocol-specific field mappings in the
 /// `protocols` crate (chat_completions / responses / messages /
@@ -1552,12 +1755,18 @@ fn usage_is_empty(u: &Usage) -> bool {
 fn extract_usage_from_json(body: &serde_json::Value) -> Option<Usage> {
     // Gemini uses `usageMetadata`, all others use `usage`.
     if let Some(u) = body.get("usageMetadata") {
+        let cache_read = u["cachedContentTokenCount"].as_u64();
+        // Gemini's promptTokenCount includes cached content; the IR
+        // convention keeps prompt_tokens cache-free to avoid
+        // double-counting in cost computation. Mirrors
+        // protocols/gemini.rs decode_response.
+        let raw_prompt = u["promptTokenCount"].as_u64().unwrap_or(0);
         return Some(Usage {
-            prompt_tokens: u["promptTokenCount"].as_u64().unwrap_or(0),
+            prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
             completion_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0),
             total_tokens: u["totalTokenCount"].as_u64().unwrap_or(0),
             reasoning_tokens: u["thoughtsTokenCount"].as_u64(),
-            cache_read_tokens: u["cachedContentTokenCount"].as_u64(),
+            cache_read_tokens: cache_read,
             cache_write_tokens: None,
         });
     }
@@ -1582,6 +1791,8 @@ fn extract_usage_from_json(body: &serde_json::Value) -> Option<Usage> {
             let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
             // Anthropic has no total_tokens; derive it identically to
             // protocols/messages.rs: input + cache_creation + cache_read + output.
+            // Anthropic's input_tokens is already disjoint from cache
+            // fields, so no subtraction is needed (unlike OpenAI/Gemini).
             let total = u["total_tokens"]
                 .as_u64()
                 .unwrap_or(input + cache_creation + cache_read + output);
@@ -1600,24 +1811,32 @@ fn extract_usage_from_json(body: &serde_json::Value) -> Option<Usage> {
                     .then_some(cache_creation),
             });
         }
-        // OpenAI Responses API.
+        // OpenAI Responses API. input_tokens includes cached_tokens
+        // (subset model); subtract to keep the IR cache-free, mirroring
+        // protocols/responses.rs decode_response.
+        let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
+        let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
         return Some(Usage {
-            prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0),
+            prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
             completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
             total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
             reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
-            cache_read_tokens: u["input_tokens_details"]["cached_tokens"].as_u64(),
+            cache_read_tokens: cache_read,
             cache_write_tokens: None,
         });
     }
 
     // OpenAI chat.completions / embeddings: prompt_tokens / completion_tokens.
+    // prompt_tokens includes cached_tokens (subset model); subtract to
+    // keep the IR cache-free, mirroring protocols/chat_completions.rs.
+    let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
+    let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
     Some(Usage {
-        prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+        prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
         total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
         reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"].as_u64(),
-        cache_read_tokens: u["prompt_tokens_details"]["cached_tokens"].as_u64(),
+        cache_read_tokens: cache_read,
         cache_write_tokens: None,
     })
 }
@@ -1672,13 +1891,19 @@ fn extract_usage_from_sse(raw: &str) -> Option<Usage> {
         if ev.get("object").and_then(|o| o.as_str()) == Some("chat.completion.chunk") {
             if let Some(u) = ev.get("usage") {
                 if !u.is_null() {
+                    // OpenAI chat.completions prompt_tokens includes
+                    // cached_tokens (subset model); subtract to keep
+                    // the IR cache-free, mirroring
+                    // protocols/chat_completions.rs stream decoder.
+                    let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
+                    let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
                     last_json_usage = Some(Usage {
-                        prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+                        prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
                         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
                         total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
                         reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"]
                             .as_u64(),
-                        cache_read_tokens: u["prompt_tokens_details"]["cached_tokens"].as_u64(),
+                        cache_read_tokens: cache_read,
                         cache_write_tokens: None,
                     });
                 }
@@ -1690,13 +1915,19 @@ fn extract_usage_from_sse(raw: &str) -> Option<Usage> {
             Some("response.completed") => {
                 if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
                     if !u.is_null() {
+                        // OpenAI Responses input_tokens includes
+                        // cached_tokens (subset model); subtract to
+                        // keep the IR cache-free, mirroring
+                        // protocols/responses.rs stream decoder.
+                        let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
+                        let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
                         last_json_usage = Some(Usage {
-                            prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0),
+                            prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
                             completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
                             total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
                             reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"]
                                 .as_u64(),
-                            cache_read_tokens: u["input_tokens_details"]["cached_tokens"].as_u64(),
+                            cache_read_tokens: cache_read,
                             cache_write_tokens: None,
                         });
                     }
@@ -2463,6 +2694,10 @@ pub struct RequestLogEntry {
     pub cache_write_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub cost: Option<u64>,
+    pub input_cost: Option<u64>,
+    pub output_cost: Option<u64>,
+    pub cache_read_cost: Option<u64>,
+    pub cache_write_cost: Option<u64>,
     pub api_key_id: Option<String>,
     pub client_ip: Option<String>,
     pub user_agent: Option<String>,
@@ -2530,6 +2765,18 @@ fn row_to_entry(row: &sqlx::any::AnyRow) -> RequestLogEntry {
             .map(|n| n as u64),
         total_tokens: row.get::<Option<i64>, _>("total_tokens").map(|n| n as u64),
         cost: row.get::<Option<i64>, _>("cost").map(|n| n as u64),
+        input_cost: row
+            .get::<Option<i64>, _>("input_cost")
+            .map(|n| n as u64),
+        output_cost: row
+            .get::<Option<i64>, _>("output_cost")
+            .map(|n| n as u64),
+        cache_read_cost: row
+            .get::<Option<i64>, _>("cache_read_cost")
+            .map(|n| n as u64),
+        cache_write_cost: row
+            .get::<Option<i64>, _>("cache_write_cost")
+            .map(|n| n as u64),
         api_key_id: row.get("api_key_id"),
         client_ip: row.get("client_ip"),
         user_agent: row.get("user_agent"),
@@ -2593,7 +2840,8 @@ pub async fn list_requests(
                     total_latency_ms, upstream_latency_ms, queue_latency_ms, ttfb_ms, \
                     prompt_tokens, completion_tokens, reasoning_tokens, \
                     cache_read_tokens, cache_write_tokens, total_tokens, \
-                    cost, api_key_id, client_ip, user_agent, truncation_reason, finish_reason, \
+                    cost, input_cost, output_cost, cache_read_cost, cache_write_cost, \
+                    api_key_id, client_ip, user_agent, truncation_reason, finish_reason, \
                     stream_duration_ms \
              FROM request_logs \
              WHERE request_id = $1 \
@@ -2727,7 +2975,8 @@ pub async fn list_requests(
                 total_latency_ms, upstream_latency_ms, queue_latency_ms, ttfb_ms, \
                 prompt_tokens, completion_tokens, reasoning_tokens, \
                 cache_read_tokens, cache_write_tokens, total_tokens, \
-                cost, api_key_id, client_ip, user_agent, truncation_reason, finish_reason, \
+                cost, input_cost, output_cost, cache_read_cost, cache_write_cost, \
+                api_key_id, client_ip, user_agent, truncation_reason, finish_reason, \
                 stream_duration_ms \
          FROM request_logs \
          WHERE {where_str} \
@@ -4114,7 +4363,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             }
         });
         let u = extract_usage_from_json(&body).expect("usage");
-        assert_eq!(u.prompt_tokens, 11);
+        assert_eq!(u.prompt_tokens, 7); // 11 - 4 cached
         assert_eq!(u.completion_tokens, 22);
         assert_eq!(u.total_tokens, 33);
         assert_eq!(u.cache_read_tokens, Some(4));
@@ -4134,7 +4383,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             }
         });
         let u = extract_usage_from_json(&body).expect("usage");
-        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.prompt_tokens, 80); // 100 - 20 cached
         assert_eq!(u.completion_tokens, 50);
         assert_eq!(u.total_tokens, 150);
         assert_eq!(u.cache_read_tokens, Some(20));
@@ -4172,7 +4421,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             }
         });
         let u = extract_usage_from_json(&body).expect("usage");
-        assert_eq!(u.prompt_tokens, 8);
+        assert_eq!(u.prompt_tokens, 6); // 8 - 2 cached
         assert_eq!(u.completion_tokens, 12);
         assert_eq!(u.total_tokens, 20);
         assert_eq!(u.reasoning_tokens, Some(4));
@@ -4297,7 +4546,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
                 .fetch_one(pool.any())
                 .await
                 .expect("query");
-        assert_eq!(row.get::<Option<i64>, _>("prompt_tokens"), Some(15));
+        assert_eq!(row.get::<Option<i64>, _>("prompt_tokens"), Some(10)); // 15 - 5 cached
         assert_eq!(row.get::<Option<i64>, _>("completion_tokens"), Some(25));
         assert_eq!(row.get::<Option<i64>, _>("total_tokens"), Some(40));
         assert_eq!(row.get::<Option<i64>, _>("cache_read_tokens"), Some(5));
@@ -4308,7 +4557,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
         let by_model = aggregate_by_model(&pool, &earlier, &now)
             .await
             .expect("agg");
-        assert_eq!(by_model[0].prompt_tokens, 15);
+        assert_eq!(by_model[0].prompt_tokens, 10); // 15 - 5 cached
         assert_eq!(by_model[0].completion_tokens, 25);
         assert_eq!(by_model[0].total_tokens, 40);
         assert_eq!(by_model[0].cache_read_tokens, 5);
