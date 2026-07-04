@@ -754,220 +754,242 @@ export default function RequestLogs() {
             </span>
           </div>
 
-          {/* ── Area 2a: Overview Card ── */}
-          <div className="rounded-md border border-border bg-surface p-3">
-            <DetailSection title={t("requests.sectionOverview")}>
-              <div className="grid grid-cols-2 gap-3">
-                <MetricCell
-                  label={t("requests.model")}
-                  value={detail?.virtual_model}
-                />
-                {detail?.api_key_id && (
-                  <MetricCell
-                    label={t("requests.apiKeyId")}
-                    value={
-                      resolveApiKeyName(detail.api_key_id) ?? detail.api_key_id
-                    }
-                  />
-                )}
-                <MetricCell
-                  label={t("requests.provider")}
-                  value={
-                    detail?.resolved_provider
-                      ? (resolveProvider(detail.resolved_provider) ??
-                        detail.resolved_provider)
-                      : undefined
-                  }
-                />
-                {detail?.resolved_model && (
-                  <MetricCell
-                    label={t("requests.resolvedModel")}
-                    value={detail.resolved_model}
-                  />
-                )}
-                {(detail?.status === "ok" ||
-                  detail?.status === "success") &&
-                  (replayQuery.data?.finish_reason ??
-                    detail?.finish_reason) && (
-                  <MetricCell
-                    label={t("requests.finishReason")}
-                    value={
-                      replayQuery.data?.finish_reason ??
-                      detail?.finish_reason
-                    }
-                  />
-                )}
-                {(replayQuery.data?.truncation_reason ??
-                  detail?.truncation_reason) && (
-                  <MetricCell
-                    label={t("requests.truncationReason")}
-                    value={
-                      replayQuery.data?.truncation_reason ??
-                      detail?.truncation_reason
-                    }
-                  />
-                )}
-                {(detail?.error_class ||
-                  (detail?.status !== "ok" &&
-                    detail?.status !== "success")) && (
-                  <MetricCell
-                    label={t("requests.errorClass")}
-                    badge={
-                      detail?.error_class ? (
-                        <Badge tone="danger">
-                          {errorClassLabel(t, detail.error_class)}
-                        </Badge>
-                      ) : undefined
-                    }
-                  />
-                )}
-                {detail?.error_source && (
-                  <MetricCell
-                    label={t("requests.errorSource")}
-                    value={detail.error_source}
-                  />
-                )}
-                {detail?.client_ip && (
-                  <MetricCell
-                    label={t("requests.clientIp")}
-                    value={detail.client_ip}
-                    mono
-                  />
-                )}
-                {detail?.user_agent && (
-                  <MetricCell
-                    label={t("requests.userAgent")}
-                    value={detail.user_agent}
-                  />
-                )}
-              </div>
-            </DetailSection>
-          </div>
-
-          {/* ── Area 2b: Performance Card ── */}
-          <div className="rounded-md border border-border bg-surface p-3">
-            <DetailSection title={t("requests.sectionPerformance")}>
-              <div className="grid grid-cols-4 gap-3">
-                <MetricCell
-                  label={t("requests.latency")}
-                  value={detail?.total_latency_ms}
-                  mono
-                  unit="ms"
-                />
-                <MetricCell
-                  label={t("requests.ttfb")}
-                  value={detail?.ttfb_ms}
-                  mono
-                  unit="ms"
-                />
-                <MetricCell
-                  label={t("requests.generationTime")}
-                  value={detail?.stream_duration_ms}
-                  mono
-                  unit="ms"
-                />
-                <MetricCell
-                  label={t("requests.outputRate")}
-                  value={
-                    detail?.stream_duration_ms &&
-                    detail.stream_duration_ms > 0 &&
-                    detail?.completion_tokens
-                      ? fmtThroughput(
-                          detail.completion_tokens /
-                            (detail.stream_duration_ms / 1000),
-                        )
-                      : undefined
-                  }
-                  mono
-                  unit="tok/s"
-                />
-              </div>
-            </DetailSection>
-          </div>
-
-          {/* ── Area 3: Token Usage ── */}
-          <div className="rounded-md border border-border bg-surface p-3">
-            <DetailSection title={t("requests.sectionTokens")}>
-              <div className="grid grid-cols-3 gap-3">
-                <MetricCell
-                  label={t("requests.tokenPrompt")}
-                  value={fmtTokens(detail?.prompt_tokens)}
-                  mono
-                />
-                <MetricCell
-                  label={t("requests.tokenCompletion")}
-                  value={fmtTokens(detail?.completion_tokens)}
-                  mono
-                />
-                <MetricCell
-                  label={t("requests.tokenReasoning")}
-                  value={fmtTokens(detail?.reasoning_tokens)}
-                  mono
-                />
-                <MetricCell
-                  label={t("requests.tokenCacheRead")}
-                  value={
-                    detail?.cache_read_tokens
-                      ? detail.total_tokens
-                        ? `${fmtTokens(detail.cache_read_tokens)} (${(
-                            (detail.cache_read_tokens / detail.total_tokens) *
-                            100
-                          ).toFixed(1)}%)`
-                        : fmtTokens(detail.cache_read_tokens)
-                      : undefined
-                  }
-                  mono
-                />
-                <MetricCell
-                  label={t("requests.tokenCacheWrite")}
-                  value={fmtTokens(detail?.cache_write_tokens)}
-                  mono
-                />
-                <MetricCell
-                  label={t("requests.tokenTotal")}
-                  value={fmtTokens(detail?.total_tokens)}
-                  mono
-                />
-              </div>
-            </DetailSection>
-          </div>
-
-          {/* ── Area 3b: Cost ── */}
-          {detail?.cost != null && (
-            <div className="rounded-md border border-border bg-surface p-3">
-              <DetailSection title={t("requests.cost")}>
-                <div className="grid grid-cols-3 gap-3">
-                  <div className="col-span-1 row-span-2 flex items-center">
+          {/* ── Area 2: Summary Metric Tabs ── */}
+          <DetailMetricTabGroup
+            tabs={[
+              {
+                label: t("requests.sectionOverview"),
+                content: (
+                  <div className="grid grid-cols-2 gap-3">
                     <MetricCell
-                      label={t("requests.costTotal")}
-                      value={`$${(detail.cost / 1_000_000).toFixed(6)}`}
+                      label={t("requests.model")}
+                      value={detail?.virtual_model}
+                    />
+                    {detail?.api_key_id && (
+                      <MetricCell
+                        label={t("requests.apiKeyId")}
+                        value={
+                          resolveApiKeyName(detail.api_key_id) ??
+                          detail.api_key_id
+                        }
+                      />
+                    )}
+                    <MetricCell
+                      label={t("requests.provider")}
+                      value={
+                        detail?.resolved_provider
+                          ? (resolveProvider(detail.resolved_provider) ??
+                            detail.resolved_provider)
+                          : undefined
+                      }
+                    />
+                    {detail?.resolved_model && (
+                      <MetricCell
+                        label={t("requests.resolvedModel")}
+                        value={detail.resolved_model}
+                      />
+                    )}
+                    {(detail?.status === "ok" ||
+                      detail?.status === "success") &&
+                      (replayQuery.data?.finish_reason ??
+                        detail?.finish_reason) && (
+                      <MetricCell
+                        label={t("requests.finishReason")}
+                        value={
+                          replayQuery.data?.finish_reason ??
+                          detail?.finish_reason
+                        }
+                      />
+                    )}
+                    {(replayQuery.data?.truncation_reason ??
+                      detail?.truncation_reason) && (
+                      <MetricCell
+                        label={t("requests.truncationReason")}
+                        value={
+                          replayQuery.data?.truncation_reason ??
+                          detail?.truncation_reason
+                        }
+                      />
+                    )}
+                    {(detail?.error_class ||
+                      (detail?.status !== "ok" &&
+                        detail?.status !== "success")) && (
+                      <MetricCell
+                        label={t("requests.errorClass")}
+                        badge={
+                          detail?.error_class ? (
+                            <Badge tone="danger">
+                              {errorClassLabel(t, detail.error_class)}
+                            </Badge>
+                          ) : undefined
+                        }
+                      />
+                    )}
+                    {detail?.error_source && (
+                      <MetricCell
+                        label={t("requests.errorSource")}
+                        value={detail.error_source}
+                      />
+                    )}
+                    {detail?.client_ip && (
+                      <MetricCell
+                        label={t("requests.clientIp")}
+                        value={detail.client_ip}
+                        mono
+                      />
+                    )}
+                    {detail?.user_agent && (
+                      <MetricCell
+                        label={t("requests.userAgent")}
+                        value={detail.user_agent}
+                      />
+                    )}
+                  </div>
+                ),
+              },
+              {
+                label: t("requests.sectionPerformance"),
+                content: (
+                  <div className="grid grid-cols-4 gap-3">
+                    <MetricCell
+                      label={t("requests.latency")}
+                      value={detail?.total_latency_ms}
+                      mono
+                      unit="ms"
+                    />
+                    <MetricCell
+                      label={t("requests.ttfb")}
+                      value={detail?.ttfb_ms}
+                      mono
+                      unit="ms"
+                    />
+                    <MetricCell
+                      label={t("requests.generationTime")}
+                      value={detail?.stream_duration_ms}
+                      mono
+                      unit="ms"
+                    />
+                    <MetricCell
+                      label={t("requests.outputRate")}
+                      value={
+                        detail?.stream_duration_ms &&
+                        detail.stream_duration_ms > 0 &&
+                        detail?.completion_tokens
+                          ? fmtThroughput(
+                              detail.completion_tokens /
+                                (detail.stream_duration_ms / 1000),
+                            )
+                          : undefined
+                      }
+                      mono
+                      unit="tok/s"
+                    />
+                  </div>
+                ),
+              },
+              {
+                label: t("requests.sectionTokens"),
+                content: (
+                  <div className="grid grid-cols-3 gap-3">
+                    <MetricCell
+                      label={t("requests.tokenPrompt")}
+                      value={fmtTokens(detail?.prompt_tokens)}
+                      mono
+                    />
+                    <MetricCell
+                      label={t("requests.tokenCompletion")}
+                      value={fmtTokens(detail?.completion_tokens)}
+                      mono
+                    />
+                    <MetricCell
+                      label={t("requests.tokenReasoning")}
+                      value={fmtTokens(detail?.reasoning_tokens)}
+                      mono
+                    />
+                    <MetricCell
+                      label={t("requests.tokenCacheRead")}
+                      value={
+                        detail?.cache_read_tokens
+                          ? detail.total_tokens
+                            ? `${fmtTokens(detail.cache_read_tokens)} (${(
+                                (detail.cache_read_tokens /
+                                  detail.total_tokens) *
+                                100
+                              ).toFixed(1)}%)`
+                            : fmtTokens(detail.cache_read_tokens)
+                          : undefined
+                      }
+                      mono
+                    />
+                    <MetricCell
+                      label={t("requests.tokenCacheWrite")}
+                      value={fmtTokens(detail?.cache_write_tokens)}
+                      mono
+                    />
+                    <MetricCell
+                      label={t("requests.tokenTotal")}
+                      value={fmtTokens(detail?.total_tokens)}
                       mono
                     />
                   </div>
-                  <MetricCell
-                    label={t("requests.costInput")}
-                    value={`$${((detail.input_cost ?? 0) / 1_000_000).toFixed(6)}`}
-                    mono
-                  />
-                  <MetricCell
-                    label={t("requests.costOutput")}
-                    value={`$${((detail.output_cost ?? 0) / 1_000_000).toFixed(6)}`}
-                    mono
-                  />
-                  <MetricCell
-                    label={t("requests.costCacheRead")}
-                    value={`$${((detail.cache_read_cost ?? 0) / 1_000_000).toFixed(6)}`}
-                    mono
-                  />
-                  <MetricCell
-                    label={t("requests.costCacheWrite")}
-                    value={`$${((detail.cache_write_cost ?? 0) / 1_000_000).toFixed(6)}`}
-                    mono
-                  />
-                </div>
-              </DetailSection>
-            </div>
-          )}
+                ),
+              },
+              {
+                label: t("requests.cost"),
+                content: (
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="col-span-1 row-span-2 flex items-center">
+                      <MetricCell
+                        label={t("requests.costTotal")}
+                        value={
+                          detail?.cost != null
+                            ? `$${(detail.cost / 1_000_000).toFixed(6)}`
+                            : undefined
+                        }
+                        mono
+                      />
+                    </div>
+                    <MetricCell
+                      label={t("requests.costInput")}
+                      value={
+                        detail?.input_cost != null
+                          ? `$${(detail.input_cost / 1_000_000).toFixed(6)}`
+                          : undefined
+                      }
+                      mono
+                    />
+                    <MetricCell
+                      label={t("requests.costOutput")}
+                      value={
+                        detail?.output_cost != null
+                          ? `$${(detail.output_cost / 1_000_000).toFixed(6)}`
+                          : undefined
+                      }
+                      mono
+                    />
+                    <MetricCell
+                      label={t("requests.costCacheRead")}
+                      value={
+                        detail?.cache_read_cost != null
+                          ? `$${(detail.cache_read_cost / 1_000_000).toFixed(6)}`
+                          : undefined
+                      }
+                      mono
+                    />
+                    <MetricCell
+                      label={t("requests.costCacheWrite")}
+                      value={
+                        detail?.cache_write_cost != null
+                          ? `$${(detail.cache_write_cost / 1_000_000).toFixed(6)}`
+                          : undefined
+                      }
+                      mono
+                    />
+                  </div>
+                ),
+              },
+            ]}
+          />
 
           {/* ── Area 4: Unified Payload Tabs ── */}
           {replayQuery.isLoading ? (
@@ -1124,19 +1146,34 @@ function MetricCell({
   );
 }
 
-function DetailSection({
-  title,
-  children,
+function DetailMetricTabGroup({
+  tabs,
 }: {
-  title: string;
-  children: ReactNode;
+  tabs: { label: string; content: ReactNode }[];
 }) {
+  const [active, setActive] = useState(0);
   return (
-    <div className="space-y-2">
-      <h3 className="text-xs font-medium uppercase tracking-wide text-text-subtle">
-        {title}
-      </h3>
-      {children}
+    <div className="space-y-3 rounded-md border border-border bg-surface p-3">
+      <div className="flex gap-1 overflow-x-auto border-b border-border" role="tablist">
+        {tabs.map((tab, i) => (
+          <button
+            key={tab.label}
+            type="button"
+            role="tab"
+            aria-selected={i === active}
+            onClick={() => setActive(i)}
+            className={
+              "-mb-px whitespace-nowrap border-b-2 px-3 py-1.5 text-xs font-medium uppercase tracking-wide transition-colors " +
+              (i === active
+                ? "border-accent text-text"
+                : "border-transparent text-text-subtle hover:text-text")
+            }
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <div role="tabpanel">{tabs[active]?.content}</div>
     </div>
   );
 }
