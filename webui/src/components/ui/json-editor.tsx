@@ -122,7 +122,11 @@ export function JsonEditor({
       view.destroy();
       viewRef.current = null;
     };
-  }, [extensions, value]);
+  // Re-mount only when extensions change; `value` is intentionally excluded
+  // so that keystrokes (which update `value`) do not destroy & recreate the
+  // EditorView. External value updates are synced by the effect below.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extensions]);
 
   useEffect(() => {
     const view = viewRef.current;
