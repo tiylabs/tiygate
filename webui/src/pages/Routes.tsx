@@ -785,7 +785,10 @@ export default function RoutesPage() {
                     >
                       <div className="flex items-center gap-1.5">
                         <span
-                          className="truncate font-medium text-text"
+                          className={cn(
+                            "truncate font-medium",
+                            r.enabled ? "text-text" : "text-text-subtle line-through",
+                          )}
                           title={r.virtual_model}
                         >
                           {r.virtual_model}
