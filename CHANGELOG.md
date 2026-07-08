@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-08
+### :sparkles: New Features
+- [`ff89669`](https://github.com/tiylabs/tiygate/commit/ff89669d544eab545a019901d85d196f8268f15a) - **store**: ✨ Add per-request cost breakdown and route model-metadata auto-resolution *(PR [#32](https://github.com/tiylabs/tiygate/pull/32) by [@jorben](https://github.com/jorben))*
+- [`29fd594`](https://github.com/tiylabs/tiygate/commit/29fd594a18377fbc374c92dbe62939b3d57a582d) - **ui**: ✨ remove OAuth navigation item from sidebar *(PR [#33](https://github.com/tiylabs/tiygate/pull/33) by [@HayWolf](https://github.com/HayWolf))*
+
+### :bug: Bug Fixes
+- [`b394942`](https://github.com/tiylabs/tiygate/commit/b3949421b6dd30cd3407315d0ab8aa3964a8b2c9) - **webui**: 🐛 keep JSON editor mounted and mark disabled routes *(PR [#36](https://github.com/tiylabs/tiygate/pull/36) by [@jorben](https://github.com/jorben))*
+
+### :recycle: Refactors
+- [`c2c0c96`](https://github.com/tiylabs/tiygate/commit/c2c0c96ad9c22927ad78909c50633b47b612ffb1) - **ui**: ♻️ reorganize request log detail view into tabbed interface *(PR [#34](https://github.com/tiylabs/tiygate/pull/34) by [@HayWolf](https://github.com/HayWolf))*
+
+
 ## [0.1.9] - 2026-07-03
 ### :sparkles: New Features
 - [`454ac5f`](https://github.com/tiylabs/tiygate/commit/454ac5fdbae900a3891c7faeeac504d4d26719e8) - **admin,webui**: ✨ add route target model auto-discovery with searchable dropdown *(PR [#28](https://github.com/tiylabs/tiygate/pull/28) by [@jorben](https://github.com/jorben))*
@@ -184,3 +196,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.7]: https://github.com/tiylabs/tiygate/compare/0.1.6...0.1.7
 [0.1.8]: https://github.com/tiylabs/tiygate/compare/0.1.7...0.1.8
 [0.1.9]: https://github.com/tiylabs/tiygate/compare/0.1.8...0.1.9
+[0.2.0]: https://github.com/tiylabs/tiygate/compare/0.1.9...0.2.0
