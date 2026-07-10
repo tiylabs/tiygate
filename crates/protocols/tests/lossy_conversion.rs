@@ -36,6 +36,7 @@ fn req_with_tools() -> IrRequest {
             description: Some("Get weather".to_string()),
             parameters: Some(serde_json::json!({})),
             required: false,
+            ..Default::default()
         }],
         params: Default::default(),
         response_format: None,

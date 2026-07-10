@@ -1298,8 +1298,8 @@ fn cross_thinking_max_effort_clamping() {
         },
     );
     let (chat_out, _) = chat.encode_request(&ir).unwrap();
-    // OpenAI has no "max", clamps to "xhigh"
-    assert_eq!(chat_out["reasoning_effort"], "xhigh");
+    // OpenAI GPT-5.6+ supports "max" natively.
+    assert_eq!(chat_out["reasoning_effort"], "max");
 
     let (gem_out, _) = gemini.encode_request(&ir).unwrap();
     // Gemini only has 4 levels, clamps to "high"

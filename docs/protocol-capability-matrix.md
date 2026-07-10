@@ -85,21 +85,43 @@
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
 |------|:---:|:---:|:---:|:---:|:---:|
-| `effort` (minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`) | ✅ (`output_config.effort`，adaptive 类型) | ✅ (`reasoning.effort`) | ✅ (Gemini 3+ `thinkingConfig.thinkingLevel`；2.5 → 推导 `thinkingBudget`) | N/A |
+| `effort` (minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`，含 `max`) | ✅ (`output_config.effort`，adaptive 类型) | ✅ (`reasoning.effort`，含 `max`) | ✅ (Gemini 3+ `thinkingConfig.thinkingLevel`；2.5 → 推导 `thinkingBudget`) | N/A |
 | `budget_tokens` | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinking.budget_tokens`，enabled 类型) | ✅ → 推导 effort（`budget_to_effort`） | ✅ (Gemini 2.5 `thinkingConfig.thinkingBudget`；3+ → 推导 `thinkingLevel`) | N/A |
 | `display` (summarized/omitted) | ⚠️ → 丢弃 | ✅ (`thinking.display`) | ⚠️ → 丢弃 | ✅ → 推导 `includeThoughts` | N/A |
 | `include_thoughts` | ⚠️ → 丢弃 | ✅ → 推导 `display`（需同时有 effort 或 budget_tokens） | ⚠️ → 丢弃 | ✅ (`thinkingConfig.includeThoughts`) | N/A |
+| `mode` (e.g. `pro`) | ⚠️ → 丢弃 | ⚠️ → 丢弃 | ✅ (`reasoning.mode`) | ⚠️ → 丢弃 | N/A |
+| `context` (persisted reasoning) | ⚠️ → 丢弃 | ⚠️ → 丢弃 | ✅ (`reasoning.context`) | ⚠️ → 丢弃 | N/A |
 
-**跨协议策略**：thinking 配置跨协议时映射或丢弃，不拒绝（thinking 配置不影响语义正确性，只影响模型行为质量）。
+**跨协议策略**：thinking 配置跨协议时映射或丢弃，不拒绝（thinking 配置不影响语义正确性，只影响模型行为质量）。`mode` / `context` 仅 Responses 一等支持；跨协议静默丢弃。
 
 **effort 级别映射**：IR 使用 6 级枚举（Minimal/Low/Medium/High/XHigh/Max）。各协议支持级别不同，超出部分 clamp：
-- OpenAI: minimal/low/medium/high/xhigh（Max → xhigh）
+- OpenAI Chat/Responses: minimal/low/medium/high/xhigh/**max**（GPT-5.6+ 原生支持 max，不再 clamp）
 - Anthropic: low/medium/high/xhigh/max（Minimal → low，使用 adaptive thinking + 顶层 `output_config.effort`）
 - Gemini: 3+ 使用 minimal/low/medium/high（XHigh/Max → high）并只输出 `thinkingLevel`；2.5 使用 `thinkingBudget`。官方协议不允许同一请求同时包含 `thinkingLevel` 和 `thinkingBudget`。
 
 **effort ↔ budget_tokens 双向映射**：`ThinkingConfig::effort_to_budget` / `budget_to_effort` 提供数值映射，各协议 encode 时自动推导缺失字段。
 
 **display ↔ include_thoughts 映射**：Summarized ↔ true，Omitted ↔ false。Anthropic encode 时从 `include_thoughts` 推导 `display`；Gemini encode 时从 `display` 推导 `includeThoughts`。注意 Anthropic 的 `enabled` thinking 类型必须有 `budget_tokens`，仅 `include_thoughts` 无法单独表达。
+
+## 6.1 Hosted Tools（Responses 托管工具）
+
+| 维度 | chat_completions | messages | responses | gemini | embeddings |
+|------|:---:|:---:|:---:|:---:|:---:|
+| function tools | ✅ | ✅ | ✅ | ✅ | N/A |
+| hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ⚠️ → 忽略 | ⚠️ → 忽略 | ✅（`Tool.tool_type` + `config` 往返） | ⚠️ → 忽略 | N/A |
+
+**跨协议策略**：hosted tools 定义侧仅在 Responses 往返保留；转 Chat/Messages/Gemini 时静默过滤，不拒绝。本轮未建模 hosted 输出 item（如 `web_search_call`）与流式事件。
+
+## 6.2 Explicit Prompt Caching
+
+| 维度 | chat_completions | messages | responses | gemini | embeddings |
+|------|:---:|:---:|:---:|:---:|:---:|
+| `prompt_cache_key` | ✅（`openai_extra` 透传） | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
+| `prompt_cache_retention` | ✅（`openai_extra` 透传） | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
+| `prompt_cache_options` | ⚠️ → 未收录 | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
+| per-item `prompt_cache_breakpoint` | ⚠️ 未一等建模 | ✅（Anthropic `cache_control`） | ⚠️ 未一等建模；同协议 PassThrough 无损 | N/A | N/A |
+
+**跨协议策略**：Responses 顶层 `prompt_cache_options` 可经 Convert 重编码回放；per-item breakpoint 本轮不做 IR 字段，Convert 路径可能丢弃。
 
 ## 7. Metadata
 

@@ -268,6 +268,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         description: t["function"]["description"].as_str().map(|s| s.to_string()),
                         parameters: Some(t["function"]["parameters"].clone()),
                         required: mark_required,
+                        ..Default::default()
                     })
                     .collect()
             })
@@ -705,11 +706,12 @@ impl EndpointCodec for ChatCompletionsCodec {
 
         body["messages"] = json!(messages);
 
-        // Tools
+        // Tools — only emit function tools; hosted tools are Responses-only.
         if !ir.tools.is_empty() {
             let tools: Vec<Value> = ir
                 .tools
                 .iter()
+                .filter(|t| t.is_function())
                 .map(|t| {
                     json!({
                         "type": "function",
@@ -721,7 +723,9 @@ impl EndpointCodec for ChatCompletionsCodec {
                     })
                 })
                 .collect();
-            body["tools"] = json!(tools);
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
+            }
         }
 
         // Generation params
@@ -760,15 +764,14 @@ impl EndpointCodec for ChatCompletionsCodec {
                     .map(tiygate_core::ThinkingConfig::budget_to_effort)
             });
             if let Some(effort) = effort {
-                // OpenAI supports minimal/low/medium/high/xhigh; Max clamps to
-                // "xhigh" since OpenAI has no "max" effort level.
+                // GPT-5.6+ supports max natively on OpenAI Chat Completions.
                 body["reasoning_effort"] = json!(match effort {
                     tiygate_core::ThinkingEffort::Minimal => "minimal",
                     tiygate_core::ThinkingEffort::Low => "low",
                     tiygate_core::ThinkingEffort::Medium => "medium",
                     tiygate_core::ThinkingEffort::High => "high",
                     tiygate_core::ThinkingEffort::XHigh => "xhigh",
-                    tiygate_core::ThinkingEffort::Max => "xhigh",
+                    tiygate_core::ThinkingEffort::Max => "max",
                 });
             }
         }

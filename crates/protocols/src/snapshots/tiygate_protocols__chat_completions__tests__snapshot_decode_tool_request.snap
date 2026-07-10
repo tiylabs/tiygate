@@ -1,5 +1,6 @@
 ---
 source: crates/protocols/src/chat_completions.rs
+assertion_line: 2169
 expression: ir
 ---
 IrRequest {
@@ -33,6 +34,8 @@ IrRequest {
                 },
             ),
             required: false,
+            tool_type: None,
+            config: None,
         },
     ],
     params: GenerationParams {

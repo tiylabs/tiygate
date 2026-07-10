@@ -265,6 +265,7 @@ impl EndpointCodec for MessagesCodec {
                         description: t["description"].as_str().map(|s| s.to_string()),
                         parameters: Some(t["input_schema"].clone()),
                         required: false,
+                        ..Default::default()
                     })
                     .collect()
             })
@@ -328,6 +329,7 @@ impl EndpointCodec for MessagesCodec {
                         display,
                         include_thoughts,
                         summary: None,
+                        ..Default::default()
                     })
                 }
             }),
@@ -642,28 +644,30 @@ impl EndpointCodec for MessagesCodec {
 
         body["messages"] = json!(messages);
 
-        // Tools
+        // Tools — only emit function tools; hosted tools are Responses-only.
         if !ir.tools.is_empty() {
-            let tool_count = ir.tools.len();
-            let tools: Vec<Value> = ir
-                .tools
-                .iter()
-                .enumerate()
-                .map(|(idx, t)| {
-                    let mut tool = json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": t.parameters,
-                    });
-                    // 在最后一个 tool 上打断点即可缓存整段 tools 前缀
-                    // （Anthropic 缓存层级中 tools 是第一级）。
-                    if inject_cache && idx + 1 == tool_count {
-                        tool["cache_control"] = json!({ "type": "ephemeral" });
-                    }
-                    tool
-                })
-                .collect();
-            body["tools"] = json!(tools);
+            let function_tools: Vec<_> = ir.tools.iter().filter(|t| t.is_function()).collect();
+            let tool_count = function_tools.len();
+            if tool_count > 0 {
+                let tools: Vec<Value> = function_tools
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, t)| {
+                        let mut tool = json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "input_schema": t.parameters,
+                        });
+                        // 在最后一个 tool 上打断点即可缓存整段 tools 前缀
+                        // （Anthropic 缓存层级中 tools 是第一级）。
+                        if inject_cache && idx + 1 == tool_count {
+                            tool["cache_control"] = json!({ "type": "ephemeral" });
+                        }
+                        tool
+                    })
+                    .collect();
+                body["tools"] = json!(tools);
+            }
         }
 
         // Other params
@@ -1677,12 +1681,14 @@ mod tests {
                     description: Some("first".to_string()),
                     parameters: Some(json!({"type": "object"})),
                     required: false,
+                    ..Default::default()
                 },
                 tiygate_core::Tool {
                     name: "t2".to_string(),
                     description: Some("second".to_string()),
                     parameters: Some(json!({"type": "object"})),
                     required: false,
+                    ..Default::default()
                 },
             ],
             params: GenerationParams {

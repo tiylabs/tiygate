@@ -270,9 +270,14 @@ impl MediaSource {
 }
 
 /// A tool / function definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Function tools use `name` + `parameters`. Hosted tools (OpenAI Responses
+/// `web_search`, `file_search`, `code_interpreter`, `computer_use_preview`,
+/// etc.) set `tool_type` to the wire `type` and stash remaining fields in
+/// `config` for same-protocol replay.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Tool {
-    /// The name of the function.
+    /// The name of the function (empty for hosted tools without a name).
     pub name: String,
     /// A human-readable description.
     pub description: Option<String>,
@@ -281,6 +286,24 @@ pub struct Tool {
     /// Whether to require this tool call.
     #[serde(default)]
     pub required: bool,
+    /// Wire tool type for non-function tools (e.g. `"web_search"`).
+    /// `None` or `"function"` means a regular function tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_type: Option<String>,
+    /// Hosted-tool configuration payload (everything except `type`/`name`/
+    /// `description`/`parameters` on the wire object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+}
+
+impl Tool {
+    /// True when this is a regular function tool (default / missing type).
+    pub fn is_function(&self) -> bool {
+        match self.tool_type.as_deref() {
+            None | Some("function") => true,
+            Some(_) => false,
+        }
+    }
 }
 
 /// Generation parameters (sampling, length control).
@@ -313,7 +336,7 @@ pub struct GenerationParams {
 ///
 /// Six canonical levels that map across all protocols:
 /// - **OpenAI Chat/Responses**: `reasoning_effort` / `reasoning.effort`
-///   (minimal/low/medium/high/xhigh; Max clamps to xhigh)
+///   (minimal/low/medium/high/xhigh/max; GPT-5.6+ supports `max` natively)
 /// - **Anthropic**: `output_config.effort` (low/medium/high/xhigh/max;
 ///   Minimal clamps to low) or `thinking.budget_tokens` (numeric)
 /// - **Gemini**: `thinkingConfig.thinkingLevel` (minimal/low/medium/high;
@@ -341,7 +364,8 @@ pub enum ThinkingDisplay {
 /// Reasoning / thinking configuration that maps across protocols.
 ///
 /// - **OpenAI Chat**: `reasoning_effort` ↔ `effort`
-/// - **OpenAI Responses**: `reasoning.effort` ↔ `effort`
+/// - **OpenAI Responses**: `reasoning.effort` ↔ `effort`,
+///   `reasoning.mode` ↔ `mode`, `reasoning.context` ↔ `context`
 /// - **Anthropic**: `thinking: {type, budget_tokens, display}` ↔
 ///   `budget_tokens` / `display`
 /// - **Gemini**: `thinkingConfig: {includeThoughts, thinkingLevel}` or
@@ -368,6 +392,14 @@ pub struct ThinkingConfig {
     /// summary of the reasoning alongside encrypted content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Reasoning mode (OpenAI Responses `reasoning.mode`, e.g. `"pro"`).
+    /// Cross-protocol targets without an equivalent silently drop this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Persisted-reasoning / context control (OpenAI Responses
+    /// `reasoning.context`). Provider-specific JSON payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
 }
 
 impl ThinkingConfig {

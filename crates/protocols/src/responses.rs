@@ -423,11 +423,47 @@ impl EndpointCodec for ResponsesCodec {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|t| Tool {
-                        name: t["name"].as_str().unwrap_or("").to_string(),
-                        description: t["description"].as_str().map(String::from),
-                        parameters: t["parameters"].as_object().map(|p| json!(p)),
-                        required: false,
+                    .map(|t| {
+                        let tool_type = t["type"].as_str().map(String::from);
+                        let is_function = matches!(tool_type.as_deref(), None | Some("function"));
+                        if is_function {
+                            Tool {
+                                name: t["name"].as_str().unwrap_or("").to_string(),
+                                description: t["description"].as_str().map(String::from),
+                                parameters: t["parameters"].as_object().map(|p| json!(p)),
+                                required: false,
+                                tool_type: if tool_type.as_deref() == Some("function") {
+                                    Some("function".to_string())
+                                } else {
+                                    None
+                                },
+                                config: None,
+                            }
+                        } else {
+                            // Hosted tools: preserve type + remaining fields.
+                            let mut config = t.as_object().cloned().unwrap_or_default();
+                            config.remove("type");
+                            let name = config
+                                .remove("name")
+                                .and_then(|v| v.as_str().map(String::from))
+                                .unwrap_or_default();
+                            let description = config
+                                .remove("description")
+                                .and_then(|v| v.as_str().map(String::from));
+                            let parameters = config.remove("parameters");
+                            Tool {
+                                name,
+                                description,
+                                parameters,
+                                required: false,
+                                tool_type,
+                                config: if config.is_empty() {
+                                    None
+                                } else {
+                                    Some(Value::Object(config))
+                                },
+                            }
+                        }
                     })
                     .collect()
             })
@@ -459,12 +495,16 @@ impl EndpointCodec for ResponsesCodec {
                     }
                 });
                 let summary = r.get("summary").and_then(|v| v.as_str()).map(String::from);
-                if effort.is_none() && summary.is_none() {
+                let mode = r.get("mode").and_then(|v| v.as_str()).map(String::from);
+                let context = r.get("context").cloned();
+                if effort.is_none() && summary.is_none() && mode.is_none() && context.is_none() {
                     None
                 } else {
                     Some(tiygate_core::ThinkingConfig {
                         effort,
                         summary,
+                        mode,
+                        context,
                         ..Default::default()
                     })
                 }
@@ -506,6 +546,7 @@ impl EndpointCodec for ResponsesCodec {
                 "include",
                 "prompt_cache_key",
                 "prompt_cache_retention",
+                "prompt_cache_options",
                 "client_metadata",
             ] {
                 if let Some(v) = body.get(key) {
@@ -868,7 +909,42 @@ impl EndpointCodec for ResponsesCodec {
             }
         }
         if !ir.tools.is_empty() {
-            let tools: Vec<Value> = ir.tools.iter().map(|t| json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.parameters})).collect();
+            let tools: Vec<Value> = ir
+                .tools
+                .iter()
+                .map(|t| {
+                    if t.is_function() {
+                        json!({
+                            "type": "function",
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        })
+                    } else {
+                        // Hosted tools: emit type + config fields, plus any
+                        // name/description/parameters that were preserved.
+                        let mut obj = serde_json::Map::new();
+                        if let Some(ref ty) = t.tool_type {
+                            obj.insert("type".to_string(), json!(ty));
+                        }
+                        if !t.name.is_empty() {
+                            obj.insert("name".to_string(), json!(t.name));
+                        }
+                        if let Some(ref desc) = t.description {
+                            obj.insert("description".to_string(), json!(desc));
+                        }
+                        if let Some(ref params) = t.parameters {
+                            obj.insert("parameters".to_string(), params.clone());
+                        }
+                        if let Some(Value::Object(cfg)) = &t.config {
+                            for (k, v) in cfg {
+                                obj.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                        Value::Object(obj)
+                    }
+                })
+                .collect();
             body["tools"] = json!(tools);
         }
         if let Some(mt) = ir.params.max_tokens {
@@ -917,23 +993,38 @@ impl EndpointCodec for ResponsesCodec {
                         .map(tiygate_core::ThinkingConfig::budget_to_effort)
                 });
                 if let Some(effort) = effort {
-                    // OpenAI supports minimal/low/medium/high/xhigh; Max clamps
-                    // to "xhigh" since OpenAI has no "max" effort level.
+                    // GPT-5.6+ supports max natively; emit the IR level as-is.
                     body["reasoning"] = json!({"effort": match effort {
                         tiygate_core::ThinkingEffort::Minimal => "minimal",
                         tiygate_core::ThinkingEffort::Low => "low",
                         tiygate_core::ThinkingEffort::Medium => "medium",
                         tiygate_core::ThinkingEffort::High => "high",
                         tiygate_core::ThinkingEffort::XHigh => "xhigh",
-                        tiygate_core::ThinkingEffort::Max => "xhigh",
+                        tiygate_core::ThinkingEffort::Max => "max",
                     }});
                 }
-                // Attach reasoning.summary if present in params.thinking.
+                // Attach reasoning.summary / mode / context when present.
+                let ensure_reasoning_obj = |body: &mut Value| {
+                    if body.get("reasoning").is_none() {
+                        body["reasoning"] = json!({});
+                    }
+                };
                 if let Some(ref summary) = thinking.summary {
+                    ensure_reasoning_obj(&mut body);
                     if let Some(obj) = body["reasoning"].as_object_mut() {
                         obj.insert("summary".to_string(), json!(summary));
-                    } else {
-                        body["reasoning"] = json!({"summary": summary});
+                    }
+                }
+                if let Some(ref mode) = thinking.mode {
+                    ensure_reasoning_obj(&mut body);
+                    if let Some(obj) = body["reasoning"].as_object_mut() {
+                        obj.insert("mode".to_string(), json!(mode));
+                    }
+                }
+                if let Some(ref context) = thinking.context {
+                    ensure_reasoning_obj(&mut body);
+                    if let Some(obj) = body["reasoning"].as_object_mut() {
+                        obj.insert("context".to_string(), context.clone());
                     }
                 }
             } else if let Some(effort) = ir
@@ -3023,6 +3114,133 @@ mod tests {
         assert_eq!(re["reasoning"]["effort"], "medium");
         assert_eq!(re["reasoning"]["summary"], "auto");
         assert_eq!(re["reasoning"]["generate_summary"], "detailed");
+    }
+
+    #[test]
+    fn test_reasoning_mode_context_max_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "reasoning": {
+                "effort": "max",
+                "mode": "pro",
+                "context": {"preserve": true},
+                "summary": "auto"
+            }
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let thinking = ir.params.thinking.as_ref().expect("thinking present");
+        assert_eq!(thinking.effort, Some(tiygate_core::ThinkingEffort::Max));
+        assert_eq!(thinking.mode.as_deref(), Some("pro"));
+        assert_eq!(thinking.context, Some(json!({"preserve": true})));
+        assert_eq!(thinking.summary.as_deref(), Some("auto"));
+
+        // Cross-protocol rebuild (no reasoning_full) must still emit all fields.
+        let mut ir_cross = ir.clone();
+        ir_cross.extensions.remove("reasoning_full");
+        ir_cross.ingress_protocol =
+            ProtocolEndpoint::new(ProtocolSuite::AnthropicMessages, "messages", "2023-06-01");
+        let (encoded, _) = codec.encode_request(&ir_cross).unwrap();
+        assert_eq!(encoded["reasoning"]["effort"], "max");
+        assert_eq!(encoded["reasoning"]["mode"], "pro");
+        assert_eq!(encoded["reasoning"]["context"]["preserve"], true);
+        assert_eq!(encoded["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn test_hosted_tools_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "search something",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "fn",
+                    "parameters": {"type": "object"}
+                },
+                {
+                    "type": "web_search",
+                    "search_context_size": "medium"
+                },
+                {
+                    "type": "file_search",
+                    "vector_store_ids": ["vs_1"]
+                }
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(ir.tools.len(), 3);
+        assert!(ir.tools[0].is_function());
+        assert_eq!(ir.tools[0].name, "lookup");
+        assert_eq!(ir.tools[1].tool_type.as_deref(), Some("web_search"));
+        assert_eq!(
+            ir.tools[1]
+                .config
+                .as_ref()
+                .and_then(|c| c.get("search_context_size")),
+            Some(&json!("medium"))
+        );
+        assert_eq!(ir.tools[2].tool_type.as_deref(), Some("file_search"));
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let tools = encoded["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "lookup");
+        assert_eq!(tools[1]["type"], "web_search");
+        assert_eq!(tools[1]["search_context_size"], "medium");
+        assert_eq!(tools[2]["type"], "file_search");
+        assert_eq!(tools[2]["vector_store_ids"][0], "vs_1");
+    }
+
+    #[test]
+    fn test_prompt_cache_options_passthrough() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "prompt_cache_key": "k1",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"}
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let extra = ir
+            .extensions
+            .get("responses_extra")
+            .and_then(|v| v.as_object())
+            .expect("responses_extra");
+        assert_eq!(extra["prompt_cache_key"], "k1");
+        assert_eq!(extra["prompt_cache_options"]["mode"], "explicit");
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["prompt_cache_key"], "k1");
+        assert_eq!(encoded["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(encoded["prompt_cache_options"]["ttl"], "30m");
+    }
+
+    #[test]
+    fn test_hosted_tools_dropped_on_chat_completions() {
+        let responses = ResponsesCodec::new();
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                {"type": "web_search"}
+            ]
+        });
+        let ir = responses.decode_request(body, &env).unwrap();
+        let (encoded, _) = chat.encode_request(&ir).unwrap();
+        let tools = encoded["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "lookup");
     }
 
     #[test]

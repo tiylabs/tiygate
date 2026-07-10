@@ -466,6 +466,7 @@ impl EndpointCodec for GeminiCodec {
                                     description: fd["description"].as_str().map(String::from),
                                     parameters: fd["parameters"].as_object().map(|p| json!(p)),
                                     required: false,
+                                    ..Default::default()
                                 })
                                 .collect::<Vec<_>>()
                         })
@@ -527,6 +528,7 @@ impl EndpointCodec for GeminiCodec {
                     effort,
                     display,
                     summary: None,
+                    ..Default::default()
                 })
             }
         });
@@ -888,6 +890,7 @@ impl EndpointCodec for GeminiCodec {
             let declarations: Vec<Value> = ir
                 .tools
                 .iter()
+                .filter(|t| t.is_function())
                 .map(|t| {
                     let params = t
                         .parameters
@@ -897,7 +900,9 @@ impl EndpointCodec for GeminiCodec {
                     json!({"name": t.name, "description": t.description, "parameters": params})
                 })
                 .collect();
-            body["tools"] = json!([{"functionDeclarations": declarations}]);
+            if !declarations.is_empty() {
+                body["tools"] = json!([{"functionDeclarations": declarations}]);
+            }
         }
 
         // Emit toolConfig from IR extensions["tool_choice"].
@@ -2047,6 +2052,7 @@ mod tests {
                     }
                 })),
                 required: false,
+                ..Default::default()
             }],
             params: Default::default(),
             response_format: None,
@@ -2085,6 +2091,7 @@ mod tests {
                 description: None,
                 parameters: None,
                 required: false,
+                ..Default::default()
             }],
             params: Default::default(),
             response_format: None,
@@ -2121,6 +2128,7 @@ mod tests {
                 description: None,
                 parameters: None,
                 required: false,
+                ..Default::default()
             }],
             params: Default::default(),
             response_format: None,
@@ -2160,6 +2168,7 @@ mod tests {
                 description: None,
                 parameters: None,
                 required: false,
+                ..Default::default()
             }],
             params: Default::default(),
             response_format: None,
