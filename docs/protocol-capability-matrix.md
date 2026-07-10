@@ -85,7 +85,7 @@
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
 |------|:---:|:---:|:---:|:---:|:---:|
-| `effort` (minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`，含 `max`) | ✅ (`output_config.effort`，adaptive 类型) | ✅ (`reasoning.effort`，含 `max`) | ✅ (Gemini 3+ `thinkingConfig.thinkingLevel`；2.5 → 推导 `thinkingBudget`) | N/A |
+| `effort` (none/minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`，含 `none`/`max`) | ✅（`none` 表示不下发 thinking；其余使用 `output_config.effort`） | ✅ (`reasoning.effort`，含 `none`/`max`) | ✅（2.5 的 `none` → `thinkingBudget: 0`；3+ 近似为 `minimal`） | N/A |
 | `budget_tokens` | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinking.budget_tokens`，enabled 类型) | ✅ → 推导 effort（`budget_to_effort`） | ✅ (Gemini 2.5 `thinkingConfig.thinkingBudget`；3+ → 推导 `thinkingLevel`) | N/A |
 | `display` (summarized/omitted) | ⚠️ → 丢弃 | ✅ (`thinking.display`) | ⚠️ → 丢弃 | ✅ → 推导 `includeThoughts` | N/A |
 | `include_thoughts` | ⚠️ → 丢弃 | ✅ → 推导 `display`（需同时有 effort 或 budget_tokens） | ⚠️ → 丢弃 | ✅ (`thinkingConfig.includeThoughts`) | N/A |
@@ -94,10 +94,10 @@
 
 **跨协议策略**：thinking 配置跨协议时映射或丢弃，不拒绝（thinking 配置不影响语义正确性，只影响模型行为质量）。`mode` / `context` 仅 Responses 一等支持；跨协议静默丢弃。
 
-**effort 级别映射**：IR 使用 6 级枚举（Minimal/Low/Medium/High/XHigh/Max）。各协议支持级别不同，超出部分 clamp：
-- OpenAI Chat/Responses: minimal/low/medium/high/xhigh/**max**（GPT-5.6+ 原生支持 max，不再 clamp）
-- Anthropic: low/medium/high/xhigh/max（Minimal → low，使用 adaptive thinking + 顶层 `output_config.effort`）
-- Gemini: 3+ 使用 minimal/low/medium/high（XHigh/Max → high）并只输出 `thinkingLevel`；2.5 使用 `thinkingBudget`。官方协议不允许同一请求同时包含 `thinkingLevel` 和 `thinkingBudget`。
+**effort 级别映射**：IR 使用 7 级枚举（None/Minimal/Low/Medium/High/XHigh/Max）。各协议支持级别不同：
+- OpenAI Chat/Responses: none/minimal/low/medium/high/xhigh/**max**；server 按真实 upstream model 判定，仅 GPT-5.6 系列保留 max，旧模型降为 xhigh。
+- Anthropic: low/medium/high/xhigh/max；None 不下发 thinking，Minimal → low。
+- Gemini: 3+ 使用 minimal/low/medium/high（None → minimal 近似，XHigh/Max → high）；2.5 使用 `thinkingBudget`，None → 0。官方协议不允许同一请求同时包含 `thinkingLevel` 和 `thinkingBudget`。
 
 **effort ↔ budget_tokens 双向映射**：`ThinkingConfig::effort_to_budget` / `budget_to_effort` 提供数值映射，各协议 encode 时自动推导缺失字段。
 
@@ -108,9 +108,10 @@
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
 |------|:---:|:---:|:---:|:---:|:---:|
 | function tools | ✅ | ✅ | ✅ | ✅ | N/A |
-| hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ⚠️ → 忽略 | ⚠️ → 忽略 | ✅（`Tool.tool_type` + `config` 往返） | ⚠️ → 忽略 | N/A |
+| hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅（`Tool.tool_type` + `config` 往返） | ❌ 跨协议拒绝 | N/A |
+| Programmatic Tool Calling (`programmatic_tool_calling` / `allowed_callers` / `program` / `caller` / `program_output`) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ 稳定版有序往返 | ❌ 跨协议拒绝 | N/A |
 
-**跨协议策略**：hosted tools 定义侧仅在 Responses 往返保留；转 Chat/Messages/Gemini 时静默过滤，不拒绝。本轮未建模 hosted 输出 item（如 `web_search_call`）与流式事件。
+**跨协议策略**：Responses 保留 hosted/function tool 的完整配置，并建模 PTC 的 program、caller 与 program_output 关系。目标协议不能表达 hosted tool 或 PTC 时由 lossy guard 明确拒绝，不再静默过滤。Hosted tool 的 provider-specific 输出 item（除本节列出的稳定 PTC 项）仍依赖 Responses 同协议透传。
 
 ## 6.2 Explicit Prompt Caching
 
@@ -118,10 +119,22 @@
 |------|:---:|:---:|:---:|:---:|:---:|
 | `prompt_cache_key` | ✅（`openai_extra` 透传） | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
 | `prompt_cache_retention` | ✅（`openai_extra` 透传） | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
-| `prompt_cache_options` | ⚠️ → 未收录 | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
-| per-item `prompt_cache_breakpoint` | ⚠️ 未一等建模 | ✅（Anthropic `cache_control`） | ⚠️ 未一等建模；同协议 PassThrough 无损 | N/A | N/A |
+| `prompt_cache_options` | ✅（Chat ↔ Responses 重放） | N/A | ✅（Chat ↔ Responses 重放） | N/A | N/A |
+| per-item `prompt_cache_breakpoint` | ✅（有序 content block） | ❌ 跨协议拒绝 | ✅（有序 input content block） | ❌ 跨协议拒绝 | N/A |
+| `cache_write_tokens` usage | ✅（non-stream/stream） | ✅（`cache_creation_input_tokens`） | ✅（non-stream/stream） | N/A | N/A |
 
-**跨协议策略**：Responses 顶层 `prompt_cache_options` 可经 Convert 重编码回放；per-item breakpoint 本轮不做 IR 字段，Convert 路径可能丢弃。
+**跨协议策略**：Chat 与 Responses 通过 canonical content block 保持显式 breakpoint 的精确位置，顶层 options 使用统一 OpenAI extension 重放；目标协议无等价 carrier 时明确拒绝。
+
+## 6.3 GPT-5.6 Text Controls 与 Beta 边界
+
+| 维度 | chat_completions | messages | responses | gemini |
+|------|:---:|:---:|:---:|:---:|
+| `verbosity` | ✅ 顶层 `verbosity` | ❌ 跨协议拒绝 | ✅ `text.verbosity` | ❌ 跨协议拒绝 |
+| `safety_identifier` | ✅ | N/A | ✅ | N/A |
+| image `detail: "original"` | ✅ | ⚠️ 无等价语义 | ✅ | ⚠️ 无等价语义 |
+| Multi-agent Beta | 延后 | 延后 | 同协议 raw passthrough；无 typed/cross-protocol 保证 | 延后 |
+
+Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v1`，本轮不建模 `multi_agent`、`multi_agent_call/output` 或 agent 事件；不得将同协议透明转发描述为完整支持。
 
 ## 7. Metadata
 

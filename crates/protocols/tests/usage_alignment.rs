@@ -156,6 +156,7 @@ fn cache_chat_to_responses_roundtrip() {
         content: vec![Content::Text {
             text: "ok".to_string(),
             annotations: None,
+            prompt_cache_breakpoint: None,
         }],
         usage: Some(Usage {
             prompt_tokens: 100,
@@ -454,6 +455,7 @@ fn stream_responses_emit_cache_in_completion() {
         content: vec![Content::Text {
             text: "ok".to_string(),
             annotations: None,
+            prompt_cache_breakpoint: None,
         }],
         usage: Some(Usage {
             prompt_tokens: 100,
@@ -489,6 +491,7 @@ fn nxn_cache_preserved(from: ProtocolSuite, to: ProtocolSuite) {
         content: vec![Content::Text {
             text: "x".to_string(),
             annotations: None,
+            prompt_cache_breakpoint: None,
         }],
         usage: Some(Usage {
             prompt_tokens: 100,

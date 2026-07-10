@@ -162,24 +162,63 @@ pub(super) fn maybe_inject_prompt_cache_key(
     body: &mut serde_json::Value,
     egress_suite: &tiygate_core::ProtocolSuite,
     api_key_id: &str,
-) {
+) -> bool {
     let dominated_by_openai = matches!(
         egress_suite,
         tiygate_core::ProtocolSuite::OpenAiCompatible
             | tiygate_core::ProtocolSuite::OpenAiResponses
     );
     if !dominated_by_openai {
-        return;
+        return false;
     }
     // Never overwrite a value the client explicitly set.
     if body.get("prompt_cache_key").is_some() {
-        return;
+        return false;
     }
     // "anonymous" callers have no stable identity → skip injection.
     if api_key_id == "anonymous" {
-        return;
+        return false;
     }
     body["prompt_cache_key"] = serde_json::Value::String(api_key_id.to_string());
+    true
+}
+
+/// Return whether the normalized upstream model id belongs to GPT-5.6.
+fn supports_openai_reasoning_max(model_id: &str) -> bool {
+    let without_provider = model_id.split(':').next().unwrap_or(model_id);
+    let model = without_provider
+        .rsplit('/')
+        .next()
+        .unwrap_or(without_provider)
+        .to_ascii_lowercase();
+    model == "gpt-5.6" || model.starts_with("gpt-5.6-")
+}
+
+/// Downgrade GPT-5.6-only `max` reasoning for older OpenAI-family targets.
+/// The codec sees a virtual model; this helper runs after routing and therefore
+/// uses the real `target.model_id`.
+pub(super) fn normalize_openai_reasoning_for_target(
+    body: &mut serde_json::Value,
+    egress_suite: &tiygate_core::ProtocolSuite,
+    target_model_id: &str,
+) -> bool {
+    if supports_openai_reasoning_max(target_model_id) {
+        return false;
+    }
+    let effort = match egress_suite {
+        tiygate_core::ProtocolSuite::OpenAiCompatible => body.get_mut("reasoning_effort"),
+        tiygate_core::ProtocolSuite::OpenAiResponses => body
+            .get_mut("reasoning")
+            .and_then(|value| value.get_mut("effort")),
+        _ => None,
+    };
+    if effort.as_deref().and_then(serde_json::Value::as_str) == Some("max") {
+        if let Some(effort) = effort {
+            *effort = serde_json::json!("xhigh");
+            return true;
+        }
+    }
+    false
 }
 
 /// Extract Retry-After value from response headers.
@@ -209,4 +248,51 @@ pub(super) fn extract_rate_limit_headers(headers: &HeaderMap) -> Vec<(&'static s
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_max_is_target_model_aware() {
+        let mut responses = serde_json::json!({"reasoning": {"effort": "max"}});
+        assert!(!normalize_openai_reasoning_for_target(
+            &mut responses,
+            &tiygate_core::ProtocolSuite::OpenAiResponses,
+            "openai/gpt-5.6-sol:provider"
+        ));
+        assert_eq!(responses["reasoning"]["effort"], "max");
+
+        assert!(normalize_openai_reasoning_for_target(
+            &mut responses,
+            &tiygate_core::ProtocolSuite::OpenAiResponses,
+            "gpt-5.5"
+        ));
+        assert_eq!(responses["reasoning"]["effort"], "xhigh");
+
+        let mut chat = serde_json::json!({"reasoning_effort": "max"});
+        assert!(normalize_openai_reasoning_for_target(
+            &mut chat,
+            &tiygate_core::ProtocolSuite::OpenAiCompatible,
+            "gpt-5.4"
+        ));
+        assert_eq!(chat["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn prompt_cache_key_reports_body_mutation() {
+        let mut body = serde_json::json!({});
+        assert!(maybe_inject_prompt_cache_key(
+            &mut body,
+            &tiygate_core::ProtocolSuite::OpenAiResponses,
+            "key-id"
+        ));
+        assert_eq!(body["prompt_cache_key"], "key-id");
+        assert!(!maybe_inject_prompt_cache_key(
+            &mut body,
+            &tiygate_core::ProtocolSuite::OpenAiResponses,
+            "other"
+        ));
+    }
 }

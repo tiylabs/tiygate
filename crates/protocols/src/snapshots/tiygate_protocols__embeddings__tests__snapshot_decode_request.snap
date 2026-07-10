@@ -1,5 +1,6 @@
 ---
 source: crates/protocols/src/embeddings.rs
+assertion_line: 296
 expression: ir
 ---
 IrRequest {
@@ -12,6 +13,7 @@ IrRequest {
                 Text {
                     text: "Hello world",
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 },
             ],
         },
@@ -27,6 +29,7 @@ IrRequest {
         presence_penalty: None,
         seed: None,
         thinking: None,
+        verbosity: None,
     },
     response_format: None,
     stream: false,

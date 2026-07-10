@@ -28,8 +28,9 @@ pub mod tracing_ctx;
 pub use header_forward::HeaderForwardPolicy;
 pub use ir::{
     Annotation, AnnotationKind, Content, FinishReason, GenerationParams, IrRequest, IrResponse,
-    Message, RawEnvelope, ResponseFormat, Role, StreamPart, ThinkingConfig, ThinkingDisplay,
-    ThinkingEffort, Tool, TruncationReason, UpstreamStreamError, Usage, UsageAccumulator,
+    Message, PromptCacheBreakpoint, PromptCacheBreakpointMode, RawEnvelope, ResponseFormat, Role,
+    StreamPart, ThinkingConfig, ThinkingDisplay, ThinkingEffort, Tool, ToolCaller,
+    TruncationReason, UpstreamStreamError, Usage, UsageAccumulator, Verbosity,
 };
 pub use pipeline::{
     ExecutionHook, HookDecision, ObserveHook, PipelineContext, PipelineStage, PreRequestHook,

@@ -313,6 +313,8 @@ impl GeminiCodec {
                 // concurrent-fan-out semantics are not preserved). Mark as
                 // unsupported so `check_lossy_conversion` rejects the crossing.
                 parallel_tool_calls: false,
+                hosted_tools: false,
+                programmatic_tool_calling: false,
                 extended_reasoning: true,
                 deterministic_seed: false,
                 // Gemini supports tool_choice=required via
@@ -384,6 +386,7 @@ impl EndpointCodec for GeminiCodec {
                             cp.push(Content::Text {
                                 text: text.to_string(),
                                 annotations: None,
+                                prompt_cache_breakpoint: None,
                             });
                         } else if let Some(fc) = part.get("functionCall") {
                             let name = fc["name"].as_str().unwrap_or("").to_string();
@@ -402,6 +405,7 @@ impl EndpointCodec for GeminiCodec {
                                 name,
                                 arguments: fc["args"].clone(),
                                 call_id: None,
+                                caller: None,
                             });
                         } else if let Some(fr) = part.get("functionResponse") {
                             let name = fr["name"].as_str().unwrap_or("").to_string();
@@ -417,6 +421,7 @@ impl EndpointCodec for GeminiCodec {
                                     .map(|o| serde_json::to_string(o).unwrap_or_default())
                                     .unwrap_or_default(),
                                 id: None,
+                                caller: None,
                             });
                         } else if let Some(id) = part.get("inlineData") {
                             cp.push(Content::Media {
@@ -428,6 +433,7 @@ impl EndpointCodec for GeminiCodec {
                                     .unwrap_or("application/octet-stream")
                                     .to_string(),
                                 metadata: Default::default(),
+                                prompt_cache_breakpoint: None,
                             });
                         } else if let Some(fd) = part.get("fileData") {
                             cp.push(Content::Media {
@@ -439,6 +445,7 @@ impl EndpointCodec for GeminiCodec {
                                     .unwrap_or("application/octet-stream")
                                     .to_string(),
                                 metadata: Default::default(),
+                                prompt_cache_breakpoint: None,
                             });
                         }
                     }
@@ -447,6 +454,7 @@ impl EndpointCodec for GeminiCodec {
                     vec![Content::Text {
                         text: String::new(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }]
                 };
                 messages.push(Message { role, content });
@@ -502,14 +510,15 @@ impl EndpointCodec for GeminiCodec {
             let budget_tokens = tc["thinkingBudget"].as_u64().map(|v| v as u32);
             // Parse thinkingLevel → effort (Gemini 3.x).
             // Gemini supports minimal/low/medium/high (4 levels).
-            let effort = tc["thinkingLevel"].as_str().map(|s| {
+            let effort = tc["thinkingLevel"].as_str().and_then(|s| {
                 use tiygate_core::ThinkingEffort;
                 match s {
-                    "minimal" => ThinkingEffort::Minimal,
-                    "low" => ThinkingEffort::Low,
-                    "medium" => ThinkingEffort::Medium,
-                    "high" => ThinkingEffort::High,
-                    _ => ThinkingEffort::High,
+                    "none" => Some(ThinkingEffort::None),
+                    "minimal" => Some(ThinkingEffort::Minimal),
+                    "low" => Some(ThinkingEffort::Low),
+                    "medium" => Some(ThinkingEffort::Medium),
+                    "high" => Some(ThinkingEffort::High),
+                    _ => None,
                 }
             });
             // Derive display from include_thoughts for cross-protocol
@@ -785,6 +794,9 @@ impl EndpointCodec for GeminiCodec {
                     Content::Refusal { text, .. } => {
                         parts.push(json!({"text": text}));
                     }
+                    Content::Program { .. } | Content::ProgramOutput { .. } => {
+                        // Rejected by the cross-protocol lossy guard.
+                    }
                 }
             }
             if !parts.is_empty() {
@@ -849,6 +861,7 @@ impl EndpointCodec for GeminiCodec {
                 if let Some(effort) = effort {
                     // Gemini supports minimal/low/medium/high; XHigh/Max clamp to "high".
                     tc["thinkingLevel"] = json!(match effort {
+                        tiygate_core::ThinkingEffort::None => "minimal",
                         tiygate_core::ThinkingEffort::Minimal => "minimal",
                         tiygate_core::ThinkingEffort::Low => "low",
                         tiygate_core::ThinkingEffort::Medium => "medium",
@@ -1015,6 +1028,7 @@ impl EndpointCodec for GeminiCodec {
                                 content.push(Content::Text {
                                     text: text.to_string(),
                                     annotations: None,
+                                    prompt_cache_breakpoint: None,
                                 });
                             } else if let Some(t) = part["thought"].as_str() {
                                 content.push(Content::Reasoning {
@@ -1042,6 +1056,7 @@ impl EndpointCodec for GeminiCodec {
                                     name,
                                     arguments: fc["args"].clone(),
                                     call_id: None,
+                                    caller: None,
                                 });
                             }
                         }
@@ -1139,20 +1154,28 @@ impl EndpointCodec for GeminiCodec {
         } else {
             None
         };
-        let usage = body.get("usageMetadata").map(|u| {
-            let cache_read = u["cachedContentTokenCount"].as_u64();
-            // Gemini's promptTokenCount includes cached content; the IR keeps
-            // prompt_tokens cache-free to avoid double-counting on re-encode.
-            let raw_prompt = u["promptTokenCount"].as_u64().unwrap_or(0);
-            Usage {
-                prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
-                completion_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0),
-                total_tokens: u["totalTokenCount"].as_u64().unwrap_or(0),
-                reasoning_tokens: u["thoughtsTokenCount"].as_u64(),
-                cache_read_tokens: cache_read,
-                ..Default::default()
-            }
-        });
+        let usage = body
+            .get("usageMetadata")
+            .filter(|usage| {
+                usage.is_object()
+                    && (usage["promptTokenCount"].is_u64()
+                        || usage["candidatesTokenCount"].is_u64()
+                        || usage["totalTokenCount"].is_u64())
+            })
+            .map(|u| {
+                let cache_read = u["cachedContentTokenCount"].as_u64();
+                // Gemini's promptTokenCount includes cached content; the IR keeps
+                // prompt_tokens cache-free to avoid double-counting on re-encode.
+                let raw_prompt = u["promptTokenCount"].as_u64().unwrap_or(0);
+                Usage {
+                    prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
+                    completion_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0),
+                    total_tokens: u["totalTokenCount"].as_u64().unwrap_or(0),
+                    reasoning_tokens: u["thoughtsTokenCount"].as_u64(),
+                    cache_read_tokens: cache_read,
+                    ..Default::default()
+                }
+            });
         Ok(IrResponse {
             content,
             usage,
@@ -1357,12 +1380,17 @@ impl StreamDecoder for GeminiStreamDecoder {
                 parts.push(StreamPart::ResponseStarted { id: id.to_string() });
             }
         }
-        if event.get("error").is_some() {
-            let code = event["error"]["status"].as_str();
+        if let Some(error) = event
+            .get("error")
+            .and_then(Value::as_object)
+            .filter(|error| !error.is_empty())
+        {
+            let code = error.get("status").and_then(Value::as_str);
             let class = tiygate_core::classify_upstream_error(None, code);
             parts.push(StreamPart::Error {
-                message: event["error"]["message"]
-                    .as_str()
+                message: error
+                    .get("message")
+                    .and_then(Value::as_str)
                     .unwrap_or("Unknown")
                     .to_string(),
                 class,
@@ -1560,6 +1588,7 @@ mod tests {
             content: vec![Content::Text {
                 text: "Hi!".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 5,
@@ -1738,6 +1767,7 @@ mod tests {
                 Content::Text {
                     text: "answer".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 },
             ],
             usage: None,
@@ -1800,6 +1830,22 @@ mod tests {
         assert_eq!(fc["name"], "get_weather");
         assert_eq!(fc["args"]["city"], "London");
         assert_eq!(fc["args"]["unit"], "c");
+    }
+
+    #[test]
+    fn test_stream_decoder_error_null_is_ignored() {
+        let mut decoder = GeminiStreamDecoder::new();
+        let parts = decoder
+            .feed(
+                r#"data: {"responseId":"r1","error":null,"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#,
+            )
+            .unwrap();
+        assert!(parts
+            .iter()
+            .any(|part| matches!(part, StreamPart::TextDelta { text } if text == "ok")));
+        assert!(!parts
+            .iter()
+            .any(|part| matches!(part, StreamPart::Error { .. })));
     }
 
     #[test]
@@ -1896,6 +1942,7 @@ mod tests {
                     name: "get_weather".to_string(),
                     arguments: json!({"city": "London"}),
                     call_id: None,
+                    caller: None,
                 }],
             }],
             tools: vec![],
@@ -1930,6 +1977,7 @@ mod tests {
                     name: "get_weather".to_string(),
                     arguments: json!({}),
                     call_id: None,
+                    caller: None,
                 }],
             }],
             tools: vec![],
@@ -2001,6 +2049,7 @@ mod tests {
                 content: vec![Content::Text {
                     text: "hi".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             tools: vec![],
@@ -2040,6 +2089,7 @@ mod tests {
                 content: vec![Content::Text {
                     text: "hi".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             tools: vec![Tool {
@@ -2084,6 +2134,7 @@ mod tests {
                 content: vec![Content::Text {
                     text: "hi".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             tools: vec![Tool {
@@ -2121,6 +2172,7 @@ mod tests {
                 content: vec![Content::Text {
                     text: "hi".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             tools: vec![Tool {
@@ -2161,6 +2213,7 @@ mod tests {
                 content: vec![Content::Text {
                     text: "hi".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             tools: vec![Tool {

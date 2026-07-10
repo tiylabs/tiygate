@@ -172,6 +172,10 @@ pub struct EndpointCapabilities {
     pub function_calling: bool,
     /// Whether this endpoint supports parallel tool calls.
     pub parallel_tool_calls: bool,
+    /// Whether this endpoint supports non-function hosted tool definitions.
+    pub hosted_tools: bool,
+    /// Whether this endpoint supports Responses Programmatic Tool Calling.
+    pub programmatic_tool_calling: bool,
     /// Whether this endpoint supports extended reasoning.
     pub extended_reasoning: bool,
     /// Whether this endpoint supports deterministic seeds.
@@ -202,6 +206,8 @@ impl EndpointCapabilities {
         structured_output: false,
         function_calling: false,
         parallel_tool_calls: false,
+        hosted_tools: false,
+        programmatic_tool_calling: false,
         extended_reasoning: false,
         deterministic_seed: false,
         tool_choice_required: false,
@@ -227,6 +233,8 @@ impl EndpointCapabilities {
         structured_output: true,
         function_calling: true,
         parallel_tool_calls: true,
+        hosted_tools: false,
+        programmatic_tool_calling: false,
         extended_reasoning: false,
         deterministic_seed: false,
         tool_choice_required: true,

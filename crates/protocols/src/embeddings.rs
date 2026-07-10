@@ -56,6 +56,8 @@ impl EmbeddingsCodec {
                 structured_output: false,
                 function_calling: false,
                 parallel_tool_calls: false,
+                hosted_tools: false,
+                programmatic_tool_calling: false,
                 extended_reasoning: false,
                 deterministic_seed: false,
                 tool_choice_required: false,
@@ -118,6 +120,7 @@ impl EndpointCodec for EmbeddingsCodec {
             content: vec![Content::Text {
                 text: input_text,
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
         }];
 

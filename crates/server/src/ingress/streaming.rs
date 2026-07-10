@@ -1542,7 +1542,10 @@ mod tests {
         let bytes = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"error\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":12,\"total_tokens\":24}}}\n\n";
         detect_verbatim_signals(bytes, &accum);
         let acc = accum.lock().unwrap();
-        assert!(acc.upstream_terminal, "response.completed must set terminal");
+        assert!(
+            acc.upstream_terminal,
+            "response.completed must set terminal"
+        );
         assert!(
             acc.upstream_error.is_none(),
             "\"error\":null in response.completed must not be treated as an error"

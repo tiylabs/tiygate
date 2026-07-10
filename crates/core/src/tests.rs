@@ -195,18 +195,20 @@ mod tests {
 
     #[test]
     fn test_health_registry_exponential_backoff() {
-        // Tiers: 10ms → 20ms → 40ms (3 tiers, last is ceiling)
+        // Use 100ms-scale tiers so scheduler jitter cannot cross an assertion
+        // boundary; the production logic is duration-agnostic.
+        // Tiers: 100ms → 200ms → 400ms (last is ceiling)
         let registry = HealthRegistry::new(
             3,
             vec![
-                Duration::from_millis(10),
-                Duration::from_millis(20),
-                Duration::from_millis(40),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
             ],
         );
         let key = "test:backoff";
 
-        // --- Tier 0: 3 failures → circuit-broken, recovers after 10ms ---
+        // --- Tier 0: 3 failures → circuit-broken, recovers after 100ms ---
         registry.record_failure(key);
         registry.record_failure(key);
         registry.record_failure(key);
@@ -215,77 +217,77 @@ mod tests {
             "should be broken after 3 failures"
         );
 
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(150));
         assert!(
             registry.is_healthy(key),
-            "should be half-open after tier-0 (10ms)"
+            "should be half-open after tier-0 (100ms)"
         );
 
-        // --- Tier 1: 4th failure → needs 20ms ---
+        // --- Tier 1: 4th failure → needs 200ms ---
         registry.record_failure(key); // consecutive_failures = 4
         assert!(
             !registry.is_healthy(key),
             "should be broken after 4th failure"
         );
 
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(150));
         assert!(
             !registry.is_healthy(key),
-            "15ms < tier-1 (20ms), still broken"
+            "150ms < tier-1 (200ms), still broken"
         );
 
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(100));
         assert!(
             registry.is_healthy(key),
-            "should be half-open after tier-1 (20ms)"
+            "should be half-open after tier-1 (200ms)"
         );
 
-        // --- Tier 2: 5th failure → needs 40ms ---
+        // --- Tier 2: 5th failure → needs 400ms ---
         registry.record_failure(key); // consecutive_failures = 5
         assert!(!registry.is_healthy(key));
 
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(300));
         assert!(
             !registry.is_healthy(key),
-            "30ms < tier-2 (40ms), still broken"
+            "300ms < tier-2 (400ms), still broken"
         );
 
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(150));
         assert!(
             registry.is_healthy(key),
-            "should be half-open after tier-2 (40ms)"
+            "should be half-open after tier-2 (400ms)"
         );
 
-        // --- Ceiling: 6th failure → still needs 40ms (last tier) ---
+        // --- Ceiling: 6th failure → still needs 400ms (last tier) ---
         registry.record_failure(key); // consecutive_failures = 6
         assert!(!registry.is_healthy(key));
 
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(300));
         assert!(
             !registry.is_healthy(key),
-            "30ms < ceiling (40ms), still broken"
+            "300ms < ceiling (400ms), still broken"
         );
 
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(150));
         assert!(
             registry.is_healthy(key),
-            "should be half-open after ceiling (40ms)"
+            "should be half-open after ceiling (400ms)"
         );
 
         // --- Recovery: record_success resets to tier 0 ---
         registry.record_success(key);
         assert!(registry.is_healthy(key));
 
-        // Re-break: should use tier 0 again (10ms), not the ceiling
+        // Re-break: should use tier 0 again (100ms), not the ceiling
         registry.record_failure(key);
         registry.record_failure(key);
         registry.record_failure(key);
         assert!(!registry.is_healthy(key));
 
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(150));
         assert!(
             registry.is_healthy(key),
-            "after reset, should use tier-0 (10ms) again"
+            "after reset, should use tier-0 (100ms) again"
         );
     }
 
@@ -488,6 +490,7 @@ mod tests {
         let text = Content::Text {
             text: "hello".to_string(),
             annotations: None,
+            prompt_cache_breakpoint: None,
         };
         let json = serde_json::to_value(&text).unwrap();
         assert_eq!(json["type"], "text");
@@ -498,6 +501,7 @@ mod tests {
             name: "get_weather".to_string(),
             arguments: serde_json::json!({"city": "London"}),
             call_id: None,
+            caller: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["type"], "tool_call");

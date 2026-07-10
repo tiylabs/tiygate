@@ -19,7 +19,8 @@ use tiygate_protocols::responses::ResponsesCodec;
 use super::headers::{
     extract_rate_limit_headers, extract_retry_after, forward_upstream_resp_headers,
     forwarded_resp_headers_for_capture, header_map_to_vec, maybe_inject_prompt_cache_key,
-    merge_client_headers, override_model_in_body, reqwest_headers_to_vec, spawn_capture,
+    merge_client_headers, normalize_openai_reasoning_for_target, override_model_in_body,
+    reqwest_headers_to_vec, spawn_capture,
 };
 use super::streaming::{
     drive_upstream_stream, StreamCapture, StreamTranscode, DEFAULT_SSE_KEEPALIVE_INTERVAL,
@@ -194,16 +195,20 @@ pub(super) async fn execute_upstream(
     // Inject `prompt_cache_key` for OpenAI-family egress targets so that
     // requests from the same caller are routed to the same inference
     // machine, improving prompt-prefix cache hit rates.
-    maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+    let mut body_mutated =
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
 
     // Replace the (possibly virtual) model name with the routing
     // target's real upstream model id before sending and before we
     // snapshot the egress body for the request-log detail view.
-    let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
-    // PassThrough can only forward the raw client bytes verbatim when the
-    // model name did not change. If we rewrote `model`, the raw body is
-    // stale and we must send the re-serialized `upstream_body` instead.
-    let pass_through_verbatim = is_pass_through && !model_was_overridden;
+    body_mutated |= override_model_in_body(&mut upstream_body, &target.model_id);
+    body_mutated |= normalize_openai_reasoning_for_target(
+        &mut upstream_body,
+        &egress_protocol.suite,
+        &target.model_id,
+    );
+    // Any body mutation invalidates the byte-for-byte raw body.
+    let pass_through_verbatim = is_pass_through && !body_mutated;
 
     // Apply auth via the registered provider's AuthApplier. Falls
     // back to a static `Bearer {api_key}` if no provider is registered
@@ -682,11 +687,15 @@ pub(super) async fn execute_messages_upstream(
 
     // Replace the (possibly virtual) model name with the routing
     // target's real upstream model id.
-    let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
-    maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
-    // PassThrough forwards raw bytes verbatim only when `model` was
-    // unchanged; otherwise we must send the re-serialized body.
-    let pass_through_verbatim = is_pass_through && !model_was_overridden;
+    let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
+    body_mutated |=
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+    body_mutated |= normalize_openai_reasoning_for_target(
+        &mut upstream_body,
+        &egress_protocol.suite,
+        &target.model_id,
+    );
+    let pass_through_verbatim = is_pass_through && !body_mutated;
 
     // Apply auth via the registered provider's AuthApplier. For
     // Anthropic, this inserts the x-api-key header. The
@@ -1404,9 +1413,15 @@ pub(super) async fn execute_responses_upstream(
         encode_cross_protocol(codec, &egress_protocol, ir_request)?
     };
 
-    let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
-    maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
-    let pass_through_verbatim = is_pass_through && !model_was_overridden;
+    let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
+    body_mutated |=
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+    body_mutated |= normalize_openai_reasoning_for_target(
+        &mut upstream_body,
+        &egress_protocol.suite,
+        &target.model_id,
+    );
+    let pass_through_verbatim = is_pass_through && !body_mutated;
     merge_client_headers(
         client_headers,
         &mut upstream_headers,
@@ -1830,9 +1845,15 @@ pub(super) async fn execute_gemini_upstream(
         encode_cross_protocol(codec, &egress_protocol, ir_request)?
     };
 
-    let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
-    maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
-    let pass_through_verbatim = is_pass_through && !model_was_overridden;
+    let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
+    body_mutated |=
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+    body_mutated |= normalize_openai_reasoning_for_target(
+        &mut upstream_body,
+        &egress_protocol.suite,
+        &target.model_id,
+    );
+    let pass_through_verbatim = is_pass_through && !body_mutated;
     merge_client_headers(
         client_headers,
         &mut upstream_headers,
@@ -2230,10 +2251,11 @@ pub(super) async fn execute_images_generations_upstream(
         encode_cross_protocol(codec, &egress_protocol, ir_request)?
     };
 
-    maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+    let cache_key_injected =
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
 
     let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
-    let pass_through_verbatim = is_pass_through && !model_was_overridden;
+    let pass_through_verbatim = is_pass_through && !model_was_overridden && !cache_key_injected;
 
     merge_client_headers(
         client_headers,

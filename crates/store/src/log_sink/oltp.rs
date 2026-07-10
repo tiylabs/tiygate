@@ -1826,14 +1826,17 @@ fn extract_usage_from_json(body: &serde_json::Value) -> Option<Usage> {
         // (subset model); subtract to keep the IR cache-free, mirroring
         // protocols/responses.rs decode_response.
         let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
+        let cache_write = u["input_tokens_details"]["cache_write_tokens"].as_u64();
         let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
         return Some(Usage {
-            prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
+            prompt_tokens: raw_input
+                .saturating_sub(cache_read.unwrap_or(0))
+                .saturating_sub(cache_write.unwrap_or(0)),
             completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
             total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
             reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
             cache_read_tokens: cache_read,
-            cache_write_tokens: None,
+            cache_write_tokens: cache_write,
         });
     }
 
@@ -1841,14 +1844,17 @@ fn extract_usage_from_json(body: &serde_json::Value) -> Option<Usage> {
     // prompt_tokens includes cached_tokens (subset model); subtract to
     // keep the IR cache-free, mirroring protocols/chat_completions.rs.
     let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
+    let cache_write = u["prompt_tokens_details"]["cache_write_tokens"].as_u64();
     let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
     Some(Usage {
-        prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
+        prompt_tokens: raw_prompt
+            .saturating_sub(cache_read.unwrap_or(0))
+            .saturating_sub(cache_write.unwrap_or(0)),
         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
         total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
         reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"].as_u64(),
         cache_read_tokens: cache_read,
-        cache_write_tokens: None,
+        cache_write_tokens: cache_write,
     })
 }
 
@@ -1907,15 +1913,18 @@ fn extract_usage_from_sse(raw: &str) -> Option<Usage> {
                     // the IR cache-free, mirroring
                     // protocols/chat_completions.rs stream decoder.
                     let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
+                    let cache_write = u["prompt_tokens_details"]["cache_write_tokens"].as_u64();
                     let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
                     last_json_usage = Some(Usage {
-                        prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
+                        prompt_tokens: raw_prompt
+                            .saturating_sub(cache_read.unwrap_or(0))
+                            .saturating_sub(cache_write.unwrap_or(0)),
                         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
                         total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
                         reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"]
                             .as_u64(),
                         cache_read_tokens: cache_read,
-                        cache_write_tokens: None,
+                        cache_write_tokens: cache_write,
                     });
                 }
             }
@@ -1931,15 +1940,18 @@ fn extract_usage_from_sse(raw: &str) -> Option<Usage> {
                         // keep the IR cache-free, mirroring
                         // protocols/responses.rs stream decoder.
                         let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
+                        let cache_write = u["input_tokens_details"]["cache_write_tokens"].as_u64();
                         let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
                         last_json_usage = Some(Usage {
-                            prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
+                            prompt_tokens: raw_input
+                                .saturating_sub(cache_read.unwrap_or(0))
+                                .saturating_sub(cache_write.unwrap_or(0)),
                             completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
                             total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
                             reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"]
                                 .as_u64(),
                             cache_read_tokens: cache_read,
-                            cache_write_tokens: None,
+                            cache_write_tokens: cache_write,
                         });
                     }
                 }
@@ -4367,6 +4379,28 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             extract_finish_reason_from_sse(raw),
             Some("tool_calls".to_string())
         );
+    }
+
+    #[test]
+    fn extract_usage_openai_cache_write_tokens() {
+        let chat = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 30}
+            }
+        });
+        let usage = extract_usage_from_json(&chat).unwrap();
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.cache_read_tokens, Some(20));
+        assert_eq!(usage.cache_write_tokens, Some(30));
+
+        let responses = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"total_tokens\":110,\"input_tokens_details\":{\"cached_tokens\":20,\"cache_write_tokens\":30}}}}\n";
+        let usage = extract_usage_from_sse(responses).unwrap();
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.cache_read_tokens, Some(20));
+        assert_eq!(usage.cache_write_tokens, Some(30));
     }
 
     #[test]

@@ -92,6 +92,8 @@ impl MessagesCodec {
                 // concurrently" are not preserved). Mark as unsupported so
                 // `check_lossy_conversion` rejects the crossing.
                 parallel_tool_calls: false,
+                hosted_tools: false,
+                programmatic_tool_calling: false,
                 extended_reasoning: true,
                 deterministic_seed: false,
                 // Anthropic supports tool_choice={type:"any"} (equivalent to
@@ -162,6 +164,7 @@ impl EndpointCodec for MessagesCodec {
                                 parts.push(Content::Text {
                                     text: block["text"].as_str().unwrap_or("").to_string(),
                                     annotations: None,
+                                    prompt_cache_breakpoint: None,
                                 });
                             }
                             Some("thinking") => {
@@ -199,6 +202,7 @@ impl EndpointCodec for MessagesCodec {
                                         block["input"].clone()
                                     },
                                     call_id: None,
+                                    caller: None,
                                 });
                             }
                             Some("tool_result") => {
@@ -210,6 +214,7 @@ impl EndpointCodec for MessagesCodec {
                                     name: String::new(),
                                     content: flatten_anthropic_content(&block["content"]),
                                     id: None,
+                                    caller: None,
                                 });
                             }
                             Some("image") => {
@@ -224,6 +229,7 @@ impl EndpointCodec for MessagesCodec {
                                             .unwrap_or("image/*")
                                             .to_string(),
                                         metadata: Default::default(),
+                                        prompt_cache_breakpoint: None,
                                     });
                                 } else {
                                     parts.push(Content::Media {
@@ -235,6 +241,7 @@ impl EndpointCodec for MessagesCodec {
                                             .unwrap_or("image/*")
                                             .to_string(),
                                         metadata: Default::default(),
+                                        prompt_cache_breakpoint: None,
                                     });
                                 }
                             }
@@ -246,6 +253,7 @@ impl EndpointCodec for MessagesCodec {
                     vec![Content::Text {
                         text: text.to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }]
                 } else {
                     vec![]
@@ -295,16 +303,17 @@ impl EndpointCodec for MessagesCodec {
                     .and_then(|oc| oc.get("effort"))
                     .or_else(|| t.get("output_config").and_then(|oc| oc.get("effort")))
                     .and_then(|v| v.as_str())
-                    .map(|s| {
+                    .and_then(|s| {
                         use tiygate_core::ThinkingEffort;
                         match s {
-                            "minimal" => ThinkingEffort::Minimal,
-                            "low" => ThinkingEffort::Low,
-                            "medium" => ThinkingEffort::Medium,
-                            "high" => ThinkingEffort::High,
-                            "xhigh" => ThinkingEffort::XHigh,
-                            "max" => ThinkingEffort::Max,
-                            _ => ThinkingEffort::High,
+                            "none" => Some(ThinkingEffort::None),
+                            "minimal" => Some(ThinkingEffort::Minimal),
+                            "low" => Some(ThinkingEffort::Low),
+                            "medium" => Some(ThinkingEffort::Medium),
+                            "high" => Some(ThinkingEffort::High),
+                            "xhigh" => Some(ThinkingEffort::XHigh),
+                            "max" => Some(ThinkingEffort::Max),
+                            _ => None,
                         }
                     });
                 let budget_tokens = t["budget_tokens"].as_u64().map(|v| v as u32);
@@ -601,6 +610,7 @@ impl EndpointCodec for MessagesCodec {
                         _ => None,
                     },
                     Content::Refusal { text, .. } => Some(json!({"type": "text", "text": text})),
+                    Content::Program { .. } | Content::ProgramOutput { .. } => None,
                 })
                 .collect()
         }
@@ -703,7 +713,10 @@ impl EndpointCodec for MessagesCodec {
                 })
             });
 
-            if let Some(effort) = thinking.effort {
+            if let Some(effort) = thinking
+                .effort
+                .filter(|e| *e != tiygate_core::ThinkingEffort::None)
+            {
                 // Effort-based adaptive thinking (new Anthropic mechanism).
                 // Anthropic supports low/medium/high/xhigh/max; Minimal clamps
                 // to "low" since Anthropic has no "minimal" effort level.
@@ -724,6 +737,7 @@ impl EndpointCodec for MessagesCodec {
                 body["thinking"] = t;
                 body["output_config"] = json!({
                     "effort": match effort {
+                        tiygate_core::ThinkingEffort::None => "low",
                         tiygate_core::ThinkingEffort::Minimal => "low",
                         tiygate_core::ThinkingEffort::Low => "low",
                         tiygate_core::ThinkingEffort::Medium => "medium",
@@ -802,6 +816,7 @@ impl EndpointCodec for MessagesCodec {
                         content.push(Content::Text {
                             text: block["text"].as_str().unwrap_or("").to_string(),
                             annotations: None,
+                            prompt_cache_breakpoint: None,
                         });
                     }
                     Some("thinking") => {
@@ -832,6 +847,7 @@ impl EndpointCodec for MessagesCodec {
                             name: block["name"].as_str().unwrap_or("").to_string(),
                             arguments: block["input"].clone(),
                             call_id: None,
+                            caller: None,
                         });
                     }
                     _ => {}
@@ -852,37 +868,47 @@ impl EndpointCodec for MessagesCodec {
             other => FinishReason::Other(other.to_string()),
         });
 
-        let usage = body.get("usage").map(|u| {
-            let input = u["input_tokens"].as_u64().unwrap_or(0);
-            let output = u["output_tokens"].as_u64().unwrap_or(0);
-            let cache_creation = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            // Anthropic 协议无 total_tokens；按官方 spec 派生：
-            //   total = input + cache_creation + cache_read + output
-            // 优先用上游响应里若带的 total_tokens（部分 SDK/代理会注入）
-            let total = u["total_tokens"]
-                .as_u64()
-                .unwrap_or(input + cache_creation + cache_read + output);
-            let reasoning = u["output_tokens_details"]["thinking_tokens"].as_u64();
-            let has_cache_creation_field = u.get("cache_creation_input_tokens").is_some();
-            let has_cache_read_field = u.get("cache_read_input_tokens").is_some();
-            Usage {
-                prompt_tokens: input,
-                completion_tokens: output,
-                total_tokens: total,
-                reasoning_tokens: reasoning,
-                cache_read_tokens: if has_cache_read_field {
-                    Some(cache_read)
-                } else {
-                    None
-                },
-                cache_write_tokens: if has_cache_creation_field {
-                    Some(cache_creation)
-                } else {
-                    None
-                },
-            }
-        });
+        let usage = body
+            .get("usage")
+            .filter(|usage| {
+                usage.is_object()
+                    && (usage["input_tokens"].is_u64()
+                        || usage["output_tokens"].is_u64()
+                        || usage["total_tokens"].is_u64()
+                        || usage["cache_creation_input_tokens"].is_u64()
+                        || usage["cache_read_input_tokens"].is_u64())
+            })
+            .map(|u| {
+                let input = u["input_tokens"].as_u64().unwrap_or(0);
+                let output = u["output_tokens"].as_u64().unwrap_or(0);
+                let cache_creation = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                // Anthropic 协议无 total_tokens；按官方 spec 派生：
+                //   total = input + cache_creation + cache_read + output
+                // 优先用上游响应里若带的 total_tokens（部分 SDK/代理会注入）
+                let total = u["total_tokens"]
+                    .as_u64()
+                    .unwrap_or(input + cache_creation + cache_read + output);
+                let reasoning = u["output_tokens_details"]["thinking_tokens"].as_u64();
+                let has_cache_creation_field = u.get("cache_creation_input_tokens").is_some();
+                let has_cache_read_field = u.get("cache_read_input_tokens").is_some();
+                Usage {
+                    prompt_tokens: input,
+                    completion_tokens: output,
+                    total_tokens: total,
+                    reasoning_tokens: reasoning,
+                    cache_read_tokens: if has_cache_read_field {
+                        Some(cache_read)
+                    } else {
+                        None
+                    },
+                    cache_write_tokens: if has_cache_creation_field {
+                        Some(cache_creation)
+                    } else {
+                        None
+                    },
+                }
+            });
 
         let stop_details = body["stop_reason"].as_str().map(|s| {
             // Anthropic may emit a structured `stop_details` object (e.g. for
@@ -1604,6 +1630,20 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_response_usage_null_is_none() {
+        let codec = MessagesCodec::new();
+        let decoded = codec
+            .decode_response(json!({
+                "id": "msg_1",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": null
+            }))
+            .unwrap();
+        assert!(decoded.usage.is_none());
+    }
+
+    #[test]
     fn test_decode_basic_request() {
         let codec = MessagesCodec::new();
         let env = make_raw_envelope();
@@ -1658,6 +1698,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "Hello".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 Message {
@@ -1665,6 +1706,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "Hi!".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 Message {
@@ -1672,6 +1714,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "How are you?".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
             ],
@@ -1755,6 +1798,7 @@ mod tests {
                 content: vec![Content::Text {
                     text: "Hello".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             tools: vec![],
@@ -1795,6 +1839,7 @@ mod tests {
             content: vec![Content::Text {
                 text: "Hello!".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -1829,6 +1874,7 @@ mod tests {
                 name: "get_weather".to_string(),
                 arguments: json!({"city": "London"}),
                 call_id: None,
+                caller: None,
             }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
@@ -1994,6 +2040,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "hi".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 Message {
@@ -2003,6 +2050,7 @@ mod tests {
                         name: "f".to_string(),
                         arguments: json!({}),
                         call_id: None,
+                        caller: None,
                     }],
                 },
                 Message {
@@ -2012,6 +2060,7 @@ mod tests {
                         name: "f".to_string(),
                         content: "r1".to_string(),
                         id: None,
+                        caller: None,
                     }],
                 },
                 Message {
@@ -2021,6 +2070,7 @@ mod tests {
                         name: "f".to_string(),
                         content: "r2".to_string(),
                         id: None,
+                        caller: None,
                     }],
                 },
             ],
@@ -2266,6 +2316,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "hi".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 // reasoning 无 signature(来自 OpenAI 历史)→ 应被丢弃
@@ -2281,6 +2332,7 @@ mod tests {
                         Content::Text {
                             text: "answer A".to_string(),
                             annotations: None,
+                            prompt_cache_breakpoint: None,
                         },
                     ],
                 },
@@ -2297,6 +2349,7 @@ mod tests {
                         Content::Text {
                             text: "answer B".to_string(),
                             annotations: None,
+                            prompt_cache_breakpoint: None,
                         },
                     ],
                 },

@@ -175,6 +175,7 @@ impl BedrockExecutor {
                     ir_content.push(Content::Text {
                         text: text.to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     });
                 }
                 if item["toolUse"].is_object() {
@@ -184,6 +185,7 @@ impl BedrockExecutor {
                         name: tu["name"].as_str().unwrap_or("").to_string(),
                         arguments: tu["input"].clone(),
                         call_id: None,
+                        caller: None,
                     });
                 }
             }
@@ -576,6 +578,7 @@ mod tests {
                 content: vec![Content::Text {
                     text: "Hello".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             system: Some("You are helpful.".to_string()),
@@ -591,6 +594,7 @@ mod tests {
                 presence_penalty: None,
                 seed: None,
                 thinking: None,
+                verbosity: None,
             },
             response_format: None,
             ingress_protocol: ProtocolEndpoint::new(

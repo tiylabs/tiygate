@@ -46,6 +46,14 @@ pub enum LossyDimension {
     /// Request has `response_format` constraints but the egress protocol does
     /// not support structured output.
     StructuredOutput,
+    /// Request contains non-function hosted tools unsupported by the target.
+    HostedTools,
+    /// Request contains Responses program state or program caller links.
+    ProgrammaticToolCalling,
+    /// Request uses output verbosity unsupported by the target.
+    Verbosity,
+    /// Request carries explicit content-block cache breakpoints unsupported by the target.
+    PromptCacheBreakpoint,
     /// Request has `extended_reasoning` (Anthropic-style thinking blocks) but
     /// the egress protocol cannot carry reasoning parts.
     ExtendedReasoning,
@@ -61,6 +69,10 @@ impl LossyDimension {
             Self::ToolChoiceSpecific => "tool_choice=specific_function",
             Self::MediaSourceUnsupported => "media_source",
             Self::StructuredOutput => "response_format (structured output)",
+            Self::HostedTools => "hosted_tools",
+            Self::ProgrammaticToolCalling => "programmatic_tool_calling",
+            Self::Verbosity => "verbosity",
+            Self::PromptCacheBreakpoint => "prompt_cache_breakpoint",
             Self::ExtendedReasoning => "extended_reasoning",
         }
     }
@@ -176,7 +188,101 @@ pub fn check_lossy_conversion(
         ));
     }
 
-    // 7. Extended reasoning — request contains Reasoning content blocks (e.g.
+    // 7. Hosted tools are first-class only on Responses. Do not silently
+    // filter them from Chat/Messages/Gemini requests.
+    if request.tools.iter().any(|tool| !tool.is_function()) && !egress_caps.hosted_tools {
+        return Err((
+            LossyDimension::HostedTools,
+            lossy_error(
+                LossyDimension::HostedTools,
+                egress,
+                "non-function hosted tool definition",
+            ),
+        ));
+    }
+
+    // 8. Programmatic Tool Calling state cannot be flattened without losing
+    // replay state or caller ancestry.
+    let has_programmatic_state = request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .any(|content| {
+            matches!(
+                content,
+                Content::Program { .. }
+                    | Content::ProgramOutput { .. }
+                    | Content::ToolCall {
+                        caller: Some(_),
+                        ..
+                    }
+                    | Content::ToolResult {
+                        caller: Some(_),
+                        ..
+                    }
+            )
+        });
+    let tool_config_uses_programmatic_callers = request.tools.iter().any(|tool| {
+        tool.is_function()
+            && tool
+                .config
+                .as_ref()
+                .and_then(|config| config.get("allowed_callers"))
+                .is_some()
+    });
+    if (has_programmatic_state || tool_config_uses_programmatic_callers)
+        && !egress_caps.programmatic_tool_calling
+    {
+        return Err((
+            LossyDimension::ProgrammaticToolCalling,
+            lossy_error(
+                LossyDimension::ProgrammaticToolCalling,
+                egress,
+                "program/program_output/caller relationship",
+            ),
+        ));
+    }
+
+    let openai_text_controls = matches!(
+        egress.suite,
+        crate::protocol::ProtocolSuite::OpenAiCompatible
+            | crate::protocol::ProtocolSuite::OpenAiResponses
+    );
+    if request.params.verbosity.is_some() && !openai_text_controls {
+        return Err((
+            LossyDimension::Verbosity,
+            lossy_error(LossyDimension::Verbosity, egress, "text verbosity"),
+        ));
+    }
+
+    let has_breakpoint = request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .any(|content| {
+            matches!(
+                content,
+                Content::Text {
+                    prompt_cache_breakpoint: Some(_),
+                    ..
+                } | Content::Media {
+                    prompt_cache_breakpoint: Some(_),
+                    ..
+                }
+            )
+        });
+    if has_breakpoint && !openai_text_controls {
+        return Err((
+            LossyDimension::PromptCacheBreakpoint,
+            lossy_error(
+                LossyDimension::PromptCacheBreakpoint,
+                egress,
+                "explicit content-block cache breakpoint",
+            ),
+        ));
+    }
+
+    // 9. Extended reasoning — request contains Reasoning content blocks (e.g.
     // Anthropic thinking) but target cannot carry reasoning.
     let has_reasoning = request
         .messages

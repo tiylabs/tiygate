@@ -36,6 +36,7 @@ fn basic_request() -> IrRequest {
             content: vec![Content::Text {
                 text: "Hello".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],
@@ -49,6 +50,7 @@ fn basic_request() -> IrRequest {
             presence_penalty: None,
             seed: None,
             thinking: None,
+            verbosity: None,
         },
         response_format: None,
         stream: false,
@@ -83,6 +85,7 @@ fn response() -> IrResponse {
         content: vec![Content::Text {
             text: "Hi!".to_string(),
             annotations: None,
+            prompt_cache_breakpoint: None,
         }],
         usage: None,
         finish_reason: Some(tiygate_core::FinishReason::Stop),
@@ -360,6 +363,7 @@ fn pass_through_bytes_preserved_in_response() {
             content: vec![Content::Text {
                 text: original_text.to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],
@@ -691,6 +695,7 @@ fn orphan_tool_result_to_gemini_returns_codec_error() {
             name: String::new(),
             content: "{}".to_string(),
             id: None,
+            caller: None,
         }],
     });
 
@@ -990,6 +995,7 @@ fn thinking_ir_for_model(model: &str, thinking: ThinkingConfig) -> IrRequest {
             content: vec![Content::Text {
                 text: "Hello".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],
@@ -1258,6 +1264,34 @@ fn cross_thinking_include_thoughts_to_display_gemini_to_anthropic() {
     assert!(
         out.get("thinking").is_none(),
         "expected no thinking block when only include_thoughts is set, got: {out}"
+    );
+}
+
+#[test]
+fn cross_thinking_none_preserves_or_safely_disables() {
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let responses = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = thinking_ir_for_model(
+        "gemini-2.5-pro",
+        ThinkingConfig {
+            effort: Some(ThinkingEffort::None),
+            ..Default::default()
+        },
+    );
+
+    let (chat_body, _) = chat.encode_request(&ir).unwrap();
+    assert_eq!(chat_body["reasoning_effort"], "none");
+    let (responses_body, _) = responses.encode_request(&ir).unwrap();
+    assert_eq!(responses_body["reasoning"]["effort"], "none");
+    let (anthropic_body, _) = anthropic.encode_request(&ir).unwrap();
+    assert!(anthropic_body.get("thinking").is_none());
+    assert!(anthropic_body.get("output_config").is_none());
+    let (gemini_body, _) = gemini.encode_request(&ir).unwrap();
+    assert_eq!(
+        gemini_body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        0
     );
 }
 
@@ -1532,6 +1566,7 @@ fn gemini_encode_response_includes_cache_write_in_prompt() {
         content: vec![Content::Text {
             text: "ok".to_string(),
             annotations: None,
+            prompt_cache_breakpoint: None,
         }],
         usage: Some(tiygate_core::Usage {
             prompt_tokens: 100,
@@ -1675,6 +1710,7 @@ fn chat_encode_image_url_emits_detail() {
                     m.insert(tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(), json!("low"));
                     m
                 },
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],
@@ -1772,6 +1808,7 @@ fn responses_encode_image_url_emits_detail() {
                     );
                     m
                 },
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],

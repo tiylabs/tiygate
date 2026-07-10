@@ -74,6 +74,8 @@ impl ImagesGenerationsCodec {
                 structured_output: false,
                 function_calling: false,
                 parallel_tool_calls: false,
+                hosted_tools: false,
+                programmatic_tool_calling: false,
                 extended_reasoning: false,
                 deterministic_seed: false,
                 tool_choice_required: false,
@@ -180,18 +182,21 @@ impl EndpointCodec for ImagesGenerationsCodec {
     }
 
     fn decode_response(&self, body: Value) -> Result<IrResponse, Error> {
-        let usage = body.get("usage").map(|u| {
-            let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            let total = u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            tiygate_core::Usage {
-                prompt_tokens: prompt,
-                completion_tokens: 0,
-                reasoning_tokens: None,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                total_tokens: total,
-            }
-        });
+        let usage = body
+            .get("usage")
+            .filter(|usage| usage.is_object() && usage["total_tokens"].is_u64())
+            .map(|u| {
+                let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let total = u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                tiygate_core::Usage {
+                    prompt_tokens: prompt,
+                    completion_tokens: 0,
+                    reasoning_tokens: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    total_tokens: total,
+                }
+            });
 
         Ok(IrResponse {
             content: Vec::new(),
@@ -260,6 +265,8 @@ impl ImagesEditsCodec {
                 structured_output: false,
                 function_calling: false,
                 parallel_tool_calls: false,
+                hosted_tools: false,
+                programmatic_tool_calling: false,
                 extended_reasoning: false,
                 deterministic_seed: false,
                 tool_choice_required: false,
@@ -352,18 +359,21 @@ impl EndpointCodec for ImagesEditsCodec {
     }
 
     fn decode_response(&self, body: Value) -> Result<IrResponse, Error> {
-        let usage = body.get("usage").map(|u| {
-            let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            let total = u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            tiygate_core::Usage {
-                prompt_tokens: prompt,
-                completion_tokens: 0,
-                reasoning_tokens: None,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                total_tokens: total,
-            }
-        });
+        let usage = body
+            .get("usage")
+            .filter(|usage| usage.is_object() && usage["total_tokens"].is_u64())
+            .map(|u| {
+                let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let total = u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                tiygate_core::Usage {
+                    prompt_tokens: prompt,
+                    completion_tokens: 0,
+                    reasoning_tokens: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    total_tokens: total,
+                }
+            });
 
         Ok(IrResponse {
             content: Vec::new(),

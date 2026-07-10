@@ -29,6 +29,7 @@ fn req_with_tools() -> IrRequest {
             content: vec![Content::Text {
                 text: "hi".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![Tool {
@@ -88,6 +89,7 @@ fn with_media_url(req: &mut IrRequest) {
         },
         mime_type: "image/png".to_string(),
         metadata: HashMap::new(),
+        prompt_cache_breakpoint: None,
     });
 }
 
@@ -98,6 +100,7 @@ fn with_file_id_media(req: &mut IrRequest) {
         },
         mime_type: "image/png".to_string(),
         metadata: HashMap::new(),
+        prompt_cache_breakpoint: None,
     });
 }
 
@@ -108,6 +111,7 @@ fn with_inline_media(req: &mut IrRequest) {
         },
         mime_type: "image/png".to_string(),
         metadata: HashMap::new(),
+        prompt_cache_breakpoint: None,
     });
 }
 
@@ -119,6 +123,7 @@ fn with_data_url_media(req: &mut IrRequest) {
         source,
         mime_type,
         metadata: HashMap::new(),
+        prompt_cache_breakpoint: None,
     });
 }
 
@@ -375,6 +380,47 @@ fn error_message_names_dimension() {
     assert!(
         msg.contains("response_format"),
         "error should name the dimension; got: {msg}"
+    );
+}
+
+#[test]
+fn hosted_and_programmatic_tools_are_rejected_outside_responses() {
+    let mut hosted = text_only_req();
+    hosted.tools.push(Tool {
+        tool_type: Some("web_search".to_string()),
+        ..Default::default()
+    });
+    let (dimension, _) =
+        check_lossy_conversion(&hosted, &chat_endpoint(), &chat_caps()).unwrap_err();
+    assert_eq!(dimension, LossyDimension::HostedTools);
+    assert!(check_lossy_conversion(&hosted, &responses_endpoint(), &responses_caps()).is_ok());
+
+    let mut allowed_callers = text_only_req();
+    allowed_callers.tools.push(Tool {
+        name: "lookup".to_string(),
+        tool_type: Some("function".to_string()),
+        config: Some(serde_json::json!({"allowed_callers": ["programmatic"]})),
+        ..Default::default()
+    });
+    let (dimension, _) =
+        check_lossy_conversion(&allowed_callers, &chat_endpoint(), &chat_caps()).unwrap_err();
+    assert_eq!(dimension, LossyDimension::ProgrammaticToolCalling);
+    assert!(
+        check_lossy_conversion(&allowed_callers, &responses_endpoint(), &responses_caps()).is_ok()
+    );
+
+    let mut programmatic = text_only_req();
+    programmatic.messages[0].content.push(Content::Program {
+        id: "prog_1".to_string(),
+        call_id: "call_prog_1".to_string(),
+        code: "return 1".to_string(),
+        fingerprint: "fp_1".to_string(),
+    });
+    let (dimension, _) =
+        check_lossy_conversion(&programmatic, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert_eq!(dimension, LossyDimension::ProgrammaticToolCalling);
+    assert!(
+        check_lossy_conversion(&programmatic, &responses_endpoint(), &responses_caps()).is_ok()
     );
 }
 
