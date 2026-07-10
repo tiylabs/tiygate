@@ -60,7 +60,7 @@ import { fmtTokens } from "@/lib/format";
 
 const DEFAULT_PAGE_SIZE = 50;
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
-const AUTO_REFRESH_INTERVAL_MS = 30_000;
+const AUTO_REFRESH_INTERVAL_MS = 5_000;
 const AUTO_REFRESH_STORAGE_KEY = "tiygate.requests.autoRefresh";
 
 function fmtThroughput(value?: number | null): string {
@@ -243,6 +243,7 @@ export default function RequestLogs() {
     limit: DEFAULT_PAGE_SIZE,
     offset: 0,
   });
+  const [refreshNonce, setRefreshNonce] = useState(0);
   const limit = filter.limit ?? DEFAULT_PAGE_SIZE;
   const [draft, setDraft] = useState<RequestFilter>({});
   const [detail, setDetail] = useState<RequestLogEntry | null>(null);
@@ -265,7 +266,7 @@ export default function RequestLogs() {
   }, [autoRefresh]);
 
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ["requests", filter],
+    queryKey: ["requests", filter, refreshNonce],
     queryFn: () => requestsApi.list(filter),
   });
 
@@ -385,6 +386,7 @@ export default function RequestLogs() {
     const requestId = draft.request_id?.trim();
     if (requestId) {
       setFilter({ request_id: requestId, limit, offset: 0 });
+      setRefreshNonce((n) => n + 1);
       return;
     }
     setFilter({
@@ -397,6 +399,7 @@ export default function RequestLogs() {
       limit,
       offset: 0,
     });
+    setRefreshNonce((n) => n + 1);
   }
   function clearFilters() {
     setDraft({});
