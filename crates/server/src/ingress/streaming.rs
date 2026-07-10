@@ -595,7 +595,8 @@ fn detect_verbatim_signals(bytes: &[u8], accum: &Arc<std::sync::Mutex<UsageAccum
                 if has_error && json_str.contains("\"error\"") {
                     let error = value
                         .get("error")
-                        .or_else(|| value.get("response").and_then(|r| r.get("error")));
+                        .or_else(|| value.get("response").and_then(|r| r.get("error")))
+                        .filter(|e| e.is_object());
                     if let Some(error) = error {
                         let message = error["message"].as_str().unwrap_or("upstream stream error");
                         let code = error["type"].as_str().or_else(|| error["code"].as_str());
@@ -610,7 +611,7 @@ fn detect_verbatim_signals(bytes: &[u8], accum: &Arc<std::sync::Mutex<UsageAccum
             // Some providers embed `{"error": {...}}` without a `"type"`
             // wrapper. Parse only when `"error"` is present.
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(error) = value.get("error") {
+                if let Some(error) = value.get("error").filter(|e| e.is_object()) {
                     let message = error["message"].as_str().unwrap_or("upstream stream error");
                     let code = error["type"].as_str().or_else(|| error["code"].as_str());
                     if let Ok(mut a) = accum.lock() {
@@ -1514,6 +1515,52 @@ mod tests {
         let acc = accum.lock().unwrap();
         let err = acc.upstream_error.as_ref().expect("error should be set");
         assert_eq!(err.message, "First error");
+    }
+
+    #[test]
+    fn detect_verbatim_signals_error_null_not_flagged() {
+        // OpenAI Responses protocol frames include `"error":null` in
+        // `response.created`, `response.in_progress`, and
+        // `response.completed` events. These must NOT be treated as
+        // upstream errors — only a non-null error object should.
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"error\":null}}\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(
+            acc.upstream_error.is_none(),
+            "\"error\":null must not be treated as an error"
+        );
+    }
+
+    #[test]
+    fn detect_verbatim_signals_response_completed_with_error_null_not_flagged() {
+        // The `response.completed` event from OpenAI Responses includes
+        // `"error":null` alongside usage data. This was the exact frame
+        // shape that caused the false-positive failure.
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"error\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":12,\"total_tokens\":24}}}\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(acc.upstream_terminal, "response.completed must set terminal");
+        assert!(
+            acc.upstream_error.is_none(),
+            "\"error\":null in response.completed must not be treated as an error"
+        );
+    }
+
+    #[test]
+    fn detect_verbatim_signals_bare_error_null_not_flagged() {
+        // A frame without a `\"type\"` field but with `"error":null`
+        // (no-type error detection path) must also not be flagged.
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let bytes = b"data: {\"error\":null}\n\n";
+        detect_verbatim_signals(bytes, &accum);
+        let acc = accum.lock().unwrap();
+        assert!(
+            acc.upstream_error.is_none(),
+            "bare \"error\":null must not be treated as an error"
+        );
     }
 
     // --- terminal signal detection tests ---

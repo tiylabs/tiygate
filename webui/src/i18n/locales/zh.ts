@@ -432,7 +432,7 @@ const zh: Translation = {
     apply: "应用",
     clear: "清除",
     autoRefresh: "自动刷新",
-    autoRefreshOn: "每 30 秒自动刷新",
+    autoRefreshOn: "每 5 秒自动刷新",
     autoRefreshOff: "自动刷新已关闭",
     autoRefreshEvery: "每 {{seconds}} 秒",
     snapshotNote: "这是已存储的快照，不会重新向上游发起请求。",

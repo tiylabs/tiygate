@@ -443,7 +443,7 @@ const en = {
     apply: "Apply",
     clear: "Clear",
     autoRefresh: "Auto refresh",
-    autoRefreshOn: "Auto refresh every 30s",
+    autoRefreshOn: "Auto refresh every 5s",
     autoRefreshOff: "Auto refresh off",
     autoRefreshEvery: "Every {{seconds}}s",
     snapshotNote: "This is a stored snapshot; it is not re-sent upstream.",
