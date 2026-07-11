@@ -551,6 +551,12 @@ impl EndpointCodec for MessagesCodec {
         &self,
         ir: &IrRequest,
     ) -> Result<(serde_json::Value, HeaderMap), tiygate_core::Error> {
+        tiygate_core::protocol::structured_output::validate_response_format_for_target(
+            ir.response_format.as_ref(),
+            self.id(),
+        )
+        .map_err(|error| tiygate_core::Error::Codec(error.to_string()))?;
+
         let mut body = json!({
             "model": ir.model,
             "stream": ir.stream,
@@ -1779,6 +1785,24 @@ mod tests {
             encoded["output_config"]["format"],
             json!({"type": "json_schema", "schema": {"type": "object"}})
         );
+    }
+
+    #[test]
+    fn test_encode_request_rejects_anthropic_unsupported_schema_constraint() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        let mut ir = codec.decode_request(make_basic_request(), &env).unwrap();
+        ir.response_format = Some(ResponseFormat::JsonSchema {
+            name: "out".to_string(),
+            schema: json!({
+                "type": "object",
+                "properties": {"score": {"type": "number", "minimum": 0}},
+            }),
+            strict: Some(true),
+        });
+
+        let error = codec.encode_request(&ir).unwrap_err();
+        assert!(error.to_string().contains("/properties/score/minimum"));
     }
 
     #[test]

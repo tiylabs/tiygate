@@ -1215,6 +1215,12 @@ impl EndpointCodec for ResponsesCodec {
     }
 
     fn encode_request(&self, ir: &IrRequest) -> Result<(Value, HeaderMap), tiygate_core::Error> {
+        tiygate_core::protocol::structured_output::validate_response_format_for_target(
+            ir.response_format.as_ref(),
+            self.id(),
+        )
+        .map_err(|error| tiygate_core::Error::Codec(error.to_string()))?;
+
         let mut body = json!({"model": ir.model, "stream": ir.stream});
         if let Some(sys) = &ir.system {
             body["instructions"] = json!(sys);

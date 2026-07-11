@@ -669,6 +669,12 @@ impl EndpointCodec for ChatCompletionsCodec {
         &self,
         ir: &IrRequest,
     ) -> Result<(serde_json::Value, HeaderMap), tiygate_core::Error> {
+        tiygate_core::protocol::structured_output::validate_response_format_for_target(
+            ir.response_format.as_ref(),
+            self.id(),
+        )
+        .map_err(|error| tiygate_core::Error::Codec(error.to_string()))?;
+
         let mut body = json!({
             "model": ir.model,
             "stream": ir.stream,

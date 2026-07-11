@@ -1,0 +1,17 @@
+id = "openai-structured-outputs"
+vendor = "OpenAI"
+carrier = "response_format.json_schema / text.format"
+schema_dialect = "OpenAI Structured Outputs JSON Schema subset"
+source = "https://developers.openai.com/api/docs/guides/structured-outputs"
+profile_status = "bootstrap"
+unknown_keyword_policy = "unclassified"
+model_capability_scope = "model-dependent"
+
+# Verified examples from the official guide. This is deliberately not a claim
+# that every JSON Schema keyword is supported.
+supported_types = ["string", "number", "integer", "boolean", "object", "array"]
+known_supported_keywords = [
+  "properties", "required", "additionalProperties", "items", "enum",
+  "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+  "minItems", "maxItems",
+]

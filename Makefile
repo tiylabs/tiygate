@@ -176,6 +176,18 @@ doc: ## 生成并打开 Rust 文档
 check: ## cargo check(workspace 全量,比 build 快)
 	$(CARGO) check --workspace --all-targets --all-features
 
+.PHONY: sync-protocol-specs
+sync-protocol-specs: ## 刷新官方 API wire-schema 快照及其锁定摘要
+	sh scripts/sync-protocol-specs.sh
+
+.PHONY: check-protocol-specs
+check-protocol-specs: ## 检查已提交的 API wire-schema 快照是否仍与官方来源一致
+	sh scripts/sync-protocol-specs.sh --check
+
+.PHONY: test-structured-output-profiles
+test-structured-output-profiles: ## 验证 Structured Output profile 与核心协议规则一致
+	$(CARGO) test -p tiygate-core --test structured_output_profiles
+
 .PHONY: update
 update: ## 更新 Cargo 与 npm 依赖
 	$(CARGO) update

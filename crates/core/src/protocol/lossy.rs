@@ -24,6 +24,7 @@
 //! escape hatch: a lossy combination is rejected outright, full stop.
 
 use crate::ir::{Content, IrRequest, MediaSource, ResponseFormat};
+use crate::protocol::structured_output::validate_response_format_for_target;
 use crate::protocol::{EndpointCapabilities, Error, ProtocolEndpoint};
 
 /// A dimension-level lossy conversion check.
@@ -192,6 +193,14 @@ pub fn check_lossy_conversion(
                 egress,
                 "response_format (json_schema/json_object)",
             ),
+        ));
+    }
+    if let Err(error) =
+        validate_response_format_for_target(request.response_format.as_ref(), egress)
+    {
+        return Err((
+            LossyDimension::StructuredOutput,
+            lossy_error(LossyDimension::StructuredOutput, egress, &error.to_string()),
         ));
     }
 

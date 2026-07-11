@@ -701,6 +701,12 @@ impl EndpointCodec for GeminiCodec {
     }
 
     fn encode_request(&self, ir: &IrRequest) -> Result<(Value, HeaderMap), tiygate_core::Error> {
+        tiygate_core::protocol::structured_output::validate_response_format_for_target(
+            ir.response_format.as_ref(),
+            self.id(),
+        )
+        .map_err(|error| tiygate_core::Error::Codec(error.to_string()))?;
+
         let mut body = json!({});
         if let Some(sys) = &ir.system {
             body["system_instruction"] = json!({"parts": [{"text": sys}]});

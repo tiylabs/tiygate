@@ -315,6 +315,25 @@ fn json_schema_to_anthropic_passes() {
 }
 
 #[test]
+fn unsupported_json_schema_constraint_to_anthropic_is_rejected() {
+    let mut req = text_only_req();
+    with_response_format(
+        &mut req,
+        ResponseFormat::JsonSchema {
+            name: "out".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"score": {"type": "number", "minimum": 0}},
+            }),
+            strict: Some(true),
+        },
+    );
+    let (_, error) =
+        check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert!(error.to_string().contains("/properties/score/minimum"));
+}
+
+#[test]
 fn json_object_to_anthropic_passes() {
     let mut req = text_only_req();
     with_response_format(&mut req, ResponseFormat::JsonObject);

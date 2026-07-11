@@ -51,7 +51,7 @@
 | `reasoning` | ✅ | ✅ | ✅ | ✅ | N/A |
 | `extended_reasoning` | ❌ | ✅ | ✅ | ✅ | N/A |
 | `structured_output` | ✅ | ✅ | ✅ | ✅ | N/A |
-| `response_format json_schema` | ✅ | ✅ | ✅ | ✅ | N/A |
+| `response_format json_schema` | ✅ | ✅² | ✅ | ✅ | N/A |
 | `response_format json_object` | ✅ | ✅¹ | ✅ | ✅ | N/A |
 
 **有损组合（阶段 1-3 已知）**：
@@ -60,6 +60,12 @@
 > ¹ Anthropic Messages 以 `output_config.format: {type: "json_schema"}` 表达结构化输出；
 > `json_object` 映射为根类型为 `object` 的 JSON Schema。Anthropic 原生不含 OpenAI 的
 > `json_object` 简写。
+>
+> ² Anthropic Structured Outputs 只接受其 JSON Schema 子集。跨协议转换会递归拒绝已知
+> 不支持的数值/字符串约束（`minimum`、`maximum`、`exclusiveMinimum`、
+> `exclusiveMaximum`、`multipleOf`、`minLength`、`maxLength`），以避免静默弱化
+> 原始 response contract；拒绝错误携带 JSON Pointer。完整来源和 profile 基线见
+> `protocol-specs/structured-output/anthropic.toml`。
 
 ## 4. 确定性/种子
 

@@ -1,0 +1,15 @@
+id = "gemini-structured-outputs"
+vendor = "Google"
+carrier = "generationConfig.responseSchema / response_format.schema"
+schema_dialect = "Gemini structured-output JSON Schema subset"
+source = "https://ai.google.dev/gemini-api/docs/structured-output"
+profile_status = "bootstrap"
+unknown_keyword_policy = "unclassified"
+model_capability_scope = "model-dependent"
+
+supported_types = ["string", "number", "integer", "boolean", "object", "array", "null"]
+known_supported_keywords = [
+  "title", "description", "properties", "required", "additionalProperties",
+  "enum", "format", "minimum", "maximum", "items", "prefixItems",
+  "minItems", "maxItems",
+]

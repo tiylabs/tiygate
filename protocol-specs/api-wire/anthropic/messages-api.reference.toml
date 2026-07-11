@@ -1,0 +1,10 @@
+# This is a source record, not a hand-maintained replacement OpenAPI schema.
+# Keep this distinction so generated tests never attribute an unofficial schema
+# to Anthropic.
+
+vendor = "Anthropic"
+endpoint = "Messages API"
+reference = "https://platform.claude.com/docs/en/api/messages"
+sdk_types = "https://github.com/anthropics/anthropic-sdk-typescript"
+machine_readable_wire_schema = false
+recommended_update_check = "Review the API reference and SDK release notes together."

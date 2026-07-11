@@ -1,0 +1,17 @@
+id = "anthropic-structured-outputs"
+vendor = "Anthropic"
+carrier = "output_config.format"
+schema_dialect = "Anthropic Structured Outputs JSON Schema subset"
+source = "https://platform.claude.com/docs/en/build-with-claude/structured-outputs"
+profile_status = "bootstrap"
+unknown_keyword_policy = "unclassified"
+model_capability_scope = "model-and-platform-dependent"
+
+# Anthropic documents that its SDK transformation removes these constraints
+# before calling the API. Keep them classified as unsupported for a lossless
+# cross-protocol conversion.
+known_unsupported_keywords = [
+  "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+  "minLength", "maxLength",
+]
+object_normalization = "SDKs add additionalProperties: false to objects"

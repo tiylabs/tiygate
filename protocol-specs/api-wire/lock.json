@@ -1,0 +1,14 @@
+{
+  "generated_at": "2026-07-11T16:01:14Z",
+  "resources": {
+    "openai-openapi": {
+      "url": "https://raw.githubusercontent.com/openai/openai-openapi/main/openapi.yaml",
+      "sha256": "74cbcf73838f4cd7e209b2d3f2e9ddc9fa155f21a44360b6fac7646a6d4f5f8b"
+    },
+    "gemini-v1beta-discovery": {
+      "url": "https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta",
+      "revision": "20260709",
+      "sha256": "590b0a107e0258d82ba373c99d45a4211451a9fe1959f289364ae27ea9b43392"
+    }
+  }
+}

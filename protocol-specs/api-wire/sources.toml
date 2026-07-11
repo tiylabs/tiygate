@@ -1,0 +1,31 @@
+# Official sources for the API wire-schema layer.
+#
+# `snapshot_path` is present only where the vendor publishes a directly
+# machine-readable source. Anthropic deliberately has no snapshot entry: an
+# unofficial OpenAPI file must never be mistaken for an authoritative one.
+
+[[source]]
+id = "openai-openapi"
+vendor = "OpenAI"
+kind = "openapi"
+url = "https://raw.githubusercontent.com/openai/openai-openapi/main/openapi.yaml"
+upstream_repository = "https://github.com/openai/openai-openapi"
+snapshot_path = "openai/openapi.yaml"
+update_signal = "Git commit and file digest"
+
+[[source]]
+id = "gemini-v1beta-discovery"
+vendor = "Google"
+kind = "google-api-discovery"
+url = "https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta"
+snapshot_path = "gemini/v1beta.discovery.json"
+update_signal = "Discovery revision and file digest"
+
+[[source]]
+id = "anthropic-messages-reference"
+vendor = "Anthropic"
+kind = "reference-only"
+url = "https://platform.claude.com/docs/en/api/messages"
+sdk_types_url = "https://github.com/anthropics/anthropic-sdk-typescript"
+update_signal = "API-reference and SDK release monitoring"
+notes = "Anthropic does not currently publish an official OpenAPI document."
