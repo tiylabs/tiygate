@@ -48,6 +48,8 @@ pub enum LossyDimension {
     StructuredOutput,
     /// Request contains non-function hosted tools unsupported by the target.
     HostedTools,
+    /// Request contains OpenAI `type: "custom"` tool definitions unsupported by the target.
+    CustomTools,
     /// Request contains Responses program state or program caller links.
     ProgrammaticToolCalling,
     /// Request uses output verbosity unsupported by the target.
@@ -70,6 +72,7 @@ impl LossyDimension {
             Self::MediaSourceUnsupported => "media_source",
             Self::StructuredOutput => "response_format (structured output)",
             Self::HostedTools => "hosted_tools",
+            Self::CustomTools => "custom_tools",
             Self::ProgrammaticToolCalling => "programmatic_tool_calling",
             Self::Verbosity => "verbosity",
             Self::PromptCacheBreakpoint => "prompt_cache_breakpoint",
@@ -210,9 +213,9 @@ pub fn check_lossy_conversion(
     }
     if request.tools.iter().any(|tool| tool.is_custom()) && !openai_egress {
         return Err((
-            LossyDimension::HostedTools,
+            LossyDimension::CustomTools,
             lossy_error(
-                LossyDimension::HostedTools,
+                LossyDimension::CustomTools,
                 egress,
                 "custom tool definition (OpenAI-only)",
             ),

@@ -442,10 +442,10 @@ fn custom_tools_rejected_outside_openai() {
     // reject instead of silently dropping.
     let (dim, _) =
         check_lossy_conversion(&custom, &anthropic_endpoint(), &messages_caps()).unwrap_err();
-    assert_eq!(dim, LossyDimension::HostedTools);
+    assert_eq!(dim, LossyDimension::CustomTools);
     let (dim, _) =
         check_lossy_conversion(&custom, &gemini_endpoint(), &gemini_caps()).unwrap_err();
-    assert_eq!(dim, LossyDimension::HostedTools);
+    assert_eq!(dim, LossyDimension::CustomTools);
 }
 
 // --- Codex extension: opaque items should not trigger lossy rejection ---
@@ -509,4 +509,19 @@ fn prompt_cache_breakpoint_rejected_outside_openai() {
         LossyDimension::PromptCacheBreakpoint,
         "Gemini should reject prompt_cache_breakpoint"
     );
+}
+
+#[test]
+fn verbosity_rejected_outside_openai() {
+    let mut req = text_only_req();
+    req.params.verbosity = Some(tiygate_core::Verbosity::High);
+
+    assert!(check_lossy_conversion(&req, &chat_endpoint(), &chat_caps()).is_ok());
+    assert!(check_lossy_conversion(&req, &responses_endpoint(), &responses_caps()).is_ok());
+
+    let (dim, _) =
+        check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::Verbosity);
+    let (dim, _) = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::Verbosity);
 }

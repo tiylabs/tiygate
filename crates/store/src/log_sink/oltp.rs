@@ -1487,19 +1487,66 @@ fn merge_openai_response_tool_item(
     item: &serde_json::Value,
     output_index: Option<usize>,
 ) {
-    if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
-        return;
+    match item.get("type").and_then(|t| t.as_str()) {
+        Some("function_call") => {
+            upsert_openai_response_tool_call(
+                &mut m.tool_calls,
+                item.get("call_id")
+                    .or(item.get("id"))
+                    .and_then(|i| i.as_str()),
+                item.get("name").and_then(|n| n.as_str()),
+                item.get("arguments").and_then(|a| a.as_str()),
+                false,
+                output_index,
+            );
+        }
+        Some("program") => {
+            // PTC program items count as tool-call turns for finish_reason /
+            // detail-view purposes even though they are not function tools.
+            upsert_openai_response_tool_call(
+                &mut m.tool_calls,
+                item.get("call_id")
+                    .or(item.get("id"))
+                    .and_then(|i| i.as_str()),
+                Some("program"),
+                item.get("code").and_then(|a| a.as_str()),
+                false,
+                output_index,
+            );
+        }
+        Some("custom_tool_call") => {
+            // Codex custom tools use free-text `input` rather than JSON
+            // `arguments`; surface the input as the arguments payload.
+            let input = item.get("input").and_then(|a| a.as_str());
+            upsert_openai_response_tool_call(
+                &mut m.tool_calls,
+                item.get("call_id")
+                    .or(item.get("id"))
+                    .and_then(|i| i.as_str()),
+                item.get("name").and_then(|n| n.as_str()),
+                input,
+                false,
+                output_index,
+            );
+        }
+        Some("local_shell_call") => {
+            let action = item
+                .get("action")
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            upsert_openai_response_tool_call(
+                &mut m.tool_calls,
+                item.get("call_id")
+                    .or(item.get("id"))
+                    .and_then(|i| i.as_str()),
+                Some("local_shell"),
+                Some(action.as_str()),
+                false,
+                output_index,
+            );
+        }
+        _ => {}
     }
-    upsert_openai_response_tool_call(
-        &mut m.tool_calls,
-        item.get("call_id")
-            .or(item.get("id"))
-            .and_then(|i| i.as_str()),
-        item.get("name").and_then(|n| n.as_str()),
-        item.get("arguments").and_then(|a| a.as_str()),
-        false,
-        output_index,
-    );
 }
 
 fn upsert_openai_response_tool_call(
@@ -2104,14 +2151,20 @@ fn normalise_responses_status(raw: &str, saw_tool_call: bool) -> String {
     }
 }
 
+fn responses_item_is_tool_call(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(|t| t.as_str()),
+        Some("function_call")
+            | Some("program")
+            | Some("local_shell_call")
+            | Some("custom_tool_call")
+    )
+}
+
 fn responses_body_has_tool_call(body: &serde_json::Value) -> bool {
     body.get("output")
         .and_then(|o| o.as_array())
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call"))
-        })
+        .is_some_and(|items| items.iter().any(responses_item_is_tool_call))
 }
 
 /// Extract a canonical `finish_reason` from a non-streaming upstream
@@ -2207,9 +2260,10 @@ fn extract_finish_reason_from_sse(raw: &str) -> Option<String> {
         // Type-discriminated frames: Anthropic + Responses
         match ev.get("type").and_then(|t| t.as_str()) {
             Some("response.output_item.added") => {
-                let item = &ev["item"];
-                if item["type"].as_str() == Some("function_call") {
-                    saw_tool_call = true;
+                if let Some(item) = ev.get("item") {
+                    if responses_item_is_tool_call(item) {
+                        saw_tool_call = true;
+                    }
                 }
             }
             Some("response.function_call_arguments.delta") => {
@@ -2219,16 +2273,24 @@ fn extract_finish_reason_from_sse(raw: &str) -> Option<String> {
                 saw_tool_call = true;
             }
             Some("response.output_item.done") => {
-                if ev
-                    .get("item")
-                    .and_then(|item| item.get("type"))
-                    .and_then(|t| t.as_str())
-                    == Some("function_call")
-                {
-                    saw_tool_call = true;
+                if let Some(item) = ev.get("item") {
+                    if responses_item_is_tool_call(item) {
+                        saw_tool_call = true;
+                    }
                 }
             }
             Some("response.completed") | Some("response.incomplete") => {
+                // Terminal frames may be the only place that carries completed
+                // output items (e.g. non-streamed program/custom_tool_call).
+                if let Some(output) = ev
+                    .get("response")
+                    .and_then(|r| r.get("output"))
+                    .and_then(|o| o.as_array())
+                {
+                    if output.iter().any(responses_item_is_tool_call) {
+                        saw_tool_call = true;
+                    }
+                }
                 if let Some(status) = ev
                     .get("response")
                     .and_then(|r| r.get("status"))
@@ -4379,6 +4441,71 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
             extract_finish_reason_from_sse(raw),
             Some("tool_calls".to_string())
         );
+    }
+
+    #[test]
+    fn extract_finish_reason_json_responses_program_prefers_tool_calls() {
+        let body = serde_json::json!({
+            "id": "r1",
+            "status": "completed",
+            "output": [{
+                "type": "program",
+                "id": "prog_1",
+                "call_id": "call_prog_1",
+                "code": "return 1",
+                "fingerprint": "fp"
+            }]
+        });
+        assert_eq!(
+            extract_finish_reason_from_json(&body),
+            Some("tool_calls".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_finish_reason_json_responses_custom_tool_prefers_tool_calls() {
+        let body = serde_json::json!({
+            "id": "r1",
+            "status": "completed",
+            "output": [{
+                "type": "custom_tool_call",
+                "id": "call_c1",
+                "name": "my_tool",
+                "input": "hello"
+            }]
+        });
+        assert_eq!(
+            extract_finish_reason_from_json(&body),
+            Some("tool_calls".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_finish_reason_sse_responses_program_prefers_tool_calls() {
+        let raw = "\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\
+data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"program\",\"id\":\"prog_1\",\"call_id\":\"call_prog_1\",\"code\":\"return 1\",\"fingerprint\":\"fp\"}}\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n";
+        assert_eq!(
+            extract_finish_reason_from_sse(raw),
+            Some("tool_calls".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sse_merges_openai_responses_program_as_tool_call() {
+        let raw = "\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5.6\",\"status\":\"in_progress\"}}\n\
+data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"program\",\"id\":\"prog_1\",\"call_id\":\"call_prog_1\",\"code\":\"return 1\",\"fingerprint\":\"fp\"}}\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[{\"type\":\"program\",\"id\":\"prog_1\",\"call_id\":\"call_prog_1\",\"code\":\"return 1\",\"fingerprint\":\"fp\"}]}}\n\
+data: [DONE]\n";
+        let parsed = parse_sse_to_json(raw).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(v["protocol"], "openai_responses");
+        assert_eq!(v["finish_reason"], "tool_calls");
+        assert_eq!(v["tool_call_count"], 1);
+        assert_eq!(v["tool_calls"][0]["name"], "program");
+        assert_eq!(v["tool_calls"][0]["id"], "call_prog_1");
     }
 
     #[test]

@@ -108,6 +108,7 @@
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
 |------|:---:|:---:|:---:|:---:|:---:|
 | function tools | ✅ | ✅ | ✅ | ✅ | N/A |
+| custom tools (`type: "custom"`) | ✅ | ❌ 跨协议拒绝 (`CustomTools`) | ✅ | ❌ 跨协议拒绝 (`CustomTools`) | N/A |
 | hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅（`Tool.tool_type` + `config` 往返） | ❌ 跨协议拒绝 | N/A |
 | Programmatic Tool Calling (`programmatic_tool_calling` / `allowed_callers` / `program` / `caller` / `program_output`) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ 稳定版有序往返 | ❌ 跨协议拒绝 | N/A |
 
@@ -213,7 +214,7 @@ Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字�
 | 字段 | 跨协议行为 |
 |------|-----------|
 | `reasoning.summary` | ✅ 解析到 IR `ThinkingConfig.summary`，Responses egress 时回写；跨协议到 Anthropic/Gemini 时丢弃（不拒绝） |
-| `text.verbosity` | ⚠️ 随 `extensions["text"]` 整体透传，仅 Responses egress 消费；跨协议到非 Responses 协议时有损丢弃 |
+| `text.verbosity` | ✅ 解析到 IR `params.verbosity`；Responses 同协议还通过 `extensions["text"]` 保留完整 `text` 对象；跨协议到非 OpenAI egress 时由 `LossyDimension::Verbosity` **拒绝**（不是静默丢弃） |
 | `client_metadata` | ✅ 加入 `responses_extra` 透传列表，同协议 egress 自动回写；跨协议时丢弃 |
 
 ### Codex 自定义请求头

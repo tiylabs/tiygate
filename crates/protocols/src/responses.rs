@@ -112,6 +112,235 @@ fn decode_prompt_cache_breakpoint(part: &Value) -> Option<PromptCacheBreakpoint>
     )
 }
 
+/// Map Responses `text.format` into the shared IR `response_format` so Chat ↔
+/// Responses Convert can carry structured-output constraints both ways.
+fn decode_text_format(text: &Value) -> Option<tiygate_core::ResponseFormat> {
+    let format = text.get("format")?;
+    match format["type"].as_str() {
+        Some("json_schema") => {
+            // Responses nests schema under `format` itself (name/schema/strict)
+            // rather than under a `json_schema` wrapper like Chat Completions.
+            let name = format["name"]
+                .as_str()
+                .or_else(|| format["json_schema"]["name"].as_str())
+                .unwrap_or("response")
+                .to_string();
+            let schema = if format.get("schema").is_some_and(|s| !s.is_null()) {
+                format["schema"].clone()
+            } else if format
+                .pointer("/json_schema/schema")
+                .is_some_and(|s| !s.is_null())
+            {
+                format["json_schema"]["schema"].clone()
+            } else {
+                // Malformed json_schema without a real schema object — do not
+                // promote a null/missing schema into IR.
+                return None;
+            };
+            if !schema.is_object() {
+                return None;
+            }
+            let strict = format["strict"]
+                .as_bool()
+                .or_else(|| format["json_schema"]["strict"].as_bool());
+            Some(tiygate_core::ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            })
+        }
+        Some("json_object") => Some(tiygate_core::ResponseFormat::JsonObject),
+        Some("text") => Some(tiygate_core::ResponseFormat::Text),
+        _ => None,
+    }
+}
+
+fn encode_text_format(format: &tiygate_core::ResponseFormat) -> Value {
+    match format {
+        tiygate_core::ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => {
+            let mut obj = json!({
+                "type": "json_schema",
+                "name": name,
+                "schema": schema,
+            });
+            if let Some(strict) = strict {
+                obj["strict"] = json!(strict);
+            }
+            obj
+        }
+        tiygate_core::ResponseFormat::JsonObject => json!({"type": "json_object"}),
+        tiygate_core::ResponseFormat::Text => json!({"type": "text"}),
+    }
+}
+
+fn is_image_mime(mime_type: &str) -> bool {
+    mime_type.starts_with("image/") || mime_type == "image/*" || mime_type.is_empty()
+}
+
+/// Encode IR media into a Responses content part. FileId sources map to
+/// `input_image`/`input_file` with a top-level `file_id` field; Url/Inline
+/// non-image media map to `input_file` with `file_url` / `file_data`.
+fn encode_responses_media_part(
+    source: &tiygate_core::ir::MediaSource,
+    mime_type: &str,
+    metadata: &std::collections::HashMap<String, Value>,
+    prompt_cache_breakpoint: &Option<PromptCacheBreakpoint>,
+) -> Option<Value> {
+    let image = is_image_mime(mime_type);
+    let mut part = match source {
+        tiygate_core::ir::MediaSource::Url { url } => {
+            if image {
+                json!({
+                    "type": "input_image",
+                    "image_url": url,
+                })
+            } else {
+                let mut obj = json!({
+                    "type": "input_file",
+                    "file_url": url,
+                });
+                if let Some(name) = metadata.get("filename").and_then(|v| v.as_str()) {
+                    obj["filename"] = json!(name);
+                }
+                obj
+            }
+        }
+        tiygate_core::ir::MediaSource::Inline { data } => {
+            if image {
+                json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{mime_type};base64,{data}"),
+                })
+            } else {
+                let mut obj = json!({
+                    "type": "input_file",
+                    "file_data": format!("data:{mime_type};base64,{data}"),
+                });
+                if let Some(name) = metadata.get("filename").and_then(|v| v.as_str()) {
+                    obj["filename"] = json!(name);
+                }
+                obj
+            }
+        }
+        tiygate_core::ir::MediaSource::FileId { id } => {
+            if image {
+                json!({
+                    "type": "input_image",
+                    "file_id": id,
+                })
+            } else {
+                let mut obj = json!({
+                    "type": "input_file",
+                    "file_id": id,
+                });
+                if let Some(name) = metadata.get("filename").and_then(|v| v.as_str()) {
+                    obj["filename"] = json!(name);
+                }
+                obj
+            }
+        }
+    };
+    if part["type"] == "input_image" {
+        if let Some(detail) = metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY) {
+            part["detail"] = detail.clone();
+        }
+    }
+    if let Some(breakpoint) = prompt_cache_breakpoint {
+        part["prompt_cache_breakpoint"] = json!(breakpoint);
+    }
+    Some(part)
+}
+
+/// Decode a Responses media content part (`input_image` / `input_file`) into IR.
+fn decode_responses_media_part(part: &Value) -> Option<Content> {
+    match part["type"].as_str() {
+        Some("input_image") => {
+            let detail = part["detail"]
+                .as_str()
+                .or_else(|| part["image_url"]["detail"].as_str());
+            let mut metadata = std::collections::HashMap::<String, Value>::new();
+            if let Some(d) = detail {
+                metadata.insert(
+                    tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(),
+                    Value::String(d.to_string()),
+                );
+            }
+            if let Some(file_id) = part["file_id"].as_str().filter(|s| !s.is_empty()) {
+                return Some(Content::Media {
+                    source: tiygate_core::ir::MediaSource::FileId {
+                        id: file_id.to_string(),
+                    },
+                    mime_type: "image/*".to_string(),
+                    metadata,
+                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+                });
+            }
+            let raw_url = if let Some(s) = part["image_url"].as_str() {
+                s
+            } else if let Some(s) = part["image_url"]["url"].as_str() {
+                s
+            } else {
+                ""
+            };
+            if raw_url.is_empty() {
+                return None;
+            }
+            let (source, mime_type) =
+                tiygate_core::ir::MediaSource::from_data_url(raw_url, "image/*");
+            Some(Content::Media {
+                source,
+                mime_type,
+                metadata,
+                prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+            })
+        }
+        Some("input_file") => {
+            let mut metadata = std::collections::HashMap::<String, Value>::new();
+            if let Some(name) = part["filename"].as_str().filter(|s| !s.is_empty()) {
+                metadata.insert("filename".to_string(), Value::String(name.to_string()));
+            }
+            if let Some(file_id) = part["file_id"].as_str().filter(|s| !s.is_empty()) {
+                return Some(Content::Media {
+                    source: tiygate_core::ir::MediaSource::FileId {
+                        id: file_id.to_string(),
+                    },
+                    mime_type: "application/octet-stream".to_string(),
+                    metadata,
+                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+                });
+            }
+            if let Some(url) = part["file_url"].as_str().filter(|s| !s.is_empty()) {
+                return Some(Content::Media {
+                    source: tiygate_core::ir::MediaSource::Url {
+                        url: url.to_string(),
+                    },
+                    mime_type: "application/octet-stream".to_string(),
+                    metadata,
+                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+                });
+            }
+            if let Some(data) = part["file_data"].as_str().filter(|s| !s.is_empty()) {
+                let (source, mime_type) = tiygate_core::ir::MediaSource::from_data_url(
+                    data,
+                    "application/octet-stream",
+                );
+                return Some(Content::Media {
+                    source,
+                    mime_type,
+                    metadata,
+                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 impl ResponsesCodec {
     pub fn new() -> Self {
         Self {
@@ -227,47 +456,9 @@ impl EndpointCodec for ResponsesCodec {
                                     prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
                                 });
                             }
-                            Some("input_image") => {
-                                // Accept both the string form
-                                // `{"image_url": "data:..."}` and the object
-                                // form `{"image_url": {"url": "...",
-                                // "detail": "..."}}`.
-                                let (raw_url, detail) = if let Some(s) = part["image_url"].as_str()
-                                {
-                                    (s, part["detail"].as_str())
-                                } else if let Some(s) = part["image_url"]["url"].as_str() {
-                                    (
-                                        s,
-                                        part["detail"]
-                                            .as_str()
-                                            .or_else(|| part["image_url"]["detail"].as_str()),
-                                    )
-                                } else {
-                                    ("", None)
-                                };
-                                if !raw_url.is_empty() {
-                                    let (source, mime_type) =
-                                        tiygate_core::ir::MediaSource::from_data_url(
-                                            raw_url, "image/*",
-                                        );
-                                    let mut metadata = std::collections::HashMap::<
-                                        String,
-                                        serde_json::Value,
-                                    >::new();
-                                    if let Some(d) = detail {
-                                        metadata.insert(
-                                            tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(),
-                                            serde_json::Value::String(d.to_string()),
-                                        );
-                                    }
-                                    parts.push(Content::Media {
-                                        source,
-                                        mime_type,
-                                        metadata,
-                                        prompt_cache_breakpoint: decode_prompt_cache_breakpoint(
-                                            part,
-                                        ),
-                                    });
+                            Some("input_image") | Some("input_file") => {
+                                if let Some(media) = decode_responses_media_part(part) {
+                                    parts.push(media);
                                 }
                             }
                             _ => {}
@@ -664,13 +855,20 @@ impl EndpointCodec for ResponsesCodec {
             extensions.insert("codex_opaque_items".to_string(), json!(codex_opaque_items));
         }
 
+        // Promote `text.format` into IR response_format so Chat ↔ Responses
+        // Convert can rehydrate structured-output constraints. The full `text`
+        // object remains in extensions for same-protocol fidelity.
+        let response_format = body
+            .get("text")
+            .and_then(decode_text_format);
+
         Ok(IrRequest {
             model,
             system,
             messages,
             tools,
             params,
-            response_format: None,
+            response_format,
             stream,
             ingress_protocol: self.id.clone(),
             metadata: body.get("metadata").and_then(|m| m.as_object()).map(|obj| {
@@ -881,26 +1079,14 @@ impl EndpointCodec for ResponsesCodec {
                                     metadata,
                                     prompt_cache_breakpoint,
                                 } => {
-                                    let image_url = match source {
-                                        tiygate_core::ir::MediaSource::Url { url } => url.clone(),
-                                        tiygate_core::ir::MediaSource::Inline { data } => {
-                                            format!("data:{mime_type};base64,{data}")
-                                        }
-                                        tiygate_core::ir::MediaSource::FileId { .. } => continue,
-                                    };
-                                    let mut part = json!({
-                                        "type": "input_image",
-                                        "image_url": image_url,
-                                    });
-                                    if let Some(detail) =
-                                        metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY)
-                                    {
-                                        part["detail"] = detail.clone();
+                                    if let Some(part) = encode_responses_media_part(
+                                        source,
+                                        mime_type,
+                                        metadata,
+                                        prompt_cache_breakpoint,
+                                    ) {
+                                        content_parts.push(part);
                                     }
-                                    if let Some(breakpoint) = prompt_cache_breakpoint {
-                                        part["prompt_cache_breakpoint"] = json!(breakpoint);
-                                    }
-                                    content_parts.push(part);
                                 }
                                 _ => {}
                             }
@@ -973,39 +1159,16 @@ impl EndpointCodec for ResponsesCodec {
                                 mime_type,
                                 metadata,
                                 prompt_cache_breakpoint,
-                            } => match source {
-                                tiygate_core::ir::MediaSource::Url { url } => {
-                                    let mut obj = json!({
-                                        "type": "input_image",
-                                        "image_url": url
-                                    });
-                                    if let Some(d) =
-                                        metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY)
-                                    {
-                                        obj["detail"] = d.clone();
-                                    }
-                                    if let Some(breakpoint) = prompt_cache_breakpoint {
-                                        obj["prompt_cache_breakpoint"] = json!(breakpoint);
-                                    }
-                                    text_parts.push(obj);
+                            } => {
+                                if let Some(part) = encode_responses_media_part(
+                                    source,
+                                    mime_type,
+                                    metadata,
+                                    prompt_cache_breakpoint,
+                                ) {
+                                    text_parts.push(part);
                                 }
-                                tiygate_core::ir::MediaSource::Inline { data } => {
-                                    let mut obj = json!({
-                                        "type": "input_image",
-                                        "image_url": format!("data:{};base64,{}", mime_type, data)
-                                    });
-                                    if let Some(d) =
-                                        metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY)
-                                    {
-                                        obj["detail"] = d.clone();
-                                    }
-                                    if let Some(breakpoint) = prompt_cache_breakpoint {
-                                        obj["prompt_cache_breakpoint"] = json!(breakpoint);
-                                    }
-                                    text_parts.push(obj);
-                                }
-                                _ => {}
-                            },
+                            }
                             Content::Reasoning {
                                 text,
                                 id,
@@ -1241,6 +1404,16 @@ impl EndpointCodec for ResponsesCodec {
         }
         if let Some(tf) = ir.extensions.get("text") {
             body["text"] = tf.clone();
+        }
+        // Synthesize text.format from IR response_format when the extension
+        // path did not already carry a format (e.g. Chat → Responses Convert).
+        if let Some(format) = ir.response_format.as_ref() {
+            if !body["text"].is_object() {
+                body["text"] = json!({});
+            }
+            if body["text"].get("format").is_none() {
+                body["text"]["format"] = encode_text_format(format);
+            }
         }
         if let Some(verbosity) = ir.params.verbosity {
             if !body["text"].is_object() {
@@ -2959,6 +3132,10 @@ mod tests {
             Some(tiygate_core::ThinkingEffort::None)
         );
         assert_eq!(ir.params.verbosity, Some(Verbosity::High));
+        assert!(matches!(
+            ir.response_format,
+            Some(tiygate_core::ResponseFormat::Text)
+        ));
         let (encoded, _) = codec.encode_request(&ir).unwrap();
         assert_eq!(encoded["reasoning"]["effort"], "none");
         assert_eq!(encoded["text"]["verbosity"], "high");
@@ -2970,6 +3147,152 @@ mod tests {
             "explicit"
         );
         assert_eq!(encoded["input"][0]["content"][1]["detail"], "original");
+    }
+
+    #[test]
+    fn test_text_format_json_schema_roundtrip_and_chat_cross() {
+        let responses = ResponsesCodec::new();
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let env = make_raw_env();
+
+        // Responses → IR → Responses
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+                    "strict": true
+                }
+            }
+        });
+        let ir = responses.decode_request(body, &env).unwrap();
+        match &ir.response_format {
+            Some(tiygate_core::ResponseFormat::JsonSchema { name, strict, .. }) => {
+                assert_eq!(name, "answer");
+                assert_eq!(*strict, Some(true));
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        assert_eq!(encoded["text"]["format"]["type"], "json_schema");
+        assert_eq!(encoded["text"]["format"]["name"], "answer");
+        assert_eq!(encoded["text"]["format"]["strict"], true);
+
+        // Chat → IR → Responses must rehydrate text.format from IR response_format.
+        let chat_ir = chat
+            .decode_request(
+                json!({
+                    "model": "gpt-5.6",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "answer",
+                            "schema": {"type": "object"},
+                            "strict": true
+                        }
+                    }
+                }),
+                &env,
+            )
+            .unwrap();
+        let (from_chat, _) = responses.encode_request(&chat_ir).unwrap();
+        assert_eq!(from_chat["text"]["format"]["type"], "json_schema");
+        assert_eq!(from_chat["text"]["format"]["name"], "answer");
+        assert_eq!(from_chat["text"]["format"]["strict"], true);
+    }
+
+    #[test]
+    fn test_file_id_media_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "file_id": "file-img-1", "detail": "high"},
+                    {"type": "input_file", "file_id": "file-doc-1"},
+                    {"type": "input_file", "file_url": "https://example.com/a.pdf", "filename": "a.pdf"},
+                    {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0=", "filename": "b.pdf"}
+                ]
+            }]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::FileId { id },
+                ..
+            } if id == "file-img-1"
+        )));
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::FileId { id },
+                ..
+            } if id == "file-doc-1"
+        )));
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::Url { url },
+                ..
+            } if url == "https://example.com/a.pdf"
+        )));
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::Inline { .. },
+                mime_type,
+                ..
+            } if mime_type == "application/pdf"
+        )));
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let parts = encoded["input"][0]["content"].as_array().unwrap();
+        assert!(parts.iter().any(|p| {
+            p["type"] == "input_image" && p["file_id"] == "file-img-1" && p["detail"] == "high"
+        }));
+        assert!(parts
+            .iter()
+            .any(|p| p["type"] == "input_file" && p["file_id"] == "file-doc-1"));
+        assert!(parts.iter().any(|p| {
+            p["type"] == "input_file"
+                && p["file_url"] == "https://example.com/a.pdf"
+                && p["filename"] == "a.pdf"
+        }));
+        assert!(parts.iter().any(|p| {
+            p["type"] == "input_file"
+                && p["file_data"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("data:application/pdf;base64,"))
+                && p["filename"] == "b.pdf"
+        }));
+    }
+
+    #[test]
+    fn test_text_format_rejects_null_json_schema() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "broken",
+                    "schema": null
+                }
+            }
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert!(
+            ir.response_format.is_none(),
+            "null schema must not promote into IR response_format"
+        );
     }
 
     #[test]

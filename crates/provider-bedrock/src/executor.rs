@@ -117,6 +117,67 @@ impl BedrockExecutor {
         AwsCredentials::parse(api_key)
     }
 
+    /// Reject GPT-5.6 / OpenAI-only IR features that Converse cannot express.
+    ///
+    /// Bedrock uses a custom executor path that never runs the protocol
+    /// codec's `check_lossy_conversion`, so we re-use the shared lossy guard
+    /// here. Converse body construction is currently text-only and does not
+    /// emit toolConfig/toolUse, so function calling is also disabled until
+    /// that path is implemented (otherwise tools would be silently dropped).
+    pub fn reject_unsupported_features(ir: &IrRequest) -> Result<(), tiygate_core::Error> {
+        use tiygate_core::protocol::{
+            lossy::check_lossy_conversion, EndpointCapabilities, ProtocolEndpoint, ProtocolSuite,
+        };
+
+        let endpoint =
+            ProtocolEndpoint::new(ProtocolSuite::AnthropicMessages, "bedrock-converse", "v1");
+        // Text-only Converse body: multimodal / structured-output / tools /
+        // hosted / PTC all unsupported so the shared guard rejects rather
+        // than silently dropping fields.
+        let caps = EndpointCapabilities {
+            streaming: true,
+            tools: false,
+            reasoning: false,
+            embeddings: false,
+            force_upstream_stream: false,
+            override_model_in_body: false,
+            ingress_routes: &[],
+            multimodal: false,
+            structured_output: false,
+            function_calling: false,
+            parallel_tool_calls: false,
+            hosted_tools: false,
+            programmatic_tool_calling: false,
+            extended_reasoning: false,
+            deterministic_seed: false,
+            tool_choice_required: false,
+            stream: tiygate_core::StreamCaps {
+                server_sent_events: false,
+                usage_in_stream: false,
+                requires_stream_flag: false,
+            },
+            unknown_field_policy: tiygate_core::protocol::UnknownFieldPolicy::Drop,
+            lossy_default_reject: true,
+        };
+        // Shared lossy covers tools/media/PTC/verbosity/breakpoints. Also
+        // reject ToolCall / ToolResult content blocks that would otherwise
+        // be flattened away by the text-only body builder.
+        check_lossy_conversion(ir, &endpoint, &caps).map_err(|(_dim, err)| err)?;
+        let has_tool_content = ir.messages.iter().flat_map(|m| m.content.iter()).any(|c| {
+            matches!(
+                c,
+                Content::ToolCall { .. } | Content::ToolResult { .. }
+            )
+        });
+        if has_tool_content {
+            return Err(tiygate_core::Error::LossyRejection(
+                "tool_calling not supported by Bedrock Converse executor (tools not encoded in request body)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Build the Converse API JSON body from an IR request.
     pub fn build_body(&self, ir: &IrRequest, model_id: &str) -> serde_json::Value {
         let messages: Vec<serde_json::Value> = ir
@@ -351,6 +412,7 @@ impl Executor for BedrockExecutor {
         ir: &IrRequest,
         _ctx: &PipelineContext,
     ) -> Result<IrResponse, tiygate_core::Error> {
+        Self::reject_unsupported_features(ir)?;
         let creds = Self::parse_creds(target.effective_api_key())?;
         let model_id = &target.model_id;
 
@@ -428,6 +490,7 @@ impl Executor for BedrockExecutor {
         // body. Each line is treated as a single StreamPart so the
         // client still receives content; the streaming-error frame
         // path is fully exercised.
+        Self::reject_unsupported_features(ir)?;
         let creds = Self::parse_creds(target.effective_api_key())?;
         let model_id = &target.model_id;
         let body_value = self.build_body(ir, model_id);
@@ -742,6 +805,80 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("access_key:secret_key:region"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_unsupported_features_blocks_custom_tools_and_ptc() {
+        let mut ir = make_ir();
+        ir.tools.push(tiygate_core::Tool {
+            name: "code_exec".to_string(),
+            tool_type: Some("custom".to_string()),
+            config: Some(json!({"format": {"type": "text"}})),
+            ..Default::default()
+        });
+        let err = BedrockExecutor::reject_unsupported_features(&ir)
+            .expect_err("custom tools must be rejected");
+        assert!(
+            err.to_string().contains("custom_tools")
+                || err.to_string().contains("custom tool")
+                || err.to_string().contains("tool_calling"),
+            "unexpected error: {err}"
+        );
+
+        let mut ir = make_ir();
+        ir.messages[0].content.push(Content::Program {
+            id: "prog_1".to_string(),
+            call_id: "call_prog_1".to_string(),
+            code: "return 1".to_string(),
+            fingerprint: "fp".to_string(),
+        });
+        let err = BedrockExecutor::reject_unsupported_features(&ir)
+            .expect_err("PTC program state must be rejected");
+        assert!(
+            err.to_string().contains("programmatic_tool_calling"),
+            "unexpected error: {err}"
+        );
+
+        let mut ir = make_ir();
+        ir.params.verbosity = Some(tiygate_core::Verbosity::High);
+        let err = BedrockExecutor::reject_unsupported_features(&ir)
+            .expect_err("verbosity must be rejected");
+        assert!(
+            err.to_string().contains("verbosity"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_unsupported_features_blocks_function_tools() {
+        let mut ir = make_ir();
+        ir.tools.push(tiygate_core::Tool {
+            name: "lookup".to_string(),
+            description: Some("look something up".to_string()),
+            parameters: Some(json!({"type": "object"})),
+            ..Default::default()
+        });
+        let err = BedrockExecutor::reject_unsupported_features(&ir)
+            .expect_err("function tools must be rejected until Converse toolConfig is implemented");
+        assert!(
+            err.to_string().contains("tool_calling"),
+            "unexpected error: {err}"
+        );
+
+        let mut ir = make_ir();
+        ir.messages[0].content.push(Content::ToolCall {
+            id: "call_1".to_string(),
+            name: "lookup".to_string(),
+            arguments: json!({}),
+            call_id: None,
+            caller: None,
+        });
+        let err = BedrockExecutor::reject_unsupported_features(&ir)
+            .expect_err("ToolCall content must be rejected");
+        assert!(
+            err.to_string().contains("tool_calling"),
             "unexpected error: {err}"
         );
     }
