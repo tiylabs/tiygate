@@ -324,10 +324,8 @@ fn decode_responses_media_part(part: &Value) -> Option<Content> {
                 });
             }
             if let Some(data) = part["file_data"].as_str().filter(|s| !s.is_empty()) {
-                let (source, mime_type) = tiygate_core::ir::MediaSource::from_data_url(
-                    data,
-                    "application/octet-stream",
-                );
+                let (source, mime_type) =
+                    tiygate_core::ir::MediaSource::from_data_url(data, "application/octet-stream");
                 return Some(Content::Media {
                     source,
                     mime_type,
@@ -967,9 +965,7 @@ impl EndpointCodec for ResponsesCodec {
         // Promote `text.format` into IR response_format so Chat ↔ Responses
         // Convert can rehydrate structured-output constraints. The full `text`
         // object remains in extensions for same-protocol fidelity.
-        let response_format = body
-            .get("text")
-            .and_then(decode_text_format);
+        let response_format = body.get("text").and_then(decode_text_format);
 
         Ok(IrRequest {
             model,
@@ -1132,7 +1128,46 @@ impl EndpointCodec for ResponsesCodec {
             }
         }
         flush_text(&mut pending_text, &mut output_items);
-        response["output"] = json!(output_items);
+        let ordered_opaque: Vec<(usize, Value)> = ir
+            .extensions
+            .get("responses_opaque_output_items")
+            .and_then(|v| v.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let index = entry.get("index")?.as_u64()? as usize;
+                        let item = entry.get("item")?.clone();
+                        Some((index, item))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ordered_opaque.is_empty() {
+            response["output"] = json!(output_items);
+        } else {
+            let mut merged = Vec::with_capacity(output_items.len() + ordered_opaque.len());
+            let mut opaque_iter = ordered_opaque.into_iter().peekable();
+            let mut modeled_idx = 0usize;
+            let mut cursor = 0usize;
+            while modeled_idx < output_items.len() || opaque_iter.peek().is_some() {
+                if let Some((index, _)) = opaque_iter.peek() {
+                    if *index == cursor || modeled_idx >= output_items.len() {
+                        if let Some((_, item)) = opaque_iter.next() {
+                            merged.push(item);
+                            cursor += 1;
+                        }
+                        continue;
+                    }
+                }
+                if modeled_idx < output_items.len() {
+                    merged.push(output_items[modeled_idx].clone());
+                    modeled_idx += 1;
+                    cursor += 1;
+                }
+            }
+            response["output"] = json!(merged);
+        }
         if let Some(fr) = &ir.finish_reason {
             response["status"] = json!(match fr {
                 FinishReason::Stop => "completed",
@@ -1264,27 +1299,28 @@ impl EndpointCodec for ResponsesCodec {
                     // arrives or the turn ends.
                     let mut text_parts: Vec<Value> = Vec::new();
 
-                    let flush_text_message = |text_parts: &mut Vec<Value>,
-                                              input_items: &mut Vec<Value>,
-                                              role_str: &str| {
-                        if text_parts.is_empty() {
-                            return;
-                        }
-                        let parts = std::mem::take(text_parts);
-                        let mut item = json!({"role": role_str});
-                        if parts.len() == 1
-                            && parts[0]
-                                .get("type")
-                                .map(|v| v == "input_text")
-                                .unwrap_or(false)
-                            && parts[0].get("prompt_cache_breakpoint").is_none()
-                        {
-                            item["content"] = parts[0]["text"].clone();
-                        } else {
-                            item["content"] = json!(parts);
-                        }
-                        input_items.push(item);
-                    };
+                    let flush_text_message =
+                        |text_parts: &mut Vec<Value>,
+                         input_items: &mut Vec<Value>,
+                         role_str: &str| {
+                            if text_parts.is_empty() {
+                                return;
+                            }
+                            let parts = std::mem::take(text_parts);
+                            let mut item = json!({"role": role_str});
+                            if parts.len() == 1
+                                && parts[0]
+                                    .get("type")
+                                    .map(|v| v == "input_text")
+                                    .unwrap_or(false)
+                                && parts[0].get("prompt_cache_breakpoint").is_none()
+                            {
+                                item["content"] = parts[0]["text"].clone();
+                            } else {
+                                item["content"] = json!(parts);
+                            }
+                            input_items.push(item);
+                        };
 
                     for c in &msg.content {
                         match c {
@@ -1587,9 +1623,10 @@ impl EndpointCodec for ResponsesCodec {
             while modeled_idx < input_items.len() || opaque_iter.peek().is_some() {
                 if let Some((index, _)) = opaque_iter.peek() {
                     if *index == cursor || modeled_idx >= input_items.len() {
-                        let (_, item) = opaque_iter.next().expect("peeked");
-                        merged.push(item);
-                        cursor += 1;
+                        if let Some((_, item)) = opaque_iter.next() {
+                            merged.push(item);
+                            cursor += 1;
+                        }
                         continue;
                     }
                 }
@@ -1815,8 +1852,12 @@ impl EndpointCodec for ResponsesCodec {
     fn decode_response(&self, body: Value) -> Result<IrResponse, tiygate_core::Error> {
         let response_id = body["id"].as_str().map(String::from);
         let mut content = Vec::new();
+        // Ordered opaque output items (hosted tool results, multi-agent, etc.)
+        // for same-protocol re-encode. Modeled content is rebuilt separately;
+        // these entries keep original interleaving by index.
+        let mut opaque_output_items: Vec<Value> = Vec::new();
         if let Some(output) = body["output"].as_array() {
-            for item in output {
+            for (output_index, item) in output.iter().enumerate() {
                 match item["type"].as_str() {
                     Some("message") => {
                         if let Some(content_arr) = item["content"].as_array() {
@@ -1888,8 +1929,8 @@ impl EndpointCodec for ResponsesCodec {
                             arguments: args,
                             call_id,
                             caller: decode_tool_caller(item),
-            wire_type: None,
-        });
+                            wire_type: None,
+                        });
                     }
                     Some("reasoning") => {
                         // Join the summary parts into a single reasoning block
@@ -1967,7 +2008,15 @@ impl EndpointCodec for ResponsesCodec {
                             wire_type: Some("custom_tool_call".to_string()),
                         });
                     }
-                    _ => {}
+                    // Hosted tool / multi-agent / other provider-specific output
+                    // items are not first-class IR content. Keep the raw wire
+                    // object with its original index for same-protocol re-encode.
+                    Some(_) | None => {
+                        opaque_output_items.push(json!({
+                            "index": output_index,
+                            "item": item,
+                        }));
+                    }
                 }
             }
         }
@@ -1979,12 +2028,9 @@ impl EndpointCodec for ResponsesCodec {
         // HTTP path emits `FinishReason::ToolCalls` for PTC turns, otherwise
         // the cross-protocol encoder produces `finish_reason: "stop"` and the
         // client never runs the tool.
-        let has_tool_call = content.iter().any(|c| {
-            matches!(
-                c,
-                Content::ToolCall { .. } | Content::Program { .. }
-            )
-        });
+        let has_tool_call = content
+            .iter()
+            .any(|c| matches!(c, Content::ToolCall { .. } | Content::Program { .. }));
         let finish_reason = body["status"].as_str().map(|s| match s {
             "completed" => {
                 if has_tool_call {
@@ -2042,13 +2088,20 @@ impl EndpointCodec for ResponsesCodec {
                     cache_write_tokens: cache_write,
                 }
             });
+        let mut extensions = std::collections::HashMap::new();
+        if !opaque_output_items.is_empty() {
+            extensions.insert(
+                "responses_opaque_output_items".to_string(),
+                json!(opaque_output_items),
+            );
+        }
         Ok(IrResponse {
             content,
             usage,
             finish_reason,
             response_id,
             stop_details,
-            extensions: Default::default(),
+            extensions,
         })
     }
 
@@ -2128,6 +2181,10 @@ pub struct ResponsesStreamEncoder {
     program_items: Vec<Value>,
     /// Original Responses wire type per call_id (function_call/custom_tool_call/local_shell_call).
     tool_wire_types: HashMap<String, String>,
+    /// Responses item id (fc_*) per call_id when distinct from the call id.
+    tool_item_ids: HashMap<String, String>,
+    /// PTC caller metadata per call_id.
+    tool_callers: HashMap<String, ToolCaller>,
 }
 impl Default for ResponsesStreamEncoder {
     fn default() -> Self {
@@ -2157,6 +2214,8 @@ impl ResponsesStreamEncoder {
             reasoning_encrypted: None,
             program_items: Vec::new(),
             tool_wire_types: HashMap::new(),
+            tool_item_ids: HashMap::new(),
+            tool_callers: HashMap::new(),
         }
     }
 
@@ -2185,7 +2244,14 @@ impl ResponsesStreamEncoder {
         format!("data: {}\n\n", value)
     }
 
-    fn open_tool_call(&mut self, id: &str, name: &str, wire_type: Option<&str>) -> String {
+    fn open_tool_call(
+        &mut self,
+        id: &str,
+        name: &str,
+        wire_type: Option<&str>,
+        item_id: Option<&str>,
+        caller: Option<&ToolCaller>,
+    ) -> String {
         let already_open = self.tool_output_indices.contains_key(id);
         let idx = if let Some(idx) = self.tool_output_indices.get(id).copied() {
             idx
@@ -2205,17 +2271,31 @@ impl ResponsesStreamEncoder {
                 .entry(id.to_string())
                 .or_insert_with(|| wt.to_string());
         }
+        if let Some(iid) = item_id.filter(|v| !v.is_empty()) {
+            self.tool_item_ids
+                .entry(id.to_string())
+                .or_insert_with(|| iid.to_string());
+        }
+        if let Some(c) = caller {
+            self.tool_callers
+                .entry(id.to_string())
+                .or_insert_with(|| c.clone());
+        }
         if already_open {
             return String::new();
         }
         let item_type = wire_type.unwrap_or("function_call");
-        let item = if item_type == "custom_tool_call" {
-            json!({"id": id, "call_id": id, "type": "custom_tool_call", "name": name, "input": "", "status": "in_progress"})
+        let wire_item_id = self.tool_item_ids.get(id).map(String::as_str).unwrap_or(id);
+        let mut item = if item_type == "custom_tool_call" {
+            json!({"id": wire_item_id, "call_id": id, "type": "custom_tool_call", "name": name, "input": "", "status": "in_progress"})
         } else if item_type == "local_shell_call" {
-            json!({"id": id, "call_id": id, "type": "local_shell_call", "action": {}, "status": "in_progress"})
+            json!({"id": wire_item_id, "call_id": id, "type": "local_shell_call", "action": {}, "status": "in_progress"})
         } else {
-            json!({"id": id, "call_id": id, "type": "function_call", "name": name, "arguments": "", "status": "in_progress"})
+            json!({"id": wire_item_id, "call_id": id, "type": "function_call", "name": name, "arguments": "", "status": "in_progress"})
         };
+        if let Some(c) = self.tool_callers.get(id) {
+            item["caller"] = json!(c);
+        }
         self.event(json!({"type": "response.output_item.added", "output_index": idx, "item": item}))
     }
 
@@ -2225,7 +2305,8 @@ impl ResponsesStreamEncoder {
             .entry(id.to_string())
             .or_default()
             .push_str(arguments);
-        self.event(json!({"type": "response.function_call_arguments.delta", "item_id": id, "output_index": idx, "delta": arguments}))
+        let item_id = self.tool_item_ids.get(id).map(String::as_str).unwrap_or(id);
+        self.event(json!({"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": idx, "delta": arguments}))
     }
 
     fn close_tool_calls(&mut self, status: &str) -> String {
@@ -2246,22 +2327,32 @@ impl ResponsesStreamEncoder {
                 .get(&call_id)
                 .cloned()
                 .unwrap_or_else(|| "function_call".to_string());
+            let wire_item_id = self
+                .tool_item_ids
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_else(|| call_id.clone());
             if item_type == "function_call" {
-                out.push_str(&self.event(json!({"type": "response.function_call_arguments.done", "item_id": call_id, "output_index": idx, "arguments": arguments})));
+                out.push_str(&self.event(json!({"type": "response.function_call_arguments.done", "item_id": wire_item_id, "output_index": idx, "arguments": arguments})));
             }
-            let item = if item_type == "custom_tool_call" {
+            let mut item = if item_type == "custom_tool_call" {
                 let input = serde_json::from_str::<Value>(&arguments)
                     .ok()
                     .and_then(|v| v.get("input").and_then(|x| x.as_str()).map(str::to_string))
                     .unwrap_or(arguments);
-                json!({"id": call_id, "call_id": call_id, "type": "custom_tool_call", "name": name, "input": input, "status": status})
+                json!({"id": wire_item_id, "call_id": call_id, "type": "custom_tool_call", "name": name, "input": input, "status": status})
             } else if item_type == "local_shell_call" {
                 let action = serde_json::from_str::<Value>(&arguments).unwrap_or(json!({}));
-                json!({"id": call_id, "call_id": call_id, "type": "local_shell_call", "action": action, "status": status})
+                json!({"id": wire_item_id, "call_id": call_id, "type": "local_shell_call", "action": action, "status": status})
             } else {
-                json!({"id": call_id, "call_id": call_id, "type": "function_call", "name": name, "arguments": arguments, "status": status})
+                json!({"id": wire_item_id, "call_id": call_id, "type": "function_call", "name": name, "arguments": arguments, "status": status})
             };
-            out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": item})));
+            if let Some(caller) = self.tool_callers.get(&call_id) {
+                item["caller"] = json!(caller);
+            }
+            out.push_str(&self.event(
+                json!({"type": "response.output_item.done", "output_index": idx, "item": item}),
+            ));
             self.tool_done.insert(call_id);
         }
         out
@@ -2351,38 +2442,47 @@ impl ResponsesStreamEncoder {
                 .get(&call_id)
                 .map(String::as_str)
                 .unwrap_or("function_call");
-            if item_type == "custom_tool_call" {
+            let wire_item_id = self
+                .tool_item_ids
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_else(|| call_id.clone());
+            let mut item = if item_type == "custom_tool_call" {
                 let input = serde_json::from_str::<Value>(&arguments)
                     .ok()
                     .and_then(|v| v.get("input").and_then(|x| x.as_str()).map(str::to_string))
                     .unwrap_or(arguments);
-                output.push(json!({
+                json!({
                     "type": "custom_tool_call",
-                    "id": call_id,
+                    "id": wire_item_id,
                     "call_id": call_id,
                     "name": name,
                     "input": input,
                     "status": status,
-                }));
+                })
             } else if item_type == "local_shell_call" {
                 let action = serde_json::from_str::<Value>(&arguments).unwrap_or(json!({}));
-                output.push(json!({
+                json!({
                     "type": "local_shell_call",
-                    "id": call_id,
+                    "id": wire_item_id,
                     "call_id": call_id,
                     "action": action,
                     "status": status,
-                }));
+                })
             } else {
-                output.push(json!({
+                json!({
                     "type": "function_call",
-                    "id": call_id,
+                    "id": wire_item_id,
                     "call_id": call_id,
                     "name": name,
                     "arguments": arguments,
                     "status": status,
-                }));
+                })
+            };
+            if let Some(caller) = self.tool_callers.get(&call_id) {
+                item["caller"] = json!(caller);
             }
+            output.push(item);
         }
         if !output.is_empty() {
             response["output"] = json!(output);
@@ -2473,10 +2573,18 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 name,
                 arguments,
                 wire_type,
+                item_id,
+                caller,
             } => {
                 if let Some(n) = name {
                     // Opener: allocate a distinct output_index for this call.
-                    let mut out = self.open_tool_call(id, n, wire_type.as_deref());
+                    let mut out = self.open_tool_call(
+                        id,
+                        n,
+                        wire_type.as_deref(),
+                        item_id.as_deref(),
+                        caller.as_ref(),
+                    );
                     if !arguments.is_empty() {
                         out.push_str(&self.append_tool_arguments(id, arguments));
                     }
@@ -2768,6 +2876,11 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         .unwrap_or("")
                         .to_string();
                     let name = item["name"].as_str().map(String::from);
+                    let dual_item_id = if !item_id.is_empty() && item_id != call_id {
+                        Some(item_id.clone())
+                    } else {
+                        None
+                    };
                     self.function_calls
                         .insert(item_id, (call_id.clone(), name.clone()));
                     self.current_call_id = Some(call_id.clone());
@@ -2776,6 +2889,8 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         name,
                         arguments: String::new(),
                         wire_type: None,
+                        item_id: dual_item_id,
+                        caller: decode_tool_caller(item),
                     });
                 } else if item["type"] == "reasoning" {
                     // Stash the reasoning item id / encrypted content so the
@@ -2811,10 +2926,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         id: item["id"].as_str().unwrap_or("").to_string(),
                         call_id: item["call_id"].as_str().unwrap_or("").to_string(),
                         result: item["result"].as_str().unwrap_or("").to_string(),
-                        status: item["status"]
-                            .as_str()
-                            .unwrap_or("completed")
-                            .to_string(),
+                        status: item["status"].as_str().unwrap_or("completed").to_string(),
                     });
                 } else if item["type"] == "local_shell_call" {
                     // Codex local_shell_call: treat as a tool call so the
@@ -2828,6 +2940,8 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         name: Some("local_shell".to_string()),
                         arguments: action.to_string(),
                         wire_type: Some("local_shell_call".to_string()),
+                        item_id: None,
+                        caller: None,
                     });
                 } else if item["type"] == "custom_tool_call" {
                     // Codex custom_tool_call: treat as a tool call so the
@@ -2842,6 +2956,8 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         name: Some(name),
                         arguments: json!({"input": input_text}).to_string(),
                         wire_type: Some("custom_tool_call".to_string()),
+                        item_id: None,
+                        caller: None,
                     });
                 }
             }
@@ -2860,6 +2976,8 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         name: None,
                         arguments: args.to_string(),
                         wire_type: None,
+                        item_id: None,
+                        caller: None,
                     });
                 }
             }
@@ -3175,10 +3293,11 @@ mod tests {
         // response.completed.output array so strict clients that reconstruct
         // from the snapshot don't lose them.
         let mut encoder = ResponsesStreamEncoder::new();
-        encoder.encode_part(&StreamPart::ResponseStarted {
-            id: "resp_1".to_string(),
-        })
-        .unwrap();
+        encoder
+            .encode_part(&StreamPart::ResponseStarted {
+                id: "resp_1".to_string(),
+            })
+            .unwrap();
         encoder
             .encode_part(&StreamPart::ProgramDelta {
                 id: "prog_1".to_string(),
@@ -3412,8 +3531,8 @@ mod tests {
                 name: "get_weather".to_string(),
                 arguments: json!({}),
                 caller: None,
-            wire_type: None,
-        }],
+                wire_type: None,
+            }],
             finish_reason: Some(FinishReason::ToolCalls),
             usage: None,
             response_id: Some("resp_1".to_string()),
@@ -3864,6 +3983,127 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_function_call_preserves_caller_and_dual_ids() {
+        let mut decoder = ResponsesStreamDecoder::new();
+        let parts = decoder
+            .feed(r#"data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}","caller":{"type":"program","caller_id":"call_prog_1"}}}"#)
+            .unwrap();
+        match &parts[0] {
+            StreamPart::ToolCallDelta {
+                id,
+                name,
+                item_id,
+                caller,
+                ..
+            } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name.as_deref(), Some("lookup"));
+                assert_eq!(item_id.as_deref(), Some("fc_1"));
+                assert!(matches!(
+                    caller,
+                    Some(ToolCaller::Program { caller_id }) if caller_id == "call_prog_1"
+                ));
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+
+        let mut encoder = ResponsesStreamEncoder::new();
+        let bytes = encoder.encode_part(&parts[0]).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains(r#""id":"fc_1""#),
+            "stream re-encode must keep item id: {s}"
+        );
+        assert!(
+            s.contains(r#""call_id":"call_1""#),
+            "stream re-encode must keep call_id: {s}"
+        );
+        assert!(
+            s.contains(r#""caller":{"type":"program","caller_id":"call_prog_1"}"#)
+                || (s.contains(r#""caller""#) && s.contains(r#""caller_id":"call_prog_1"#)),
+            "stream re-encode must keep PTC caller: {s}"
+        );
+
+        let done = encoder
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        let done2 = encoder
+            .encode_part(&StreamPart::Usage {
+                usage: Usage::default(),
+            })
+            .unwrap();
+        let combined = [done.as_slice(), done2.as_slice()].concat();
+        let completed = String::from_utf8_lossy(&combined);
+        assert!(
+            completed.contains(r#""id":"fc_1""#) && completed.contains(r#""call_id":"call_1""#),
+            "response.completed must restore dual ids: {completed}"
+        );
+        assert!(
+            completed.contains(r#""caller_id":"call_prog_1""#),
+            "response.completed must restore caller: {completed}"
+        );
+    }
+
+    #[test]
+    fn test_hosted_tool_output_items_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let body = json!({
+            "id": "resp_hosted",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"query": "gpt-5.6", "type": "search"}
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "found it"}]
+                },
+                {
+                    "type": "file_search_call",
+                    "id": "fs_1",
+                    "status": "completed",
+                    "queries": ["docs"]
+                }
+            ]
+        });
+        let decoded = codec.decode_response(body).unwrap();
+        assert!(
+            decoded
+                .extensions
+                .get("responses_opaque_output_items")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len() == 2)
+                .unwrap_or(false),
+            "hosted output items must be bagged: {:?}",
+            decoded.extensions
+        );
+        assert!(matches!(
+            &decoded.content[0],
+            Content::Text { text, .. } if text == "found it"
+        ));
+        let encoded = codec.encode_response(&decoded).unwrap();
+        let output = encoded["output"].as_array().expect("output array");
+        assert_eq!(
+            output.len(),
+            3,
+            "hosted items + message must all reappear: {encoded}"
+        );
+        assert_eq!(output[0]["type"], "web_search_call");
+        assert_eq!(output[0]["id"], "ws_1");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "found it");
+        assert_eq!(output[2]["type"], "file_search_call");
+        assert_eq!(output[2]["id"], "fs_1");
+    }
+
+    #[test]
     fn test_stream_encoder_function_call_item_includes_call_id() {
         let mut enc = ResponsesStreamEncoder::new();
         let bytes = enc
@@ -3872,7 +4112,9 @@ mod tests {
                 name: Some("lookup".to_string()),
                 arguments: String::new(),
                 wire_type: None,
-})
+                item_id: None,
+                caller: None,
+            })
             .unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("\"type\":\"response.output_item.added\""));
@@ -3892,7 +4134,9 @@ mod tests {
                 name: Some("lookup".to_string()),
                 arguments: String::new(),
                 wire_type: None,
-})
+                item_id: None,
+                caller: None,
+            })
             .unwrap();
         let second = enc
             .encode_part(&StreamPart::ToolCallDelta {
@@ -3900,7 +4144,9 @@ mod tests {
                 name: Some("lookup".to_string()),
                 arguments: String::new(),
                 wire_type: None,
-})
+                item_id: None,
+                caller: None,
+            })
             .unwrap();
 
         assert!(String::from_utf8_lossy(&first).contains("response.output_item.added"));
@@ -4288,8 +4534,8 @@ mod tests {
                             arguments: serde_json::json!({"location": "杭州"}),
                             call_id: None,
                             caller: None,
-            wire_type: None,
-        },
+                            wire_type: None,
+                        },
                     ],
                 },
                 Message {
@@ -4300,8 +4546,8 @@ mod tests {
                         content: "cloudy".to_string(),
                         id: None,
                         caller: None,
-            wire_type: None,
-        }],
+                        wire_type: None,
+                    }],
                 },
             ],
             tools: vec![],
@@ -4556,11 +4802,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let expected = vec![
-            pairs[0].1.clone().unwrap(),
-            pairs[1].1.clone().unwrap(),
-        ];
-        assert_eq!(result_ids, expected, "ToolResult must use unique remapped call_ids");
+        let expected = vec![pairs[0].1.clone().unwrap(), pairs[1].1.clone().unwrap()];
+        assert_eq!(
+            result_ids, expected,
+            "ToolResult must use unique remapped call_ids"
+        );
 
         // Anthropic cross-protocol pairing.
         let anthropic = crate::messages::MessagesCodec::new();
@@ -5079,9 +5325,11 @@ mod tests {
             chat.capabilities(),
         )
         .expect_err("hosted tools must hard-reject on Chat Completions");
-        assert_eq!(err.0, tiygate_core::protocol::lossy::LossyDimension::HostedTools);
+        assert_eq!(
+            err.0,
+            tiygate_core::protocol::lossy::LossyDimension::HostedTools
+        );
     }
-
 
     #[test]
     fn test_stream_decoder_codex_local_shell_call_finish_reason() {
@@ -5276,7 +5524,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_stream_custom_tool_call_wire_type_fidelity() {
         // Streaming custom_tool_call must preserve wire_type through
@@ -5289,12 +5536,7 @@ mod tests {
         assert!(
             matches!(
                 &parts[0],
-                StreamPart::ToolCallDelta {
-                    id,
-                    name: Some(name),
-                    wire_type: Some(wt),
-                    ..
-                } if id == "call_custom_1" && name == "my_tool" && wt == "custom_tool_call"
+                StreamPart::ToolCallDelta { id, name: Some(name), wire_type: Some(wt), .. } if id == "call_custom_1" && name == "my_tool" && wt == "custom_tool_call"
             ),
             "stream decode must set wire_type=custom_tool_call, got: {parts:?}"
         );

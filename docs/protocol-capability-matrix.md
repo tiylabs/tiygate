@@ -112,7 +112,7 @@
 | hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅（`Tool.tool_type` + `config` 往返） | ❌ 跨协议拒绝 | N/A |
 | Programmatic Tool Calling (`programmatic_tool_calling` / `allowed_callers` / `program` / `caller` / `program_output`) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ 稳定版有序往返 | ❌ 跨协议拒绝 | N/A |
 
-**跨协议策略**：Responses 保留 hosted/function tool 的完整配置，并建模 PTC 的 program、caller 与 program_output 关系。目标协议不能表达 hosted tool 或 PTC 时由 lossy guard 明确拒绝，不再静默过滤。Hosted tool 的 provider-specific 输出 item（除本节列出的稳定 PTC 项）仍依赖 Responses 同协议透传。
+**跨协议策略**：Responses 保留 hosted/function tool 的完整配置，并建模 PTC 的 program、caller 与 program_output 关系。目标协议不能表达 hosted tool 或 PTC 时由 lossy guard 明确拒绝，不再静默过滤。Hosted tool 的 provider-specific 输出 item（`web_search_call` / `file_search_call` / `code_interpreter_call` / `computer_call` 等）在同协议 Convert/re-encode 路径通过有序 `extensions["responses_opaque_output_items"]` 保活；跨协议仍丢弃（客户端不会消费这些 wire item）。raw PassThrough 路径始终字节级无损。
 
 ## 6.2 Explicit Prompt Caching
 

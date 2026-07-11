@@ -203,8 +203,8 @@ impl EndpointCodec for MessagesCodec {
                                     },
                                     call_id: None,
                                     caller: None,
-            wire_type: None,
-        });
+                                    wire_type: None,
+                                });
                             }
                             Some("tool_result") => {
                                 parts.push(Content::ToolResult {
@@ -216,8 +216,8 @@ impl EndpointCodec for MessagesCodec {
                                     content: flatten_anthropic_content(&block["content"]),
                                     id: None,
                                     caller: None,
-            wire_type: None,
-        });
+                                    wire_type: None,
+                                });
                             }
                             Some("image") => {
                                 let source = block["source"].clone();
@@ -856,8 +856,8 @@ impl EndpointCodec for MessagesCodec {
                             arguments: block["input"].clone(),
                             call_id: None,
                             caller: None,
-            wire_type: None,
-        });
+                            wire_type: None,
+                        });
                     }
                     _ => {}
                 }
@@ -1401,7 +1401,9 @@ impl StreamDecoder for MessagesStreamDecoder {
                             name,
                             arguments: String::new(),
                             wire_type: None,
-});
+                            item_id: None,
+                            caller: None,
+                        });
                     }
                     Some("text") => {
                         if let Some(text) = block["text"].as_str() {
@@ -1467,7 +1469,9 @@ impl StreamDecoder for MessagesStreamDecoder {
                                 name: None,
                                 arguments: json.to_string(),
                                 wire_type: None,
-});
+                                item_id: None,
+                                caller: None,
+                            });
                         }
                     }
                     Some(other) => {
@@ -1891,8 +1895,8 @@ mod tests {
                 arguments: json!({"city": "London"}),
                 call_id: None,
                 caller: None,
-            wire_type: None,
-        }],
+                wire_type: None,
+            }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
             response_id: Some("msg_2".to_string()),
@@ -1940,7 +1944,9 @@ mod tests {
                 name: Some("fn".to_string()),
                 arguments: "{}".to_string(),
                 wire_type: None,
-},
+                item_id: None,
+                caller: None,
+            },
             StreamPart::ProgramDelta {
                 id: "prog_1".to_string(),
                 call_id: "call_prog_1".to_string(),
@@ -2081,8 +2087,8 @@ mod tests {
                         arguments: json!({}),
                         call_id: None,
                         caller: None,
-            wire_type: None,
-        }],
+                        wire_type: None,
+                    }],
                 },
                 Message {
                     role: Role::Tool,
@@ -2092,8 +2098,8 @@ mod tests {
                         content: "r1".to_string(),
                         id: None,
                         caller: None,
-            wire_type: None,
-        }],
+                        wire_type: None,
+                    }],
                 },
                 Message {
                     role: Role::Tool,
@@ -2103,8 +2109,8 @@ mod tests {
                         content: "r2".to_string(),
                         id: None,
                         caller: None,
-            wire_type: None,
-        }],
+                        wire_type: None,
+                    }],
                 },
             ],
             tools: vec![],
@@ -2183,13 +2189,17 @@ mod tests {
                 name: Some("fa".to_string()),
                 arguments: String::new(),
                 wire_type: None,
-},
+                item_id: None,
+                caller: None,
+            },
             StreamPart::ToolCallDelta {
                 id: "b".to_string(),
                 name: Some("fb".to_string()),
                 arguments: String::new(),
                 wire_type: None,
-},
+                item_id: None,
+                caller: None,
+            },
         ] {
             all.push_str(&String::from_utf8(enc.encode_part(&part).unwrap()).unwrap());
         }
@@ -2208,7 +2218,9 @@ mod tests {
             name: Some("shell".to_string()),
             arguments: r#"{"command":"git status"}"#.to_string(),
             wire_type: None,
-};
+            item_id: None,
+            caller: None,
+        };
         let out = String::from_utf8(enc.encode_part(&part).unwrap()).unwrap();
         assert!(out.contains("content_block_start"));
         assert!(out.contains("\"type\":\"tool_use\""));
@@ -2237,13 +2249,17 @@ mod tests {
                 name: Some("fa".to_string()),
                 arguments: r#"{"x":1}"#.to_string(),
                 wire_type: None,
-},
+                item_id: None,
+                caller: None,
+            },
             StreamPart::ToolCallDelta {
                 id: "b".to_string(),
                 name: Some("fb".to_string()),
                 arguments: r#"{"y":2}"#.to_string(),
                 wire_type: None,
-},
+                item_id: None,
+                caller: None,
+            },
         ] {
             all.push_str(&String::from_utf8(enc.encode_part(&part).unwrap()).unwrap());
         }

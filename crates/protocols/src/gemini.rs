@@ -406,8 +406,8 @@ impl EndpointCodec for GeminiCodec {
                                 arguments: fc["args"].clone(),
                                 call_id: None,
                                 caller: None,
-            wire_type: None,
-        });
+                                wire_type: None,
+                            });
                         } else if let Some(fr) = part.get("functionResponse") {
                             let name = fr["name"].as_str().unwrap_or("").to_string();
                             cp.push(Content::ToolResult {
@@ -423,8 +423,8 @@ impl EndpointCodec for GeminiCodec {
                                     .unwrap_or_default(),
                                 id: None,
                                 caller: None,
-            wire_type: None,
-        });
+                                wire_type: None,
+                            });
                         } else if let Some(id) = part.get("inlineData") {
                             cp.push(Content::Media {
                                 source: tiygate_core::ir::MediaSource::Inline {
@@ -1059,8 +1059,8 @@ impl EndpointCodec for GeminiCodec {
                                     arguments: fc["args"].clone(),
                                     call_id: None,
                                     caller: None,
-            wire_type: None,
-        });
+                                    wire_type: None,
+                                });
                             }
                         }
                     }
@@ -1468,6 +1468,8 @@ impl StreamDecoder for GeminiStreamDecoder {
                                 name,
                                 arguments,
                                 wire_type: None,
+                                item_id: None,
+                                caller: None,
                             });
                         }
                     }
@@ -1650,7 +1652,9 @@ mod tests {
                 name: Some("f".to_string()),
                 arguments: "{}".to_string(),
                 wire_type: None,
-},
+                item_id: None,
+                caller: None,
+            },
             StreamPart::ProgramDelta {
                 id: "prog_1".to_string(),
                 call_id: "call_prog_1".to_string(),
@@ -1843,7 +1847,9 @@ mod tests {
             name: Some("get_weather".to_string()),
             arguments: r#"{"city":"London","unit":"c"}"#.to_string(),
             wire_type: None,
-};
+            item_id: None,
+            caller: None,
+        };
         let bytes = enc.encode_part(&part).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         let json_part = s.strip_prefix("data: ").unwrap().trim();
@@ -1883,8 +1889,8 @@ mod tests {
                     id,
                     name,
                     arguments,
-                ..
-            } => Some((id.clone(), name.clone(), arguments.clone())),
+                    ..
+                } => Some((id.clone(), name.clone(), arguments.clone())),
                 _ => None,
             })
             .unwrap();
@@ -1966,8 +1972,8 @@ mod tests {
                     arguments: json!({"city": "London"}),
                     call_id: None,
                     caller: None,
-            wire_type: None,
-        }],
+                    wire_type: None,
+                }],
             }],
             tools: vec![],
             params: Default::default(),
@@ -2002,8 +2008,8 @@ mod tests {
                     arguments: json!({}),
                     call_id: None,
                     caller: None,
-            wire_type: None,
-        }],
+                    wire_type: None,
+                }],
             }],
             tools: vec![],
             params: Default::default(),

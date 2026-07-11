@@ -91,6 +91,15 @@ pub enum StreamPart {
         /// wire shape; other protocols ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wire_type: Option<String>,
+        /// Responses item reference id (e.g. `fc_xxx`) when distinct from the
+        /// function-call identifier carried in `id` (e.g. `call_xxx`).
+        /// Same-protocol Responses stream re-encode restores both ids.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        /// Execution context for Responses Programmatic Tool Calling.
+        /// Same-protocol Responses stream re-encode restores `caller`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolCaller>,
     },
     /// A complete Responses program item (item-level, not incremental code).
     ProgramDelta {

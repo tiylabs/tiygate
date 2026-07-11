@@ -202,7 +202,9 @@ fn chat_stream_encoder_assigns_distinct_tool_call_indices() {
             name: Some("f".to_string()),
             arguments: String::new(),
             wire_type: None,
-})
+            item_id: None,
+            caller: None,
+        })
         .unwrap();
     let second = enc
         .encode_part(&StreamPart::ToolCallDelta {
@@ -210,7 +212,9 @@ fn chat_stream_encoder_assigns_distinct_tool_call_indices() {
             name: Some("g".to_string()),
             arguments: String::new(),
             wire_type: None,
-})
+            item_id: None,
+            caller: None,
+        })
         .unwrap();
     let s1 = String::from_utf8_lossy(&first);
     let s2 = String::from_utf8_lossy(&second);
@@ -231,7 +235,9 @@ fn chat_stream_encoder_assigns_distinct_tool_call_indices() {
             name: None,
             arguments: "{\"x\":1}".to_string(),
             wire_type: None,
-})
+            item_id: None,
+            caller: None,
+        })
         .unwrap();
     let s3 = String::from_utf8_lossy(&frag);
     assert!(
@@ -267,7 +273,9 @@ fn anthropic_stream_encoder_frames_blocks() {
             name: Some("f".to_string()),
             arguments: String::new(),
             wire_type: None,
-})
+            item_id: None,
+            caller: None,
+        })
         .unwrap(),
     ));
     sse.push_str(&String::from_utf8_lossy(
@@ -276,7 +284,9 @@ fn anthropic_stream_encoder_frames_blocks() {
             name: None,
             arguments: "{\"x\":1}".to_string(),
             wire_type: None,
-})
+            item_id: None,
+            caller: None,
+        })
         .unwrap(),
     ));
     sse.push_str(&String::from_utf8_lossy(
