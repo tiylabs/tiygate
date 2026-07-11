@@ -1623,8 +1623,6 @@ pub struct ResponsesStreamEncoder {
     /// Monotonic sequence_number stamped on every emitted event, per the
     /// Responses streaming contract.
     sequence_number: u64,
-    /// Whether `response.in_progress` has been emitted yet.
-    in_progress_sent: bool,
     /// Usage stashed from a `StreamPart::Usage`, emitted inside the terminal
     /// `response.completed`. Emitting `response.completed` early (on Usage)
     /// terminated the stream prematurely for strict clients; we now defer it
@@ -1679,7 +1677,6 @@ impl ResponsesStreamEncoder {
             tool_arguments: std::collections::HashMap::new(),
             tool_done: std::collections::HashSet::new(),
             sequence_number: 0,
-            in_progress_sent: false,
             pending_usage: None,
             completed_sent: false,
             pending_finish_status: None,
@@ -1870,7 +1867,6 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 let created = self.event(json!({"type": "response.created", "response": {"id": id, "object": "response", "status": "in_progress"}}));
                 // Emit response.in_progress right after created so strict
                 // clients see the lifecycle transition.
-                self.in_progress_sent = true;
                 let in_progress = self.event(json!({"type": "response.in_progress", "response": {"id": id, "object": "response", "status": "in_progress"}}));
                 format!("{created}{in_progress}")
             }
