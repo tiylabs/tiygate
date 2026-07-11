@@ -983,14 +983,17 @@ impl EndpointCodec for ChatCompletionsCodec {
 
         // Replay OpenAI-specific top-level fields captured at decode time.
         // Only fields not already set by the modeled path above are written,
-        // so explicit params win over the passthrough copy.
+        // so explicit params win over the passthrough copy — except
+        // `metadata`, where the original extra value may contain non-string
+        // entries that ir.metadata (HashMap<String, String>) cannot represent,
+        // so it takes priority over the lossy IR subset.
         if let Some(extra) = ir
             .extensions
             .get("openai_extra")
             .and_then(|v| v.as_object())
         {
             for (k, v) in extra {
-                if body.get(k).is_none() {
+                if k == "metadata" || body.get(k).is_none() {
                     body[k] = v.clone();
                 }
             }

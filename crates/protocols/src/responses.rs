@@ -1322,13 +1322,17 @@ impl EndpointCodec for ResponsesCodec {
             }
         }
         // Replay Responses-specific top-level passthrough fields.
+        // `metadata` from responses_extra may contain non-string entries that
+        // ir.metadata (HashMap<String, String>) cannot represent, so it takes
+        // priority over the lossy IR subset; other fields follow the usual
+        // "modeled path wins" rule.
         if let Some(extra) = ir
             .extensions
             .get("responses_extra")
             .and_then(|v| v.as_object())
         {
             for (k, v) in extra {
-                if body.get(k).is_none() {
+                if k == "metadata" || body.get(k).is_none() {
                     body[k] = v.clone();
                 }
             }
