@@ -329,6 +329,29 @@ pub fn check_lossy_conversion(
         ));
     }
 
+    // `reasoning.mode` and `reasoning.context` are Responses-only request
+    // controls. Unlike replayed reasoning content, they live in generation
+    // parameters, so the check above cannot see them. Reject crossings to
+    // every other suite rather than allowing their encoders to silently drop
+    // the controls.
+    let has_responses_reasoning_controls = request
+        .params
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.mode.is_some() || thinking.context.is_some());
+    if has_responses_reasoning_controls
+        && egress.suite != crate::protocol::ProtocolSuite::OpenAiResponses
+    {
+        return Err((
+            LossyDimension::ExtendedReasoning,
+            lossy_error(
+                LossyDimension::ExtendedReasoning,
+                egress,
+                "Responses-only reasoning.mode or reasoning.context",
+            ),
+        ));
+    }
+
     // 10. Multi-agent Beta is Responses-only. Detect either the top-level
     // `multi_agent` config bag or opaque multi-agent input items; reject when
     // the egress suite cannot express them (do not silently drop).

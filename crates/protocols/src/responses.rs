@@ -397,6 +397,23 @@ impl EndpointCodec for ResponsesCodec {
             let mut call_id_counts: HashMap<String, usize> = HashMap::new();
             let mut call_id_remap: HashMap<String, VecDeque<String>> = HashMap::new();
             let mut used_call_ids: HashSet<String> = HashSet::new();
+            // Once an opaque item is present, every modeled input item must
+            // retain its own boundary. The opaque-item replay indexes refer to
+            // the original input array, while coalescing consecutive messages
+            // would reduce the modeled item count and shift later indexes.
+            let preserve_input_item_boundaries = arr.iter().any(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("tool_search_call")
+                        | Some("tool_search_output")
+                        | Some("agent_message")
+                        | Some("compaction")
+                        | Some("compaction_trigger")
+                        | Some("context_compaction")
+                        | Some("multi_agent_call")
+                        | Some("multi_agent_call_output")
+                )
+            });
             // When an opaque item appears between two same-role messages,
             // keep those messages separate so ordered opaque replay can
             // reinsert the item at its original index.
@@ -694,7 +711,7 @@ impl EndpointCodec for ResponsesCodec {
                     continue;
                 }
                 if let Some(last) = messages.last_mut() {
-                    if last.role == role && !break_role_merge {
+                    if last.role == role && !break_role_merge && !preserve_input_item_boundaries {
                         last.content.extend(content);
                     } else {
                         messages.push(Message { role, content });
@@ -1125,45 +1142,20 @@ impl EndpointCodec for ResponsesCodec {
             }
         }
         flush_text(&mut pending_text, &mut output_items);
-        let ordered_opaque: Vec<(usize, Value)> = ir
+        if let Some(original_output) = ir
             .extensions
-            .get("responses_opaque_output_items")
-            .and_then(|v| v.as_array())
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let index = entry.get("index")?.as_u64()? as usize;
-                        let item = entry.get("item")?.clone();
-                        Some((index, item))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if ordered_opaque.is_empty() {
-            response["output"] = json!(output_items);
+            .get("responses_original_output")
+            .and_then(|value| value.as_array())
+        {
+            // Opaque output items can be interleaved with several modeled
+            // message items. `IrResponse::content` intentionally flattens
+            // those messages, so rebuilding then inserting opaque items by
+            // their old indexes can move later text ahead of a hosted-tool
+            // result. Same-protocol replay uses this source snapshot to retain
+            // the exact item order and item boundaries.
+            response["output"] = json!(original_output);
         } else {
-            let mut merged = Vec::with_capacity(output_items.len() + ordered_opaque.len());
-            let mut opaque_iter = ordered_opaque.into_iter().peekable();
-            let mut modeled_idx = 0usize;
-            let mut cursor = 0usize;
-            while modeled_idx < output_items.len() || opaque_iter.peek().is_some() {
-                if let Some((index, _)) = opaque_iter.peek() {
-                    if *index == cursor || modeled_idx >= output_items.len() {
-                        if let Some((_, item)) = opaque_iter.next() {
-                            merged.push(item);
-                            cursor += 1;
-                        }
-                        continue;
-                    }
-                }
-                if modeled_idx < output_items.len() {
-                    merged.push(output_items[modeled_idx].clone());
-                    modeled_idx += 1;
-                    cursor += 1;
-                }
-            }
-            response["output"] = json!(merged);
+            response["output"] = json!(output_items);
         }
         if let Some(fr) = &ir.finish_reason {
             response["status"] = json!(match fr {
@@ -1226,6 +1218,15 @@ impl EndpointCodec for ResponsesCodec {
             body["instructions"] = json!(sys);
         }
         let mut input_items = Vec::new();
+        // Opaque input entries are indexed against the original Responses
+        // input array. Keep developer messages as input items in this mode;
+        // flattening them into `instructions` would remove an indexed item and
+        // shift every opaque entry that follows it.
+        let preserve_input_item_boundaries = ir
+            .extensions
+            .get("responses_opaque_input_items")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty());
         for msg in &ir.messages {
             match msg.role {
                 Role::System => {
@@ -1241,7 +1242,7 @@ impl EndpointCodec for ResponsesCodec {
                             }
                         )
                     });
-                    if has_breakpoint {
+                    if has_breakpoint || preserve_input_item_boundaries {
                         let mut content_parts = Vec::new();
                         for content in &msg.content {
                             match content {
@@ -2096,6 +2097,13 @@ impl EndpointCodec for ResponsesCodec {
             extensions.insert(
                 "responses_opaque_output_items".to_string(),
                 json!(opaque_output_items),
+            );
+            // Preserve the full source layout for same-protocol replay. The
+            // modeled IR intentionally flattens message content, so opaque
+            // indexes alone are insufficient to reconstruct interleaving.
+            extensions.insert(
+                "responses_original_output".to_string(),
+                body["output"].clone(),
             );
         }
         Ok(IrResponse {
@@ -5595,5 +5603,53 @@ mod tests {
         );
         assert_eq!(input[0]["content"], "before");
         assert_eq!(input[2]["content"], "after");
+    }
+
+    #[test]
+    fn test_opaque_input_keeps_boundaries_before_later_item() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "second"},
+                {"type": "compaction", "id": "comp_1", "summary": "compact"},
+                {"role": "user", "content": "third"}
+            ]
+        });
+
+        let ir = codec.decode_request(body, &env).unwrap();
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let input = encoded["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["content"], "first");
+        assert_eq!(input[1]["content"], "second");
+        assert_eq!(input[2]["type"], "compaction");
+        assert_eq!(input[3]["content"], "third");
+    }
+
+    #[test]
+    fn test_opaque_output_preserves_later_message_order() {
+        let codec = ResponsesCodec::new();
+        let body = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {"type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "first"}]},
+                {"type": "message", "id": "msg_2", "role": "assistant", "content": [{"type": "output_text", "text": "second"}]},
+                {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"query": "q"}},
+                {"type": "message", "id": "msg_3", "role": "assistant", "content": [{"type": "output_text", "text": "third"}]}
+            ]
+        });
+
+        let ir = codec.decode_response(body).unwrap();
+        let encoded = codec.encode_response(&ir).unwrap();
+        let output = encoded["output"].as_array().expect("output array");
+        assert_eq!(output.len(), 4);
+        assert_eq!(output[0]["content"][0]["text"], "first");
+        assert_eq!(output[1]["content"][0]["text"], "second");
+        assert_eq!(output[2]["type"], "web_search_call");
+        assert_eq!(output[3]["content"][0]["text"], "third");
     }
 }

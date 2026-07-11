@@ -60,6 +60,14 @@ fn text_only_req() -> IrRequest {
     r
 }
 
+fn with_responses_reasoning_controls(req: &mut IrRequest) {
+    req.params.thinking = Some(tiygate_core::ThinkingConfig {
+        mode: Some("pro".to_string()),
+        context: Some(serde_json::json!({"preserve": true})),
+        ..Default::default()
+    });
+}
+
 fn with_required_tool(req: &mut IrRequest) {
     if let Some(t) = req.tools.first_mut() {
         t.required = true;
@@ -583,4 +591,21 @@ fn verbosity_rejected_outside_openai() {
     assert_eq!(dim, LossyDimension::Verbosity);
     let (dim, _) = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps()).unwrap_err();
     assert_eq!(dim, LossyDimension::Verbosity);
+}
+
+#[test]
+fn responses_reasoning_mode_and_context_rejected_outside_responses() {
+    let mut req = text_only_req();
+    with_responses_reasoning_controls(&mut req);
+
+    assert!(check_lossy_conversion(&req, &responses_endpoint(), &responses_caps()).is_ok());
+
+    for (endpoint, caps) in [
+        (chat_endpoint(), chat_caps()),
+        (anthropic_endpoint(), messages_caps()),
+        (gemini_endpoint(), gemini_caps()),
+    ] {
+        let (dimension, _) = check_lossy_conversion(&req, &endpoint, &caps).unwrap_err();
+        assert_eq!(dimension, LossyDimension::ExtendedReasoning);
+    }
 }

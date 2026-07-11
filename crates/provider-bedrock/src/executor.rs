@@ -849,6 +849,20 @@ mod tests {
             err.to_string().contains("verbosity"),
             "unexpected error: {err}"
         );
+
+        let mut ir = make_ir();
+        ir.params.thinking = Some(tiygate_core::ThinkingConfig {
+            mode: Some("pro".to_string()),
+            context: Some(json!({"preserve": true})),
+            ..Default::default()
+        });
+        let err = BedrockExecutor::reject_unsupported_features(&ir)
+            .expect_err("Responses-only reasoning controls must be rejected");
+        assert!(
+            err.to_string().contains("reasoning.mode")
+                || err.to_string().contains("extended_reasoning"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
