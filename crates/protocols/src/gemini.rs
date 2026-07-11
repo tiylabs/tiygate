@@ -1234,6 +1234,10 @@ impl StreamEncoder for GeminiStreamEncoder {
                     json!({"candidates": [{"content": {"parts": [{"functionCall": fc}]}}]})
                 )
             }
+            // PTC is Responses-only; no Gemini wire carrier.
+            StreamPart::ProgramDelta { .. } | StreamPart::ProgramOutputDelta { .. } => {
+                String::new()
+            }
             StreamPart::Usage { usage } => {
                 // IR prompt_tokens is cache-free; Gemini's promptTokenCount
                 // includes both cache_read and cache_write. Re-add both so
@@ -1641,6 +1645,18 @@ mod tests {
                 id: "t1".to_string(),
                 name: Some("f".to_string()),
                 arguments: "{}".to_string(),
+            },
+            StreamPart::ProgramDelta {
+                id: "prog_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                code: "x".to_string(),
+                fingerprint: "fp".to_string(),
+            },
+            StreamPart::ProgramOutputDelta {
+                id: "progo_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                result: "ok".to_string(),
+                status: "completed".to_string(),
             },
             StreamPart::Usage {
                 usage: Usage::default(),

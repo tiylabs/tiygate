@@ -86,6 +86,20 @@ pub enum StreamPart {
         name: Option<String>,
         arguments: String,
     },
+    /// A complete Responses program item (item-level, not incremental code).
+    ProgramDelta {
+        id: String,
+        call_id: String,
+        code: String,
+        fingerprint: String,
+    },
+    /// A complete Responses program_output item (item-level).
+    ProgramOutputDelta {
+        id: String,
+        call_id: String,
+        result: String,
+        status: String,
+    },
     /// Token usage reported during streaming.
     Usage { usage: Usage },
     /// The response has started (carries the response id).
@@ -322,10 +336,12 @@ impl MediaSource {
 
 /// A tool / function definition.
 ///
-/// Function tools use `name` + `parameters`. Hosted tools (OpenAI Responses
-/// `web_search`, `file_search`, `code_interpreter`, `computer_use_preview`,
-/// etc.) set `tool_type` to the wire `type` and stash remaining fields in
-/// `config` for same-protocol replay.
+/// Function tools use `name` + `parameters`. Custom tools (OpenAI Chat/Responses
+/// `type: "custom"`) set `tool_type` to `"custom"` and stash remaining wire
+/// fields in `config`. Hosted tools (OpenAI Responses `web_search`,
+/// `file_search`, `code_interpreter`, `computer_use_preview`, etc.) set
+/// `tool_type` to the wire `type` and stash remaining fields in `config` for
+/// same-protocol replay.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Tool {
     /// The name of the function (empty for hosted tools without a name).
@@ -337,12 +353,12 @@ pub struct Tool {
     /// Whether to require this tool call.
     #[serde(default)]
     pub required: bool,
-    /// Wire tool type for non-function tools (e.g. `"web_search"`).
+    /// Wire tool type for non-function tools (e.g. `"web_search"`, `"custom"`).
     /// `None` or `"function"` means a regular function tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<String>,
-    /// Hosted-tool configuration payload (everything except `type`/`name`/
-    /// `description`/`parameters` on the wire object).
+    /// Hosted/custom-tool configuration payload (everything except
+    /// `type`/`name`/`description`/`parameters` on the wire object).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<serde_json::Value>,
 }
@@ -354,6 +370,16 @@ impl Tool {
             None | Some("function") => true,
             Some(_) => false,
         }
+    }
+
+    /// True when this is an OpenAI custom tool (`type: "custom"`).
+    pub fn is_custom(&self) -> bool {
+        self.tool_type.as_deref() == Some("custom")
+    }
+
+    /// True when this is a provider-hosted tool (not function, not custom).
+    pub fn is_hosted(&self) -> bool {
+        !self.is_function() && !self.is_custom()
     }
 }
 

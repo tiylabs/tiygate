@@ -299,12 +299,50 @@ impl EndpointCodec for ChatCompletionsCodec {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|t| Tool {
-                        name: t["function"]["name"].as_str().unwrap_or("").to_string(),
-                        description: t["function"]["description"].as_str().map(|s| s.to_string()),
-                        parameters: Some(t["function"]["parameters"].clone()),
-                        required: mark_required,
-                        ..Default::default()
+                    .map(|t| {
+                        let tool_type = t["type"].as_str().unwrap_or("function");
+                        if tool_type == "custom" {
+                            // OpenAI custom tools: type + remaining fields
+                            // (name/description/format/...) live at the top
+                            // level. Stash non-standard fields in config so a
+                            // same-protocol re-encode restores the wire shape.
+                            let mut config = serde_json::Map::new();
+                            if let Some(obj) = t.as_object() {
+                                for (k, v) in obj {
+                                    if k != "type"
+                                        && k != "name"
+                                        && k != "description"
+                                        && k != "parameters"
+                                    {
+                                        config.insert(k.clone(), v.clone());
+                                    }
+                                }
+                            }
+                            Tool {
+                                name: t["name"].as_str().unwrap_or("").to_string(),
+                                description: t["description"].as_str().map(|s| s.to_string()),
+                                parameters: t.get("parameters").cloned(),
+                                required: mark_required,
+                                tool_type: Some("custom".to_string()),
+                                config: if config.is_empty() {
+                                    None
+                                } else {
+                                    Some(Value::Object(config))
+                                },
+                            }
+                        } else {
+                            // Default / function tools (and any unknown type
+                            // that still carries a nested `function` object).
+                            Tool {
+                                name: t["function"]["name"].as_str().unwrap_or("").to_string(),
+                                description: t["function"]["description"]
+                                    .as_str()
+                                    .map(|s| s.to_string()),
+                                parameters: Some(t["function"]["parameters"].clone()),
+                                required: mark_required,
+                                ..Default::default()
+                            }
+                        }
                     })
                     .collect()
             })
@@ -361,6 +399,15 @@ impl EndpointCodec for ChatCompletionsCodec {
         }
         if let Some(value) = body.get("prompt_cache_options") {
             extensions.insert("openai.prompt_cache_options".to_string(), value.clone());
+        }
+        // Shared OpenAI cache-key extensions so Chat ↔ Responses conversion
+        // preserves prompt_cache_key / prompt_cache_retention (not only the
+        // protocol-local openai_extra / responses_extra bags).
+        if let Some(value) = body.get("prompt_cache_key") {
+            extensions.insert("openai.prompt_cache_key".to_string(), value.clone());
+        }
+        if let Some(value) = body.get("prompt_cache_retention") {
+            extensions.insert("openai.prompt_cache_retention".to_string(), value.clone());
         }
 
         let params = tiygate_core::GenerationParams {
@@ -789,21 +836,43 @@ impl EndpointCodec for ChatCompletionsCodec {
 
         body["messages"] = json!(messages);
 
-        // Tools — only emit function tools; hosted tools are Responses-only.
+        // Tools — emit function tools and custom tools; hosted tools are
+        // Responses-only and are rejected by the lossy guard before we reach
+        // this encoder on cross-protocol paths.
         if !ir.tools.is_empty() {
             let tools: Vec<Value> = ir
                 .tools
                 .iter()
-                .filter(|t| t.is_function())
+                .filter(|t| t.is_function() || t.is_custom())
                 .map(|t| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
+                    if t.is_custom() {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("type".to_string(), json!("custom"));
+                        if !t.name.is_empty() {
+                            obj.insert("name".to_string(), json!(t.name));
                         }
-                    })
+                        if let Some(ref desc) = t.description {
+                            obj.insert("description".to_string(), json!(desc));
+                        }
+                        if let Some(ref params) = t.parameters {
+                            obj.insert("parameters".to_string(), params.clone());
+                        }
+                        if let Some(Value::Object(cfg)) = &t.config {
+                            for (k, v) in cfg {
+                                obj.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                        Value::Object(obj)
+                    } else {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.parameters,
+                            }
+                        })
+                    }
                 })
                 .collect();
             if !tools.is_empty() {
@@ -811,12 +880,10 @@ impl EndpointCodec for ChatCompletionsCodec {
             }
         }
 
-        // Generation params
+        // Generation params — OpenAI o-series / GPT-5 require
+        // max_completion_tokens; legacy max_tokens is deprecated and rejected
+        // by some upstreams, so emit only max_completion_tokens.
         if let Some(mt) = ir.params.max_tokens {
-            body["max_tokens"] = json!(mt);
-            // OpenAI o-series models require max_completion_tokens;
-            // max_tokens is deprecated in the Chat Completions spec.
-            // Emit both so the request works across all model families.
             body["max_completion_tokens"] = json!(mt);
         }
         if let Some(t) = ir.params.temperature {
@@ -919,6 +986,8 @@ impl EndpointCodec for ChatCompletionsCodec {
         for (extension, field) in [
             ("openai.safety_identifier", "safety_identifier"),
             ("openai.prompt_cache_options", "prompt_cache_options"),
+            ("openai.prompt_cache_key", "prompt_cache_key"),
+            ("openai.prompt_cache_retention", "prompt_cache_retention"),
         ] {
             if let Some(value) = ir.extensions.get(extension) {
                 body[field] = value.clone();
@@ -1248,6 +1317,11 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                         }]
                     })
                 )
+            }
+            // Programmatic Tool Calling is Responses-only; Chat has no wire
+            // carrier, so these item-level parts are no-ops here.
+            StreamPart::ProgramDelta { .. } | StreamPart::ProgramOutputDelta { .. } => {
+                String::new()
             }
             StreamPart::Usage { usage } => {
                 let id = self.response_id.as_deref().unwrap_or("");
@@ -2177,6 +2251,18 @@ mod tests {
                 name: Some("fn".to_string()),
                 arguments: "{}".to_string(),
             },
+            StreamPart::ProgramDelta {
+                id: "prog_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                code: "await tools.f({})".to_string(),
+                fingerprint: "fp".to_string(),
+            },
+            StreamPart::ProgramOutputDelta {
+                id: "progo_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                result: "ok".to_string(),
+                status: "completed".to_string(),
+            },
             StreamPart::Usage {
                 usage: Usage::default(),
             },
@@ -2686,5 +2772,80 @@ mod tests {
             ir.usage.is_none(),
             "null usage must decode to None, not a zero-valued Usage"
         );
+    }
+
+    #[test]
+    fn test_custom_tool_roundtrip() {
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let body = json!({
+            "model": "gpt-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "custom",
+                "name": "code_exec",
+                "description": "run code",
+                "format": {"type": "text"}
+            }]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(ir.tools.len(), 1);
+        assert!(ir.tools[0].is_custom());
+        assert_eq!(ir.tools[0].name, "code_exec");
+        assert_eq!(
+            ir.tools[0]
+                .config
+                .as_ref()
+                .and_then(|c| c.get("format"))
+                .and_then(|f| f.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("text")
+        );
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["tools"][0]["type"], "custom");
+        assert_eq!(encoded["tools"][0]["name"], "code_exec");
+        assert_eq!(encoded["tools"][0]["format"]["type"], "text");
+    }
+
+    #[test]
+    fn test_encode_only_max_completion_tokens() {
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let body = json!({
+            "model": "gpt-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 128
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(ir.params.max_tokens, Some(128));
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["max_completion_tokens"], 128);
+        assert!(
+            encoded.get("max_tokens").is_none(),
+            "legacy max_tokens must not be emitted: {encoded}"
+        );
+    }
+
+    #[test]
+    fn test_prompt_cache_key_cross_protocol() {
+        let chat = ChatCompletionsCodec::new();
+        let responses = crate::responses::ResponsesCodec::new();
+        let env = make_raw_envelope();
+        let body = json!({
+            "model": "gpt-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "cache-k1",
+            "prompt_cache_retention": "24h"
+        });
+        let ir = chat.decode_request(body, &env).unwrap();
+        assert_eq!(
+            ir.extensions
+                .get("openai.prompt_cache_key")
+                .and_then(|v| v.as_str()),
+            Some("cache-k1")
+        );
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        assert_eq!(encoded["prompt_cache_key"], "cache-k1");
+        assert_eq!(encoded["prompt_cache_retention"], "24h");
     }
 }

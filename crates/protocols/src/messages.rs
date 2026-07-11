@@ -1150,6 +1150,10 @@ impl StreamEncoder for MessagesStreamEncoder {
                     )
                 }
             }
+            // PTC is Responses-only; no Anthropic wire carrier.
+            StreamPart::ProgramDelta { .. } | StreamPart::ProgramOutputDelta { .. } => {
+                String::new()
+            }
             StreamPart::Usage { usage } => {
                 self.last_usage = Some(usage.clone());
                 let stop_reason = self.pending_stop_reason.take();
@@ -1922,6 +1926,18 @@ mod tests {
                 id: "tc1".to_string(),
                 name: Some("fn".to_string()),
                 arguments: "{}".to_string(),
+            },
+            StreamPart::ProgramDelta {
+                id: "prog_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                code: "x".to_string(),
+                fingerprint: "fp".to_string(),
+            },
+            StreamPart::ProgramOutputDelta {
+                id: "progo_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                result: "ok".to_string(),
+                status: "completed".to_string(),
             },
             StreamPart::Usage {
                 usage: Usage::default(),
