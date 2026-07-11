@@ -621,6 +621,14 @@ impl EndpointCodec for ResponsesCodec {
                 prompt_cache_options.clone(),
             );
         }
+        // Shared OpenAI cache-key extensions so Chat ↔ Responses conversion
+        // preserves prompt_cache_key / prompt_cache_retention.
+        if let Some(value) = body.get("prompt_cache_key") {
+            extensions.insert("openai.prompt_cache_key".to_string(), value.clone());
+        }
+        if let Some(value) = body.get("prompt_cache_retention") {
+            extensions.insert("openai.prompt_cache_retention".to_string(), value.clone());
+        }
 
         // Preserve Responses-specific top-level fields the IR does not model so
         // a same-protocol re-encode is lossless. Stored under a prefixed key.
@@ -914,12 +922,34 @@ impl EndpointCodec for ResponsesCodec {
                         Role::Assistant => "assistant",
                         _ => "user",
                     };
+                    // Walk content in original order so PTC interleaving
+                    // (reasoning / program / function_call / text / outputs)
+                    // is preserved. Text and media parts are buffered and
+                    // flushed as a single message item when a non-text item
+                    // arrives or the turn ends.
                     let mut text_parts: Vec<Value> = Vec::new();
-                    let mut reasoning_items: Vec<Value> = Vec::new();
-                    let mut tool_calls_json: Vec<Value> = Vec::new();
-                    let mut tool_outputs_json: Vec<Value> = Vec::new();
-                    let mut program_items: Vec<Value> = Vec::new();
-                    let mut program_outputs: Vec<Value> = Vec::new();
+
+                    let flush_text_message = |text_parts: &mut Vec<Value>,
+                                              input_items: &mut Vec<Value>,
+                                              role_str: &str| {
+                        if text_parts.is_empty() {
+                            return;
+                        }
+                        let parts = std::mem::take(text_parts);
+                        let mut item = json!({"role": role_str});
+                        if parts.len() == 1
+                            && parts[0]
+                                .get("type")
+                                .map(|v| v == "input_text")
+                                .unwrap_or(false)
+                            && parts[0].get("prompt_cache_breakpoint").is_none()
+                        {
+                            item["content"] = parts[0]["text"].clone();
+                        } else {
+                            item["content"] = json!(parts);
+                        }
+                        input_items.push(item);
+                    };
 
                     for c in &msg.content {
                         match c {
@@ -978,26 +1008,10 @@ impl EndpointCodec for ResponsesCodec {
                                 encrypted_content,
                                 ..
                             } => {
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 // Responses API treats reasoning as a sibling
-                                // output/input item, NOT as a content sub-part
-                                // of the message. The OpenAI Responses spec
-                                // (and the Deepseek thinking-mode spec it
-                                // mirrors) requires that the reasoning item be
-                                // echoed back alongside any function_call
-                                // item the same turn produced — otherwise
-                                // the request is rejected.
-                                //
-                                // Each reasoning block is emitted as its own
-                                // item so a Responses-issued `id` (`rs_...`)
-                                // can be replayed verbatim. The Responses API
-                                // pairs each reasoning item with the following
-                                // item by id; replaying the original id keeps
-                                // same-protocol multi-turn from 400ing with
-                                // "Item provided without its required preceding
-                                // item of type reasoning". Cross-protocol
-                                // reasoning has no Responses id (id == None),
-                                // so we emit it idless rather than fabricate
-                                // one.
+                                // input item. Replay the original `rs_...` id
+                                // when present so multi-turn pairing stays valid.
                                 let summary = if text.is_empty() {
                                     json!([])
                                 } else {
@@ -1013,7 +1027,7 @@ impl EndpointCodec for ResponsesCodec {
                                 if let Some(enc) = encrypted_content {
                                     item["encrypted_content"] = json!(enc);
                                 }
-                                reasoning_items.push(item);
+                                input_items.push(item);
                             }
                             Content::ToolCall {
                                 id,
@@ -1022,13 +1036,11 @@ impl EndpointCodec for ResponsesCodec {
                                 call_id,
                                 caller,
                             } => {
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 let args_str = match arguments {
                                     serde_json::Value::String(s) => s.clone(),
                                     other => other.to_string(),
                                 };
-                                // Use the dedicated `call_id` when present
-                                // (Responses round-trip); otherwise `id` serves
-                                // both roles (cross-protocol).
                                 let wire_call_id = call_id.as_deref().unwrap_or(id);
                                 let mut fc = json!({
                                     "type": "function_call",
@@ -1036,15 +1048,13 @@ impl EndpointCodec for ResponsesCodec {
                                     "name": name,
                                     "arguments": args_str,
                                 });
-                                // Include the item reference `id` when the IR
-                                // carries a separate call_id.
                                 if call_id.is_some() {
                                     fc["id"] = json!(id);
                                 }
                                 if let Some(caller) = caller {
                                     fc["caller"] = json!(caller);
                                 }
-                                tool_calls_json.push(fc);
+                                input_items.push(fc);
                             }
                             Content::ToolResult {
                                 tool_call_id,
@@ -1053,13 +1063,11 @@ impl EndpointCodec for ResponsesCodec {
                                 id,
                                 caller,
                             } => {
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 // Cross-protocol Anthropic Messages carries
-                                // `tool_result` blocks inside a user message,
-                                // while Responses requires a sibling
-                                // `function_call_output` input item. Preserve
-                                // them regardless of the IR message role so
-                                // prior function calls have matching outputs.
-                                tool_outputs_json.push(responses_function_call_output(
+                                // tool_result inside a user message; Responses
+                                // requires a sibling function_call_output item.
+                                input_items.push(responses_function_call_output(
                                     tool_call_id,
                                     content,
                                     id.as_deref(),
@@ -1072,7 +1080,8 @@ impl EndpointCodec for ResponsesCodec {
                                 code,
                                 fingerprint,
                             } => {
-                                program_items.push(json!({
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
+                                input_items.push(json!({
                                     "type": "program",
                                     "id": id,
                                     "call_id": call_id,
@@ -1086,7 +1095,8 @@ impl EndpointCodec for ResponsesCodec {
                                 result,
                                 status,
                             } => {
-                                program_outputs.push(json!({
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
+                                input_items.push(json!({
                                     "type": "program_output",
                                     "id": id,
                                     "call_id": call_id,
@@ -1100,44 +1110,7 @@ impl EndpointCodec for ResponsesCodec {
                         }
                     }
 
-                    for item in reasoning_items {
-                        input_items.push(item);
-                    }
-
-                    for item in program_items {
-                        input_items.push(item);
-                    }
-
-                    for tc in tool_calls_json {
-                        input_items.push(tc);
-                    }
-
-                    // Only emit a message item if there is text/image content.
-                    // A turn that is purely reasoning + function_call (the
-                    // shape Responses actually returns) is fully represented
-                    // by the items above.
-                    if !text_parts.is_empty() {
-                        let mut item = json!({"role": role_str});
-                        if text_parts.len() == 1
-                            && text_parts[0]
-                                .get("type")
-                                .map(|v| v == "input_text")
-                                .unwrap_or(false)
-                            && text_parts[0].get("prompt_cache_breakpoint").is_none()
-                        {
-                            item["content"] = text_parts[0]["text"].clone();
-                        } else {
-                            item["content"] = json!(text_parts);
-                        }
-                        input_items.push(item);
-                    }
-
-                    for output in tool_outputs_json {
-                        input_items.push(output);
-                    }
-                    for output in program_outputs {
-                        input_items.push(output);
-                    }
+                    flush_text_message(&mut text_parts, &mut input_items, role_str);
                 }
                 Role::Tool => {
                     for c in &msg.content {
@@ -1278,6 +1251,8 @@ impl EndpointCodec for ResponsesCodec {
         for (extension, field) in [
             ("openai.safety_identifier", "safety_identifier"),
             ("openai.prompt_cache_options", "prompt_cache_options"),
+            ("openai.prompt_cache_key", "prompt_cache_key"),
+            ("openai.prompt_cache_retention", "prompt_cache_retention"),
         ] {
             if let Some(value) = ir.extensions.get(extension) {
                 body[field] = value.clone();
@@ -1655,6 +1630,10 @@ pub struct ResponsesStreamEncoder {
     /// the terminal reasoning `output_item.done` and the reconstructed
     /// `response.completed.output` item for cross-turn replay.
     reasoning_encrypted: Option<String>,
+    /// PTC (program / program_output) items emitted during the stream, in
+    /// arrival order, so `response.completed.output` can reconstruct them
+    /// for strict clients that rely on the terminal snapshot.
+    program_items: Vec<Value>,
 }
 impl Default for ResponsesStreamEncoder {
     fn default() -> Self {
@@ -1683,6 +1662,7 @@ impl ResponsesStreamEncoder {
             reasoning_text: String::new(),
             reasoning_id: None,
             reasoning_encrypted: None,
+            program_items: Vec::new(),
         }
     }
 
@@ -1828,6 +1808,11 @@ impl ResponsesStreamEncoder {
                 }]
             }));
         }
+        // PTC items (program / program_output) in arrival order, so strict
+        // clients that reconstruct from response.completed.output see them.
+        for item in &self.program_items {
+            output.push(item.clone());
+        }
         for call_id in self.tool_output_order.clone() {
             let name = self.tool_names.get(&call_id).cloned().unwrap_or_default();
             let arguments = self
@@ -1944,6 +1929,63 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 } else {
                     self.append_tool_arguments(id, arguments)
                 }
+            }
+            // Item-level PTC events (complete program / program_output items).
+            StreamPart::ProgramDelta {
+                id,
+                call_id,
+                code,
+                fingerprint,
+            } => {
+                let idx = self.next_output_index;
+                self.next_output_index += 1;
+                let item = json!({
+                    "type": "program",
+                    "id": id,
+                    "call_id": call_id,
+                    "code": code,
+                    "fingerprint": fingerprint,
+                });
+                self.program_items.push(item.clone());
+                let mut out = self.event(json!({
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": item.clone(),
+                }));
+                out.push_str(&self.event(json!({
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": item,
+                })));
+                out
+            }
+            StreamPart::ProgramOutputDelta {
+                id,
+                call_id,
+                result,
+                status,
+            } => {
+                let idx = self.next_output_index;
+                self.next_output_index += 1;
+                let item = json!({
+                    "type": "program_output",
+                    "id": id,
+                    "call_id": call_id,
+                    "result": result,
+                    "status": status,
+                });
+                self.program_items.push(item.clone());
+                let mut out = self.event(json!({
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": item.clone(),
+                }));
+                out.push_str(&self.event(json!({
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": item,
+                })));
+                out
             }
             StreamPart::Usage { usage } => {
                 // Stash usage for the terminal response.completed instead of
@@ -2190,6 +2232,34 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     if let Some(enc) = item["encrypted_content"].as_str() {
                         self.pending_reasoning_encrypted = Some(enc.to_string());
                     }
+                } else if item["type"] == "program" {
+                    // Item-level PTC program (complete on added; done is ignored
+                    // to avoid double emission of the same item). Latch as a
+                    // tool-calling turn so finish_reason maps to ToolCalls.
+                    self.saw_function_call = true;
+                    parts.push(StreamPart::ProgramDelta {
+                        id: item["id"].as_str().unwrap_or("").to_string(),
+                        call_id: item["call_id"].as_str().unwrap_or("").to_string(),
+                        code: item["code"].as_str().unwrap_or("").to_string(),
+                        fingerprint: item["fingerprint"].as_str().unwrap_or("").to_string(),
+                    });
+                } else if item["type"] == "program_output" {
+                    // program_output is a *result* item, not a tool-call
+                    // request. Do NOT latch saw_function_call here — a lone
+                    // program_output (e.g. upstream replaying prior-turn
+                    // output) would otherwise force finish_reason to
+                    // ToolCalls even though the model made no tool call this
+                    // turn. Only the `program` item (the tool-call equivalent)
+                    // latches above.
+                    parts.push(StreamPart::ProgramOutputDelta {
+                        id: item["id"].as_str().unwrap_or("").to_string(),
+                        call_id: item["call_id"].as_str().unwrap_or("").to_string(),
+                        result: item["result"].as_str().unwrap_or("").to_string(),
+                        status: item["status"]
+                            .as_str()
+                            .unwrap_or("completed")
+                            .to_string(),
+                    });
                 } else if item["type"] == "local_shell_call" {
                     // Codex local_shell_call: treat as a tool call so the
                     // streaming finish_reason is ToolCalls, not Stop.
@@ -2258,6 +2328,9 @@ impl StreamDecoder for ResponsesStreamDecoder {
                             encrypted_content: self.pending_reasoning_encrypted.take(),
                         });
                     }
+                } else if item["type"] == "program" || item["type"] == "program_output" {
+                    // Already emitted on output_item.added; ignore done to
+                    // avoid duplicate ProgramDelta / ProgramOutputDelta.
                 }
                 if item["type"] == "function_call" {
                     if let Some(item_id) = item["id"].as_str() {
@@ -2421,6 +2494,204 @@ mod tests {
             original_body_size: 0,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn test_interleaved_ptc_wire_order_preserved() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        // Wire order: user → program → function_call → text message → program_output
+        // must survive decode → encode without bucket reordering.
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "run"},
+                {"type": "program", "id": "prog_1", "call_id": "call_prog_1", "code": "await tools.lookup({})", "fingerprint": "fp_1"},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{}", "caller": {"type": "program", "caller_id": "call_prog_1"}},
+                {"role": "assistant", "content": "mid"},
+                {"type": "program_output", "id": "progo_1", "call_id": "call_prog_1", "result": "done", "status": "completed"}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let input = encoded["input"].as_array().unwrap();
+        let types: Vec<&str> = input
+            .iter()
+            .map(|item| {
+                if let Some(t) = item.get("type").and_then(|v| v.as_str()) {
+                    t
+                } else if item.get("role").is_some() {
+                    "message"
+                } else {
+                    "unknown"
+                }
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "message",
+                "program",
+                "function_call",
+                "message",
+                "program_output"
+            ],
+            "PTC interleaving order must be preserved: {types:?}"
+        );
+        assert_eq!(input[3]["content"], "mid");
+    }
+
+    #[test]
+    fn test_stream_program_item_roundtrip() {
+        let mut decoder = ResponsesStreamDecoder::new();
+        let parts = decoder
+            .feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"program","id":"prog_1","call_id":"call_prog_1","code":"await tools.f({})","fingerprint":"fp_1"}}"#)
+            .unwrap();
+        assert!(matches!(
+            &parts[0],
+            StreamPart::ProgramDelta {
+                id,
+                call_id,
+                code,
+                fingerprint
+            } if id == "prog_1" && call_id == "call_prog_1" && code.contains("tools.f") && fingerprint == "fp_1"
+        ));
+        let mut encoder = ResponsesStreamEncoder::new();
+        let bytes = encoder.encode_part(&parts[0]).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\"type\":\"response.output_item.added\""));
+        assert!(s.contains("\"type\":\"program\""));
+        assert!(s.contains("\"call_id\":\"call_prog_1\""));
+        assert!(s.contains("\"type\":\"response.output_item.done\""));
+    }
+
+    #[test]
+    fn test_stream_program_only_turn_finish_reason_tool_calls() {
+        let mut dec = ResponsesStreamDecoder::new();
+        dec.feed(r#"data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress"}}"#)
+            .unwrap();
+        dec.feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"program","id":"prog_1","call_id":"call_prog_1","code":"await tools.f({})","fingerprint":"fp_1"}}"#)
+            .unwrap();
+        let parts = dec
+            .feed(r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#)
+            .unwrap();
+        assert!(
+            parts.iter().any(|p| matches!(
+                p,
+                StreamPart::Finish {
+                    reason: FinishReason::ToolCalls
+                }
+            )),
+            "program-only stream must finish with ToolCalls, got: {parts:?}"
+        );
+    }
+
+    #[test]
+    fn test_stream_lone_program_output_does_not_latch_tool_calls() {
+        // A lone program_output (without a preceding program) is a *result*
+        // item, not a tool-call request. finish_reason should NOT be
+        // ToolCalls — the model made no tool call this turn.
+        let mut dec = ResponsesStreamDecoder::new();
+        dec.feed(r#"data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress"}}"#)
+            .unwrap();
+        dec.feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"program_output","id":"progo_1","call_id":"call_prog_1","result":"ok","status":"completed"}}"#)
+            .unwrap();
+        let parts = dec
+            .feed(r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#)
+            .unwrap();
+        assert!(
+            !parts.iter().any(|p| matches!(
+                p,
+                StreamPart::Finish {
+                    reason: FinishReason::ToolCalls
+                }
+            )),
+            "lone program_output must NOT finish with ToolCalls, got: {parts:?}"
+        );
+    }
+
+    #[test]
+    fn test_stream_completed_event_includes_ptc_items() {
+        // PTC items (program / program_output) must appear in the terminal
+        // response.completed.output array so strict clients that reconstruct
+        // from the snapshot don't lose them.
+        let mut encoder = ResponsesStreamEncoder::new();
+        encoder.encode_part(&StreamPart::ResponseStarted {
+            id: "resp_1".to_string(),
+        })
+        .unwrap();
+        encoder
+            .encode_part(&StreamPart::ProgramDelta {
+                id: "prog_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                code: "await tools.f({})".to_string(),
+                fingerprint: "fp_1".to_string(),
+            })
+            .unwrap();
+        encoder
+            .encode_part(&StreamPart::ProgramOutputDelta {
+                id: "progo_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                result: "ok".to_string(),
+                status: "completed".to_string(),
+            })
+            .unwrap();
+        let bytes = encoder
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        // Finish defers response.completed when usage hasn't arrived yet.
+        // Feed Usage so completed_event fires and includes the output array.
+        let bytes2 = encoder
+            .encode_part(&StreamPart::Usage {
+                usage: Usage::default(),
+            })
+            .unwrap();
+        let combined = [bytes.as_slice(), bytes2.as_slice()].concat();
+        let s = String::from_utf8_lossy(&combined);
+        // The terminal response.completed must carry both PTC items in output.
+        assert!(
+            s.contains("\"type\":\"response.completed\""),
+            "must emit response.completed, got: {s}"
+        );
+        assert!(
+            s.contains("\"type\":\"program\""),
+            "completed output must include program item, got: {s}"
+        );
+        assert!(
+            s.contains("\"type\":\"program_output\""),
+            "completed output must include program_output item, got: {s}"
+        );
+        assert!(
+            s.contains("\"id\":\"prog_1\""),
+            "completed output must carry program id, got: {s}"
+        );
+        assert!(
+            s.contains("\"id\":\"progo_1\""),
+            "completed output must carry program_output id, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_prompt_cache_key_from_chat_shared_extension() {
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let responses = ResponsesCodec::new();
+        let env = make_raw_env();
+        let ir = chat
+            .decode_request(
+                json!({
+                    "model": "gpt-5.6",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "prompt_cache_key": "shared-key",
+                    "prompt_cache_retention": "in_memory"
+                }),
+                &env,
+            )
+            .unwrap();
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        assert_eq!(encoded["prompt_cache_key"], "shared-key");
+        assert_eq!(encoded["prompt_cache_retention"], "in_memory");
     }
 
     #[test]

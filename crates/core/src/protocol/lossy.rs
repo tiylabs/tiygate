@@ -189,14 +189,32 @@ pub fn check_lossy_conversion(
     }
 
     // 7. Hosted tools are first-class only on Responses. Do not silently
-    // filter them from Chat/Messages/Gemini requests.
-    if request.tools.iter().any(|tool| !tool.is_function()) && !egress_caps.hosted_tools {
+    // filter them from Chat/Messages/Gemini requests. Custom tools
+    // (`type: "custom"`) are expressible on Chat and Responses but not on
+    // Anthropic Messages or Gemini, so reject them on those egress paths
+    // instead of silently dropping the tool definition.
+    let openai_egress = matches!(
+        egress.suite,
+        crate::protocol::ProtocolSuite::OpenAiCompatible
+            | crate::protocol::ProtocolSuite::OpenAiResponses
+    );
+    if request.tools.iter().any(|tool| tool.is_hosted()) && !egress_caps.hosted_tools {
         return Err((
             LossyDimension::HostedTools,
             lossy_error(
                 LossyDimension::HostedTools,
                 egress,
                 "non-function hosted tool definition",
+            ),
+        ));
+    }
+    if request.tools.iter().any(|tool| tool.is_custom()) && !openai_egress {
+        return Err((
+            LossyDimension::HostedTools,
+            lossy_error(
+                LossyDimension::HostedTools,
+                egress,
+                "custom tool definition (OpenAI-only)",
             ),
         ));
     }
@@ -243,12 +261,7 @@ pub fn check_lossy_conversion(
         ));
     }
 
-    let openai_text_controls = matches!(
-        egress.suite,
-        crate::protocol::ProtocolSuite::OpenAiCompatible
-            | crate::protocol::ProtocolSuite::OpenAiResponses
-    );
-    if request.params.verbosity.is_some() && !openai_text_controls {
+    if request.params.verbosity.is_some() && !openai_egress {
         return Err((
             LossyDimension::Verbosity,
             lossy_error(LossyDimension::Verbosity, egress, "text verbosity"),
@@ -271,7 +284,7 @@ pub fn check_lossy_conversion(
                 }
             )
         });
-    if has_breakpoint && !openai_text_controls {
+    if has_breakpoint && !openai_egress {
         return Err((
             LossyDimension::PromptCacheBreakpoint,
             lossy_error(

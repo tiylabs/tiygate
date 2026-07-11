@@ -424,6 +424,30 @@ fn hosted_and_programmatic_tools_are_rejected_outside_responses() {
     );
 }
 
+#[test]
+fn custom_tools_rejected_outside_openai() {
+    let mut custom = text_only_req();
+    custom.tools.push(Tool {
+        name: "code_exec".to_string(),
+        tool_type: Some("custom".to_string()),
+        config: Some(serde_json::json!({"format": {"type": "text"}})),
+        ..Default::default()
+    });
+    // Custom tools are expressible on Chat and Responses.
+    assert!(check_lossy_conversion(&custom, &chat_endpoint(), &chat_caps()).is_ok());
+    assert!(
+        check_lossy_conversion(&custom, &responses_endpoint(), &responses_caps()).is_ok()
+    );
+    // Custom tools are NOT expressible on Anthropic Messages or Gemini —
+    // reject instead of silently dropping.
+    let (dim, _) =
+        check_lossy_conversion(&custom, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::HostedTools);
+    let (dim, _) =
+        check_lossy_conversion(&custom, &gemini_endpoint(), &gemini_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::HostedTools);
+}
+
 // --- Codex extension: opaque items should not trigger lossy rejection ---
 
 #[test]
