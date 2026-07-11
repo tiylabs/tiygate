@@ -36,6 +36,7 @@ config/local*.yml
 
 # Runtime / data
 data/
+.firecrawl/
 *.db
 *.db-journal
 *.db-shm
