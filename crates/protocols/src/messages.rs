@@ -436,11 +436,13 @@ impl EndpointCodec for MessagesCodec {
                     id,
                     name,
                     arguments,
+                    call_id,
                     ..
                 } => {
+                    let wire_id = call_id.as_deref().unwrap_or(id);
                     content_blocks.push(json!({
                         "type": "tool_use",
-                        "id": id,
+                        "id": wire_id,
                         "name": name,
                         "input": arguments,
                     }));
@@ -584,10 +586,14 @@ impl EndpointCodec for MessagesCodec {
                         id,
                         name,
                         arguments,
+                        call_id,
                         ..
-                    } => Some(
-                        json!({"type": "tool_use", "id": id, "name": name, "input": arguments}),
-                    ),
+                    } => {
+                        let wire_id = call_id.as_deref().unwrap_or(id);
+                        Some(
+                        json!({"type": "tool_use", "id": wire_id, "name": name, "input": arguments}),
+                    )
+                    },
                     Content::ToolResult {
                         tool_call_id,
                         name: _,
@@ -1113,6 +1119,7 @@ impl StreamEncoder for MessagesStreamEncoder {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 // The opener carries `name`: always close any prior block and
                 // open a FRESH tool_use block. Two consecutive openers (e.g.
@@ -1393,7 +1400,8 @@ impl StreamDecoder for MessagesStreamDecoder {
                             id,
                             name,
                             arguments: String::new(),
-                        });
+                            wire_type: None,
+});
                     }
                     Some("text") => {
                         if let Some(text) = block["text"].as_str() {
@@ -1458,7 +1466,8 @@ impl StreamDecoder for MessagesStreamDecoder {
                                 id: self.tool_use_id(index),
                                 name: None,
                                 arguments: json.to_string(),
-                            });
+                                wire_type: None,
+});
                         }
                     }
                     Some(other) => {
@@ -1930,7 +1939,8 @@ mod tests {
                 id: "tc1".to_string(),
                 name: Some("fn".to_string()),
                 arguments: "{}".to_string(),
-            },
+                wire_type: None,
+},
             StreamPart::ProgramDelta {
                 id: "prog_1".to_string(),
                 call_id: "call_prog_1".to_string(),
@@ -2144,6 +2154,7 @@ mod tests {
                 id,
                 name: None,
                 arguments,
+                ..
             } => Some((id.clone(), arguments.clone())),
             _ => None,
         });
@@ -2152,6 +2163,7 @@ mod tests {
                 id,
                 name: None,
                 arguments,
+                ..
             } => Some((id.clone(), arguments.clone())),
             _ => None,
         });
@@ -2170,12 +2182,14 @@ mod tests {
                 id: "a".to_string(),
                 name: Some("fa".to_string()),
                 arguments: String::new(),
-            },
+                wire_type: None,
+},
             StreamPart::ToolCallDelta {
                 id: "b".to_string(),
                 name: Some("fb".to_string()),
                 arguments: String::new(),
-            },
+                wire_type: None,
+},
         ] {
             all.push_str(&String::from_utf8(enc.encode_part(&part).unwrap()).unwrap());
         }
@@ -2193,7 +2207,8 @@ mod tests {
             id: "gemini_call_shell".to_string(),
             name: Some("shell".to_string()),
             arguments: r#"{"command":"git status"}"#.to_string(),
-        };
+            wire_type: None,
+};
         let out = String::from_utf8(enc.encode_part(&part).unwrap()).unwrap();
         assert!(out.contains("content_block_start"));
         assert!(out.contains("\"type\":\"tool_use\""));
@@ -2221,12 +2236,14 @@ mod tests {
                 id: "a".to_string(),
                 name: Some("fa".to_string()),
                 arguments: r#"{"x":1}"#.to_string(),
-            },
+                wire_type: None,
+},
             StreamPart::ToolCallDelta {
                 id: "b".to_string(),
                 name: Some("fb".to_string()),
                 arguments: r#"{"y":2}"#.to_string(),
-            },
+                wire_type: None,
+},
         ] {
             all.push_str(&String::from_utf8(enc.encode_part(&part).unwrap()).unwrap());
         }

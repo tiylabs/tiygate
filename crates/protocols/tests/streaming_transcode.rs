@@ -149,6 +149,7 @@ fn tool_call_summaries(parts: &[StreamPart]) -> Vec<(String, Option<String>, Str
                 id,
                 name,
                 arguments,
+                ..
             } => Some((id.clone(), name.clone(), arguments.clone())),
             _ => None,
         })
@@ -486,16 +487,19 @@ fn matrix_tool_call_arguments_roundtrip_all_pairs() {
             id: "call_1".to_string(),
             name: Some("get_weather".to_string()),
             arguments: String::new(),
-        },
+            wire_type: None,
+},
         StreamPart::ToolCallDelta {
             id: "call_1".to_string(),
             name: None,
             arguments: "{\"city\":".to_string(),
+            wire_type: None,
         },
         StreamPart::ToolCallDelta {
             id: "call_1".to_string(),
             name: None,
             arguments: "\"SF\"}".to_string(),
+            wire_type: None,
         },
         StreamPart::Finish {
             reason: FinishReason::ToolCalls,

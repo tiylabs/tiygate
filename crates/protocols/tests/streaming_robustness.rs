@@ -201,14 +201,16 @@ fn chat_stream_encoder_assigns_distinct_tool_call_indices() {
             id: "call_a".to_string(),
             name: Some("f".to_string()),
             arguments: String::new(),
-        })
+            wire_type: None,
+})
         .unwrap();
     let second = enc
         .encode_part(&StreamPart::ToolCallDelta {
             id: "call_b".to_string(),
             name: Some("g".to_string()),
             arguments: String::new(),
-        })
+            wire_type: None,
+})
         .unwrap();
     let s1 = String::from_utf8_lossy(&first);
     let s2 = String::from_utf8_lossy(&second);
@@ -228,7 +230,8 @@ fn chat_stream_encoder_assigns_distinct_tool_call_indices() {
             id: "call_b".to_string(),
             name: None,
             arguments: "{\"x\":1}".to_string(),
-        })
+            wire_type: None,
+})
         .unwrap();
     let s3 = String::from_utf8_lossy(&frag);
     assert!(
@@ -263,7 +266,8 @@ fn anthropic_stream_encoder_frames_blocks() {
             id: "call_a".to_string(),
             name: Some("f".to_string()),
             arguments: String::new(),
-        })
+            wire_type: None,
+})
         .unwrap(),
     ));
     sse.push_str(&String::from_utf8_lossy(
@@ -271,7 +275,8 @@ fn anthropic_stream_encoder_frames_blocks() {
             id: "call_a".to_string(),
             name: None,
             arguments: "{\"x\":1}".to_string(),
-        })
+            wire_type: None,
+})
         .unwrap(),
     ));
     sse.push_str(&String::from_utf8_lossy(

@@ -85,6 +85,12 @@ pub enum StreamPart {
         id: String,
         name: Option<String>,
         arguments: String,
+        /// Original Responses/Codex wire item type when it is not a plain
+        /// `function_call` (e.g. `custom_tool_call`, `local_shell_call`).
+        /// Same-protocol Responses stream re-encode uses this to restore the
+        /// wire shape; other protocols ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wire_type: Option<String>,
     },
     /// A complete Responses program item (item-level, not incremental code).
     ProgramDelta {

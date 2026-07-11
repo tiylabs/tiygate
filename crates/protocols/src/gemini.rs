@@ -1467,6 +1467,7 @@ impl StreamDecoder for GeminiStreamDecoder {
                                 id,
                                 name,
                                 arguments,
+                                wire_type: None,
                             });
                         }
                     }
@@ -1648,7 +1649,8 @@ mod tests {
                 id: "t1".to_string(),
                 name: Some("f".to_string()),
                 arguments: "{}".to_string(),
-            },
+                wire_type: None,
+},
             StreamPart::ProgramDelta {
                 id: "prog_1".to_string(),
                 call_id: "call_prog_1".to_string(),
@@ -1840,7 +1842,8 @@ mod tests {
             id: "gemini_call_get_weather".to_string(),
             name: Some("get_weather".to_string()),
             arguments: r#"{"city":"London","unit":"c"}"#.to_string(),
-        };
+            wire_type: None,
+};
         let bytes = enc.encode_part(&part).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         let json_part = s.strip_prefix("data: ").unwrap().trim();
@@ -1880,7 +1883,8 @@ mod tests {
                     id,
                     name,
                     arguments,
-                } => Some((id.clone(), name.clone(), arguments.clone())),
+                ..
+            } => Some((id.clone(), name.clone(), arguments.clone())),
                 _ => None,
             })
             .unwrap();

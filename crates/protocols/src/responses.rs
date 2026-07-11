@@ -535,15 +535,18 @@ impl EndpointCodec for ResponsesCodec {
                     let original_call_id = item["call_id"].as_str().map(|s| s.to_string());
                     // If the item has both `id` (item ref) and `call_id`
                     // (function-call identifier), store the item ref in IR
-                    // `id` and the call_id in IR `call_id`. Otherwise the
-                    // deduped id serves both roles.
+                    // `id` and the *normalized unique* call_id in IR
+                    // `call_id`. Cross-protocol encoders (Anthropic/Chat)
+                    // pair tool_use/tool_result via
+                    // `call_id.as_deref().unwrap_or(id)`, so the unique
+                    // call_id must live in IR.call_id (and in the remap
+                    // queue for following outputs). Using the raw
+                    // (possibly duplicated) call_id here would leave
+                    // ToolCall and ToolResult with mismatched pairing ids.
                     let (ir_id, ir_call_id) = if item_ref.is_some() && original_call_id.is_some() {
                         // IR `id` = item reference (e.g. `fc_xxx`)
-                        // IR `call_id` = function-call id (e.g. `call_xxx`)
-                        (
-                            item_ref.clone().unwrap_or_default(),
-                            original_call_id.clone(),
-                        )
+                        // IR `call_id` = unique function-call id
+                        (item_ref.clone().unwrap_or_default(), Some(id))
                     } else {
                         (id, None)
                     };
@@ -2123,6 +2126,8 @@ pub struct ResponsesStreamEncoder {
     /// arrival order, so `response.completed.output` can reconstruct them
     /// for strict clients that rely on the terminal snapshot.
     program_items: Vec<Value>,
+    /// Original Responses wire type per call_id (function_call/custom_tool_call/local_shell_call).
+    tool_wire_types: HashMap<String, String>,
 }
 impl Default for ResponsesStreamEncoder {
     fn default() -> Self {
@@ -2151,6 +2156,7 @@ impl ResponsesStreamEncoder {
             reasoning_id: None,
             reasoning_encrypted: None,
             program_items: Vec::new(),
+            tool_wire_types: HashMap::new(),
         }
     }
 
@@ -2179,7 +2185,7 @@ impl ResponsesStreamEncoder {
         format!("data: {}\n\n", value)
     }
 
-    fn open_tool_call(&mut self, id: &str, name: &str) -> String {
+    fn open_tool_call(&mut self, id: &str, name: &str, wire_type: Option<&str>) -> String {
         let already_open = self.tool_output_indices.contains_key(id);
         let idx = if let Some(idx) = self.tool_output_indices.get(id).copied() {
             idx
@@ -2194,10 +2200,23 @@ impl ResponsesStreamEncoder {
             .entry(id.to_string())
             .or_insert_with(|| name.to_string());
         self.tool_arguments.entry(id.to_string()).or_default();
+        if let Some(wt) = wire_type {
+            self.tool_wire_types
+                .entry(id.to_string())
+                .or_insert_with(|| wt.to_string());
+        }
         if already_open {
             return String::new();
         }
-        self.event(json!({"type": "response.output_item.added", "output_index": idx, "item": {"id": id, "call_id": id, "type": "function_call", "name": name, "arguments": "", "status": "in_progress"}}))
+        let item_type = wire_type.unwrap_or("function_call");
+        let item = if item_type == "custom_tool_call" {
+            json!({"id": id, "call_id": id, "type": "custom_tool_call", "name": name, "input": "", "status": "in_progress"})
+        } else if item_type == "local_shell_call" {
+            json!({"id": id, "call_id": id, "type": "local_shell_call", "action": {}, "status": "in_progress"})
+        } else {
+            json!({"id": id, "call_id": id, "type": "function_call", "name": name, "arguments": "", "status": "in_progress"})
+        };
+        self.event(json!({"type": "response.output_item.added", "output_index": idx, "item": item}))
     }
 
     fn append_tool_arguments(&mut self, id: &str, arguments: &str) -> String {
@@ -2222,8 +2241,27 @@ impl ResponsesStreamEncoder {
                 .get(&call_id)
                 .cloned()
                 .unwrap_or_default();
-            out.push_str(&self.event(json!({"type": "response.function_call_arguments.done", "item_id": call_id, "output_index": idx, "arguments": arguments})));
-            out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": call_id, "call_id": call_id, "type": "function_call", "name": name, "arguments": arguments, "status": status}})));
+            let item_type = self
+                .tool_wire_types
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_else(|| "function_call".to_string());
+            if item_type == "function_call" {
+                out.push_str(&self.event(json!({"type": "response.function_call_arguments.done", "item_id": call_id, "output_index": idx, "arguments": arguments})));
+            }
+            let item = if item_type == "custom_tool_call" {
+                let input = serde_json::from_str::<Value>(&arguments)
+                    .ok()
+                    .and_then(|v| v.get("input").and_then(|x| x.as_str()).map(str::to_string))
+                    .unwrap_or(arguments);
+                json!({"id": call_id, "call_id": call_id, "type": "custom_tool_call", "name": name, "input": input, "status": status})
+            } else if item_type == "local_shell_call" {
+                let action = serde_json::from_str::<Value>(&arguments).unwrap_or(json!({}));
+                json!({"id": call_id, "call_id": call_id, "type": "local_shell_call", "action": action, "status": status})
+            } else {
+                json!({"id": call_id, "call_id": call_id, "type": "function_call", "name": name, "arguments": arguments, "status": status})
+            };
+            out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": item})));
             self.tool_done.insert(call_id);
         }
         out
@@ -2308,14 +2346,43 @@ impl ResponsesStreamEncoder {
                 .get(&call_id)
                 .cloned()
                 .unwrap_or_default();
-            output.push(json!({
-                "type": "function_call",
-                "id": call_id,
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-                "status": status,
-            }));
+            let item_type = self
+                .tool_wire_types
+                .get(&call_id)
+                .map(String::as_str)
+                .unwrap_or("function_call");
+            if item_type == "custom_tool_call" {
+                let input = serde_json::from_str::<Value>(&arguments)
+                    .ok()
+                    .and_then(|v| v.get("input").and_then(|x| x.as_str()).map(str::to_string))
+                    .unwrap_or(arguments);
+                output.push(json!({
+                    "type": "custom_tool_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "input": input,
+                    "status": status,
+                }));
+            } else if item_type == "local_shell_call" {
+                let action = serde_json::from_str::<Value>(&arguments).unwrap_or(json!({}));
+                output.push(json!({
+                    "type": "local_shell_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "action": action,
+                    "status": status,
+                }));
+            } else {
+                output.push(json!({
+                    "type": "function_call",
+                    "id": call_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                    "status": status,
+                }));
+            }
         }
         if !output.is_empty() {
             response["output"] = json!(output);
@@ -2405,10 +2472,11 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 id,
                 name,
                 arguments,
+                wire_type,
             } => {
                 if let Some(n) = name {
                     // Opener: allocate a distinct output_index for this call.
-                    let mut out = self.open_tool_call(id, n);
+                    let mut out = self.open_tool_call(id, n, wire_type.as_deref());
                     if !arguments.is_empty() {
                         out.push_str(&self.append_tool_arguments(id, arguments));
                     }
@@ -2707,6 +2775,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         id: call_id,
                         name,
                         arguments: String::new(),
+                        wire_type: None,
                     });
                 } else if item["type"] == "reasoning" {
                     // Stash the reasoning item id / encrypted content so the
@@ -2758,6 +2827,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         id,
                         name: Some("local_shell".to_string()),
                         arguments: action.to_string(),
+                        wire_type: Some("local_shell_call".to_string()),
                     });
                 } else if item["type"] == "custom_tool_call" {
                     // Codex custom_tool_call: treat as a tool call so the
@@ -2771,6 +2841,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         id,
                         name: Some(name),
                         arguments: json!({"input": input_text}).to_string(),
+                        wire_type: Some("custom_tool_call".to_string()),
                     });
                 }
             }
@@ -2788,6 +2859,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         id,
                         name: None,
                         arguments: args.to_string(),
+                        wire_type: None,
                     });
                 }
             }
@@ -3799,7 +3871,8 @@ mod tests {
                 id: "call_123".to_string(),
                 name: Some("lookup".to_string()),
                 arguments: String::new(),
-            })
+                wire_type: None,
+})
             .unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("\"type\":\"response.output_item.added\""));
@@ -3818,14 +3891,16 @@ mod tests {
                 id: "call_123".to_string(),
                 name: Some("lookup".to_string()),
                 arguments: String::new(),
-            })
+                wire_type: None,
+})
             .unwrap();
         let second = enc
             .encode_part(&StreamPart::ToolCallDelta {
                 id: "call_123".to_string(),
                 name: Some("lookup".to_string()),
                 arguments: String::new(),
-            })
+                wire_type: None,
+})
             .unwrap();
 
         assert!(String::from_utf8_lossy(&first).contains("response.output_item.added"));
@@ -4413,6 +4488,121 @@ mod tests {
     /// Cross-protocol reasoning (no Responses id) must be emitted WITHOUT an
     /// `id` field — fabricating one would be rejected by the Responses API.
     #[test]
+    fn test_responses_both_id_and_call_id_normalize_for_cross_protocol_pairing() {
+        // When function_call items carry both `id` (item ref) and `call_id`
+        // (function-call identifier) and the call_ids collide, the unique
+        // remapped call_id must live in IR.call_id AND in ToolResult.tool_call_id.
+        // Cross-protocol encoders (Anthropic/Chat) pair via
+        // call_id.as_deref().unwrap_or(id). Using the raw (duplicated) call_id
+        // would leave ToolCall and ToolResult mismatched → upstream 400.
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let duplicate = "call_shared";
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "review"},
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": duplicate,
+                    "name": "git_status",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": duplicate,
+                    "name": "git_diff",
+                    "arguments": "{\"path\":\"a.rs\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": duplicate,
+                    "output": "status output"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": duplicate,
+                    "output": "diff output"
+                }
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+
+        let pairs: Vec<(String, Option<String>)> = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                Content::ToolCall { id, call_id, .. } => Some((id.clone(), call_id.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pairs.len(), 2);
+        // IR.id keeps the item ref; IR.call_id is the unique function-call id.
+        assert_eq!(pairs[0].0, "fc_1");
+        assert_eq!(pairs[0].1.as_deref(), Some(duplicate));
+        assert_eq!(pairs[1].0, "fc_2");
+        let second_unique = format!("{duplicate}_1");
+        assert_eq!(pairs[1].1.as_deref(), Some(second_unique.as_str()));
+
+        let result_ids: Vec<String> = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                Content::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected = vec![
+            pairs[0].1.clone().unwrap(),
+            pairs[1].1.clone().unwrap(),
+        ];
+        assert_eq!(result_ids, expected, "ToolResult must use unique remapped call_ids");
+
+        // Anthropic cross-protocol pairing.
+        let anthropic = crate::messages::MessagesCodec::new();
+        let (a_enc, _) = anthropic.encode_request(&ir).unwrap();
+        let a_msgs = a_enc["messages"].as_array().unwrap();
+        let a_tool_use: Vec<String> = a_msgs
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter(|b| b["type"] == "tool_use")
+            .filter_map(|b| b["id"].as_str().map(String::from))
+            .collect();
+        let a_tool_result: Vec<String> = a_msgs
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter(|b| b["type"] == "tool_result")
+            .filter_map(|b| b["tool_use_id"].as_str().map(String::from))
+            .collect();
+        assert_eq!(a_tool_use, expected);
+        assert_eq!(a_tool_result, expected);
+
+        // Chat Completions cross-protocol pairing.
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let (c_enc, _) = chat.encode_request(&ir).unwrap();
+        let c_msgs = c_enc["messages"].as_array().unwrap();
+        let c_tool_calls: Vec<String> = c_msgs
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+            .filter_map(|tc| tc["id"].as_str().map(String::from))
+            .collect();
+        let c_tool_results: Vec<String> = c_msgs
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["tool_call_id"].as_str().map(String::from))
+            .collect();
+        assert_eq!(c_tool_calls, expected);
+        assert_eq!(c_tool_results, expected);
+    }
+
+    #[test]
     fn test_responses_cross_protocol_reasoning_has_no_id() {
         let codec = ResponsesCodec::new();
         let ir = tiygate_core::IrRequest {
@@ -4867,7 +5057,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hosted_tools_dropped_on_chat_completions() {
+    fn test_hosted_tools_hard_reject_on_chat_completions() {
+        // Hosted tools (web_search/file_search/...) are Responses-only.
+        // Cross-protocol conversion must hard-reject via check_lossy_conversion
+        // rather than silently filtering them out of the Chat tools array.
         let responses = ResponsesCodec::new();
         let chat = crate::chat_completions::ChatCompletionsCodec::new();
         let env = make_raw_env();
@@ -4880,12 +5073,15 @@ mod tests {
             ]
         });
         let ir = responses.decode_request(body, &env).unwrap();
-        let (encoded, _) = chat.encode_request(&ir).unwrap();
-        let tools = encoded["tools"].as_array().expect("tools");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["function"]["name"], "lookup");
+        let err = tiygate_core::protocol::lossy::check_lossy_conversion(
+            &ir,
+            chat.id(),
+            chat.capabilities(),
+        )
+        .expect_err("hosted tools must hard-reject on Chat Completions");
+        assert_eq!(err.0, tiygate_core::protocol::lossy::LossyDimension::HostedTools);
     }
+
 
     #[test]
     fn test_stream_decoder_codex_local_shell_call_finish_reason() {
@@ -5077,6 +5273,42 @@ mod tests {
                 .any(|item| item["type"] == "custom_tool_call_output"
                     && item["output"] == "tool result"),
             "custom_tool_call_output wire type must survive re-encode: {input:?}"
+        );
+    }
+
+
+    #[test]
+    fn test_stream_custom_tool_call_wire_type_fidelity() {
+        // Streaming custom_tool_call must preserve wire_type through
+        // decode → encode so same-protocol clients do not see a plain
+        // function_call.
+        let mut decoder = ResponsesStreamDecoder::new();
+        let parts = decoder
+            .feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_custom_1","name":"my_tool","input":"hello"}}"#)
+            .unwrap();
+        assert!(
+            matches!(
+                &parts[0],
+                StreamPart::ToolCallDelta {
+                    id,
+                    name: Some(name),
+                    wire_type: Some(wt),
+                    ..
+                } if id == "call_custom_1" && name == "my_tool" && wt == "custom_tool_call"
+            ),
+            "stream decode must set wire_type=custom_tool_call, got: {parts:?}"
+        );
+
+        let mut encoder = ResponsesStreamEncoder::new();
+        let bytes = encoder.encode_part(&parts[0]).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains(r#""type":"custom_tool_call""#),
+            "stream re-encode must emit custom_tool_call, got: {s}"
+        );
+        assert!(
+            !s.contains(r#""type":"function_call""#),
+            "stream re-encode must not collapse custom_tool_call to function_call: {s}"
         );
     }
 

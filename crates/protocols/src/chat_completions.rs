@@ -564,10 +564,12 @@ impl EndpointCodec for ChatCompletionsCodec {
                     id,
                     name,
                     arguments,
+                    call_id,
                     ..
                 } => {
+                    let wire_id = call_id.as_deref().unwrap_or(id);
                     tool_calls_json.push(json!({
-                        "id": id,
+                        "id": wire_id,
                         "type": "function",
                         "function": {
                             "name": name,
@@ -726,8 +728,12 @@ impl EndpointCodec for ChatCompletionsCodec {
                         id,
                         name,
                         arguments,
+                        call_id,
                         ..
                     } => {
+                        // Prefer normalized function-call id when present
+                        // (Responses items keep a separate item ref in `id`).
+                        let wire_id = call_id.as_deref().unwrap_or(id);
                         // Re-emit the tool call on the assistant message so the
                         // downstream API sees a self-consistent turn.
                         let args_str = match arguments {
@@ -735,7 +741,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                             other => other.to_string(),
                         };
                         tool_calls_json.push(json!({
-                            "id": id,
+                            "id": wire_id,
                             "type": "function",
                             "function": {
                                 "name": name,
@@ -1308,6 +1314,7 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 let tc_index = self.tool_call_index(id);
                 let resp_id = self.response_id.clone().unwrap_or_default();
@@ -1643,13 +1650,15 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                             id: id.clone(),
                                             name: Some(n),
                                             arguments: String::new(),
-                                        });
+                                            wire_type: None,
+});
                                         if !args.is_empty() {
                                             parts.push(StreamPart::ToolCallDelta {
                                                 id,
                                                 name: None,
                                                 arguments: args,
-                                            });
+                                                wire_type: None,
+});
                                         }
                                     }
                                     (Some(n), None) => {
@@ -1657,14 +1666,16 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                             id,
                                             name: Some(n),
                                             arguments: String::new(),
-                                        });
+                                            wire_type: None,
+});
                                     }
                                     (None, Some(args)) => {
                                         parts.push(StreamPart::ToolCallDelta {
                                             id,
                                             name: None,
                                             arguments: args,
-                                        });
+                                            wire_type: None,
+});
                                     }
                                     (None, None) => {}
                                 }
@@ -2336,7 +2347,8 @@ mod tests {
                 id: "tc1".to_string(),
                 name: Some("fn".to_string()),
                 arguments: "{}".to_string(),
-            },
+                wire_type: None,
+},
             StreamPart::ProgramDelta {
                 id: "prog_1".to_string(),
                 call_id: "call_prog_1".to_string(),
@@ -2420,6 +2432,7 @@ mod tests {
                 id,
                 name: None,
                 arguments,
+                ..
             } => Some((id.clone(), arguments.clone())),
             _ => None,
         });
@@ -2428,6 +2441,7 @@ mod tests {
                 id,
                 name: None,
                 arguments,
+                ..
             } => Some((id.clone(), arguments.clone())),
             _ => None,
         });
