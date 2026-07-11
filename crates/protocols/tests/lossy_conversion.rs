@@ -9,7 +9,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::HashMap;
-use tiygate_core::ir::{Content, MediaSource, ResponseFormat};
+use tiygate_core::ir::{Content, MediaSource, PromptCacheBreakpoint, PromptCacheBreakpointMode, ResponseFormat};
 use tiygate_core::protocol::lossy::{check_lossy_conversion, LossyDimension};
 use tiygate_core::{
     EndpointCapabilities, EndpointCodec, IrRequest, Message, ProtocolEndpoint, ProtocolSuite, Role,
@@ -470,4 +470,43 @@ fn codex_opaque_items_do_not_trigger_lossy_rejection() {
             "codex_opaque_items should not trigger lossy rejection at {label}: {err:?}"
         );
     }
+}
+
+// --- Prompt cache breakpoint ---
+
+#[test]
+fn prompt_cache_breakpoint_rejected_outside_openai() {
+    let mut req = text_only_req();
+    req.messages[0].content.push(Content::Text {
+        text: "cached prefix".to_string(),
+        annotations: None,
+        prompt_cache_breakpoint: Some(PromptCacheBreakpoint {
+            mode: PromptCacheBreakpointMode::Explicit,
+        }),
+    });
+
+    // Chat and Responses carry the breakpoint on the canonical content block.
+    assert!(
+        check_lossy_conversion(&req, &chat_endpoint(), &chat_caps()).is_ok(),
+        "Chat should accept prompt_cache_breakpoint"
+    );
+    assert!(
+        check_lossy_conversion(&req, &responses_endpoint(), &responses_caps()).is_ok(),
+        "Responses should accept prompt_cache_breakpoint"
+    );
+
+    // Anthropic and Gemini have no equivalent carrier — reject, not silently drop.
+    let (dim, _) =
+        check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert_eq!(
+        dim,
+        LossyDimension::PromptCacheBreakpoint,
+        "Anthropic should reject prompt_cache_breakpoint"
+    );
+    let (dim, _) = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps()).unwrap_err();
+    assert_eq!(
+        dim,
+        LossyDimension::PromptCacheBreakpoint,
+        "Gemini should reject prompt_cache_breakpoint"
+    );
 }

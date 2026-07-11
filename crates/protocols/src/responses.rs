@@ -795,7 +795,11 @@ impl EndpointCodec for ResponsesCodec {
                 FinishReason::Stop => "completed",
                 FinishReason::Length => "incomplete",
                 FinishReason::ContentFilter => "incomplete",
-                FinishReason::ToolCalls => "incomplete",
+                // OpenAI Responses reports `status: "completed"` for tool-call
+                // turns.  The streaming encoder already maps ToolCalls →
+                // "completed"; align the non-streaming encoder so cross-protocol
+                // round-trips preserve the status.
+                FinishReason::ToolCalls => "completed",
                 _ => "completed",
             });
         }
@@ -1494,13 +1498,30 @@ impl EndpointCodec for ResponsesCodec {
                 }
             }
         }
+        // OpenAI Responses reports `status: "completed"` even for tool-call
+        // turns — the only reliable signal that the turn ended to call a tool
+        // is the presence of a `function_call` / `program` / `local_shell_call`
+        // / `custom_tool_call` output item, NOT the status.  This mirrors the
+        // streaming decoder's `saw_function_call` latch so the non-streaming
+        // HTTP path emits `FinishReason::ToolCalls` for PTC turns, otherwise
+        // the cross-protocol encoder produces `finish_reason: "stop"` and the
+        // client never runs the tool.
+        let has_tool_call = content.iter().any(|c| {
+            matches!(
+                c,
+                Content::ToolCall { .. } | Content::Program { .. }
+            )
+        });
         let finish_reason = body["status"].as_str().map(|s| match s {
-            "completed" => FinishReason::Stop,
+            "completed" => {
+                if has_tool_call {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                }
+            }
             "incomplete" => {
-                if content
-                    .iter()
-                    .any(|c| matches!(c, Content::ToolCall { .. }))
-                {
+                if has_tool_call {
                     FinishReason::ToolCalls
                 } else {
                     FinishReason::Length
@@ -2801,6 +2822,70 @@ mod tests {
         assert_eq!(encoded["output"][3]["type"], "program_output");
         assert_eq!(encoded["output"][4]["type"], "message");
         assert_eq!(encoded["output"][4]["content"][0]["text"], "after");
+    }
+
+    #[test]
+    fn test_http_decode_ptc_finish_reason_is_tool_calls() {
+        // Regression: HTTP decode_response must map `status:"completed"` to
+        // `FinishReason::ToolCalls` when the output contains a `program` item,
+        // mirroring the streaming decoder's `saw_function_call` latch.
+        // Without this, a cross-protocol encoder emits `finish_reason:"stop"`
+        // and the client never runs the tool.
+        let codec = ResponsesCodec::new();
+        let body = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {"type": "program", "id": "prog_1", "call_id": "call_prog_1", "code": "return 1", "fingerprint": "fp_1"}
+            ]
+        });
+        let decoded = codec.decode_response(body).unwrap();
+        assert_eq!(
+            decoded.finish_reason,
+            Some(FinishReason::ToolCalls),
+            "PTC program response must map to ToolCalls, not Stop"
+        );
+
+        // A pure-text completed response must still map to Stop.
+        let body_text = json!({
+            "id": "resp_2",
+            "status": "completed",
+            "output": [
+                {"type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+            ]
+        });
+        let decoded_text = codec.decode_response(body_text).unwrap();
+        assert_eq!(
+            decoded_text.finish_reason,
+            Some(FinishReason::Stop),
+            "pure-text response must map to Stop"
+        );
+    }
+
+    #[test]
+    fn test_http_encode_tool_calls_status_is_completed() {
+        // Regression: encode_response must map ToolCalls → "completed" to
+        // match the streaming encoder and OpenAI's wire behavior.
+        let codec = ResponsesCodec::new();
+        let ir = IrResponse {
+            content: vec![Content::ToolCall {
+                id: "fc_1".to_string(),
+                call_id: Some("call_1".to_string()),
+                name: "get_weather".to_string(),
+                arguments: json!({}),
+                caller: None,
+            }],
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: None,
+            response_id: Some("resp_1".to_string()),
+            stop_details: None,
+            extensions: HashMap::new(),
+        };
+        let encoded = codec.encode_response(&ir).unwrap();
+        assert_eq!(
+            encoded["status"], "completed",
+            "ToolCalls must encode to status 'completed', not 'incomplete'"
+        );
     }
 
     #[test]

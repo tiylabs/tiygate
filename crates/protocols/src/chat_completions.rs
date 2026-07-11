@@ -220,15 +220,15 @@ impl EndpointCodec for ChatCompletionsCodec {
             }
         }
 
-        // Extract system message(s) if present. OpenAI permits multiple
-        // system/developer messages anywhere in the list; concatenate all of
-        // their text parts so none are lost. The previous implementation only
-        // captured the first text part of the first system message.
-        let system_chunks: Vec<String> = messages
-            .iter()
-            .filter(|message| message.role == Role::System)
-            .filter(|message| {
-                !message.content.iter().any(|content| {
+        // Detect whether ANY system message carries a prompt-cache
+        // breakpoint.  When breakpoints are present, ALL system messages
+        // must remain in the ordered message list — flattening even the
+        // non-breakpoint ones into the top-level `system` string would
+        // reorder them relative to the breakpoint-carrying messages and
+        // shift the cache boundary position.
+        let any_system_breakpoint = messages.iter().any(|message| {
+            message.role == Role::System
+                && message.content.iter().any(|content| {
                     matches!(
                         content,
                         Content::Text {
@@ -240,39 +240,52 @@ impl EndpointCodec for ChatCompletionsCodec {
                         }
                     )
                 })
-            })
-            .flat_map(|message| {
-                message.content.iter().filter_map(|content| match content {
-                    Content::Text { text, .. } => Some(text.clone()),
-                    _ => None,
+        });
+
+        // Extract system message(s) if present. OpenAI permits multiple
+        // system/developer messages anywhere in the list; concatenate all of
+        // their text parts so none are lost. The previous implementation only
+        // captured the first text part of the first system message.
+        //
+        // When any system message carries a breakpoint, skip extraction so
+        // every system message stays in the ordered list at its original
+        // position (see filter below).
+        let system_chunks: Vec<String> = if any_system_breakpoint {
+            Vec::new()
+        } else {
+            messages
+                .iter()
+                .filter(|message| message.role == Role::System)
+                .flat_map(|message| {
+                    message.content.iter().filter_map(|content| match content {
+                        Content::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
         let system = if system_chunks.is_empty() {
             None
         } else {
             Some(system_chunks.join("\n"))
         };
 
-        // Keep system/developer messages that carry explicit prompt-cache
-        // breakpoints in the ordered message list. Flattening those into the
-        // request-level system string would discard the exact cache boundary.
+        // Keep system/developer messages in the ordered message list when
+        // any of them carry explicit prompt-cache breakpoints.  When no
+        // breakpoints are present, system messages are flattened into the
+        // request-level system string (above) and removed from the list.
         let messages: Vec<Message> = messages
             .into_iter()
             .filter(|message| {
-                message.role != Role::System
-                    || message.content.iter().any(|content| {
-                        matches!(
-                            content,
-                            Content::Text {
-                                prompt_cache_breakpoint: Some(_),
-                                ..
-                            } | Content::Media {
-                                prompt_cache_breakpoint: Some(_),
-                                ..
-                            }
-                        )
-                    })
+                if message.role != Role::System {
+                    return true;
+                }
+                if any_system_breakpoint {
+                    // Keep all system messages to preserve ordering.
+                    return true;
+                }
+                // No breakpoints — system messages were extracted above.
+                false
             })
             .collect();
 
@@ -2012,6 +2025,71 @@ mod tests {
             encoded["messages"][0]["content"][1]["image_url"]["detail"],
             "original"
         );
+    }
+
+    #[test]
+    fn test_system_messages_with_breakpoint_preserve_order() {
+        // Regression: when any system message carries a prompt-cache
+        // breakpoint, ALL system messages must remain in the ordered message
+        // list at their original positions.  Previously, non-breakpoint system
+        // messages were flattened into the top-level `system` string and
+        // emitted first, reordering [system+breakpoint, system+plain] →
+        // [system+plain, system+breakpoint] and shifting the cache boundary.
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let body = json!({
+            "model": "gpt-5.6",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{
+                        "type": "text",
+                        "text": "breakpoint system",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    }]
+                },
+                {
+                    "role": "system",
+                    "content": "plain system"
+                },
+                {
+                    "role": "user",
+                    "content": "hello"
+                }
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        // system string must be empty — no flattening when breakpoints exist.
+        assert!(ir.system.is_none(), "system must be None when breakpoints present");
+        // All three messages preserved in order.
+        assert_eq!(ir.messages.len(), 3);
+        // First message: system with breakpoint.
+        assert!(matches!(ir.messages[0].role, Role::System));
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Text { text, prompt_cache_breakpoint: Some(_), .. } if text == "breakpoint system"
+        )));
+        // Second message: plain system (no breakpoint).
+        assert!(matches!(ir.messages[1].role, Role::System));
+        assert!(ir.messages[1].content.iter().any(|c| matches!(
+            c,
+            Content::Text { text, prompt_cache_breakpoint: None, .. } if text == "plain system"
+        )));
+        // Third message: user.
+        assert!(matches!(ir.messages[2].role, Role::User));
+
+        // Re-encode and verify order is preserved.
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let msgs = encoded["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(
+            msgs[0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(msgs[1]["role"], "system");
+        assert_eq!(msgs[1]["content"], "plain system");
+        assert_eq!(msgs[2]["role"], "user");
     }
 
     #[test]
