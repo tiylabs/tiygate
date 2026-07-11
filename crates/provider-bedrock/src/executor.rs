@@ -163,12 +163,11 @@ impl BedrockExecutor {
         // reject ToolCall / ToolResult content blocks that would otherwise
         // be flattened away by the text-only body builder.
         check_lossy_conversion(ir, &endpoint, &caps).map_err(|(_dim, err)| err)?;
-        let has_tool_content = ir.messages.iter().flat_map(|m| m.content.iter()).any(|c| {
-            matches!(
-                c,
-                Content::ToolCall { .. } | Content::ToolResult { .. }
-            )
-        });
+        let has_tool_content = ir
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .any(|c| matches!(c, Content::ToolCall { .. } | Content::ToolResult { .. }));
         if has_tool_content {
             return Err(tiygate_core::Error::LossyRejection(
                 "tool_calling not supported by Bedrock Converse executor (tools not encoded in request body)"
@@ -247,8 +246,8 @@ impl BedrockExecutor {
                         arguments: tu["input"].clone(),
                         call_id: None,
                         caller: None,
-            wire_type: None,
-        });
+                        wire_type: None,
+                    });
                 }
             }
         }

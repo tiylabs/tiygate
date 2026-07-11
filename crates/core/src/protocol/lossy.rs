@@ -334,7 +334,10 @@ pub fn check_lossy_conversion(
         .and_then(|v| v.as_array())
         .is_some_and(|items| !items.is_empty());
     if (has_multi_agent_config || has_multi_agent_items)
-        && !matches!(egress.suite, crate::protocol::ProtocolSuite::OpenAiResponses)
+        && !matches!(
+            egress.suite,
+            crate::protocol::ProtocolSuite::OpenAiResponses
+        )
     {
         return Err((
             LossyDimension::MultiAgent,

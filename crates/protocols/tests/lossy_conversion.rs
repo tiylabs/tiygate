@@ -9,7 +9,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::HashMap;
-use tiygate_core::ir::{Content, MediaSource, PromptCacheBreakpoint, PromptCacheBreakpointMode, ResponseFormat};
+use tiygate_core::ir::{
+    Content, MediaSource, PromptCacheBreakpoint, PromptCacheBreakpointMode, ResponseFormat,
+};
 use tiygate_core::protocol::lossy::{check_lossy_conversion, LossyDimension};
 use tiygate_core::{
     EndpointCapabilities, EndpointCodec, IrRequest, Message, ProtocolEndpoint, ProtocolSuite, Role,
@@ -435,16 +437,13 @@ fn custom_tools_rejected_outside_openai() {
     });
     // Custom tools are expressible on Chat and Responses.
     assert!(check_lossy_conversion(&custom, &chat_endpoint(), &chat_caps()).is_ok());
-    assert!(
-        check_lossy_conversion(&custom, &responses_endpoint(), &responses_caps()).is_ok()
-    );
+    assert!(check_lossy_conversion(&custom, &responses_endpoint(), &responses_caps()).is_ok());
     // Custom tools are NOT expressible on Anthropic Messages or Gemini —
     // reject instead of silently dropping.
     let (dim, _) =
         check_lossy_conversion(&custom, &anthropic_endpoint(), &messages_caps()).unwrap_err();
     assert_eq!(dim, LossyDimension::CustomTools);
-    let (dim, _) =
-        check_lossy_conversion(&custom, &gemini_endpoint(), &gemini_caps()).unwrap_err();
+    let (dim, _) = check_lossy_conversion(&custom, &gemini_endpoint(), &gemini_caps()).unwrap_err();
     assert_eq!(dim, LossyDimension::CustomTools);
 }
 
@@ -516,8 +515,7 @@ fn multi_agent_rejected_outside_responses() {
         check_lossy_conversion(&with_items, &responses_endpoint(), &responses_caps()).is_ok(),
         "Responses should accept multi_agent_items"
     );
-    let (dim, _) =
-        check_lossy_conversion(&with_items, &chat_endpoint(), &chat_caps()).unwrap_err();
+    let (dim, _) = check_lossy_conversion(&with_items, &chat_endpoint(), &chat_caps()).unwrap_err();
     assert_eq!(dim, LossyDimension::MultiAgent);
 }
 

@@ -279,13 +279,10 @@ fn decode_responses_media_part(part: &Value) -> Option<Content> {
                     prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
                 });
             }
-            let raw_url = if let Some(s) = part["image_url"].as_str() {
-                s
-            } else if let Some(s) = part["image_url"]["url"].as_str() {
-                s
-            } else {
-                ""
-            };
+            let raw_url = part["image_url"]
+                .as_str()
+                .or_else(|| part["image_url"]["url"].as_str())
+                .unwrap_or_default();
             if raw_url.is_empty() {
                 return None;
             }
