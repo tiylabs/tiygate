@@ -50,13 +50,16 @@
 |------|:---:|:---:|:---:|:---:|:---:|
 | `reasoning` | ✅ | ✅ | ✅ | ✅ | N/A |
 | `extended_reasoning` | ❌ | ✅ | ✅ | ✅ | N/A |
-| `structured_output` | ✅ | ❌ | ✅ | ✅ | N/A |
-| `response_format json_schema` | ✅ | ❌ | ✅ | ✅ | N/A |
-| `response_format json_object` | ✅ | ❌ | ✅ | ✅ | N/A |
+| `structured_output` | ✅ | ✅ | ✅ | ✅ | N/A |
+| `response_format json_schema` | ✅ | ✅ | ✅ | ✅ | N/A |
+| `response_format json_object` | ✅ | ✅¹ | ✅ | ✅ | N/A |
 
 **有损组合（阶段 1-3 已知）**：
-- 任意协议 → `messages` 且请求含 `response_format` → **拒绝**（Anthropic 不支持结构化输出）
 - `chat_completions` → 任意 且请求含 `extended_reasoning` → OpenAI 不产生 reasoning，但也不报错，所以 **⚠️ 方向单向有损**
+
+> ¹ Anthropic Messages 以 `output_config.format: {type: "json_schema"}` 表达结构化输出；
+> `json_object` 映射为根类型为 `object` 的 JSON Schema。Anthropic 原生不含 OpenAI 的
+> `json_object` 简写。
 
 ## 4. 确定性/种子
 
@@ -72,7 +75,7 @@
 |----------------------|:---:|:---:|:---:|:---:|
 | **chat_completions** | PassThrough ✅ | ⚠️ parallel_tc 可能拒绝 | ✅ | ✅ |
 | **messages** | ✅ | PassThrough ✅ | ✅ | ⚠️ tool_use→functionCall 有损 |
-| **responses** | ⚠️ file_id 丢失 | ⚠️ file_id + structured_output 拒绝 | PassThrough ✅ | ⚠️ file_id+audio 拒绝 |
+| **responses** | ⚠️ file_id 丢失 | ⚠️ file_id | PassThrough ✅ | ⚠️ file_id+audio 拒绝 |
 | **gemini** | ⚠️ inline video/audio 拒绝 | ⚠️ inline video/audio 拒绝 | ⚠️ inline video/audio 拒绝 | PassThrough ✅ |
 
 ## 维护策略

@@ -272,28 +272,26 @@ fn lossy_parallel_tool_calls_chat_to_messages() {
 }
 
 #[test]
-fn lossy_no_response_format_in_anthropic() {
-    // Anthropic messages protocol does not support response_format
-    // (structured output). The gateway must reject when the request
-    // contains a non-null response_format.
+fn structured_output_supported_in_anthropic() {
+    // Anthropic Messages supports Structured Outputs through
+    // `output_config.format` with a `json_schema` format.
     let ingress = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let egress = find_codec(ProtocolSuite::AnthropicMessages, "messages");
 
     assert!(ingress.capabilities().structured_output);
-    assert!(!egress.capabilities().structured_output);
+    assert!(egress.capabilities().structured_output);
     assert!(ingress.capabilities().lossy_default_reject);
     assert!(egress.capabilities().lossy_default_reject);
 }
 
 #[test]
-fn lossy_structured_output_chat_to_anthropic() {
-    // OpenAI supports response_format. Anthropic messages does not.
-    // Gateway should reject when response_format is non-null.
+fn structured_output_chat_to_anthropic_is_supported() {
+    // Both protocols support a JSON Schema response format.
     let ingress = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let egress = find_codec(ProtocolSuite::AnthropicMessages, "messages");
 
     assert!(ingress.capabilities().structured_output);
-    assert!(!egress.capabilities().structured_output);
+    assert!(egress.capabilities().structured_output);
     assert!(ingress.capabilities().lossy_default_reject);
     assert!(egress.capabilities().lossy_default_reject);
 }
@@ -749,10 +747,9 @@ fn runtime_tool_choice_to_gemini_accepted() {
 }
 
 #[test]
-fn runtime_lossy_reject_response_format_to_anthropic() {
-    // `response_format: { "type": "json_schema", ... }` (OpenAI) → Anthropic.
-    // Anthropic has no equivalent of json_schema response_format — only
-    // free-form text. The runtime must surface a lossy rejection.
+fn json_schema_response_format_encodes_to_anthropic() {
+    // OpenAI's JSON Schema response format maps to Anthropic's
+    // `output_config.format` Structured Outputs field.
     let ingress = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let body = json!({
         "model": "m",
@@ -765,14 +762,12 @@ fn runtime_lossy_reject_response_format_to_anthropic() {
     let ir = ingress.decode_request(body, &make_env()).expect("decode");
     // Sanity: the IR models response_format.
     assert!(ir.response_format.is_some());
-    // The runtime contract: Anthropic cannot express json_schema, so
-    // the gateway must reject. We simulate the check inline.
     let egress = find_codec(ProtocolSuite::AnthropicMessages, "messages");
     let caps = egress.capabilities();
-    assert!(
-        caps.lossy_default_reject,
-        "Anthropic must declare lossy_default_reject"
-    );
+    assert!(tiygate_core::protocol::lossy::check_lossy_conversion(&ir, egress.id(), caps,).is_ok());
+    let (encoded, _) = egress.encode_request(&ir).expect("encode");
+    assert_eq!(encoded["output_config"]["format"]["type"], "json_schema");
+    assert_eq!(encoded["output_config"]["format"]["schema"], json!({}));
 }
 
 #[test]

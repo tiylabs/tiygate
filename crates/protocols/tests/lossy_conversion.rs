@@ -301,7 +301,7 @@ fn data_url_parsed_as_inline_passes_anthropic_lossy() {
 // --- Dimension 6: structured output ---
 
 #[test]
-fn json_schema_to_anthropic_rejected() {
+fn json_schema_to_anthropic_passes() {
     let mut req = text_only_req();
     with_response_format(
         &mut req,
@@ -311,15 +311,14 @@ fn json_schema_to_anthropic_rejected() {
             strict: Some(true),
         },
     );
-    let err = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps());
-    assert_eq!(extract_dim(&err), Some(LossyDimension::StructuredOutput));
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
 }
 
 #[test]
-fn json_object_to_responses_passes() {
+fn json_object_to_anthropic_passes() {
     let mut req = text_only_req();
     with_response_format(&mut req, ResponseFormat::JsonObject);
-    assert!(check_lossy_conversion(&req, &responses_endpoint(), &responses_caps()).is_ok());
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
 }
 
 #[test]
@@ -366,7 +365,7 @@ fn text_only_round_trip_never_rejected() {
 }
 
 #[test]
-fn error_message_names_dimension() {
+fn structured_output_is_not_reported_as_lossy_for_anthropic() {
     let mut req = text_only_req();
     with_response_format(
         &mut req,
@@ -376,13 +375,7 @@ fn error_message_names_dimension() {
             strict: None,
         },
     );
-    let (_, err) = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps())
-        .expect_err("expected lossy rejection");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("response_format"),
-        "error should name the dimension; got: {msg}"
-    );
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
 }
 
 #[test]

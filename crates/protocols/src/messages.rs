@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 
 use tiygate_core::{
     Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
-    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder,
-    StreamPart, Tool, Usage,
+    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, ResponseFormat, Role, StreamDecoder,
+    StreamEncoder, StreamPart, Tool, Usage,
 };
 
 /// Map an `ErrorClass` to the Anthropic-native `error.type` string.
@@ -59,6 +59,48 @@ fn flatten_anthropic_content(value: &Value) -> String {
     String::new()
 }
 
+/// Decode Anthropic Structured Outputs into the canonical response format.
+///
+/// Anthropic exposes this as `output_config.format`, whose currently supported
+/// native format is `json_schema`. There is no native schema name, so use a
+/// stable IR name when the request subsequently crosses to an OpenAI protocol.
+fn decode_output_format(output_config: &Value) -> Option<ResponseFormat> {
+    let format = output_config.get("format")?;
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return None;
+    }
+
+    let schema = format.get("schema")?.clone();
+    if !schema.is_object() {
+        return None;
+    }
+
+    Some(ResponseFormat::JsonSchema {
+        name: "response".to_string(),
+        schema,
+        // Anthropic JSON outputs constrain the response to the supplied schema.
+        strict: Some(true),
+    })
+}
+
+/// Encode the canonical response format as Anthropic's `output_config.format`.
+fn encode_output_format(format: &ResponseFormat) -> Option<Value> {
+    match format {
+        ResponseFormat::JsonSchema { schema, .. } => Some(json!({
+            "type": "json_schema",
+            "schema": schema,
+        })),
+        // Anthropic does not have OpenAI's `json_object` shorthand. A JSON
+        // Schema whose root is an object preserves its semantics while using
+        // the native Structured Outputs mechanism.
+        ResponseFormat::JsonObject => Some(json!({
+            "type": "json_schema",
+            "schema": {"type": "object"},
+        })),
+        ResponseFormat::Text => None,
+    }
+}
+
 pub struct MessagesCodec {
     id: ProtocolEndpoint,
     capabilities: EndpointCapabilities,
@@ -83,7 +125,7 @@ impl MessagesCodec {
                 override_model_in_body: false,
                 ingress_routes: &[("POST", "/v1/messages")],
                 multimodal: true,
-                structured_output: false,
+                structured_output: true,
                 function_calling: true,
                 // §1 of docs/protocol-capability-matrix.md: parallel tool
                 // calls are lossy when crossing chat→messages (Anthropic
@@ -353,7 +395,7 @@ impl EndpointCodec for MessagesCodec {
             messages,
             tools,
             params,
-            response_format: None,
+            response_format: body.get("output_config").and_then(decode_output_format),
             stream,
             ingress_protocol: self.id.clone(),
             metadata: body.get("metadata").and_then(|m| {
@@ -515,6 +557,14 @@ impl EndpointCodec for MessagesCodec {
             // Messages 协议要求 max_tokens 必填；上游未提供时填充默认值 64k
             "max_tokens": ir.params.max_tokens.unwrap_or(65536),
         });
+
+        // Anthropic's `output_config` carries both Structured Outputs format
+        // and adaptive-thinking effort. Accumulate its fields so either
+        // feature can be used alone or both can be used together.
+        let mut output_config = serde_json::Map::new();
+        if let Some(format) = ir.response_format.as_ref().and_then(encode_output_format) {
+            output_config.insert("format".to_string(), format);
+        }
 
         // 写缓存（prompt caching）注入开关。
         //
@@ -743,8 +793,9 @@ impl EndpointCodec for MessagesCodec {
                     });
                 }
                 body["thinking"] = t;
-                body["output_config"] = json!({
-                    "effort": match effort {
+                output_config.insert(
+                    "effort".to_string(),
+                    json!(match effort {
                         tiygate_core::ThinkingEffort::None => "low",
                         tiygate_core::ThinkingEffort::Minimal => "low",
                         tiygate_core::ThinkingEffort::Low => "low",
@@ -752,8 +803,8 @@ impl EndpointCodec for MessagesCodec {
                         tiygate_core::ThinkingEffort::High => "high",
                         tiygate_core::ThinkingEffort::XHigh => "xhigh",
                         tiygate_core::ThinkingEffort::Max => "max",
-                    }
-                });
+                    }),
+                );
             } else if let Some(budget) = thinking.budget_tokens {
                 // Budget-based enabled thinking (traditional mechanism).
                 // Anthropic's enabled type requires budget_tokens; when only
@@ -768,6 +819,9 @@ impl EndpointCodec for MessagesCodec {
                 }
                 body["thinking"] = t;
             }
+        }
+        if !output_config.is_empty() {
+            body["output_config"] = Value::Object(output_config);
         }
         // tool_choice: convert normalized extensions format to Anthropic native
         if let Some(tc) = ir.extensions.get("tool_choice") {
@@ -1671,6 +1725,60 @@ mod tests {
         assert_eq!(ir.model, "claude-sonnet-4-20250514");
         assert_eq!(ir.messages.len(), 1);
         assert_eq!(ir.params.max_tokens, Some(100));
+    }
+
+    #[test]
+    fn test_structured_output_round_trip_preserves_format_and_effort() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        let schema = json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false,
+        });
+        let request = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {
+                "effort": "high",
+                "format": {"type": "json_schema", "schema": schema},
+            },
+        });
+
+        let ir = codec.decode_request(request, &env).unwrap();
+        assert!(matches!(
+            ir.response_format,
+            Some(ResponseFormat::JsonSchema { .. })
+        ));
+        assert_eq!(
+            ir.params
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.effort),
+            Some(tiygate_core::ThinkingEffort::High)
+        );
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(encoded["output_config"]["format"]["schema"], schema);
+        assert_eq!(encoded["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_json_object_encodes_as_anthropic_object_schema() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        let mut ir = codec.decode_request(make_basic_request(), &env).unwrap();
+        ir.response_format = Some(ResponseFormat::JsonObject);
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(
+            encoded["output_config"]["format"],
+            json!({"type": "json_schema", "schema": {"type": "object"}})
+        );
     }
 
     #[test]
