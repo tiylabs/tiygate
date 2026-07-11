@@ -10,7 +10,7 @@ export function fmtTokens(value?: number | null): string {
 /** Format a micro-USD integer amount as USD, preserving extra precision for sub-dollar values. */
 export function fmtUsdFromMicros(value?: number | null): string {
   if (value === null || value === undefined) return "—";
-  return new Intl.NumberFormat(undefined, {
+  return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
     minimumFractionDigits: 2,
