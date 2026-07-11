@@ -391,15 +391,23 @@ impl EndpointCodec for ResponsesCodec {
         let stream = body["stream"].as_bool().unwrap_or(false);
         let system = body["instructions"].as_str().map(String::from);
         let mut messages: Vec<Message> = Vec::new();
-        let mut codex_opaque_items: Vec<Value> = Vec::new();
+        // Ordered bag of Responses-only opaque input items (Codex + multi-agent).
+        // Each entry is `{ "index": <original_input_index>, "item": <raw_json> }`
+        // so same-protocol re-encode can restore original interleaving.
+        let mut opaque_input_items: Vec<Value> = Vec::new();
+        // Separate multi-agent presence bag for lossy rejection (content only).
         let mut multi_agent_items: Vec<Value> = Vec::new();
 
         if let Some(arr) = body["input"].as_array() {
             let mut call_id_counts: HashMap<String, usize> = HashMap::new();
             let mut call_id_remap: HashMap<String, VecDeque<String>> = HashMap::new();
             let mut used_call_ids: HashSet<String> = HashSet::new();
+            // When an opaque item appears between two same-role messages,
+            // keep those messages separate so ordered opaque replay can
+            // reinsert the item at its original index.
+            let mut break_role_merge = false;
 
-            for item in arr {
+            for (input_index, item) in arr.iter().enumerate() {
                 // Responses typed items (function_call, function_call_output,
                 // reasoning) do NOT carry a `role` field — their semantic role
                 // is implied by the item type. Determine role from `type` first
@@ -434,21 +442,31 @@ impl EndpointCodec for ResponsesCodec {
                         | Some("context_compaction")
                 ) {
                     // Known Codex opaque item types: preserve the raw JSON
-                    // for same-protocol replay. Cross-protocol egress drops
-                    // these silently (no lossy rejection). Must be checked
-                    // BEFORE the content-based branches because some opaque
-                    // items (e.g. agent_message) carry a `content` field.
-                    codex_opaque_items.push(item.clone());
+                    // with its original input index for same-protocol replay.
+                    // Cross-protocol egress drops these silently (no lossy
+                    // rejection). Must be checked BEFORE the content-based
+                    // branches because some opaque items (e.g. agent_message)
+                    // carry a `content` field.
+                    opaque_input_items.push(json!({
+                        "index": input_index,
+                        "item": item,
+                    }));
                     vec![]
                 } else if matches!(
                     item["type"].as_str(),
                     Some("multi_agent_call") | Some("multi_agent_call_output")
                 ) {
                     // GPT-5.6 Multi-agent Beta items: keep raw JSON under a
-                    // dedicated extension so same-protocol re-encode is
-                    // lossless and cross-protocol conversion can hard-reject
-                    // (unlike codex_opaque_items which drop silently).
+                    // dedicated ordered extension so same-protocol re-encode
+                    // restores original interleaving, and keep a content-only
+                    // multi_agent_items bag so cross-protocol conversion can
+                    // hard-reject (unlike codex opaque items which drop
+                    // silently).
                     multi_agent_items.push(item.clone());
+                    opaque_input_items.push(json!({
+                        "index": input_index,
+                        "item": item,
+                    }));
                     vec![]
                 } else if let Some(text) = item["content"].as_str() {
                     vec![Content::Text {
@@ -537,6 +555,7 @@ impl EndpointCodec for ResponsesCodec {
                             .unwrap_or(json!({})),
                         call_id: ir_call_id,
                         caller: decode_tool_caller(item),
+                        wire_type: None,
                     }]
                 } else if item["type"] == "function_call_output" {
                     // `output` is usually a string but some clients send a
@@ -561,6 +580,7 @@ impl EndpointCodec for ResponsesCodec {
                         content: output,
                         id: item_id,
                         caller: decode_tool_caller(item),
+                        wire_type: None,
                     }]
                 } else if item["type"] == "reasoning" {
                     // Reasoning input item (replayed assistant chain-of-thought).
@@ -602,6 +622,7 @@ impl EndpointCodec for ResponsesCodec {
                         name: "local_shell".to_string(),
                         arguments,
                         caller: None,
+                        wire_type: Some("local_shell_call".to_string()),
                     }]
                 } else if item["type"] == "local_shell_call_output" {
                     let output = match &item["output"] {
@@ -616,10 +637,13 @@ impl EndpointCodec for ResponsesCodec {
                         content: output,
                         id: None,
                         caller: None,
+                        wire_type: Some("local_shell_call_output".to_string()),
                     }]
                 } else if item["type"] == "custom_tool_call" {
                     // Codex custom_tool_call: map to a ToolCall with the
                     // tool name and input text wrapped as JSON arguments.
+                    // Preserve wire_type so same-protocol re-encode restores
+                    // `custom_tool_call` rather than function_call.
                     let id = responses_call_id(item).unwrap_or("").to_string();
                     let name = item["name"].as_str().unwrap_or("").to_string();
                     let input_text = item["input"].as_str().unwrap_or("").to_string();
@@ -629,6 +653,7 @@ impl EndpointCodec for ResponsesCodec {
                         name,
                         arguments: json!({"input": input_text}),
                         caller: None,
+                        wire_type: Some("custom_tool_call".to_string()),
                     }]
                 } else if item["type"] == "custom_tool_call_output" {
                     let output = match &item["output"] {
@@ -643,6 +668,7 @@ impl EndpointCodec for ResponsesCodec {
                         content: output,
                         id: None,
                         caller: None,
+                        wire_type: Some("custom_tool_call_output".to_string()),
                     }]
                 } else {
                     vec![Content::Text {
@@ -657,13 +683,20 @@ impl EndpointCodec for ResponsesCodec {
                 // cross-protocol conversion: the Chat Completions encoder gates
                 // reasoning_content on the presence of tool_calls *within the
                 // same message*, so splitting them would silently drop reasoning.
+                //
+                // Exception: when an opaque Codex / multi-agent item sits between
+                // two same-role messages, do NOT merge them — otherwise the
+                // original input interleaving cannot be restored on re-encode.
                 if content.is_empty() {
-                    // Opaque Codex items produce no IR content; skip message
-                    // creation to avoid inserting empty placeholder messages.
+                    // Opaque Codex / multi-agent items produce no IR content;
+                    // skip message creation and force the next same-role item
+                    // to start a new message so ordered opaque replay stays
+                    // index-aligned with modeled items.
+                    break_role_merge = true;
                     continue;
                 }
                 if let Some(last) = messages.last_mut() {
-                    if last.role == role {
+                    if last.role == role && !break_role_merge {
                         last.content.extend(content);
                     } else {
                         messages.push(Message { role, content });
@@ -671,6 +704,7 @@ impl EndpointCodec for ResponsesCodec {
                 } else {
                     messages.push(Message { role, content });
                 }
+                break_role_merge = false;
             }
         } else if let Some(text) = body["input"].as_str() {
             // OpenAI Responses API allows `input` to be a plain string
@@ -692,47 +726,78 @@ impl EndpointCodec for ResponsesCodec {
                 arr.iter()
                     .map(|t| {
                         let tool_type = t["type"].as_str().map(String::from);
-                        let is_function = matches!(tool_type.as_deref(), None | Some("function"));
-                        if is_function {
-                            let mut config = t.as_object().cloned().unwrap_or_default();
-                            for key in ["type", "name", "description", "parameters"] {
-                                config.remove(key);
+                        match tool_type.as_deref() {
+                            None | Some("function") => {
+                                let mut config = t.as_object().cloned().unwrap_or_default();
+                                for key in ["type", "name", "description", "parameters"] {
+                                    config.remove(key);
+                                }
+                                Tool {
+                                    name: t["name"].as_str().unwrap_or("").to_string(),
+                                    description: t["description"].as_str().map(String::from),
+                                    parameters: t["parameters"].as_object().map(|p| json!(p)),
+                                    required: false,
+                                    tool_type: if tool_type.as_deref() == Some("function") {
+                                        Some("function".to_string())
+                                    } else {
+                                        None
+                                    },
+                                    config: (!config.is_empty()).then_some(Value::Object(config)),
+                                }
                             }
-                            Tool {
-                                name: t["name"].as_str().unwrap_or("").to_string(),
-                                description: t["description"].as_str().map(String::from),
-                                parameters: t["parameters"].as_object().map(|p| json!(p)),
-                                required: false,
-                                tool_type: if tool_type.as_deref() == Some("function") {
-                                    Some("function".to_string())
-                                } else {
-                                    None
-                                },
-                                config: (!config.is_empty()).then_some(Value::Object(config)),
+                            Some("custom") => {
+                                // OpenAI custom tools are first-class on Chat and
+                                // Responses (not hosted tools). Keep remaining
+                                // non-standard fields in config for round-trip.
+                                let mut config = serde_json::Map::new();
+                                if let Some(obj) = t.as_object() {
+                                    for (k, v) in obj {
+                                        if k != "type"
+                                            && k != "name"
+                                            && k != "description"
+                                            && k != "parameters"
+                                        {
+                                            config.insert(k.clone(), v.clone());
+                                        }
+                                    }
+                                }
+                                Tool {
+                                    name: t["name"].as_str().unwrap_or("").to_string(),
+                                    description: t["description"].as_str().map(String::from),
+                                    parameters: t.get("parameters").cloned(),
+                                    required: false,
+                                    tool_type: Some("custom".to_string()),
+                                    config: if config.is_empty() {
+                                        None
+                                    } else {
+                                        Some(Value::Object(config))
+                                    },
+                                }
                             }
-                        } else {
-                            // Hosted tools: preserve type + remaining fields.
-                            let mut config = t.as_object().cloned().unwrap_or_default();
-                            config.remove("type");
-                            let name = config
-                                .remove("name")
-                                .and_then(|v| v.as_str().map(String::from))
-                                .unwrap_or_default();
-                            let description = config
-                                .remove("description")
-                                .and_then(|v| v.as_str().map(String::from));
-                            let parameters = config.remove("parameters");
-                            Tool {
-                                name,
-                                description,
-                                parameters,
-                                required: false,
-                                tool_type,
-                                config: if config.is_empty() {
-                                    None
-                                } else {
-                                    Some(Value::Object(config))
-                                },
+                            _ => {
+                                // Hosted tools: preserve type + remaining fields.
+                                let mut config = t.as_object().cloned().unwrap_or_default();
+                                config.remove("type");
+                                let name = config
+                                    .remove("name")
+                                    .and_then(|v| v.as_str().map(String::from))
+                                    .unwrap_or_default();
+                                let description = config
+                                    .remove("description")
+                                    .and_then(|v| v.as_str().map(String::from));
+                                let parameters = config.remove("parameters");
+                                Tool {
+                                    name,
+                                    description,
+                                    parameters,
+                                    required: false,
+                                    tool_type,
+                                    config: if config.is_empty() {
+                                        None
+                                    } else {
+                                        Some(Value::Object(config))
+                                    },
+                                }
                             }
                         }
                     })
@@ -860,15 +925,38 @@ impl EndpointCodec for ResponsesCodec {
             }
         }
 
-        // Preserve Codex opaque input items (tool_search_call, agent_message,
-        // compaction, etc.) for same-protocol replay. Cross-protocol egress
-        // drops these silently.
+        // Ordered opaque input items (Codex + multi-agent) for same-protocol
+        // re-encode that preserves original input interleaving. Cross-protocol
+        // egress drops these silently unless multi-agent hard-reject fires.
+        if !opaque_input_items.is_empty() {
+            extensions.insert(
+                "responses_opaque_input_items".to_string(),
+                json!(opaque_input_items),
+            );
+        }
+        // Backward-compatible Codex bag (content only, no indices). Prefer the
+        // ordered extension on encode; this remains for older IR snapshots.
+        let codex_opaque_items: Vec<Value> = opaque_input_items
+            .iter()
+            .filter_map(|entry| {
+                let item = entry.get("item")?;
+                match item.get("type").and_then(|v| v.as_str()) {
+                    Some("tool_search_call")
+                    | Some("tool_search_output")
+                    | Some("agent_message")
+                    | Some("compaction")
+                    | Some("compaction_trigger")
+                    | Some("context_compaction") => Some(item.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
         if !codex_opaque_items.is_empty() {
             extensions.insert("codex_opaque_items".to_string(), json!(codex_opaque_items));
         }
 
-        // GPT-5.6 Multi-agent Beta input items. Same-protocol re-encode
-        // replays them; cross-protocol conversion rejects via lossy check.
+        // GPT-5.6 Multi-agent Beta input items (content only) so lossy guard
+        // can hard-reject cross-protocol conversion.
         if !multi_agent_items.is_empty() {
             extensions.insert("multi_agent_items".to_string(), json!(multi_agent_items));
         }
@@ -952,12 +1040,48 @@ impl EndpointCodec for ResponsesCodec {
                     arguments,
                     call_id,
                     caller,
+                    wire_type,
                 } => {
                     flush_text(&mut pending_text, &mut output_items);
                     // Use `call_id` when available (Responses round-trip),
                     // otherwise fall back to `id` (cross-protocol).
                     let wire_call_id = call_id.as_deref().unwrap_or(id);
-                    let mut tc = json!({"type": "function_call", "call_id": wire_call_id, "name": name, "arguments": serde_json::to_string(arguments).unwrap_or_default(), "status": "completed"});
+                    let item_type = wire_type.as_deref().unwrap_or("function_call");
+                    let mut tc = if item_type == "custom_tool_call" {
+                        let input = arguments
+                            .get("input")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                if let Value::String(s) = arguments {
+                                    s.clone()
+                                } else {
+                                    arguments.to_string()
+                                }
+                            });
+                        json!({
+                            "type": "custom_tool_call",
+                            "call_id": wire_call_id,
+                            "name": name,
+                            "input": input,
+                            "status": "completed"
+                        })
+                    } else if item_type == "local_shell_call" {
+                        json!({
+                            "type": "local_shell_call",
+                            "call_id": wire_call_id,
+                            "action": arguments,
+                            "status": "completed"
+                        })
+                    } else {
+                        json!({
+                            "type": "function_call",
+                            "call_id": wire_call_id,
+                            "name": name,
+                            "arguments": serde_json::to_string(arguments).unwrap_or_default(),
+                            "status": "completed"
+                        })
+                    };
                     // Include the item reference `id` when available.
                     if call_id.is_some() {
                         tc["id"] = json!(id);
@@ -1220,19 +1344,47 @@ impl EndpointCodec for ResponsesCodec {
                                 arguments,
                                 call_id,
                                 caller,
+                                wire_type,
                             } => {
                                 flush_text_message(&mut text_parts, &mut input_items, role_str);
-                                let args_str = match arguments {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    other => other.to_string(),
-                                };
                                 let wire_call_id = call_id.as_deref().unwrap_or(id);
-                                let mut fc = json!({
-                                    "type": "function_call",
-                                    "call_id": wire_call_id,
-                                    "name": name,
-                                    "arguments": args_str,
-                                });
+                                let item_type = wire_type.as_deref().unwrap_or("function_call");
+                                let mut fc = if item_type == "custom_tool_call" {
+                                    let input = arguments
+                                        .get("input")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from)
+                                        .unwrap_or_else(|| {
+                                            if let Value::String(s) = arguments {
+                                                s.clone()
+                                            } else {
+                                                arguments.to_string()
+                                            }
+                                        });
+                                    json!({
+                                        "type": "custom_tool_call",
+                                        "call_id": wire_call_id,
+                                        "name": name,
+                                        "input": input,
+                                    })
+                                } else if item_type == "local_shell_call" {
+                                    json!({
+                                        "type": "local_shell_call",
+                                        "call_id": wire_call_id,
+                                        "action": arguments,
+                                    })
+                                } else {
+                                    let args_str = match arguments {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    };
+                                    json!({
+                                        "type": "function_call",
+                                        "call_id": wire_call_id,
+                                        "name": name,
+                                        "arguments": args_str,
+                                    })
+                                };
                                 if call_id.is_some() {
                                     fc["id"] = json!(id);
                                 }
@@ -1247,17 +1399,42 @@ impl EndpointCodec for ResponsesCodec {
                                 content,
                                 id,
                                 caller,
+                                wire_type,
                             } => {
                                 flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 // Cross-protocol Anthropic Messages carries
                                 // tool_result inside a user message; Responses
                                 // requires a sibling function_call_output item.
-                                input_items.push(responses_function_call_output(
-                                    tool_call_id,
-                                    content,
-                                    id.as_deref(),
-                                    caller.as_ref(),
-                                ));
+                                // Preserve custom/local_shell wire types for
+                                // same-protocol multi-turn fidelity.
+                                if wire_type.as_deref() == Some("custom_tool_call_output") {
+                                    let mut item = json!({
+                                        "type": "custom_tool_call_output",
+                                        "call_id": tool_call_id,
+                                        "output": content,
+                                    });
+                                    if let Some(item_id) = id {
+                                        item["id"] = json!(item_id);
+                                    }
+                                    input_items.push(item);
+                                } else if wire_type.as_deref() == Some("local_shell_call_output") {
+                                    let mut item = json!({
+                                        "type": "local_shell_call_output",
+                                        "call_id": tool_call_id,
+                                        "output": content,
+                                    });
+                                    if let Some(item_id) = id {
+                                        item["id"] = json!(item_id);
+                                    }
+                                    input_items.push(item);
+                                } else {
+                                    input_items.push(responses_function_call_output(
+                                        tool_call_id,
+                                        content,
+                                        id.as_deref(),
+                                        caller.as_ref(),
+                                    ));
+                                }
                             }
                             Content::Program {
                                 id,
@@ -1305,14 +1482,37 @@ impl EndpointCodec for ResponsesCodec {
                             content,
                             id,
                             caller,
+                            wire_type,
                         } = c
                         {
-                            input_items.push(responses_function_call_output(
-                                tool_call_id,
-                                content,
-                                id.as_deref(),
-                                caller.as_ref(),
-                            ));
+                            if wire_type.as_deref() == Some("custom_tool_call_output") {
+                                let mut item = json!({
+                                    "type": "custom_tool_call_output",
+                                    "call_id": tool_call_id,
+                                    "output": content,
+                                });
+                                if let Some(item_id) = id {
+                                    item["id"] = json!(item_id);
+                                }
+                                input_items.push(item);
+                            } else if wire_type.as_deref() == Some("local_shell_call_output") {
+                                let mut item = json!({
+                                    "type": "local_shell_call_output",
+                                    "call_id": tool_call_id,
+                                    "output": content,
+                                });
+                                if let Some(item_id) = id {
+                                    item["id"] = json!(item_id);
+                                }
+                                input_items.push(item);
+                            } else {
+                                input_items.push(responses_function_call_output(
+                                    tool_call_id,
+                                    content,
+                                    id.as_deref(),
+                                    caller.as_ref(),
+                                ));
+                            }
                         } else if let Content::ProgramOutput {
                             id,
                             call_id,
@@ -1332,31 +1532,71 @@ impl EndpointCodec for ResponsesCodec {
                 }
             }
         }
-        body["input"] = json!(input_items);
-        // Restore Codex opaque input items (tool_search_call, agent_message,
-        // compaction, etc.) from extensions for same-protocol replay.
-        if let Some(opaque) = ir
+        // Merge modeled IR messages with ordered opaque input items so
+        // multi-agent / Codex items keep their original interleaving.
+        let ordered_opaque: Vec<(usize, Value)> = ir
             .extensions
-            .get("codex_opaque_items")
+            .get("responses_opaque_input_items")
             .and_then(|v| v.as_array())
-        {
-            if let Some(arr) = body["input"].as_array_mut() {
-                for item in opaque {
-                    arr.push(item.clone());
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let index = entry.get("index")?.as_u64()? as usize;
+                        let item = entry.get("item")?.clone();
+                        Some((index, item))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                // Backward-compatible fallback: append-only bags from older IR.
+                let mut fallback = Vec::new();
+                let mut next = input_items.len();
+                if let Some(items) = ir
+                    .extensions
+                    .get("codex_opaque_items")
+                    .and_then(|v| v.as_array())
+                {
+                    for item in items {
+                        fallback.push((next, item.clone()));
+                        next += 1;
+                    }
+                }
+                if let Some(items) = ir
+                    .extensions
+                    .get("multi_agent_items")
+                    .and_then(|v| v.as_array())
+                {
+                    for item in items {
+                        fallback.push((next, item.clone()));
+                        next += 1;
+                    }
+                }
+                fallback
+            });
+        if ordered_opaque.is_empty() {
+            body["input"] = json!(input_items);
+        } else {
+            let mut merged = Vec::with_capacity(input_items.len() + ordered_opaque.len());
+            let mut opaque_iter = ordered_opaque.into_iter().peekable();
+            let mut modeled_idx = 0usize;
+            let mut cursor = 0usize;
+            while modeled_idx < input_items.len() || opaque_iter.peek().is_some() {
+                if let Some((index, _)) = opaque_iter.peek() {
+                    if *index == cursor || modeled_idx >= input_items.len() {
+                        let (_, item) = opaque_iter.next().expect("peeked");
+                        merged.push(item);
+                        cursor += 1;
+                        continue;
+                    }
+                }
+                if modeled_idx < input_items.len() {
+                    merged.push(input_items[modeled_idx].clone());
+                    modeled_idx += 1;
+                    cursor += 1;
                 }
             }
-        }
-        // Restore GPT-5.6 Multi-agent Beta input items for same-protocol replay.
-        if let Some(items) = ir
-            .extensions
-            .get("multi_agent_items")
-            .and_then(|v| v.as_array())
-        {
-            if let Some(arr) = body["input"].as_array_mut() {
-                for item in items {
-                    arr.push(item.clone());
-                }
-            }
+            body["input"] = json!(merged);
         }
         if !ir.tools.is_empty() {
             let tools: Vec<Value> = ir
@@ -1378,6 +1618,26 @@ impl EndpointCodec for ResponsesCodec {
                             }
                         }
                         obj
+                    } else if t.is_custom() {
+                        // Custom tools share the Chat/Responses top-level shape:
+                        // { "type":"custom", "name", "description", ...config }
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("type".to_string(), json!("custom"));
+                        if !t.name.is_empty() {
+                            obj.insert("name".to_string(), json!(t.name));
+                        }
+                        if let Some(ref desc) = t.description {
+                            obj.insert("description".to_string(), json!(desc));
+                        }
+                        if let Some(ref params) = t.parameters {
+                            obj.insert("parameters".to_string(), params.clone());
+                        }
+                        if let Some(Value::Object(cfg)) = &t.config {
+                            for (k, v) in cfg {
+                                obj.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                        Value::Object(obj)
                     } else {
                         // Hosted tools: emit type + config fields, plus any
                         // name/description/parameters that were preserved.
@@ -1625,7 +1885,8 @@ impl EndpointCodec for ResponsesCodec {
                             arguments: args,
                             call_id,
                             caller: decode_tool_caller(item),
-                        });
+            wire_type: None,
+        });
                     }
                     Some("reasoning") => {
                         // Join the summary parts into a single reasoning block
@@ -1686,6 +1947,7 @@ impl EndpointCodec for ResponsesCodec {
                             name: "local_shell".to_string(),
                             arguments,
                             caller: None,
+                            wire_type: Some("local_shell_call".to_string()),
                         });
                     }
                     Some("custom_tool_call") => {
@@ -1699,6 +1961,7 @@ impl EndpointCodec for ResponsesCodec {
                             name,
                             arguments: json!({"input": input_text}),
                             caller: None,
+                            wire_type: Some("custom_tool_call".to_string()),
                         });
                     }
                     _ => {}
@@ -3077,7 +3340,8 @@ mod tests {
                 name: "get_weather".to_string(),
                 arguments: json!({}),
                 caller: None,
-            }],
+            wire_type: None,
+        }],
             finish_reason: Some(FinishReason::ToolCalls),
             usage: None,
             response_id: Some("resp_1".to_string()),
@@ -3949,7 +4213,8 @@ mod tests {
                             arguments: serde_json::json!({"location": "杭州"}),
                             call_id: None,
                             caller: None,
-                        },
+            wire_type: None,
+        },
                     ],
                 },
                 Message {
@@ -3960,7 +4225,8 @@ mod tests {
                         content: "cloudy".to_string(),
                         id: None,
                         caller: None,
-                    }],
+            wire_type: None,
+        }],
                 },
             ],
             tools: vec![],
@@ -4697,15 +4963,160 @@ mod tests {
         assert_eq!(encoded["multi_agent"]["enabled"], true);
         assert_eq!(encoded["multi_agent"]["max_concurrent_subagents"], 4);
         let input = encoded["input"].as_array().expect("input array");
+        let types: Vec<&str> = input
+            .iter()
+            .map(|item| {
+                item.get("type")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("role").map(|_| "message"))
+                    .unwrap_or("unknown")
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec!["message", "multi_agent_call", "multi_agent_call_output"],
+            "multi-agent items must keep original interleaving: {types:?}"
+        );
+    }
+
+    #[test]
+    fn test_custom_tool_definition_roundtrip_and_chat_cross() {
+        let responses = ResponsesCodec::new();
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "tools": [{
+                "type": "custom",
+                "name": "code_exec",
+                "description": "run code",
+                "format": {"type": "text"}
+            }]
+        });
+        let ir = responses.decode_request(body, &env).unwrap();
+        assert!(ir.tools[0].is_custom());
+        assert!(!ir.tools[0].is_hosted());
+        assert_eq!(ir.tools[0].name, "code_exec");
+        assert_eq!(
+            ir.tools[0]
+                .config
+                .as_ref()
+                .and_then(|c| c.get("format"))
+                .and_then(|f| f.get("type")),
+            Some(&json!("text"))
+        );
+
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        assert_eq!(encoded["tools"][0]["type"], "custom");
+        assert_eq!(encoded["tools"][0]["name"], "code_exec");
+        assert_eq!(encoded["tools"][0]["format"]["type"], "text");
+
+        let (chat_encoded, _) = chat.encode_request(&ir).unwrap();
+        assert_eq!(chat_encoded["tools"][0]["type"], "custom");
+        assert_eq!(chat_encoded["tools"][0]["name"], "code_exec");
+        assert_eq!(chat_encoded["tools"][0]["format"]["type"], "text");
+    }
+
+    #[test]
+    fn test_custom_tool_call_wire_type_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "run custom tool"},
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom_1",
+                    "name": "my_tool",
+                    "input": "some input text"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_custom_1",
+                    "output": "tool result"
+                }
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert!(ir.messages.iter().any(|m| {
+            m.content.iter().any(|c| {
+                matches!(
+                    c,
+                    Content::ToolCall {
+                        wire_type: Some(wt),
+                        ..
+                    } if wt == "custom_tool_call"
+                )
+            })
+        }));
+        assert!(ir.messages.iter().any(|m| {
+            m.content.iter().any(|c| {
+                matches!(
+                    c,
+                    Content::ToolResult {
+                        wire_type: Some(wt),
+                        ..
+                    } if wt == "custom_tool_call_output"
+                )
+            })
+        }));
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let input = encoded["input"].as_array().expect("input");
         assert!(
-            input.iter().any(|item| item["type"] == "multi_agent_call"),
-            "multi_agent_call should be replayed: {input:?}"
+            input.iter().any(|item| item["type"] == "custom_tool_call"
+                && item["name"] == "my_tool"
+                && item["input"] == "some input text"),
+            "custom_tool_call wire type must survive re-encode: {input:?}"
         );
         assert!(
             input
                 .iter()
-                .any(|item| item["type"] == "multi_agent_call_output"),
-            "multi_agent_call_output should be replayed: {input:?}"
+                .any(|item| item["type"] == "custom_tool_call_output"
+                    && item["output"] == "tool result"),
+            "custom_tool_call_output wire type must survive re-encode: {input:?}"
         );
+    }
+
+    #[test]
+    fn test_opaque_items_preserve_interleaving_order() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "before"},
+                {"type": "compaction", "id": "comp_1", "summary": "compacted"},
+                {"role": "user", "content": "after"},
+                {
+                    "type": "multi_agent_call",
+                    "id": "ma_1",
+                    "name": "spawn_agent",
+                    "arguments": {"task": "research"}
+                }
+            ],
+            "multi_agent": {"enabled": true}
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let input = encoded["input"].as_array().expect("input");
+        let types: Vec<&str> = input
+            .iter()
+            .map(|item| {
+                item.get("type")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("role").map(|_| "message"))
+                    .unwrap_or("unknown")
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec!["message", "compaction", "message", "multi_agent_call"],
+            "opaque items must keep original interleaving: {types:?}"
+        );
+        assert_eq!(input[0]["content"], "before");
+        assert_eq!(input[2]["content"], "after");
     }
 }

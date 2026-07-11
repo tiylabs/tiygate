@@ -190,9 +190,9 @@ Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字�
 |-----------|-----------|
 | `local_shell_call` | ✅ 映射为 IR `Content::ToolCall { name: "local_shell" }`，跨协议可转换 |
 | `local_shell_call_output` | ✅ 映射为 IR `Content::ToolResult`，跨协议可转换 |
-| `custom_tool_call` | ✅ 映射为 IR `Content::ToolCall`（input 文本包装为 JSON arguments），跨协议可转换 |
-| `custom_tool_call_output` | ✅ 映射为 IR `Content::ToolResult`，跨协议可转换 |
-| `tool_search_call` | ⚠️ 原始 JSON 存入 `extensions["codex_opaque_items"]`，同协议 egress 还原，跨协议丢弃 |
+| `custom_tool_call` | ✅ 映射为 IR `Content::ToolCall`（`wire_type=custom_tool_call`，input 文本包装为 JSON arguments）；同协议 re-encode 恢复 `custom_tool_call` |
+| `custom_tool_call_output` | ✅ 映射为 IR `Content::ToolResult`（`wire_type=custom_tool_call_output`）；同协议 re-encode 恢复原 wire type |
+| `tool_search_call` | ⚠️ 原始 JSON 存入有序 `extensions["responses_opaque_input_items"]`（兼容旧 `codex_opaque_items`），同协议 egress 按原 index 还原，跨协议丢弃 |
 | `tool_search_output` | ⚠️ 同上 |
 | `agent_message` | ⚠️ 同上 |
 | `compaction` | ⚠️ 同上 |
@@ -233,11 +233,11 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
 |------|:---:|:---:|:---:|:---:|:---:|
 | 顶层 `multi_agent` | ❌ 拒绝 | ❌ 拒绝 | ✅ 同协议透传 / re-encode 保活 | ❌ 拒绝 | N/A |
-| `multi_agent_call` / `multi_agent_call_output` input items | ❌ 拒绝 | ❌ 拒绝 | ✅ 存入 `extensions["multi_agent_items"]`，同协议回放 | ❌ 拒绝 | N/A |
+| `multi_agent_call` / `multi_agent_call_output` input items | ❌ 拒绝 | ❌ 拒绝 | ✅ 存入有序 `responses_opaque_input_items` + 内容袋 `multi_agent_items`，同协议按原顺序回放 | ❌ 拒绝 | N/A |
 | 跨协议 Convert | ❌ | ❌ | N/A（同协议） | ❌ | N/A |
 
 **运行时行为**：
-- 同协议（Responses→Responses）：raw passthrough 与 IR re-encode 均保留 `multi_agent` 与 multi-agent input items；`OpenAI-Beta` 头按现有 denylist 策略转发。
+- 同协议（Responses→Responses）：raw passthrough 与 IR re-encode 均保留 `multi_agent` 与 multi-agent input items；re-encode 通过 `responses_opaque_input_items` 的原始 index 保持与 user/assistant 消息的交错顺序；`OpenAI-Beta` 头按现有 denylist 策略转发。
 - 跨协议：`check_lossy_conversion` 检测到 `responses_extra.multi_agent` 或非空 `multi_agent_items` 时，以 `LossyDimension::MultiAgent` **拒绝**（HTTP 400），不静默丢弃。
 - 不支持 WebSocket multi-agent 长连接；本网关 Responses 面仅为 HTTP + SSE。
 - 不建模 agent 调度语义；不做跨协议转换。

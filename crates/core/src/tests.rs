@@ -502,6 +502,7 @@ mod tests {
             arguments: serde_json::json!({"city": "London"}),
             call_id: None,
             caller: None,
+            wire_type: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["type"], "tool_call");

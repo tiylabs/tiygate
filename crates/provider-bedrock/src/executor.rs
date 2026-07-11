@@ -247,7 +247,8 @@ impl BedrockExecutor {
                         arguments: tu["input"].clone(),
                         call_id: None,
                         caller: None,
-                    });
+            wire_type: None,
+        });
                 }
             }
         }
@@ -874,6 +875,7 @@ mod tests {
             arguments: json!({}),
             call_id: None,
             caller: None,
+            wire_type: None,
         });
         let err = BedrockExecutor::reject_unsupported_features(&ir)
             .expect_err("ToolCall content must be rejected");

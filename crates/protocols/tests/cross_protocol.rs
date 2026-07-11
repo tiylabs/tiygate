@@ -696,6 +696,7 @@ fn orphan_tool_result_to_gemini_returns_codec_error() {
             content: "{}".to_string(),
             id: None,
             caller: None,
+            wire_type: None,
         }],
     });
 

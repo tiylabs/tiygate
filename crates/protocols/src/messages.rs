@@ -203,7 +203,8 @@ impl EndpointCodec for MessagesCodec {
                                     },
                                     call_id: None,
                                     caller: None,
-                                });
+            wire_type: None,
+        });
                             }
                             Some("tool_result") => {
                                 parts.push(Content::ToolResult {
@@ -215,7 +216,8 @@ impl EndpointCodec for MessagesCodec {
                                     content: flatten_anthropic_content(&block["content"]),
                                     id: None,
                                     caller: None,
-                                });
+            wire_type: None,
+        });
                             }
                             Some("image") => {
                                 let source = block["source"].clone();
@@ -848,7 +850,8 @@ impl EndpointCodec for MessagesCodec {
                             arguments: block["input"].clone(),
                             call_id: None,
                             caller: None,
-                        });
+            wire_type: None,
+        });
                     }
                     _ => {}
                 }
@@ -1879,7 +1882,8 @@ mod tests {
                 arguments: json!({"city": "London"}),
                 call_id: None,
                 caller: None,
-            }],
+            wire_type: None,
+        }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
             response_id: Some("msg_2".to_string()),
@@ -2067,7 +2071,8 @@ mod tests {
                         arguments: json!({}),
                         call_id: None,
                         caller: None,
-                    }],
+            wire_type: None,
+        }],
                 },
                 Message {
                     role: Role::Tool,
@@ -2077,7 +2082,8 @@ mod tests {
                         content: "r1".to_string(),
                         id: None,
                         caller: None,
-                    }],
+            wire_type: None,
+        }],
                 },
                 Message {
                     role: Role::Tool,
@@ -2087,7 +2093,8 @@ mod tests {
                         content: "r2".to_string(),
                         id: None,
                         caller: None,
-                    }],
+            wire_type: None,
+        }],
                 },
             ],
             tools: vec![],

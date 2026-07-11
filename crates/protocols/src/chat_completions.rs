@@ -134,7 +134,8 @@ impl EndpointCodec for ChatCompletionsCodec {
                             content: msg["content"].as_str().unwrap_or("").to_string(),
                             id: None,
                             caller: None,
-                        }]
+            wire_type: None,
+        }]
                     }
                 } else if let Some(text) = msg["content"].as_str() {
                     // A non-empty assistant text alongside tool_calls is common;
@@ -202,7 +203,8 @@ impl EndpointCodec for ChatCompletionsCodec {
                             arguments,
                             call_id: None,
                             caller: None,
-                        });
+            wire_type: None,
+        });
                     }
                 }
 
@@ -1105,7 +1107,8 @@ impl EndpointCodec for ChatCompletionsCodec {
                             arguments: args,
                             call_id: None,
                             caller: None,
-                        });
+            wire_type: None,
+        });
                     }
                 }
 
@@ -1810,7 +1813,8 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
                         content: item["content"].as_str().unwrap_or("").to_string(),
                         id: None,
                         caller: None,
-                    }
+            wire_type: None,
+        }
                 } else {
                     Content::Text {
                         text: item["content"].as_str().unwrap_or("").to_string(),
@@ -2280,7 +2284,8 @@ mod tests {
                 arguments: json!({"city": "London"}),
                 call_id: None,
                 caller: None,
-            }],
+            wire_type: None,
+        }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
             response_id: None,
@@ -2656,7 +2661,8 @@ mod tests {
                             arguments: json!({"city": "杭州"}),
                             call_id: None,
                             caller: None,
-                        },
+            wire_type: None,
+        },
                     ],
                 },
                 Message {
@@ -2667,7 +2673,8 @@ mod tests {
                         content: "sunny".to_string(),
                         id: None,
                         caller: None,
-                    }],
+            wire_type: None,
+        }],
                 },
                 // 纯文本轮:reasoning_content 应丢弃
                 Message {

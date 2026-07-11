@@ -406,7 +406,8 @@ impl EndpointCodec for GeminiCodec {
                                 arguments: fc["args"].clone(),
                                 call_id: None,
                                 caller: None,
-                            });
+            wire_type: None,
+        });
                         } else if let Some(fr) = part.get("functionResponse") {
                             let name = fr["name"].as_str().unwrap_or("").to_string();
                             cp.push(Content::ToolResult {
@@ -422,7 +423,8 @@ impl EndpointCodec for GeminiCodec {
                                     .unwrap_or_default(),
                                 id: None,
                                 caller: None,
-                            });
+            wire_type: None,
+        });
                         } else if let Some(id) = part.get("inlineData") {
                             cp.push(Content::Media {
                                 source: tiygate_core::ir::MediaSource::Inline {
@@ -1057,7 +1059,8 @@ impl EndpointCodec for GeminiCodec {
                                     arguments: fc["args"].clone(),
                                     call_id: None,
                                     caller: None,
-                                });
+            wire_type: None,
+        });
                             }
                         }
                     }
@@ -1959,7 +1962,8 @@ mod tests {
                     arguments: json!({"city": "London"}),
                     call_id: None,
                     caller: None,
-                }],
+            wire_type: None,
+        }],
             }],
             tools: vec![],
             params: Default::default(),
@@ -1994,7 +1998,8 @@ mod tests {
                     arguments: json!({}),
                     call_id: None,
                     caller: None,
-                }],
+            wire_type: None,
+        }],
             }],
             tools: vec![],
             params: Default::default(),
