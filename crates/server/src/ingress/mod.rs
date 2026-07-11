@@ -13,6 +13,7 @@ mod fallback;
 mod handlers;
 mod headers;
 mod observability;
+mod response_model;
 mod streaming;
 
 use handlers::{

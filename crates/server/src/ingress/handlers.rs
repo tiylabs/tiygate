@@ -23,6 +23,7 @@ use super::executors::{
     execute_upstream,
 };
 use super::fallback::{execute_with_fallback, FallbackOutcome};
+use super::response_model::ResponseModelOverride;
 use super::{compute_pass_through, enforce_body_limit, AppError, AppState};
 use tiygate_core::telemetry::RequestErrorClass;
 
@@ -719,7 +720,10 @@ pub(super) async fn handle_embeddings(
             Some(&raw_env),
         );
         scope.disarm();
-        return Ok(Json((*cached).clone()).into_response());
+        let mut response_body = (*cached).clone();
+        ResponseModelOverride::new(codec.id().suite, &model_for_cache)
+            .apply_json(&mut response_body);
+        return Ok(Json(response_body).into_response());
     }
 
     let ir_request = match codec.decode_request(body, &raw_env) {
@@ -1501,6 +1505,7 @@ pub(super) async fn handle_images_edits(
             Box::pin(execute_images_edits_upstream(
                 &state,
                 target,
+                &virtual_model,
                 is_stream,
                 body,
                 content_type_str,

@@ -22,6 +22,7 @@ use super::headers::{
     merge_client_headers, normalize_openai_reasoning_for_target, override_model_in_body,
     reqwest_headers_to_vec, spawn_capture,
 };
+use super::response_model::ResponseModelOverride;
 use super::streaming::{
     drive_upstream_stream, StreamCapture, StreamTranscode, DEFAULT_SSE_KEEPALIVE_INTERVAL,
 };
@@ -401,6 +402,10 @@ pub(super) async fn execute_upstream(
                 client_resp_headers: forwarded_resp_headers,
             }),
             build_stream_transcode(ingress_protocol, &egress_protocol),
+            Some(ResponseModelOverride::new(
+                ingress_protocol.suite,
+                &ir_request.model,
+            )),
         );
         // Forward upstream response headers to the client (denylist).
         forward_upstream_resp_headers(
@@ -557,7 +562,7 @@ pub(super) async fn execute_upstream(
         let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
 
         // Cross-protocol re-encoding
-        let response_json = if is_same_protocol {
+        let mut response_json = if is_same_protocol {
             response_body
         } else {
             let egress_codec = get_egress_codec(&egress_protocol).ok_or_else(|| {
@@ -580,6 +585,8 @@ pub(super) async fn execute_upstream(
             })?
         };
 
+        ResponseModelOverride::new(ingress_protocol.suite, &ir_request.model)
+            .apply_json(&mut response_json);
         let client_resp_body_capture = serde_json::to_string(&response_json).ok();
         let mut response = Json(response_json).into_response();
         // Forward upstream response headers to the client (denylist).
@@ -859,6 +866,10 @@ pub(super) async fn execute_messages_upstream(
                 client_resp_headers: forwarded_resp_headers,
             }),
             build_stream_transcode(ingress_protocol, &egress_protocol),
+            Some(ResponseModelOverride::new(
+                ingress_protocol.suite,
+                &ir_request.model,
+            )),
         );
         // Forward upstream response headers to the client (denylist).
         forward_upstream_resp_headers(
@@ -996,7 +1007,7 @@ pub(super) async fn execute_messages_upstream(
         // (Anthropic Messages), decode the upstream body via the egress codec
         // and re-encode it into the ingress protocol so the client sees the
         // format it expects. Mirrors `execute_upstream`.
-        let response_json = if is_same_protocol {
+        let mut response_json = if is_same_protocol {
             response_body
         } else {
             let egress_codec = get_egress_codec(&egress_protocol).ok_or_else(|| {
@@ -1019,6 +1030,8 @@ pub(super) async fn execute_messages_upstream(
             })?
         };
 
+        ResponseModelOverride::new(ingress_protocol.suite, &ir_request.model)
+            .apply_json(&mut response_json);
         let client_resp_body_capture = serde_json::to_string(&response_json).ok();
         let mut response = Json(response_json).into_response();
         // Forward upstream response headers to the client (denylist).
@@ -1091,10 +1104,10 @@ pub(super) fn gemini_aware_upstream_url(
 
 /// Build a [`StreamTranscode`] for a streaming response when the ingress and
 /// egress protocol suites differ. Returns `None` for same-protocol streams so
-/// the caller forwards bytes verbatim (zero-loss fast path). The egress codec
-/// supplies the upstream decoder; the ingress codec supplies the client
-/// encoder. Returns `None` (verbatim) if either codec is unavailable rather
-/// than failing the request.
+/// the caller avoids protocol conversion (apart from client-model
+/// normalization). The egress codec supplies the upstream decoder; the ingress
+/// codec supplies the client encoder. Returns `None` if either codec is
+/// unavailable rather than failing the request.
 pub(super) fn build_stream_transcode(
     ingress_protocol: &tiygate_core::ProtocolEndpoint,
     egress_protocol: &tiygate_core::ProtocolEndpoint,
@@ -1321,8 +1334,12 @@ pub(super) async fn execute_embeddings_upstream(
         return Err(app_err);
     }
 
-    let body_str_capture = serde_json::to_string(&response_body).ok();
-    let mut resp = Json(response_body.clone()).into_response();
+    let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
+    let mut client_response_body = response_body.clone();
+    ResponseModelOverride::new(codec.id().suite, &ir_request.model)
+        .apply_json(&mut client_response_body);
+    let client_resp_body_capture = serde_json::to_string(&client_response_body).ok();
+    let mut resp = Json(client_response_body).into_response();
     forward_upstream_resp_headers(
         &mut resp,
         &upstream_resp_headers_capture,
@@ -1339,9 +1356,9 @@ pub(super) async fn execute_embeddings_upstream(
             egress_body: egress_body_capture,
             upstream_status: Some(upstream_status_capture),
             upstream_resp_headers: upstream_resp_headers_capture,
-            upstream_resp_body: body_str_capture.clone(),
+            upstream_resp_body: upstream_resp_body_capture,
             client_resp_headers: header_map_to_vec(resp.headers()),
-            client_resp_body: body_str_capture,
+            client_resp_body: client_resp_body_capture,
             is_stream: false,
             truncation_reason: None,
             stream_duration_ms: None,
@@ -1561,6 +1578,10 @@ pub(super) async fn execute_responses_upstream(
                 ),
             }),
             build_stream_transcode(ingress_protocol, &egress_protocol),
+            Some(ResponseModelOverride::new(
+                ingress_protocol.suite,
+                &ir_request.model,
+            )),
         );
         forward_upstream_resp_headers(
             &mut response,
@@ -1699,7 +1720,7 @@ pub(super) async fn execute_responses_upstream(
     }
 
     let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
-    let response_body = if is_same_protocol {
+    let mut response_body = if is_same_protocol {
         response_body
     } else {
         let egress_codec = get_egress_codec(&egress_protocol).ok_or_else(|| {
@@ -1721,6 +1742,8 @@ pub(super) async fn execute_responses_upstream(
             )
         })?
     };
+    ResponseModelOverride::new(ingress_protocol.suite, &ir_request.model)
+        .apply_json(&mut response_body);
     let body_str_capture = serde_json::to_string(&response_body).ok();
     let mut resp = Json(response_body).into_response();
     forward_upstream_resp_headers(
@@ -1992,6 +2015,10 @@ pub(super) async fn execute_gemini_upstream(
                 ),
             }),
             build_stream_transcode(ingress_protocol, &egress_protocol),
+            Some(ResponseModelOverride::new(
+                ingress_protocol.suite,
+                &ir_request.model,
+            )),
         );
         forward_upstream_resp_headers(
             &mut response,
@@ -2130,7 +2157,7 @@ pub(super) async fn execute_gemini_upstream(
     }
 
     let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
-    let response_body = if is_same_protocol {
+    let mut response_body = if is_same_protocol {
         response_body
     } else {
         let egress_codec = get_egress_codec(&egress_protocol).ok_or_else(|| {
@@ -2152,6 +2179,8 @@ pub(super) async fn execute_gemini_upstream(
             )
         })?
     };
+    ResponseModelOverride::new(ingress_protocol.suite, &ir_request.model)
+        .apply_json(&mut response_body);
     let body_str_capture = serde_json::to_string(&response_body).ok();
     let mut resp = Json(response_body).into_response();
     forward_upstream_resp_headers(
@@ -2386,6 +2415,10 @@ pub(super) async fn execute_images_generations_upstream(
                 client_resp_headers: forwarded_resp_headers,
             }),
             build_stream_transcode(ingress_protocol, &egress_protocol),
+            Some(ResponseModelOverride::new(
+                ingress_protocol.suite,
+                &ir_request.model,
+            )),
         );
         forward_upstream_resp_headers(
             &mut response,
@@ -2531,7 +2564,7 @@ pub(super) async fn execute_images_generations_upstream(
         // from the ingress suite, decode via the egress codec and
         // re-encode to the ingress protocol. Same-suite: forward
         // verbatim.
-        let response_json = if is_same_protocol {
+        let mut response_json = if is_same_protocol {
             response_body
         } else {
             let egress_codec = get_egress_codec(&egress_protocol).ok_or_else(|| {
@@ -2555,7 +2588,9 @@ pub(super) async fn execute_images_generations_upstream(
         };
 
         let upstream_resp_body_capture = serde_json::to_string(&response_json).ok();
-        let client_resp_body_capture = upstream_resp_body_capture.clone();
+        ResponseModelOverride::new(ingress_protocol.suite, &ir_request.model)
+            .apply_json(&mut response_json);
+        let client_resp_body_capture = serde_json::to_string(&response_json).ok();
         let mut response = Json(response_json).into_response();
         forward_upstream_resp_headers(
             &mut response,
@@ -2611,6 +2646,7 @@ pub(super) async fn execute_images_generations_upstream(
 pub(super) async fn execute_images_edits_upstream(
     state: &AppState,
     target: &tiygate_core::RoutingTarget,
+    virtual_model: &str,
     is_stream: bool,
     raw_body: bytes::Bytes,
     content_type: String,
@@ -2720,7 +2756,8 @@ pub(super) async fn execute_images_edits_upstream(
             request_id,
         );
         let upstream_resp_headers_for_forward = upstream_resp_headers_capture.clone();
-        // No transcode — verbatim SSE passthrough.
+        // No protocol transcode; the stream driver still normalizes the
+        // client-facing model field.
         let mut response = drive_upstream_stream(
             state,
             accum,
@@ -2744,6 +2781,10 @@ pub(super) async fn execute_images_edits_upstream(
                 client_resp_headers: forwarded_resp_headers,
             }),
             None,
+            Some(ResponseModelOverride::new(
+                tiygate_core::ProtocolSuite::OpenAiCompatible,
+                virtual_model,
+            )),
         );
         forward_upstream_resp_headers(
             &mut response,
@@ -2878,8 +2919,11 @@ pub(super) async fn execute_images_edits_upstream(
         }
 
         let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
-        let client_resp_body_capture = upstream_resp_body_capture.clone();
-        let mut response = Json(response_body).into_response();
+        let mut client_response_body = response_body;
+        ResponseModelOverride::new(tiygate_core::ProtocolSuite::OpenAiCompatible, virtual_model)
+            .apply_json(&mut client_response_body);
+        let client_resp_body_capture = serde_json::to_string(&client_response_body).ok();
+        let mut response = Json(client_response_body).into_response();
         forward_upstream_resp_headers(
             &mut response,
             &upstream_resp_headers_capture,

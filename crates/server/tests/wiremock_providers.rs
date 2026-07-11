@@ -802,13 +802,13 @@ async fn test_virtual_model_rewritten_to_upstream_model_id() {
 }
 
 #[tokio::test]
-async fn test_streaming_forwards_sse_bytes_verbatim_no_double_data() {
+async fn test_streaming_rewrites_model_without_double_data() {
     // Regression: the gateway used to re-wrap each upstream SSE frame in
     // an axum `Event::default().data(...)`, producing a corrupt
     // double-`data:` prefix (`data: data: {...}`) and a duplicate
-    // terminal frame. The fix forwards upstream bytes verbatim and
-    // dedups the gateway end frame against the upstream's own
-    // terminator. This test asserts the exact wire bytes.
+    // terminal frame. Model normalization intentionally reserializes
+    // JSON data lines, but must preserve framing and the single
+    // upstream terminator.
     let mock_server = wiremock::MockServer::start().await;
 
     // Faithful OpenAI-style SSE body: two delta frames plus the
@@ -825,9 +825,9 @@ async fn test_streaming_forwards_sse_bytes_verbatim_no_double_data() {
         .mount(&mock_server)
         .await;
 
-    let app = build_openai_test_app(mock_server.uri(), "gpt-4o");
+    let app = build_openai_test_app(mock_server.uri(), "virtual/chat");
     let body = json!({
-        "model": "gpt-4o",
+        "model": "virtual/chat",
         "stream": true,
         "messages": [{"role": "user", "content": "Hi"}]
     });
@@ -854,12 +854,9 @@ async fn test_streaming_forwards_sse_bytes_verbatim_no_double_data() {
         .unwrap();
     let body_str = String::from_utf8_lossy(&body_bytes);
 
-    // The bytes must be forwarded verbatim — identical to what the
-    // upstream sent (gateway adds nothing because the upstream already
-    // terminated with `data: [DONE]`).
-    assert_eq!(
-        body_str, sse_body,
-        "gateway must forward upstream SSE bytes verbatim, got: {body_str:?}"
+    assert!(
+        body_str.contains("\"model\":\"virtual/chat\""),
+        "gateway must expose the requested virtual model, got: {body_str:?}"
     );
     // Defensive: no double `data:` prefix anywhere.
     assert!(
@@ -917,11 +914,9 @@ async fn test_streaming_no_synthetic_done_when_upstream_omits_it() {
         .unwrap();
     let body_str = String::from_utf8_lossy(&body_bytes);
 
-    // Verbatim passthrough: bytes identical to upstream, no fabricated
-    // terminator appended.
-    assert_eq!(
-        body_str, sse_body,
-        "gateway must forward upstream bytes verbatim without synthesizing [DONE], got: {body_str:?}"
+    assert!(
+        body_str.contains("\"model\":\"gpt-4o\""),
+        "gateway must include the requested model in each rewritten chunk, got: {body_str:?}"
     );
     assert!(
         !body_str.contains("[DONE]"),

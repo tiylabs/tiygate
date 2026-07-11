@@ -12,6 +12,7 @@ use pin_project::pin_project;
 
 use tiygate_core::{TruncationReason, UsageAccumulator};
 
+use super::response_model::ResponseModelOverride;
 use super::AppState;
 // ---------------------------------------------------------------------------
 // Streaming helper types
@@ -480,8 +481,8 @@ impl Drop for StreamCaptureGuard {
 /// hub-spoke pair: the egress protocol's [`StreamDecoder`] (parses the
 /// upstream SSE into canonical [`tiygate_core::StreamPart`]s) and the ingress
 /// protocol's [`StreamEncoder`] (re-encodes those parts into the client's
-/// native SSE frames). When `None`, the stream is forwarded verbatim (the
-/// same-protocol fast path with zero information loss).
+/// native SSE frames). When `None`, the stream follows the same-protocol fast
+/// path; its JSON `data:` fields may still receive the client-model override.
 ///
 /// [`StreamDecoder`]: tiygate_core::StreamDecoder
 /// [`StreamEncoder`]: tiygate_core::StreamEncoder
@@ -495,9 +496,8 @@ pub(super) struct StreamTranscode {
 /// Lightweight scan of verbatim upstream SSE bytes for error frames and
 /// terminal signals.
 ///
-/// In the verbatim (same-protocol) streaming path the gateway forwards
-/// upstream bytes without parsing them. This function performs a cheap
-/// detection pass for two things:
+/// In the same-protocol streaming path the gateway avoids protocol conversion.
+/// This function performs a cheap detection pass for two things:
 ///
 /// 1. **Error frames** — `data:` lines whose JSON payload contains a
 ///    top-level `"error"` key — the shape used by OpenAI, Anthropic, and
@@ -662,6 +662,7 @@ pub(super) fn drive_upstream_stream(
     keepalive_interval: Duration,
     capture: Option<StreamCapture>,
     transcode: Option<StreamTranscode>,
+    response_model: Option<ResponseModelOverride>,
 ) -> Response {
     use async_stream::stream;
 
@@ -688,6 +689,10 @@ pub(super) fn drive_upstream_stream(
     // boundaries so a frame split by a TCP packet boundary is parsed once
     // complete.
     let mut transcode = transcode;
+    // Same-suite streams otherwise bypass protocol codecs entirely. Keep the
+    // normalization here, after either passthrough or transcoding, so every
+    // client sees its requested virtual model without leaking target ids.
+    let mut model_rewriter = response_model.map(|override_| override_.sse_rewriter());
     let mut frame_buf = String::new();
     // Transcode-only: tracks whether the upstream actually delivered a
     // genuine terminal signal in-band (a `Finish` or `ResponseCompleted`
@@ -853,13 +858,20 @@ pub(super) fn drive_upstream_stream(
                                     }
                                 }
                                 if !out.is_empty() {
+                                    let out = if let Some(rewriter) = model_rewriter.as_mut() {
+                                        rewriter.rewrite(&out)
+                                    } else {
+                                        out
+                                    };
                                     // Mirror the re-encoded bytes into the
                                     // client capture so cross-protocol streams
                                     // persist the ingress-format body in
                                     // `client_resp_body`, not the raw
                                     // upstream SSE.
-                                    capture_guard.append_client(&out);
-                                    yield Ok(Bytes::from(out));
+                                    if !out.is_empty() {
+                                        capture_guard.append_client(&out);
+                                        yield Ok(Bytes::from(out));
+                                    }
                                 }
                             } else {
                                 // Forward upstream bytes VERBATIM. The upstream
@@ -880,8 +892,15 @@ pub(super) fn drive_upstream_stream(
                                 // substring search for `"error"` gates the
                                 // more expensive JSON parse.
                                 detect_verbatim_signals(&bytes, &accum);
-                                capture_guard.append_client(&bytes);
-                                yield Ok(bytes);
+                                let client_bytes = if let Some(rewriter) = model_rewriter.as_mut() {
+                                    rewriter.rewrite(&bytes)
+                                } else {
+                                    bytes.to_vec()
+                                };
+                                if !client_bytes.is_empty() {
+                                    capture_guard.append_client(&client_bytes);
+                                    yield Ok(Bytes::from(client_bytes));
+                                }
                             }
                         }
                         Some(Err(_e)) => {
@@ -930,6 +949,13 @@ pub(super) fn drive_upstream_stream(
                             // then close. In transcode mode the frame is
                             // generated by the *ingress* encoder so the
                             // client sees its own protocol's error shape.
+                            if let Some(rewriter) = model_rewriter.as_mut() {
+                                let trailing = rewriter.finish();
+                                if !trailing.is_empty() {
+                                    capture_guard.append_client(&trailing);
+                                    yield Ok(Bytes::from(trailing));
+                                }
+                            }
                             if let Some(tc) = transcode.as_mut() {
                                 let ef = tc.encoder.encode_error(
                                     "upstream stream truncated by gateway",
@@ -1052,8 +1078,15 @@ pub(super) fn drive_upstream_stream(
                                     }
                                 }
                                 if !out.is_empty() {
-                                    capture_guard.append_client(&out);
-                                    yield Ok(Bytes::from(out));
+                                    let out = if let Some(rewriter) = model_rewriter.as_mut() {
+                                        rewriter.rewrite(&out)
+                                    } else {
+                                        out
+                                    };
+                                    if !out.is_empty() {
+                                        capture_guard.append_client(&out);
+                                        yield Ok(Bytes::from(out));
+                                    }
                                 }
                             } else {
                                 // Verbatim / same-protocol path: the upstream
@@ -1089,6 +1122,16 @@ pub(super) fn drive_upstream_stream(
                                     yield Ok(Bytes::from(end_marker.clone()));
                                 }
                             }
+                            // A final upstream chunk may end halfway through
+                            // an SSE line. Flush it only at EOF so model
+                            // normalization never drops those bytes.
+                            if let Some(rewriter) = model_rewriter.as_mut() {
+                                let trailing = rewriter.finish();
+                                if !trailing.is_empty() {
+                                    capture_guard.append_client(&trailing);
+                                    yield Ok(Bytes::from(trailing));
+                                }
+                            }
                             // Finalize capture BEFORE break: the client may
                             // close immediately after receiving the last frame
                             // (SDK reads [DONE] → response.close()), which
@@ -1114,6 +1157,13 @@ pub(super) fn drive_upstream_stream(
                     // tail does not end on a frame boundary; prepend a
                     // blank line so the error frame is not glued onto a
                     // half-written `data:` line.
+                    if let Some(rewriter) = model_rewriter.as_mut() {
+                        let trailing = rewriter.finish();
+                        if !trailing.is_empty() {
+                            capture_guard.append_client(&trailing);
+                            yield Ok(Bytes::from(trailing));
+                        }
+                    }
                     if let Some(tc) = transcode.as_mut() {
                         let ef = tc.encoder.encode_error(
                             "upstream stream idle timeout",
@@ -1150,6 +1200,13 @@ pub(super) fn drive_upstream_stream(
                     // error frame so the client can tell this was a
                     // gateway-side cap, not a natural end. In transcode
                     // mode the frame is built by the ingress encoder.
+                    if let Some(rewriter) = model_rewriter.as_mut() {
+                        let trailing = rewriter.finish();
+                        if !trailing.is_empty() {
+                            capture_guard.append_client(&trailing);
+                            yield Ok(Bytes::from(trailing));
+                        }
+                    }
                     if let Some(tc) = transcode.as_mut() {
                         let ef = tc.encoder.encode_error(
                             "upstream stream exceeded gateway total budget",
