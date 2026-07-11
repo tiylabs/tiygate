@@ -133,9 +133,9 @@
 | `verbosity` | ✅ 顶层 `verbosity` | ❌ 跨协议拒绝 | ✅ `text.verbosity` | ❌ 跨协议拒绝 |
 | `safety_identifier` | ✅ | N/A | ✅ | N/A |
 | image `detail: "original"` | ✅ | ⚠️ 无等价语义 | ✅ | ⚠️ 无等价语义 |
-| Multi-agent Beta | 延后 | 延后 | 同协议 raw passthrough；无 typed/cross-protocol 保证 | 延后 |
+| Multi-agent Beta | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ 同协议透传 / re-encode 保活（见 §13） | ❌ 跨协议拒绝 |
 
-Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v1`，本轮不建模 `multi_agent`、`multi_agent_call/output` 或 agent 事件；不得将同协议透明转发描述为完整支持。
+Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v1`。同协议路径保活顶层 `multi_agent` 与 `multi_agent_call/output` items；跨协议由 `LossyDimension::MultiAgent` 硬拒绝。不建模 agent 事件类型，也不宣称 typed multi-agent 完整支持——详见 §13。
 
 ## 7. Metadata
 
@@ -225,3 +225,19 @@ Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字�
 | `x-openai-subagent` | ✅ 同上 |
 | `x-codex-turn-state` | ✅ 响应头，不在 `DEFAULT_RESPONSE_DENY` 中，自动转发回客户端 |
 | `OpenAI-Beta` | ✅ 通用客户端头，自动转发 |
+
+## 13. Multi-agent Beta（GPT-5.6 / Responses）
+
+OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）仅在 **Responses 同协议**路径上支持透传；跨协议一律拒绝，不做 IR 类型化或转换。
+
+| 维度 | chat_completions | messages | responses | gemini | embeddings |
+|------|:---:|:---:|:---:|:---:|:---:|
+| 顶层 `multi_agent` | ❌ 拒绝 | ❌ 拒绝 | ✅ 同协议透传 / re-encode 保活 | ❌ 拒绝 | N/A |
+| `multi_agent_call` / `multi_agent_call_output` input items | ❌ 拒绝 | ❌ 拒绝 | ✅ 存入 `extensions["multi_agent_items"]`，同协议回放 | ❌ 拒绝 | N/A |
+| 跨协议 Convert | ❌ | ❌ | N/A（同协议） | ❌ | N/A |
+
+**运行时行为**：
+- 同协议（Responses→Responses）：raw passthrough 与 IR re-encode 均保留 `multi_agent` 与 multi-agent input items；`OpenAI-Beta` 头按现有 denylist 策略转发。
+- 跨协议：`check_lossy_conversion` 检测到 `responses_extra.multi_agent` 或非空 `multi_agent_items` 时，以 `LossyDimension::MultiAgent` **拒绝**（HTTP 400），不静默丢弃。
+- 不支持 WebSocket multi-agent 长连接；本网关 Responses 面仅为 HTTP + SSE。
+- 不建模 agent 调度语义；不做跨协议转换。

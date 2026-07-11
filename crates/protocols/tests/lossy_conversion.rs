@@ -472,6 +472,55 @@ fn codex_opaque_items_do_not_trigger_lossy_rejection() {
     }
 }
 
+#[test]
+fn multi_agent_rejected_outside_responses() {
+    let mut with_config = text_only_req();
+    with_config.extensions.insert(
+        "responses_extra".to_string(),
+        serde_json::json!({
+            "multi_agent": {
+                "enabled": true,
+                "max_concurrent_subagents": 4
+            }
+        }),
+    );
+
+    assert!(
+        check_lossy_conversion(&with_config, &responses_endpoint(), &responses_caps()).is_ok(),
+        "Responses should accept multi_agent config"
+    );
+
+    for (label, endpoint, caps) in [
+        ("chat", chat_endpoint(), chat_caps()),
+        ("anthropic", anthropic_endpoint(), messages_caps()),
+        ("gemini", gemini_endpoint(), gemini_caps()),
+    ] {
+        let (dim, err) = check_lossy_conversion(&with_config, &endpoint, &caps).unwrap_err();
+        assert_eq!(
+            dim,
+            LossyDimension::MultiAgent,
+            "{label} should reject multi_agent config"
+        );
+        assert!(
+            err.to_string().contains("multi_agent"),
+            "{label} rejection should mention multi_agent: {err}"
+        );
+    }
+
+    let mut with_items = text_only_req();
+    with_items.extensions.insert(
+        "multi_agent_items".to_string(),
+        serde_json::json!([{"type": "multi_agent_call", "id": "ma_1", "name": "spawn_agent"}]),
+    );
+    assert!(
+        check_lossy_conversion(&with_items, &responses_endpoint(), &responses_caps()).is_ok(),
+        "Responses should accept multi_agent_items"
+    );
+    let (dim, _) =
+        check_lossy_conversion(&with_items, &chat_endpoint(), &chat_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::MultiAgent);
+}
+
 // --- Prompt cache breakpoint ---
 
 #[test]

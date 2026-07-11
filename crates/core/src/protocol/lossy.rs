@@ -59,6 +59,9 @@ pub enum LossyDimension {
     /// Request has `extended_reasoning` (Anthropic-style thinking blocks) but
     /// the egress protocol cannot carry reasoning parts.
     ExtendedReasoning,
+    /// Request uses OpenAI Responses multi-agent beta state that only Responses
+    /// can express (top-level `multi_agent` and/or multi-agent input items).
+    MultiAgent,
 }
 
 impl LossyDimension {
@@ -77,6 +80,7 @@ impl LossyDimension {
             Self::Verbosity => "verbosity",
             Self::PromptCacheBreakpoint => "prompt_cache_breakpoint",
             Self::ExtendedReasoning => "extended_reasoning",
+            Self::MultiAgent => "multi_agent",
         }
     }
 }
@@ -312,6 +316,32 @@ pub fn check_lossy_conversion(
                 LossyDimension::ExtendedReasoning,
                 egress,
                 "reasoning content",
+            ),
+        ));
+    }
+
+    // 10. Multi-agent Beta is Responses-only. Detect either the top-level
+    // `multi_agent` config bag or opaque multi-agent input items; reject when
+    // the egress suite cannot express them (do not silently drop).
+    let has_multi_agent_config = request
+        .extensions
+        .get("responses_extra")
+        .and_then(|v| v.get("multi_agent"))
+        .is_some();
+    let has_multi_agent_items = request
+        .extensions
+        .get("multi_agent_items")
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| !items.is_empty());
+    if (has_multi_agent_config || has_multi_agent_items)
+        && !matches!(egress.suite, crate::protocol::ProtocolSuite::OpenAiResponses)
+    {
+        return Err((
+            LossyDimension::MultiAgent,
+            lossy_error(
+                LossyDimension::MultiAgent,
+                egress,
+                "multi_agent config or multi_agent_call items (Responses-only)",
             ),
         ));
     }

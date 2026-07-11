@@ -392,6 +392,7 @@ impl EndpointCodec for ResponsesCodec {
         let system = body["instructions"].as_str().map(String::from);
         let mut messages: Vec<Message> = Vec::new();
         let mut codex_opaque_items: Vec<Value> = Vec::new();
+        let mut multi_agent_items: Vec<Value> = Vec::new();
 
         if let Some(arr) = body["input"].as_array() {
             let mut call_id_counts: HashMap<String, usize> = HashMap::new();
@@ -438,6 +439,16 @@ impl EndpointCodec for ResponsesCodec {
                     // BEFORE the content-based branches because some opaque
                     // items (e.g. agent_message) carry a `content` field.
                     codex_opaque_items.push(item.clone());
+                    vec![]
+                } else if matches!(
+                    item["type"].as_str(),
+                    Some("multi_agent_call") | Some("multi_agent_call_output")
+                ) {
+                    // GPT-5.6 Multi-agent Beta items: keep raw JSON under a
+                    // dedicated extension so same-protocol re-encode is
+                    // lossless and cross-protocol conversion can hard-reject
+                    // (unlike codex_opaque_items which drop silently).
+                    multi_agent_items.push(item.clone());
                     vec![]
                 } else if let Some(text) = item["content"].as_str() {
                     vec![Content::Text {
@@ -838,6 +849,7 @@ impl EndpointCodec for ResponsesCodec {
                 "prompt_cache_retention",
                 "prompt_cache_options",
                 "client_metadata",
+                "multi_agent",
             ] {
                 if let Some(v) = body.get(key) {
                     extra.insert(key.to_string(), v.clone());
@@ -853,6 +865,12 @@ impl EndpointCodec for ResponsesCodec {
         // drops these silently.
         if !codex_opaque_items.is_empty() {
             extensions.insert("codex_opaque_items".to_string(), json!(codex_opaque_items));
+        }
+
+        // GPT-5.6 Multi-agent Beta input items. Same-protocol re-encode
+        // replays them; cross-protocol conversion rejects via lossy check.
+        if !multi_agent_items.is_empty() {
+            extensions.insert("multi_agent_items".to_string(), json!(multi_agent_items));
         }
 
         // Promote `text.format` into IR response_format so Chat ↔ Responses
@@ -1324,6 +1342,18 @@ impl EndpointCodec for ResponsesCodec {
         {
             if let Some(arr) = body["input"].as_array_mut() {
                 for item in opaque {
+                    arr.push(item.clone());
+                }
+            }
+        }
+        // Restore GPT-5.6 Multi-agent Beta input items for same-protocol replay.
+        if let Some(items) = ir
+            .extensions
+            .get("multi_agent_items")
+            .and_then(|v| v.as_array())
+        {
+            if let Some(arr) = body["input"].as_array_mut() {
+                for item in items {
                     arr.push(item.clone());
                 }
             }
@@ -4611,6 +4641,71 @@ mod tests {
             has_tool_calls_finish,
             "Codex local_shell_call stream should produce FinishReason::ToolCalls, got: {:?}",
             parts
+        );
+    }
+
+    #[test]
+    fn test_multi_agent_field_and_items_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "coordinate agents"},
+                {
+                    "type": "multi_agent_call",
+                    "id": "ma_1",
+                    "name": "spawn_agent",
+                    "arguments": {"task": "research"}
+                },
+                {
+                    "type": "multi_agent_call_output",
+                    "id": "mao_1",
+                    "call_id": "ma_1",
+                    "output": {"agent_id": "/root/child1"}
+                }
+            ],
+            "multi_agent": {
+                "enabled": true,
+                "max_concurrent_subagents": 4
+            }
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+
+        let extra = ir
+            .extensions
+            .get("responses_extra")
+            .and_then(|v| v.as_object())
+            .expect("responses_extra should exist");
+        assert_eq!(extra["multi_agent"]["enabled"], true);
+        assert_eq!(extra["multi_agent"]["max_concurrent_subagents"], 4);
+
+        let items = ir
+            .extensions
+            .get("multi_agent_items")
+            .and_then(|v| v.as_array())
+            .expect("multi_agent_items should be in extensions");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "multi_agent_call");
+        assert_eq!(items[1]["type"], "multi_agent_call_output");
+
+        // Opaque multi-agent items must not create empty IR messages.
+        assert_eq!(ir.messages.len(), 1);
+        assert_eq!(ir.messages[0].role, Role::User);
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["multi_agent"]["enabled"], true);
+        assert_eq!(encoded["multi_agent"]["max_concurrent_subagents"], 4);
+        let input = encoded["input"].as_array().expect("input array");
+        assert!(
+            input.iter().any(|item| item["type"] == "multi_agent_call"),
+            "multi_agent_call should be replayed: {input:?}"
+        );
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "multi_agent_call_output"),
+            "multi_agent_call_output should be replayed: {input:?}"
         );
     }
 }
