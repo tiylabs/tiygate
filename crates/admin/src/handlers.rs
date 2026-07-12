@@ -129,6 +129,7 @@ struct ProviderUsageResponse {
     checked_at: Option<String>,
     five_hour: Option<ProviderUsageWindow>,
     seven_day: Option<ProviderUsageWindow>,
+    account_email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +156,7 @@ fn provider_usage_response(
     reason: Option<&str>,
     five_hour: Option<ProviderUsageWindow>,
     seven_day: Option<ProviderUsageWindow>,
+    account_email: Option<&str>,
 ) -> ProviderUsageResponse {
     ProviderUsageResponse {
         provider_id: provider_id.to_string(),
@@ -163,6 +165,7 @@ fn provider_usage_response(
         checked_at: Some(chrono::Utc::now().to_rfc3339()),
         five_hour,
         seven_day,
+        account_email: account_email.map(str::to_string),
     }
 }
 
@@ -195,6 +198,20 @@ fn parse_openai_usage(
     ))
 }
 
+fn provider_oauth_account_email(provider: &Provider) -> Option<String> {
+    provider
+        .oauth_meta_cleartext
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|meta| {
+            meta.get("account_email")
+                .or_else(|| meta.get("email"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
 /// Fetch the ChatGPT/Codex subscription windows for one OpenAI OAuth
 /// provider. The OAuth cache is keyed by provider/account, so multiple
 /// providers can safely use different ChatGPT accounts in one process.
@@ -207,6 +224,7 @@ async fn provider_usage(
         .get_provider(&id)
         .await?
         .ok_or_else(|| AdminError::NotFound(format!("provider {id}")))?;
+    let stored_account_email = provider_oauth_account_email(&provider);
 
     if provider.vendor != "openai" || !matches!(provider.auth_mode, AuthMode::OAuth) {
         return Ok(Json(provider_usage_response(
@@ -215,6 +233,7 @@ async fn provider_usage(
             Some("openai_oauth_only"),
             None,
             None,
+            stored_account_email.as_deref(),
         ))
         .into_response());
     }
@@ -227,6 +246,7 @@ async fn provider_usage(
             Some("oauth_metadata_unavailable"),
             None,
             None,
+            stored_account_email.as_deref(),
         ))
         .into_response());
     };
@@ -237,6 +257,7 @@ async fn provider_usage(
             Some("refresh_token_missing"),
             None,
             None,
+            stored_account_email.as_deref(),
         ))
         .into_response());
     }
@@ -263,22 +284,27 @@ async fn provider_usage(
             Some("oauth_token_unavailable"),
             None,
             None,
+            stored_account_email.as_deref(),
         ))
         .into_response());
     }
 
+    let account_email = cache
+        .get_account_email(&id, label)
+        .or_else(|| stored_account_email.clone());
     if let Some(cached_refresh_token) = cache.get_refresh_token(&id, label) {
-        match oauth_meta_after_refresh_rotation(
+        match oauth_meta_after_cache_update(
             &provider,
             &oauth_config.refresh_token,
             &cached_refresh_token,
+            account_email.as_deref(),
         ) {
             Ok(Some(meta)) => {
                 if let Err(error) = state.store.set_provider_oauth_meta(&id, &meta).await {
                     tracing::warn!(
                         provider = %id,
                         error = %error,
-                        "persisting rotated OAuth refresh token after usage request failed"
+                        "persisting OpenAI OAuth identity after usage request failed"
                     );
                 }
             }
@@ -287,7 +313,7 @@ async fn provider_usage(
                 tracing::warn!(
                     provider = %id,
                     error = %error,
-                    "preparing rotated OAuth refresh token metadata failed"
+                    "preparing OpenAI OAuth identity metadata failed"
                 );
             }
         }
@@ -307,6 +333,7 @@ async fn provider_usage(
                 Some("upstream_request_failed"),
                 None,
                 None,
+                account_email.as_deref(),
             ))
             .into_response());
         }
@@ -330,6 +357,7 @@ async fn provider_usage(
             Some("upstream_http_error"),
             None,
             None,
+            account_email.as_deref(),
         ))
         .into_response());
     }
@@ -348,11 +376,19 @@ async fn provider_usage(
                 Some("invalid_upstream_response"),
                 None,
                 None,
+                account_email.as_deref(),
             ))
             .into_response());
         }
     };
-    let usage = provider_usage_response(&id, "available", None, five_hour, seven_day);
+    let usage = provider_usage_response(
+        &id,
+        "available",
+        None,
+        five_hour,
+        seven_day,
+        account_email.as_deref(),
+    );
     Ok(Json(usage).into_response())
 }
 
@@ -592,6 +628,59 @@ async fn record_oauth_status(
 /// observes refresh-token rotation. Existing fields such as `account_id` and
 /// `expires_in_s` are retained so model discovery cannot erase credential
 /// context while updating the token.
+fn oauth_meta_after_cache_update(
+    provider: &Provider,
+    stored_refresh_token: &str,
+    cached_refresh_token: &str,
+    account_email: Option<&str>,
+) -> Result<Option<String>, String> {
+    let raw = provider
+        .oauth_meta_cleartext
+        .as_deref()
+        .ok_or_else(|| "decrypted OAuth metadata is unavailable".to_string())?;
+    let mut meta: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("parsing decrypted OAuth metadata: {e}"))?;
+    let object = meta
+        .as_object_mut()
+        .ok_or_else(|| "decrypted OAuth metadata must be a JSON object".to_string())?;
+    let mut refresh_rotated = false;
+    if cached_refresh_token != stored_refresh_token {
+        object.insert(
+            "refresh_token".to_string(),
+            serde_json::Value::String(cached_refresh_token.to_string()),
+        );
+        refresh_rotated = true;
+    }
+    let email_changed = account_email.is_some_and(|email| {
+        object.get("account_email").and_then(|value| value.as_str()) != Some(email)
+    });
+    if let Some(email) = account_email.filter(|email| !email.is_empty()) {
+        if email_changed {
+            object.insert(
+                "account_email".to_string(),
+                serde_json::Value::String(email.to_string()),
+            );
+        }
+    }
+    if !refresh_rotated && !email_changed {
+        return Ok(None);
+    }
+    if refresh_rotated {
+        object.insert(
+            "status".to_string(),
+            serde_json::Value::String(OAuthCredentialStatus::Healthy.as_str().to_string()),
+        );
+        object.insert(
+            "status_checked_at".to_string(),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        object.remove("status_reason");
+    }
+    serde_json::to_string(&meta)
+        .map(Some)
+        .map_err(|e| format!("serializing updated OAuth metadata: {e}"))
+}
+
 fn oauth_meta_after_refresh_rotation(
     provider: &Provider,
     stored_refresh_token: &str,
@@ -1034,15 +1123,10 @@ fn normalized_provider_metadata(
     let Some(preset) = tiygate_auth::provider_oauth::preset_for_vendor(vendor) else {
         return metadata;
     };
-    let refresh_scopes = if preset.send_scopes_in_token_requests {
-        preset.scopes
-    } else {
-        Vec::new()
-    };
     metadata["oauth"] = json!({
         "token_url": preset.token_url,
         "client_id": preset.client_id,
-        "scopes": refresh_scopes,
+        "scopes": preset.refresh_scopes,
         "token_request_style": match preset.refresh_request_style {
             tiygate_core::provider::oauth::TokenRequestStyle::Form => "form",
             tiygate_core::provider::oauth::TokenRequestStyle::Json => "json",

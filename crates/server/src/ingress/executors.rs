@@ -85,6 +85,94 @@ fn uses_codex_responses_websocket(target: &tiygate_core::RoutingTarget) -> bool 
     )
 }
 
+fn is_codex_oauth_target(target: &tiygate_core::RoutingTarget) -> bool {
+    target.oauth.as_ref().is_some_and(|oauth| {
+        oauth.client_id == "app_EMoamEEZ73f0CkXaXp7hrann"
+            || target
+                .effective_api_base()
+                .contains("chatgpt.com/backend-api/codex")
+    })
+}
+
+fn normalize_codex_request(body: &mut Value, websocket: bool) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if object.get("stream").and_then(Value::as_bool) != Some(true) {
+        object.insert("stream".to_string(), json!(true));
+        changed = true;
+    }
+    if object.get("instructions").is_none_or(Value::is_null) {
+        object.insert("instructions".to_string(), json!(""));
+        changed = true;
+    }
+    for field in ["prompt_cache_retention", "safety_identifier"] {
+        changed |= object.remove(field).is_some();
+    }
+    if !websocket {
+        for field in ["previous_response_id", "stream_options"] {
+            changed |= object.remove(field).is_some();
+        }
+    }
+    changed
+}
+
+fn ensure_codex_request_headers(headers: &mut http::HeaderMap) {
+    let has_session = ["session_id", "session-id"]
+        .iter()
+        .any(|name| headers.contains_key(*name));
+    let desktop_user_agent = headers
+        .get(http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("Mac OS"));
+    if desktop_user_agent && !has_session {
+        if let Ok(value) = http::HeaderValue::from_str(&uuid::Uuid::now_v7().to_string()) {
+            headers.insert(http::HeaderName::from_static("session_id"), value);
+        }
+    }
+}
+
+fn parse_codex_http_response(body: &str) -> Result<Value, AppError> {
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        return Ok(value);
+    }
+    let mut terminal_error = None;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed" | "response.done") => {
+                if let Some(response) = event.get("response") {
+                    return Ok(response.clone());
+                }
+            }
+            Some("response.failed" | "response.incomplete" | "error") => {
+                terminal_error = Some(event);
+            }
+            _ => {}
+        }
+    }
+    if let Some(error) = terminal_error {
+        return Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Codex terminal error: {error}"),
+        ));
+    }
+    Err(AppError::new(
+        StatusCode::BAD_GATEWAY,
+        "Codex response did not contain response.completed".to_string(),
+    ))
+}
+
 fn codex_websocket_url(upstream_url: &str) -> Result<String, AppError> {
     let mut url = url::Url::parse(upstream_url).map_err(|error| {
         AppError::new(
@@ -1703,6 +1791,73 @@ pub(super) async fn execute_responses_upstream(
     client_headers: &http::HeaderMap,
     api_key_id: &str,
 ) -> Result<(Response, Option<u64>), AppError> {
+    let mut rejected_access_token = None;
+    let first = execute_responses_upstream_once(
+        state,
+        codec,
+        ingress_protocol,
+        ir_request,
+        target,
+        is_stream,
+        raw_passthrough_body,
+        trace,
+        request_id,
+        client_headers,
+        api_key_id,
+        &mut rejected_access_token,
+    )
+    .await;
+    let Err(first_error) = first else {
+        return first;
+    };
+    if first_error.http_status() != StatusCode::UNAUTHORIZED {
+        return Err(first_error);
+    }
+    let Some(rejected_access_token) = rejected_access_token else {
+        return Err(first_error);
+    };
+    match state
+        .oauth_manager
+        .refresh_after_unauthorized(target, &rejected_access_token)
+        .await
+    {
+        Ok(true) => {
+            let mut retry_token = None;
+            execute_responses_upstream_once(
+                state,
+                codec,
+                ingress_protocol,
+                ir_request,
+                target,
+                is_stream,
+                raw_passthrough_body,
+                trace,
+                request_id,
+                client_headers,
+                api_key_id,
+                &mut retry_token,
+            )
+            .await
+        }
+        Ok(false) | Err(_) => Err(first_error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_responses_upstream_once(
+    state: &AppState,
+    codec: &ResponsesCodec,
+    ingress_protocol: &tiygate_core::ProtocolEndpoint,
+    ir_request: &IrRequest,
+    target: &tiygate_core::RoutingTarget,
+    is_stream: bool,
+    raw_passthrough_body: Option<&str>,
+    trace: &TraceContext,
+    request_id: &str,
+    client_headers: &http::HeaderMap,
+    api_key_id: &str,
+    used_oauth_access_token: &mut Option<String>,
+) -> Result<(Response, Option<u64>), AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
     let is_pass_through = raw_passthrough_body.is_some() && is_same_protocol;
@@ -1749,6 +1904,11 @@ pub(super) async fn execute_responses_upstream(
         &egress_protocol.suite,
         &target.model_id,
     );
+    let codex_oauth = is_codex_oauth_target(target);
+    let codex_websocket = codex_oauth && uses_codex_responses_websocket(target);
+    if codex_oauth {
+        body_mutated |= normalize_codex_request(&mut upstream_body, codex_websocket);
+    }
     let pass_through_verbatim = is_pass_through && !body_mutated;
     merge_client_headers(
         client_headers,
@@ -1756,8 +1916,16 @@ pub(super) async fn execute_responses_upstream(
         &state.tunables().header_policy,
     );
     apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    if codex_oauth {
+        ensure_codex_request_headers(&mut upstream_headers);
+    }
+    *used_oauth_access_token = upstream_headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_string);
 
-    let egress_body_capture = if pass_through_verbatim {
+    let mut egress_body_capture = if pass_through_verbatim {
         raw_passthrough_body.map(|s| s.to_string())
     } else {
         serde_json::to_string(&upstream_body).ok()
@@ -1783,10 +1951,8 @@ pub(super) async fn execute_responses_upstream(
     // than HTTP POST + SSE. Keep this provider-specific transport outside of
     // the generic HTTP executor, while sharing the same canonical stream
     // bridge and response codecs below it.
-    if uses_codex_responses_websocket(target)
-        && egress_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses
-    {
-        return execute_codex_responses_websocket(
+    if codex_websocket && egress_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses {
+        let websocket_result = execute_codex_responses_websocket(
             state,
             codec,
             ingress_protocol,
@@ -1794,14 +1960,22 @@ pub(super) async fn execute_responses_upstream(
             ir_request,
             target,
             is_stream,
-            upstream_url,
-            upstream_body,
-            upstream_headers,
+            upstream_url.clone(),
+            upstream_body.clone(),
+            upstream_headers.clone(),
             trace,
             request_id,
             is_same_protocol,
         )
         .await;
+        match websocket_result {
+            Ok(response) => return Ok(response),
+            Err(error) if error.http_status() == StatusCode::UPGRADE_REQUIRED => {
+                normalize_codex_request(&mut upstream_body, false);
+                egress_body_capture = serde_json::to_string(&upstream_body).ok();
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     if is_stream {
@@ -1954,6 +2128,9 @@ pub(super) async fn execute_responses_upstream(
             .headers(upstream_headers),
         trace,
     );
+    if codex_oauth {
+        nonstream_req = nonstream_req.header(http::header::ACCEPT, "text/event-stream");
+    }
     if pass_through_verbatim {
         if let Some(raw) = raw_passthrough_body {
             nonstream_req = nonstream_req
@@ -1981,11 +2158,15 @@ pub(super) async fn execute_responses_upstream(
         extract_rate_limit_headers(response.headers());
     let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
     let upstream_status_capture = status.as_u16();
-    let response_body: Value = response
-        .json()
+    let response_text = response
+        .text()
         .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {e}")))?;
+        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Read error: {e}")))?;
+    let parsed_json = serde_json::from_str::<Value>(&response_text).ok();
     if !status.is_success() {
+        let response_body = parsed_json.unwrap_or_else(
+            || json!({"error": {"message": response_text, "type": "upstream_error"}}),
+        );
         spawn_capture(
             state,
             tiygate_core::ExchangeCapture {
@@ -2028,6 +2209,17 @@ pub(super) async fn execute_responses_upstream(
         return Err(app_err);
     }
 
+    let response_body = if codex_oauth {
+        parse_codex_http_response(&response_text)?
+    } else {
+        parsed_json.ok_or_else(|| {
+            AppError::new(
+                StatusCode::BAD_GATEWAY,
+                "Parse error: upstream response is not JSON".to_string(),
+            )
+        })?
+    };
+
     // Detect HTTP 200 responses that are actually error responses
     // (top-level "error" key, e.g. service_unavailable_error).
     if let Some(app_err) = check_nonstream_error_body(
@@ -2059,7 +2251,11 @@ pub(super) async fn execute_responses_upstream(
         return Err(app_err);
     }
 
-    let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
+    let upstream_resp_body_capture = if codex_oauth {
+        Some(response_text)
+    } else {
+        serde_json::to_string(&response_body).ok()
+    };
     let mut response_body = if is_same_protocol {
         response_body
     } else {
@@ -2227,6 +2423,10 @@ async fn execute_codex_responses_websocket(
     let (mut socket, handshake_response) = match connection {
         Ok(connection) => connection,
         Err(error) => {
+            let status = match &error {
+                tokio_tungstenite::tungstenite::Error::Http(response) => response.status(),
+                _ => StatusCode::BAD_GATEWAY,
+            };
             let message = format!("Codex WebSocket handshake error: {error}");
             spawn_capture(
                 state,
@@ -2236,7 +2436,7 @@ async fn execute_codex_responses_websocket(
                     egress_path,
                     egress_headers: egress_headers_capture,
                     egress_body: egress_body_capture,
-                    upstream_status: None,
+                    upstream_status: Some(status.as_u16()),
                     upstream_resp_headers: Vec::new(),
                     upstream_resp_body: Some(message.clone()),
                     client_resp_headers: Vec::new(),
@@ -2248,7 +2448,9 @@ async fn execute_codex_responses_websocket(
                     upstream_error_class: None,
                 },
             );
-            return Err(AppError::new(StatusCode::BAD_GATEWAY, message));
+            let mut app_error = AppError::new(status, message);
+            app_error.upstream_status = Some(status.as_u16());
+            return Err(app_error);
         }
     };
     let ttfb_ms = Some(connect_started.elapsed().as_millis() as u64);
@@ -3684,6 +3886,48 @@ mod tests {
         assert_eq!(event["type"], "response.create");
         assert_eq!(event["model"], "gpt-5-codex");
         assert_eq!(event["additional_tools"][0]["type"], "computer");
+    }
+
+    #[test]
+    fn codex_http_request_is_normalized_for_reference_contract() {
+        let mut body = json!({
+            "model": "gpt-5.6",
+            "stream": false,
+            "instructions": null,
+            "previous_response_id": "resp-old",
+            "stream_options": {"include_usage": true},
+            "prompt_cache_retention": "24h",
+            "safety_identifier": "user"
+        });
+        assert!(normalize_codex_request(&mut body, false));
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["instructions"], "");
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("stream_options").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert!(body.get("safety_identifier").is_none());
+    }
+
+    #[test]
+    fn codex_http_sse_returns_completed_response() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\"}}\n\n"
+        );
+        let response = parse_codex_http_response(body).unwrap();
+        assert_eq!(response["id"], "resp-1");
+        assert_eq!(response["status"], "completed");
+    }
+
+    #[test]
+    fn codex_desktop_headers_receive_session_id() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("Codex Desktop/1 (Mac OS 26; arm64)"),
+        );
+        ensure_codex_request_headers(&mut headers);
+        assert!(headers.contains_key("session_id"));
     }
 
     #[test]

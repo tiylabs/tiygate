@@ -161,7 +161,6 @@ struct OauthCallbackRequest {
 #[derive(Debug, Serialize)]
 struct OauthCallbackResponse {
     provider_id: String,
-    access_token: Option<String>,
     expires_in_s: Option<u64>,
 }
 
@@ -223,6 +222,7 @@ async fn callback_oauth_inner(
     ))?;
     let expires_in = result.expires_in;
     let account_id = result.account_id;
+    let account_email = result.account_email;
     if provider.vendor == "openai" && account_id.is_none() {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -237,6 +237,7 @@ async fn callback_oauth_inner(
     let meta_json = json!({
         "refresh_token": &refresh_token,
         "account_id": account_id.as_deref(),
+        "account_email": account_email.as_deref(),
         "expires_in_s": expires_in.map(|d| d.as_secs()),
         "status": OAuthCredentialStatus::Healthy.as_str(),
         "status_checked_at": chrono::Utc::now().to_rfc3339(),
@@ -261,25 +262,28 @@ async fn callback_oauth_inner(
     // Keep the freshly exchanged access token hot. Without this seed the
     // first model discovery/API request immediately spends the refresh token.
     let cache_label = account_id.as_deref().unwrap_or("__provider__");
-    tiygate_auth::provider_oauth::OAuthTokenCache::global().seed_tokens(
+    tiygate_auth::provider_oauth::OAuthTokenCache::global().seed_tokens_with_identity(
         &pending.provider_id,
         cache_label,
         &access_token,
         &refresh_token,
         expires_in,
+        tiygate_auth::provider_oauth::OAuthTokenIdentity {
+            account_id: account_id.clone(),
+            account_email: account_email.clone(),
+        },
     );
 
     Ok(OauthCallbackResponse {
         provider_id: pending.provider_id,
-        access_token: Some(access_token),
         expires_in_s: expires_in.map(|d| d.as_secs()),
     })
 }
 
 /// `POST /admin/v1/oauth/refresh` — refresh an existing OAuth
 /// access token. Body: `{ "provider_id": "..." }`. Response:
-/// `{ "provider_id": "...", "access_token": "...",
-/// "expires_in_s": ... }`.
+/// `{ "provider_id": "...", "expires_in_s": ... }`. Access tokens remain
+/// server-side and are never returned to the Admin Console.
 async fn refresh_oauth(
     State(state): State<AdminState>,
     Json(req): Json<RefreshOauthRequest>,
@@ -322,11 +326,7 @@ async fn refresh_oauth(
         &preset.token_url,
         &preset.client_id,
         refresh_token,
-        if preset.send_scopes_in_token_requests {
-            &preset.scopes
-        } else {
-            &[]
-        },
+        &preset.refresh_scopes,
         &preset.refresh_request_style,
         &http_client,
     )
@@ -359,6 +359,8 @@ async fn refresh_oauth(
     let expires_in = result.expires_in;
     let stored_account_id = oauth_meta.get("account_id").and_then(|v| v.as_str());
     let account_id = result.account_id.as_deref().or(stored_account_id);
+    let stored_account_email = oauth_meta.get("account_email").and_then(|v| v.as_str());
+    let account_email = result.account_email.as_deref().or(stored_account_email);
     let effective_refresh_token = new_refresh_token.as_deref().unwrap_or(refresh_token);
 
     // Persist both rotated tokens and account identity. Keeping the identity
@@ -366,6 +368,7 @@ async fn refresh_oauth(
     let meta_json = json!({
         "refresh_token": effective_refresh_token,
         "account_id": account_id,
+        "account_email": account_email,
         "expires_in_s": expires_in.map(|d| d.as_secs()),
         "status": OAuthCredentialStatus::Healthy.as_str(),
         "status_checked_at": chrono::Utc::now().to_rfc3339(),
@@ -378,17 +381,20 @@ async fn refresh_oauth(
         .await
         .map_err(|e| ApiError::internal(format!("persist oauth meta: {e}")))?;
 
-    tiygate_auth::provider_oauth::OAuthTokenCache::global().seed_tokens(
+    tiygate_auth::provider_oauth::OAuthTokenCache::global().seed_tokens_with_identity(
         &req.provider_id,
         account_id.unwrap_or("__provider__"),
         &access_token,
         effective_refresh_token,
         expires_in,
+        tiygate_auth::provider_oauth::OAuthTokenIdentity {
+            account_id: account_id.map(str::to_string),
+            account_email: account_email.map(str::to_string),
+        },
     );
 
     Ok(Json(RefreshOauthResponse {
         provider_id: req.provider_id,
-        access_token: Some(access_token),
         expires_in_s: expires_in.map(|d| d.as_secs()),
     }))
 }
@@ -401,7 +407,6 @@ struct RefreshOauthRequest {
 #[derive(Debug, Serialize)]
 struct RefreshOauthResponse {
     provider_id: String,
-    access_token: Option<String>,
     expires_in_s: Option<u64>,
 }
 

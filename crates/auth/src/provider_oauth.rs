@@ -40,10 +40,6 @@ const REFRESH_LEEWAY: Duration = Duration::from_secs(60);
 /// returns an empty model list for obsolete client versions.
 pub const CODEX_CLIENT_VERSION: &str = "0.144.0-alpha.4";
 
-/// Stable originator paired with the Codex Desktop user-agent for OpenAI OAuth
-/// authorization and Responses API requests.
-pub const CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
-
 /// Stable, non-secret classification of a failed OAuth refresh. Callers may
 /// persist these values for operator-facing health without exposing the raw
 /// authorization-server response.
@@ -139,9 +135,11 @@ pub struct OAuthProviderPreset {
     /// Refresh-token request body style. Some providers use different
     /// encodings for exchange and refresh (Codex is form + JSON).
     pub refresh_request_style: TokenRequestStyle,
-    /// Whether token requests include the authorization scopes. Codex's
-    /// token endpoints expect scopes only on the authorize URL.
-    pub send_scopes_in_token_requests: bool,
+    /// Whether the authorization-code exchange includes scopes.
+    pub send_scopes_in_exchange_request: bool,
+    /// Scopes sent specifically during refresh. This is separate from the
+    /// authorize scopes because Codex uses a smaller refresh scope set.
+    pub refresh_scopes: Vec<String>,
     /// Extra query parameters to append to the authorize URL
     /// (provider-specific, e.g. `prompt=login` for Codex).
     pub extra_authorize_params: Vec<(String, String)>,
@@ -157,22 +155,22 @@ pub fn codex_preset() -> OAuthProviderPreset {
         redirect_url: "http://localhost:1455/auth/callback".to_string(),
         scopes: vec![
             "openid".to_string(),
-            "profile".to_string(),
             "email".to_string(),
+            "profile".to_string(),
             "offline_access".to_string(),
-            "api.connectors.read".to_string(),
-            "api.connectors.invoke".to_string(),
         ],
         exchange_request_style: TokenRequestStyle::Form,
-        refresh_request_style: TokenRequestStyle::Json,
-        send_scopes_in_token_requests: false,
+        refresh_request_style: TokenRequestStyle::Form,
+        send_scopes_in_exchange_request: false,
+        refresh_scopes: vec![
+            "openid".to_string(),
+            "profile".to_string(),
+            "email".to_string(),
+        ],
         extra_authorize_params: vec![
+            ("prompt".to_string(), "login".to_string()),
             ("id_token_add_organizations".to_string(), "true".to_string()),
             ("codex_cli_simplified_flow".to_string(), "true".to_string()),
-            (
-                "originator".to_string(),
-                CODEX_DESKTOP_ORIGINATOR.to_string(),
-            ),
         ],
     }
 }
@@ -194,7 +192,14 @@ pub fn claude_preset() -> OAuthProviderPreset {
         ],
         exchange_request_style: TokenRequestStyle::Json,
         refresh_request_style: TokenRequestStyle::Json,
-        send_scopes_in_token_requests: true,
+        send_scopes_in_exchange_request: true,
+        refresh_scopes: vec![
+            "user:profile".to_string(),
+            "user:inference".to_string(),
+            "user:sessions:claude_code".to_string(),
+            "user:mcp_servers".to_string(),
+            "user:file_upload".to_string(),
+        ],
         extra_authorize_params: vec![("code".to_string(), "true".to_string())],
     }
 }
@@ -217,7 +222,15 @@ pub fn xai_preset() -> OAuthProviderPreset {
         ],
         exchange_request_style: TokenRequestStyle::Form,
         refresh_request_style: TokenRequestStyle::Form,
-        send_scopes_in_token_requests: true,
+        send_scopes_in_exchange_request: true,
+        refresh_scopes: vec![
+            "openid".to_string(),
+            "profile".to_string(),
+            "email".to_string(),
+            "offline_access".to_string(),
+            "grok-cli:access".to_string(),
+            "api:access".to_string(),
+        ],
         extra_authorize_params: vec![
             ("plan".to_string(), "generic".to_string()),
             ("referrer".to_string(), "tiygate".to_string()),
@@ -278,6 +291,8 @@ struct TokenResponseRaw {
     expires_in: Option<u64>,
     id_token: Option<String>,
     account_id: Option<String>,
+    email: Option<String>,
+    account_email: Option<String>,
 }
 
 /// Normalized token response used internally.
@@ -287,6 +302,7 @@ pub struct TokenResult {
     pub refresh_token: Option<String>,
     pub expires_in: Option<Duration>,
     pub account_id: Option<String>,
+    pub account_email: Option<String>,
 }
 
 // -----------------------------------------------------------------------
@@ -313,7 +329,7 @@ pub async fn exchange_code(
                 ("redirect_uri", preset.redirect_url.as_str()),
                 ("code_verifier", pkce_verifier),
             ];
-            if preset.send_scopes_in_token_requests {
+            if preset.send_scopes_in_exchange_request {
                 params.push(("scope", scopes.as_str()));
             }
             let resp = http_client
@@ -332,7 +348,7 @@ pub async fn exchange_code(
                 "redirect_uri": preset.redirect_url,
                 "code_verifier": pkce_verifier,
             });
-            if preset.send_scopes_in_token_requests {
+            if preset.send_scopes_in_exchange_request {
                 body["scope"] = serde_json::json!(scopes);
             }
             let resp = http_client
@@ -416,11 +432,17 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResult, St
         .account_id
         .filter(|value| !value.is_empty())
         .or_else(|| raw.id_token.as_deref().and_then(chatgpt_account_id));
+    let account_email = raw
+        .account_email
+        .or(raw.email)
+        .filter(|value| !value.is_empty())
+        .or_else(|| raw.id_token.as_deref().and_then(chatgpt_account_email));
     Ok(TokenResult {
         access_token: raw.access_token,
         refresh_token: raw.refresh_token,
         expires_in: raw.expires_in.map(Duration::from_secs),
         account_id,
+        account_email,
     })
 }
 
@@ -428,11 +450,7 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResult, St
 /// Signature verification is performed by the OAuth issuer; this local parse
 /// only reads the identity claim needed to scope subsequent requests.
 fn chatgpt_account_id(id_token: &str) -> Option<String> {
-    let payload = id_token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let claims = jwt_claims(id_token)?;
     claims
         .get("https://api.openai.com/auth")
         .and_then(|auth| auth.get("chatgpt_account_id"))
@@ -442,9 +460,46 @@ fn chatgpt_account_id(id_token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extract the email address from an OpenAI ID-token JWT. OpenAI currently
+/// emits the standard OIDC `email` claim, while accepting the namespaced
+/// variants keeps this compatible with older token shapes.
+fn chatgpt_account_email(id_token: &str) -> Option<String> {
+    let claims = jwt_claims(id_token)?;
+    claims
+        .get("email")
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|profile| profile.get("email"))
+        })
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| auth.get("email"))
+        })
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn jwt_claims(id_token: &str) -> Option<serde_json::Value> {
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 // -----------------------------------------------------------------------
 // Global token cache
 // -----------------------------------------------------------------------
+
+/// Non-secret identity claims learned from an OAuth token response.
+#[derive(Debug, Clone, Default)]
+pub struct OAuthTokenIdentity {
+    pub account_id: Option<String>,
+    pub account_email: Option<String>,
+}
 
 /// Cached token entry. The `refresh_token` is updated in-place when
 /// the provider rotates it during a refresh.
@@ -453,6 +508,8 @@ struct CachedToken {
     access_token: String,
     refresh_token: String,
     expires_at: Option<Instant>,
+    account_id: Option<String>,
+    account_email: Option<String>,
 }
 
 impl CachedToken {
@@ -528,6 +585,8 @@ impl OAuthTokenCache {
             access_token: String::new(),
             refresh_token: refresh_token.to_string(),
             expires_at: None,
+            account_id: None,
+            account_email: None,
         });
         // Only update refresh_token if the entry is empty (cold start).
         // If we already have a token, the cache's refresh_token may
@@ -549,6 +608,27 @@ impl OAuthTokenCache {
         refresh_token: &str,
         expires_in: Option<Duration>,
     ) {
+        self.seed_tokens_with_identity(
+            provider_id,
+            label,
+            access_token,
+            refresh_token,
+            expires_in,
+            OAuthTokenIdentity::default(),
+        );
+    }
+
+    /// Replace the cached credential and retain the non-secret account
+    /// identity returned by an OAuth token exchange or refresh.
+    pub fn seed_tokens_with_identity(
+        &self,
+        provider_id: &str,
+        label: &str,
+        access_token: &str,
+        refresh_token: &str,
+        expires_in: Option<Duration>,
+        identity: OAuthTokenIdentity,
+    ) {
         let key = Self::key(provider_id, label);
         self.tokens().insert(
             key,
@@ -556,6 +636,8 @@ impl OAuthTokenCache {
                 access_token: access_token.to_string(),
                 refresh_token: refresh_token.to_string(),
                 expires_at: expires_in.map(|duration| Instant::now() + duration),
+                account_id: identity.account_id,
+                account_email: identity.account_email,
             },
         );
     }
@@ -580,7 +662,12 @@ impl OAuthTokenCache {
         // Fast path: valid cached token.
         if let Some(cached) = self.tokens().get(&key) {
             if !cached.is_expiring() && !cached.access_token.is_empty() {
-                inject_token(headers, &cached.access_token, oauth)?;
+                inject_token(
+                    headers,
+                    &cached.access_token,
+                    cached.account_id.as_deref().or(oauth.account_id.as_deref()),
+                    oauth,
+                )?;
                 return Ok(());
             }
         }
@@ -592,7 +679,12 @@ impl OAuthTokenCache {
         // Re-check after acquiring the lock (double-checked locking).
         if let Some(cached) = self.tokens().get(&key) {
             if !cached.is_expiring() && !cached.access_token.is_empty() {
-                inject_token(headers, &cached.access_token, oauth)?;
+                inject_token(
+                    headers,
+                    &cached.access_token,
+                    cached.account_id.as_deref().or(oauth.account_id.as_deref()),
+                    oauth,
+                )?;
                 return Ok(());
             }
         }
@@ -629,18 +721,29 @@ impl OAuthTokenCache {
             .clone()
             .unwrap_or_else(|| refresh_token.clone());
         let expires_at = result.expires_in.map(|d| Instant::now() + d);
+        let account_email = result
+            .account_email
+            .clone()
+            .or_else(|| self.get_account_email(provider_id, label));
+        let account_id = result
+            .account_id
+            .clone()
+            .or_else(|| self.get_account_id(provider_id, label))
+            .or_else(|| oauth.account_id.clone());
         self.tokens().insert(
             key.clone(),
             CachedToken {
                 access_token: result.access_token.clone(),
                 refresh_token: new_refresh,
                 expires_at,
+                account_id: account_id.clone(),
+                account_email,
             },
         );
 
         info!(provider = %provider_id, label = %label, "OAuth token refreshed");
 
-        inject_token(headers, &result.access_token, oauth)?;
+        inject_token(headers, &result.access_token, account_id.as_deref(), oauth)?;
         Ok(())
     }
 
@@ -650,6 +753,48 @@ impl OAuthTokenCache {
     pub fn get_refresh_token(&self, provider_id: &str, label: &str) -> Option<String> {
         let key = Self::key(provider_id, label);
         self.tokens().get(&key).map(|c| c.refresh_token.clone())
+    }
+
+    /// Return the non-secret account email learned from the current token.
+    pub fn get_account_email(&self, provider_id: &str, label: &str) -> Option<String> {
+        let key = Self::key(provider_id, label);
+        self.tokens()
+            .get(&key)
+            .and_then(|cached| cached.account_email.clone())
+    }
+
+    /// Return the latest account/workspace identity learned from a refresh.
+    pub fn get_account_id(&self, provider_id: &str, label: &str) -> Option<String> {
+        let key = Self::key(provider_id, label);
+        self.tokens()
+            .get(&key)
+            .and_then(|cached| cached.account_id.clone())
+    }
+
+    /// Return the access token currently used for this credential.
+    pub fn get_access_token(&self, provider_id: &str, label: &str) -> Option<String> {
+        let key = Self::key(provider_id, label);
+        self.tokens()
+            .get(&key)
+            .map(|cached| cached.access_token.clone())
+            .filter(|token| !token.is_empty())
+    }
+
+    /// Clear a rejected access token only if it has not already been replaced
+    /// by another concurrent request's refresh.
+    pub fn invalidate_access_token_if_matches(
+        &self,
+        provider_id: &str,
+        label: &str,
+        rejected_access_token: &str,
+    ) {
+        let key = Self::key(provider_id, label);
+        if let Some(mut cached) = self.tokens().get_mut(&key) {
+            if cached.access_token == rejected_access_token {
+                cached.access_token.clear();
+                cached.expires_at = None;
+            }
+        }
     }
 }
 
@@ -665,6 +810,7 @@ impl Default for OAuthTokenCache {
 fn inject_token(
     headers: &mut HeaderMap,
     access_token: &str,
+    account_id: Option<&str>,
     oauth: &OAuthTargetConfig,
 ) -> Result<(), String> {
     let hv = format!("{}{}", oauth.bearer_prefix(), access_token);
@@ -683,6 +829,12 @@ fn inject_token(
         headers.insert(hn, hv);
     }
 
+    if let Some(account_id) = account_id.filter(|account_id| !account_id.is_empty()) {
+        let value = http::HeaderValue::from_str(account_id)
+            .map_err(|e| format!("invalid ChatGPT account header value: {e}"))?;
+        headers.insert(http::HeaderName::from_static("chatgpt-account-id"), value);
+    }
+
     Ok(())
 }
 
@@ -694,7 +846,7 @@ fn inject_token(
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -735,21 +887,15 @@ mod tests {
         assert_eq!(p.redirect_url, "http://localhost:1455/auth/callback");
         assert_eq!(
             p.scopes,
-            vec![
-                "openid",
-                "profile",
-                "email",
-                "offline_access",
-                "api.connectors.read",
-                "api.connectors.invoke"
-            ]
+            vec!["openid", "email", "profile", "offline_access"]
         );
         assert_eq!(p.exchange_request_style, TokenRequestStyle::Form);
-        assert_eq!(p.refresh_request_style, TokenRequestStyle::Json);
-        assert!(!p.send_scopes_in_token_requests);
+        assert_eq!(p.refresh_request_style, TokenRequestStyle::Form);
+        assert!(!p.send_scopes_in_exchange_request);
+        assert_eq!(p.refresh_scopes, vec!["openid", "profile", "email"]);
         assert!(p
             .extra_authorize_params
-            .contains(&("originator".into(), CODEX_DESKTOP_ORIGINATOR.into())));
+            .contains(&("prompt".into(), "login".into())));
     }
 
     #[test]
@@ -821,7 +967,9 @@ mod tests {
         assert!(url.contains("code_challenge=mychallenge"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("codex_cli_simplified_flow=true"));
-        assert!(url.contains("originator=Codex+Desktop"));
+        assert!(url.contains("prompt=login"));
+        assert!(!url.contains("originator="));
+        assert!(!url.contains("api.connectors"));
     }
 
     #[test]
@@ -890,6 +1038,8 @@ mod tests {
                 access_token: "test-access-token".to_string(),
                 refresh_token: "test-refresh-token".to_string(),
                 expires_at: Some(Instant::now() + Duration::from_secs(3600)),
+                account_id: None,
+                account_email: None,
             },
         );
 
@@ -934,12 +1084,17 @@ mod tests {
         let claims = serde_json::json!({
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": "workspace-123"
-            }
+            },
+            "email": "codex@example.com"
         });
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&claims).unwrap());
         let jwt = format!("header.{payload}.signature");
         assert_eq!(chatgpt_account_id(&jwt).as_deref(), Some("workspace-123"));
+        assert_eq!(
+            chatgpt_account_email(&jwt).as_deref(),
+            Some("codex@example.com")
+        );
     }
 
     #[test]
@@ -977,7 +1132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_refresh_uses_json_without_scope_and_parses_account() {
+    async fn codex_refresh_uses_form_with_scopes_and_parses_account() {
         let server = MockServer::start().await;
         let claims = serde_json::json!({
             "https://api.openai.com/auth": {
@@ -989,11 +1144,6 @@ mod tests {
         let id_token = format!("header.{payload}.signature");
         Mock::given(method("POST"))
             .and(path("/oauth/token"))
-            .and(body_json(serde_json::json!({
-                "grant_type": "refresh_token",
-                "refresh_token": "refresh-old",
-                "client_id": "client",
-            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "access-new",
                 "refresh_token": "refresh-new",
@@ -1007,8 +1157,8 @@ mod tests {
             &format!("{}/oauth/token", server.uri()),
             "client",
             "refresh-old",
-            &[],
-            &TokenRequestStyle::Json,
+            &["openid".into(), "profile".into(), "email".into()],
+            &TokenRequestStyle::Form,
             &reqwest::Client::new(),
         )
         .await
@@ -1017,6 +1167,21 @@ mod tests {
         assert_eq!(result.access_token, "access-new");
         assert_eq!(result.refresh_token.as_deref(), Some("refresh-new"));
         assert_eq!(result.account_id.as_deref(), Some("workspace-123"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/x-www-form-urlencoded"
+        );
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(body.contains("grant_type=refresh_token"));
+        assert!(body.contains("refresh_token=refresh-old"));
+        assert!(body.contains("client_id=client"));
+        assert!(body.contains("scope=openid+profile+email"));
     }
 
     #[tokio::test]

@@ -182,7 +182,13 @@ const zh: Translation = {
     apiBase: "API 地址",
     usage: {
       loading: "加载中…",
-      resetAt: "重置：{{time}}",
+      resetAfter: {
+        daysHours: "{{days}}天{{hours}}小时后重置",
+        days: "{{days}}天后重置",
+        hoursMinutes: "{{hours}}小时{{minutes}}分钟后重置",
+        hours: "{{hours}}小时后重置",
+        minutes: "{{minutes}}分钟后重置",
+      },
       notConnected: "未授权",
       unavailable: "暂不可用",
     },

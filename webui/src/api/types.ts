@@ -74,6 +74,7 @@ export interface ProviderUsage {
   state: ProviderUsageState;
   reason?: string | null;
   checked_at?: string | null;
+  account_email?: string | null;
   five_hour?: ProviderUsageWindow | null;
   seven_day?: ProviderUsageWindow | null;
 }
@@ -358,7 +359,6 @@ export interface OAuthStartResponse {
 
 export interface OAuthTokenResponse {
   provider_id: string;
-  access_token?: string | null;
   expires_in_s?: number | null;
 }
 

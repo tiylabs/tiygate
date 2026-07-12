@@ -98,21 +98,47 @@ impl OAuthTokenManager {
             return Err(error);
         }
 
-        // Best-effort persistence of the (possibly rotated) refresh
-        // token. The cache may have updated its refresh_token during
-        // the `apply` call; if it differs from what the routing
-        // target carried, persist the new one to the DB.
+        // Persist rotated tokens and refreshed workspace identity together.
         if let Some(new_rt) = self.cache.get_refresh_token(&target.provider_id, label) {
-            if new_rt != oauth.refresh_token {
-                self.persist_refresh_token(
-                    &target.provider_id,
-                    &new_rt,
-                    oauth.account_id.as_deref(),
-                );
+            let account_id = self
+                .cache
+                .get_account_id(&target.provider_id, label)
+                .or_else(|| oauth.account_id.clone());
+            if new_rt != oauth.refresh_token || account_id != oauth.account_id {
+                self.persist_credentials(&target.provider_id, &new_rt, account_id.as_deref());
             }
         }
 
         Ok(true)
+    }
+
+    /// Return the access token currently cached for this OAuth target.
+    #[cfg(test)]
+    pub fn cached_access_token(&self, target: &RoutingTarget) -> Option<String> {
+        let oauth = target.oauth.as_ref()?;
+        self.cache
+            .get_access_token(&target.provider_id, oauth.cache_label())
+    }
+
+    /// Recover once from an upstream 401. The conditional invalidation avoids
+    /// consuming a rotating refresh token twice when concurrent requests are
+    /// rejected with the same stale access token.
+    pub async fn refresh_after_unauthorized(
+        &self,
+        target: &RoutingTarget,
+        rejected_access_token: &str,
+    ) -> Result<bool, String> {
+        let oauth = match &target.oauth {
+            Some(oauth) => oauth,
+            None => return Ok(false),
+        };
+        self.cache.invalidate_access_token_if_matches(
+            &target.provider_id,
+            oauth.cache_label(),
+            rejected_access_token,
+        );
+        let mut headers = HeaderMap::new();
+        self.apply(target, &mut headers).await
     }
 
     /// Asynchronously persist a new refresh token to the DB.
@@ -122,7 +148,7 @@ impl OAuthTokenManager {
     /// a process restart will lose the rotated token (the operator
     /// must re-run the OAuth flow). The warning log surfaces the
     /// failure for visibility.
-    fn persist_refresh_token(
+    fn persist_credentials(
         &self,
         provider_id: &str,
         refresh_token: &str,
@@ -136,12 +162,34 @@ impl OAuthTokenManager {
         let rt = refresh_token.to_string();
         let account_id = account_id.map(str::to_string);
         tokio::spawn(async move {
-            let meta = json!({
-                "refresh_token": rt,
-                "account_id": account_id,
-                "status": OAuthCredentialStatus::Healthy.as_str(),
-                "status_checked_at": chrono::Utc::now().to_rfc3339(),
-            });
+            let provider = match store.get_provider(&pid).await {
+                Ok(Some(provider)) => provider,
+                Ok(None) => return,
+                Err(e) => {
+                    warn!(provider = %pid, error = %e, "failed to load OAuth metadata");
+                    return;
+                }
+            };
+            let mut meta = provider
+                .oauth_meta_cleartext
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .unwrap_or_else(|| json!({}));
+            let Some(object) = meta.as_object_mut() else {
+                warn!(provider = %pid, "stored OAuth metadata is not an object");
+                return;
+            };
+            object.insert("refresh_token".to_string(), json!(rt));
+            object.insert("account_id".to_string(), json!(account_id));
+            object.insert(
+                "status".to_string(),
+                json!(OAuthCredentialStatus::Healthy.as_str()),
+            );
+            object.insert(
+                "status_checked_at".to_string(),
+                json!(chrono::Utc::now().to_rfc3339()),
+            );
+            object.remove("status_reason");
             let meta_str = match serde_json::to_string(&meta) {
                 Ok(s) => s,
                 Err(e) => {
@@ -198,6 +246,8 @@ impl OAuthTokenManager {
 mod tests {
     use super::*;
     use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle, UpstreamTransport};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_oauth_config(refresh_token: &str) -> OAuthTargetConfig {
         OAuthTargetConfig {
@@ -279,5 +329,59 @@ mod tests {
             first_headers.get("authorization"),
             second_headers.get("authorization")
         );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_refresh_replaces_only_rejected_token_and_workspace() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+                "expires_in": 3600,
+                "account_id": "workspace-new"
+            })))
+            .mount(&server)
+            .await;
+
+        let manager = OAuthTokenManager::new(None, reqwest::Client::new());
+        let mut oauth = make_oauth_config("old-refresh");
+        oauth.token_url = format!("{}/token", server.uri());
+        oauth.account_id = Some("workspace-old".to_string());
+        let mut target = make_target(Some(oauth.clone()));
+        target.provider_id = "provider-401-refresh-test".to_string();
+        OAuthTokenCache::global().seed_tokens_with_identity(
+            &target.provider_id,
+            oauth.cache_label(),
+            "stale-access",
+            "old-refresh",
+            Some(std::time::Duration::from_secs(3600)),
+            tiygate_auth::provider_oauth::OAuthTokenIdentity {
+                account_id: Some("workspace-old".to_string()),
+                account_email: None,
+            },
+        );
+
+        assert!(manager
+            .refresh_after_unauthorized(&target, "stale-access")
+            .await
+            .unwrap());
+        assert_eq!(
+            manager.cached_access_token(&target).as_deref(),
+            Some("fresh-access")
+        );
+
+        let mut headers = HeaderMap::new();
+        assert!(manager.apply(&target, &mut headers).await.unwrap());
+        assert_eq!(headers["authorization"], "Bearer fresh-access");
+        assert_eq!(headers["chatgpt-account-id"], "workspace-new");
+
+        // A late 401 for the old token must not invalidate the fresh token.
+        assert!(manager
+            .refresh_after_unauthorized(&target, "stale-access")
+            .await
+            .unwrap());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

@@ -186,7 +186,13 @@ const en = {
     apiBase: "API base",
     usage: {
       loading: "Loading…",
-      resetAt: "Reset {{time}}",
+      resetAfter: {
+        daysHours: "Reset in {{days}}d {{hours}}h",
+        days: "Reset in {{days}}d",
+        hoursMinutes: "Reset in {{hours}}h {{minutes}}m",
+        hours: "Reset in {{hours}}h",
+        minutes: "Reset in {{minutes}}m",
+      },
       notConnected: "Not authorized",
       unavailable: "Unavailable",
     },

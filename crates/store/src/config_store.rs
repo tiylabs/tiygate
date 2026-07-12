@@ -338,7 +338,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let mut scopes: Vec<String> = oauth_meta
+    let scopes: Vec<String> = oauth_meta
         .get("scopes")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -347,11 +347,6 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
                 .collect()
         })
         .unwrap_or_default();
-    // The Codex refresh endpoint expects only grant_type, refresh_token,
-    // and client_id. Authorization scopes belong on the authorize URL.
-    if provider.vendor == "openai" {
-        scopes.clear();
-    }
     let authorization_header = oauth_meta
         .get("authorization_header")
         .and_then(|v| v.as_str())
@@ -360,26 +355,16 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         .get("authorization_prefix")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    // Codex's ChatGPT Responses API creates responses through a WebSocket
-    // session. The provider metadata offers an explicit escape hatch for
-    // custom OpenAI-compatible OAuth endpoints; established OpenAI OAuth
-    // rows default to the Codex transport so they work after an upgrade.
+    // Standard HTTP/SSE remains the default Codex transport. WebSocket is an
+    // explicit opt-in because many enterprise proxies reject upgrades.
     let upstream_transport = provider
         .metadata_json
         .get("upstream_transport")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_else(|| {
-            if provider.vendor == "openai" {
-                UpstreamTransport::CodexResponsesWebSocket
-            } else {
-                UpstreamTransport::Http
-            }
-        });
+        .unwrap_or(UpstreamTransport::Http);
 
-    // Codex and Anthropic refresh tokens with JSON. Codex still exchanges
-    // authorization codes as form data; that distinction lives in the admin
-    // OAuth preset and is intentionally separate from this refresh setting.
+    // Codex refreshes with form data, matching the reference CLI client.
     let token_request_style = oauth_meta
         .get("token_request_style")
         .and_then(|value| value.as_str())
@@ -389,7 +374,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
             _ => None,
         })
         .unwrap_or(match provider.vendor.as_str() {
-            "openai" | "anthropic" => TokenRequestStyle::Json,
+            "anthropic" => TokenRequestStyle::Json,
             _ => TokenRequestStyle::Form,
         });
 
@@ -2217,7 +2202,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_oauth_config_uses_workspace_scoped_json_refresh() {
+    fn openai_oauth_config_uses_workspace_scoped_form_refresh() {
         let now = chrono::Utc::now();
         let provider = Provider {
             id: "oauth-openai".to_string(),
@@ -2232,7 +2217,7 @@ mod tests {
                 "oauth": {
                     "token_url": "https://auth.openai.com/oauth/token",
                     "client_id": "client",
-                    "scopes": ["openid", "offline_access"],
+                    "scopes": ["openid", "profile", "email"],
                 }
             }),
             enabled: true,
@@ -2249,12 +2234,9 @@ mod tests {
         };
 
         let oauth = build_oauth_target_config(&provider).expect("oauth config");
-        assert_eq!(oauth.token_request_style, TokenRequestStyle::Json);
-        assert_eq!(
-            oauth.upstream_transport,
-            UpstreamTransport::CodexResponsesWebSocket
-        );
-        assert!(oauth.scopes.is_empty());
+        assert_eq!(oauth.token_request_style, TokenRequestStyle::Form);
+        assert_eq!(oauth.upstream_transport, UpstreamTransport::Http);
+        assert_eq!(oauth.scopes, vec!["openid", "profile", "email"]);
         assert_eq!(oauth.cache_label(), "workspace-123");
         assert!(oauth.extra_headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("chatgpt-account-id") && value == "workspace-123"

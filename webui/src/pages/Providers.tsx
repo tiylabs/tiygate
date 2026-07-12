@@ -62,8 +62,7 @@ const OAUTH_VENDORS = new Set(["openai", "anthropic", "xai"]);
 
 /**
  * Refresh metadata embedded into `metadata_json["oauth"]` when a provider is
- * saved with auth_mode=oauth. Authorization scopes remain backend-owned;
- * OpenAI's Codex refresh endpoint intentionally receives no scope field.
+ * saved with auth_mode=oauth. Authorization scopes remain backend-owned.
  */
 const OAUTH_PRESETS: Record<
   string,
@@ -77,9 +76,8 @@ const OAUTH_PRESETS: Record<
   openai: {
     token_url: "https://auth.openai.com/oauth/token",
     client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-    // Codex sends scopes on the authorize URL, not refresh requests.
-    scopes: [],
-    token_request_style: "json",
+    scopes: ["openid", "profile", "email"],
+    token_request_style: "form",
   },
   anthropic: {
     token_url: "https://api.anthropic.com/v1/oauth/token",
@@ -178,9 +176,30 @@ function isOAuthProvider(provider: Provider): boolean {
   return provider.auth_mode === "oauth";
 }
 
-function formatUsageResetTime(resetAt: number | null | undefined): string {
+function formatUsageResetTime(
+  resetAt: number | null | undefined,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
   if (resetAt == null) return "—";
-  return fmtTime(new Date(resetAt * 1000).toISOString());
+  const remainingMinutes = Math.max(
+    1,
+    Math.ceil((resetAt * 1000 - Date.now()) / 60_000),
+  );
+  const days = Math.floor(remainingMinutes / (24 * 60));
+  const hours = Math.floor((remainingMinutes % (24 * 60)) / 60);
+  const minutes = remainingMinutes % 60;
+
+  if (days > 0) {
+    return hours > 0
+      ? t("providers.usage.resetAfter.daysHours", { days, hours })
+      : t("providers.usage.resetAfter.days", { days });
+  }
+  if (hours > 0) {
+    return minutes > 0
+      ? t("providers.usage.resetAfter.hoursMinutes", { hours, minutes })
+      : t("providers.usage.resetAfter.hours", { hours });
+  }
+  return t("providers.usage.resetAfter.minutes", { minutes });
 }
 
 function usageWindowPercent(window: ProviderUsageWindow | null | undefined) {
@@ -205,19 +224,24 @@ function UsageWindow({
 }) {
   const percent = usageWindowPercent(window);
   const isAvailable = state === "available" && percent != null;
-  const resetAt = formatUsageResetTime(window?.reset_at);
+  const resetAt = formatUsageResetTime(window?.reset_at, t);
 
   return (
-    <div
-      className="min-w-0"
-      title={
-        isAvailable
-          ? t("providers.usage.resetAt", { time: resetAt })
-          : undefined
-      }
-    >
-      <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-wide text-text-muted">
+    <div className="min-w-0">
+      <div className="mb-0.5 flex min-w-0 items-center gap-1 text-[10px]">
         <span>{label}</span>
+        <span
+          className="min-w-0 flex-1 truncate text-[9px] font-normal normal-case tracking-normal text-text-subtle"
+          title={isAvailable ? resetAt : undefined}
+        >
+          {loading
+            ? "…"
+            : isAvailable
+              ? resetAt
+              : state === "not_connected"
+                ? t("providers.usage.notConnected")
+                : t("providers.usage.unavailable")}
+        </span>
         {loading ? (
           <span className="text-text-subtle">…</span>
         ) : isAvailable ? (
@@ -228,7 +252,7 @@ function UsageWindow({
           <span className="font-mono normal-case text-text-subtle">—</span>
         )}
       </div>
-      <div className="h-1.5 overflow-hidden rounded-full bg-surface-muted">
+      <div className="h-1 overflow-hidden rounded-full bg-surface-muted">
         {loading ? (
           <div className="h-full w-1/2 animate-pulse rounded-full bg-border-strong" />
         ) : isAvailable ? (
@@ -239,16 +263,7 @@ function UsageWindow({
             )}
             style={{ width: `${percent}%` }}
           />
-        ) : null}
-      </div>
-      <div className="mt-1 truncate text-[10px] text-text-subtle">
-        {loading
-          ? t("providers.usage.loading")
-          : isAvailable
-            ? t("providers.usage.resetAt", { time: resetAt })
-            : state === "not_connected"
-              ? t("providers.usage.notConnected")
-              : t("providers.usage.unavailable")}
+          ) : null}
       </div>
     </div>
   );
@@ -734,12 +749,24 @@ export default function Providers() {
                         </div>
                       ) : null}
                       {isOpenAiOAuth(p) ? (
-                        <div className="mt-2 grid min-w-[18rem] grid-cols-2 gap-3">
+                        <div className="mt-1.5 grid min-w-[16rem] grid-cols-2 gap-x-3 gap-y-1.5">
                           {(() => {
                             const usageQuery = usageByProvider.get(p.id);
                             const usage = usageQuery?.data;
+                            const accountEmail = usage?.account_email;
                             return (
                               <>
+                                <div className="col-span-2 flex min-w-0 items-center gap-1 text-[10px] leading-4">
+                                  <span
+                                    className="min-w-0 truncate font-mono text-[10px] text-text-muted"
+                                    title={accountEmail ?? undefined}
+                                  >
+                                    {accountEmail ??
+                                      (usageQuery?.isFetching
+                                        ? t("providers.usage.loading")
+                                        : "—")}
+                                  </span>
+                                </div>
                                 <UsageWindow
                                   label="5h"
                                   window={usage?.five_hour}
