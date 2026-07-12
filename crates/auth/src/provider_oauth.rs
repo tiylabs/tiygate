@@ -33,6 +33,54 @@ use tracing::info;
 /// Leeway before token expiry to trigger a proactive refresh.
 const REFRESH_LEEWAY: Duration = Duration::from_secs(60);
 
+/// Codex protocol version advertised to the ChatGPT backend.
+///
+/// This is deliberately independent from TiyGate's package version. The
+/// Codex models endpoint uses `client_version` as a compatibility gate and
+/// returns an empty model list for obsolete client versions.
+pub const CODEX_CLIENT_VERSION: &str = "0.144.0-alpha.4";
+
+/// Stable, non-secret classification of a failed OAuth refresh. Callers may
+/// persist these values for operator-facing health without exposing the raw
+/// authorization-server response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthRefreshFailureKind {
+    CredentialInvalid,
+    Transient,
+}
+
+impl OAuthRefreshFailureKind {
+    pub fn status_reason(self) -> &'static str {
+        match self {
+            Self::CredentialInvalid => "credential_rejected",
+            Self::Transient => "refresh_failed",
+        }
+    }
+}
+
+/// Classify a refresh failure while deliberately discarding the raw response,
+/// which may contain provider-specific details unsuitable for the Admin API.
+pub fn classify_refresh_failure(error: &str) -> OAuthRefreshFailureKind {
+    let error = error.to_ascii_lowercase();
+    let credential_rejected = [
+        "401 unauthorized",
+        "403 forbidden",
+        "invalid_grant",
+        "invalid refresh token",
+        "refresh_token_reused",
+        "refresh token has expired",
+        "refresh token is expired",
+        "token revoked",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker));
+    if credential_rejected {
+        OAuthRefreshFailureKind::CredentialInvalid
+    } else {
+        OAuthRefreshFailureKind::Transient
+    }
+}
+
 // -----------------------------------------------------------------------
 // PKCE
 // -----------------------------------------------------------------------
@@ -82,8 +130,14 @@ pub struct OAuthProviderPreset {
     pub redirect_url: String,
     /// Scopes to request.
     pub scopes: Vec<String>,
-    /// Token exchange request body style.
-    pub token_request_style: TokenRequestStyle,
+    /// Authorization-code exchange request body style.
+    pub exchange_request_style: TokenRequestStyle,
+    /// Refresh-token request body style. Some providers use different
+    /// encodings for exchange and refresh (Codex is form + JSON).
+    pub refresh_request_style: TokenRequestStyle,
+    /// Whether token requests include the authorization scopes. Codex's
+    /// token endpoints expect scopes only on the authorize URL.
+    pub send_scopes_in_token_requests: bool,
     /// Extra query parameters to append to the authorize URL
     /// (provider-specific, e.g. `prompt=login` for Codex).
     pub extra_authorize_params: Vec<(String, String)>,
@@ -99,15 +153,19 @@ pub fn codex_preset() -> OAuthProviderPreset {
         redirect_url: "http://localhost:1455/auth/callback".to_string(),
         scopes: vec![
             "openid".to_string(),
-            "email".to_string(),
             "profile".to_string(),
+            "email".to_string(),
             "offline_access".to_string(),
+            "api.connectors.read".to_string(),
+            "api.connectors.invoke".to_string(),
         ],
-        token_request_style: TokenRequestStyle::Form,
+        exchange_request_style: TokenRequestStyle::Form,
+        refresh_request_style: TokenRequestStyle::Json,
+        send_scopes_in_token_requests: false,
         extra_authorize_params: vec![
-            ("prompt".to_string(), "login".to_string()),
             ("id_token_add_organizations".to_string(), "true".to_string()),
             ("codex_cli_simplified_flow".to_string(), "true".to_string()),
+            ("originator".to_string(), "tiygate".to_string()),
         ],
     }
 }
@@ -127,7 +185,9 @@ pub fn claude_preset() -> OAuthProviderPreset {
             "user:mcp_servers".to_string(),
             "user:file_upload".to_string(),
         ],
-        token_request_style: TokenRequestStyle::Json,
+        exchange_request_style: TokenRequestStyle::Json,
+        refresh_request_style: TokenRequestStyle::Json,
+        send_scopes_in_token_requests: true,
         extra_authorize_params: vec![("code".to_string(), "true".to_string())],
     }
 }
@@ -148,7 +208,9 @@ pub fn xai_preset() -> OAuthProviderPreset {
             "grok-cli:access".to_string(),
             "api:access".to_string(),
         ],
-        token_request_style: TokenRequestStyle::Form,
+        exchange_request_style: TokenRequestStyle::Form,
+        refresh_request_style: TokenRequestStyle::Form,
+        send_scopes_in_token_requests: true,
         extra_authorize_params: vec![
             ("plan".to_string(), "generic".to_string()),
             ("referrer".to_string(), "tiygate".to_string()),
@@ -207,6 +269,8 @@ struct TokenResponseRaw {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: Option<u64>,
+    id_token: Option<String>,
+    account_id: Option<String>,
 }
 
 /// Normalized token response used internally.
@@ -215,6 +279,7 @@ pub struct TokenResult {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_in: Option<Duration>,
+    pub account_id: Option<String>,
 }
 
 // -----------------------------------------------------------------------
@@ -232,16 +297,18 @@ pub async fn exchange_code(
     http_client: &reqwest::Client,
 ) -> Result<TokenResult, String> {
     let scopes = preset.scopes.join(" ");
-    match preset.token_request_style {
+    match preset.exchange_request_style {
         TokenRequestStyle::Form => {
-            let params = [
+            let mut params = vec![
                 ("grant_type", "authorization_code"),
                 ("code", code),
-                ("client_id", &preset.client_id),
-                ("redirect_uri", &preset.redirect_url),
+                ("client_id", preset.client_id.as_str()),
+                ("redirect_uri", preset.redirect_url.as_str()),
                 ("code_verifier", pkce_verifier),
-                ("scope", &scopes),
             ];
+            if preset.send_scopes_in_token_requests {
+                params.push(("scope", scopes.as_str()));
+            }
             let resp = http_client
                 .post(&preset.token_url)
                 .form(&params)
@@ -251,14 +318,16 @@ pub async fn exchange_code(
             parse_token_response(resp).await
         }
         TokenRequestStyle::Json => {
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "grant_type": "authorization_code",
                 "code": code,
                 "client_id": preset.client_id,
                 "redirect_uri": preset.redirect_url,
                 "code_verifier": pkce_verifier,
-                "scope": scopes,
             });
+            if preset.send_scopes_in_token_requests {
+                body["scope"] = serde_json::json!(scopes);
+            }
             let resp = http_client
                 .post(&preset.token_url)
                 .header("Content-Type", "application/json")
@@ -287,12 +356,14 @@ pub async fn do_refresh_token(
     let scopes_str = scopes.join(" ");
     match style {
         TokenRequestStyle::Form => {
-            let params = [
+            let mut params = vec![
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
                 ("client_id", client_id),
-                ("scope", &scopes_str),
             ];
+            if !scopes_str.is_empty() {
+                params.push(("scope", scopes_str.as_str()));
+            }
             let resp = http_client
                 .post(token_url)
                 .form(&params)
@@ -302,12 +373,14 @@ pub async fn do_refresh_token(
             parse_token_response(resp).await
         }
         TokenRequestStyle::Json => {
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
                 "client_id": client_id,
-                "scope": scopes_str,
             });
+            if !scopes_str.is_empty() {
+                body["scope"] = serde_json::json!(scopes_str);
+            }
             let resp = http_client
                 .post(token_url)
                 .header("Content-Type", "application/json")
@@ -332,11 +405,34 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResult, St
         .json()
         .await
         .map_err(|e| format!("failed to parse token response: {e}"))?;
+    let account_id = raw
+        .account_id
+        .filter(|value| !value.is_empty())
+        .or_else(|| raw.id_token.as_deref().and_then(chatgpt_account_id));
     Ok(TokenResult {
         access_token: raw.access_token,
         refresh_token: raw.refresh_token,
         expires_in: raw.expires_in.map(Duration::from_secs),
+        account_id,
     })
+}
+
+/// Extract the ChatGPT workspace/account identifier from an ID-token JWT.
+/// Signature verification is performed by the OAuth issuer; this local parse
+/// only reads the identity claim needed to scope subsequent requests.
+fn chatgpt_account_id(id_token: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .or_else(|| claims.get("chatgpt_account_id"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 // -----------------------------------------------------------------------
@@ -432,6 +528,29 @@ impl OAuthTokenCache {
         if entry.refresh_token.is_empty() {
             entry.refresh_token = refresh_token.to_string();
         }
+    }
+
+    /// Replace the cached credential immediately after an interactive login
+    /// or explicit refresh. This preserves the access token returned by the
+    /// token endpoint and prevents the first data-plane request from consuming
+    /// the refresh token again.
+    pub fn seed_tokens(
+        &self,
+        provider_id: &str,
+        label: &str,
+        access_token: &str,
+        refresh_token: &str,
+        expires_in: Option<Duration>,
+    ) {
+        let key = Self::key(provider_id, label);
+        self.tokens().insert(
+            key,
+            CachedToken {
+                access_token: access_token.to_string(),
+                refresh_token: refresh_token.to_string(),
+                expires_at: expires_in.map(|duration| Instant::now() + duration),
+            },
+        );
     }
 
     /// Apply OAuth authentication to the upstream headers.
@@ -568,6 +687,8 @@ fn inject_token(
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn pkce_verifier_length() {
@@ -607,12 +728,21 @@ mod tests {
         assert_eq!(p.redirect_url, "http://localhost:1455/auth/callback");
         assert_eq!(
             p.scopes,
-            vec!["openid", "email", "profile", "offline_access"]
+            vec![
+                "openid",
+                "profile",
+                "email",
+                "offline_access",
+                "api.connectors.read",
+                "api.connectors.invoke"
+            ]
         );
-        assert_eq!(p.token_request_style, TokenRequestStyle::Form);
+        assert_eq!(p.exchange_request_style, TokenRequestStyle::Form);
+        assert_eq!(p.refresh_request_style, TokenRequestStyle::Json);
+        assert!(!p.send_scopes_in_token_requests);
         assert!(p
             .extra_authorize_params
-            .contains(&("prompt".into(), "login".into())));
+            .contains(&("originator".into(), "tiygate".into())));
     }
 
     #[test]
@@ -633,7 +763,8 @@ mod tests {
                 "user:file_upload"
             ]
         );
-        assert_eq!(p.token_request_style, TokenRequestStyle::Json);
+        assert_eq!(p.exchange_request_style, TokenRequestStyle::Json);
+        assert_eq!(p.refresh_request_style, TokenRequestStyle::Json);
         assert!(p
             .extra_authorize_params
             .contains(&("code".into(), "true".into())));
@@ -658,7 +789,8 @@ mod tests {
                 "api:access"
             ]
         );
-        assert_eq!(p.token_request_style, TokenRequestStyle::Form);
+        assert_eq!(p.exchange_request_style, TokenRequestStyle::Form);
+        assert_eq!(p.refresh_request_style, TokenRequestStyle::Form);
         assert!(p
             .extra_authorize_params
             .contains(&("plan".into(), "generic".into())));
@@ -681,8 +813,8 @@ mod tests {
         assert!(url.contains("state=mystate"));
         assert!(url.contains("code_challenge=mychallenge"));
         assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains("prompt=login"));
         assert!(url.contains("codex_cli_simplified_flow=true"));
+        assert!(url.contains("originator=tiygate"));
     }
 
     #[test]
@@ -727,6 +859,7 @@ mod tests {
             authorization_header: None,
             authorization_prefix: None,
             extra_headers: vec![],
+            account_id: None,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = reqwest::Client::new();
@@ -762,6 +895,7 @@ mod tests {
             authorization_header: None,
             authorization_prefix: None,
             extra_headers: vec![],
+            account_id: None,
         };
         let client = reqwest::Client::new();
 
@@ -784,5 +918,130 @@ mod tests {
             let result = handle.await.unwrap();
             assert!(result.is_ok(), "concurrent apply should succeed");
         }
+    }
+
+    #[test]
+    fn parses_chatgpt_account_id_from_namespaced_claim() {
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "workspace-123"
+            }
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        let jwt = format!("header.{payload}.signature");
+        assert_eq!(chatgpt_account_id(&jwt).as_deref(), Some("workspace-123"));
+    }
+
+    #[test]
+    fn seed_tokens_makes_access_token_immediately_available() {
+        let cache = OAuthTokenCache::new();
+        cache.seed_tokens(
+            "provider",
+            "workspace-123",
+            "access",
+            "refresh",
+            Some(Duration::from_secs(3600)),
+        );
+        let cached = cache.tokens().get("provider:workspace-123").unwrap();
+        assert_eq!(cached.access_token, "access");
+        assert_eq!(cached.refresh_token, "refresh");
+        assert!(!cached.is_expiring());
+    }
+
+    #[test]
+    fn classifies_rejected_refresh_credentials_without_exposing_details() {
+        assert_eq!(
+            classify_refresh_failure(
+                "token endpoint returned 401 Unauthorized: refresh_token_reused"
+            ),
+            OAuthRefreshFailureKind::CredentialInvalid
+        );
+        assert_eq!(
+            classify_refresh_failure("token refresh request failed: connection reset"),
+            OAuthRefreshFailureKind::Transient
+        );
+        assert_eq!(
+            OAuthRefreshFailureKind::CredentialInvalid.status_reason(),
+            "credential_rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_refresh_uses_json_without_scope_and_parses_account() {
+        let server = MockServer::start().await;
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "workspace-123"
+            }
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        let id_token = format!("header.{payload}.signature");
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_json(serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": "refresh-old",
+                "client_id": "client",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-new",
+                "refresh_token": "refresh-new",
+                "expires_in": 3600,
+                "id_token": id_token,
+            })))
+            .mount(&server)
+            .await;
+
+        let result = do_refresh_token(
+            &format!("{}/oauth/token", server.uri()),
+            "client",
+            "refresh-old",
+            &[],
+            &TokenRequestStyle::Json,
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.access_token, "access-new");
+        assert_eq!(result.refresh_token.as_deref(), Some("refresh-new"));
+        assert_eq!(result.account_id.as_deref(), Some("workspace-123"));
+    }
+
+    #[tokio::test]
+    async fn codex_exchange_uses_form_without_scope() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 3600,
+                "account_id": "workspace-123",
+            })))
+            .mount(&server)
+            .await;
+
+        let mut preset = codex_preset();
+        preset.token_url = format!("{}/oauth/token", server.uri());
+        let result = exchange_code(&preset, "code", "verifier", &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(result.account_id.as_deref(), Some("workspace-123"));
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(body.contains("grant_type=authorization_code"));
+        assert!(body.contains("code_verifier=verifier"));
+        assert!(!body.contains("scope="));
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/x-www-form-urlencoded")
+        );
     }
 }

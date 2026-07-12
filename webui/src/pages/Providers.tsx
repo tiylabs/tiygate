@@ -1,7 +1,15 @@
 import { useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Pencil, Trash2, ExternalLink, RefreshCw, Play, Copy } from "lucide-react";
+import {
+  Plus,
+  Pencil,
+  Trash2,
+  ExternalLink,
+  RefreshCw,
+  Play,
+  Copy,
+} from "lucide-react";
 import { providersApi, providerCatalogApi, oauthApi } from "@/api/resources";
 import type {
   Provider,
@@ -39,15 +47,16 @@ import { openExternalUrl } from "@/lib/external-url";
 import { VendorIcon } from "@/lib/vendors";
 
 const AUTH_MODES = ["api_key", "oauth"];
+const OPENAI_PLATFORM_BASE_URL = "https://api.openai.com/v1";
+const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
 /** Vendors that have a built-in OAuth preset (crates/auth/src/provider_oauth.rs). */
 const OAUTH_VENDORS = new Set(["openai", "anthropic", "xai"]);
 
 /**
- * OAuth preset metadata embedded into `metadata_json["oauth"]` when a
- * provider is saved with auth_mode=oauth. Mirrors the values in
- * crates/auth/src/provider_oauth.rs so the backend's
- * `build_oauth_target_config` can construct an `OAuthTargetConfig`.
+ * Refresh metadata embedded into `metadata_json["oauth"]` when a provider is
+ * saved with auth_mode=oauth. Authorization scopes remain backend-owned;
+ * OpenAI's Codex refresh endpoint intentionally receives no scope field.
  */
 const OAUTH_PRESETS: Record<
   string,
@@ -55,12 +64,15 @@ const OAUTH_PRESETS: Record<
     token_url: string;
     client_id: string;
     scopes: string[];
+    token_request_style: "form" | "json";
   }
 > = {
   openai: {
     token_url: "https://auth.openai.com/oauth/token",
     client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-    scopes: ["openid", "email", "profile", "offline_access"],
+    // Codex sends scopes on the authorize URL, not refresh requests.
+    scopes: [],
+    token_request_style: "json",
   },
   anthropic: {
     token_url: "https://api.anthropic.com/v1/oauth/token",
@@ -72,6 +84,7 @@ const OAUTH_PRESETS: Record<
       "user:mcp_servers",
       "user:file_upload",
     ],
+    token_request_style: "json",
   },
   xai: {
     token_url: "https://auth.x.ai/oauth2/token",
@@ -84,6 +97,7 @@ const OAUTH_PRESETS: Record<
       "grok-cli:access",
       "api:access",
     ],
+    token_request_style: "form",
   },
 };
 
@@ -128,6 +142,27 @@ function hasOAuthMeta(provider: Provider | null): boolean {
   return meta !== "" && meta !== "[encrypted: <short>]";
 }
 
+function oauthStatusTone(
+  provider: Provider,
+): "success" | "warning" | "danger" | "info" | "neutral" {
+  switch (provider.oauth_status?.state) {
+    case "healthy":
+      return "success";
+    case "invalid":
+      return "danger";
+    case "error":
+      return "warning";
+    case "connected":
+      return "info";
+    default:
+      return "neutral";
+  }
+}
+
+function oauthStatusKey(provider: Provider): string {
+  return `providers.oauthStatus.${provider.oauth_status?.state ?? "not_connected"}`;
+}
+
 export default function Providers() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -136,6 +171,7 @@ export default function Providers() {
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["providers"],
     queryFn: providersApi.list,
+    refetchInterval: 30_000,
   });
   const {
     data: catalog,
@@ -248,7 +284,10 @@ export default function Providers() {
 
   const oauthCallbackMutation = useMutation({
     mutationFn: () => {
-      const parsed = parseCallbackUrl(oauthCallbackUrl, oauthState ?? undefined);
+      const parsed = parseCallbackUrl(
+        oauthCallbackUrl,
+        oauthState ?? undefined,
+      );
       if (!parsed) {
         throw new Error(t("oauth.callbackUrlInvalid"));
       }
@@ -284,10 +323,14 @@ export default function Providers() {
       const label = `${editing?.name ?? ""} (${res.provider_id})`;
       setOauthMessage(t("oauth.refreshed", { provider: label }));
       toast.success(t("oauth.refreshed", { provider: label }));
+      void invalidateProviders();
+      void providersApi.get(res.provider_id).then(setEditing);
     },
     onError: (e: Error) => {
       setOauthError(e.message);
       setOauthMessage(null);
+      void invalidateProviders();
+      if (editing) void providersApi.get(editing.id).then(setEditing);
     },
   });
 
@@ -382,11 +425,32 @@ export default function Providers() {
   function submit() {
     setFormError(null);
     const isOAuth = form.auth_mode === "oauth";
+    const isOpenAi = form.vendor === "openai";
+    const apiBase = isOpenAi
+      ? isOAuth
+        ? !form.api_base || form.api_base === OPENAI_PLATFORM_BASE_URL
+          ? OPENAI_CODEX_BASE_URL
+          : form.api_base
+        : !form.api_base || form.api_base === OPENAI_CODEX_BASE_URL
+          ? OPENAI_PLATFORM_BASE_URL
+          : form.api_base
+      : form.api_base;
+    const modelsEndpoint = isOpenAi
+      ? isOAuth
+        ? !form.models_endpoint ||
+          form.models_endpoint === `${OPENAI_PLATFORM_BASE_URL}/models`
+          ? `${OPENAI_CODEX_BASE_URL}/models`
+          : form.models_endpoint
+        : !form.models_endpoint ||
+            form.models_endpoint === `${OPENAI_CODEX_BASE_URL}/models`
+          ? `${OPENAI_PLATFORM_BASE_URL}/models`
+          : form.models_endpoint
+      : form.models_endpoint;
     const body: ProviderInput = {
       name: form.name,
       vendor: form.vendor,
-      api_base: form.api_base,
-      models_endpoint: form.models_endpoint,
+      api_base: apiBase,
+      models_endpoint: modelsEndpoint,
       auth_mode: form.auth_mode,
       enabled: form.enabled,
     };
@@ -559,7 +623,23 @@ export default function Providers() {
                       {p.api_base}
                     </Td>
                     <Td className="whitespace-nowrap text-xs">
-                      {t(authModeLabelKey(p.auth_mode))}
+                      <div className="flex flex-col items-start gap-1.5">
+                        <span>{t(authModeLabelKey(p.auth_mode))}</span>
+                        {p.auth_mode === "oauth" ? (
+                          <Badge
+                            tone={oauthStatusTone(p)}
+                            title={
+                              p.oauth_status?.checked_at
+                                ? t("providers.oauthStatus.checkedAt", {
+                                    time: fmtTime(p.oauth_status.checked_at),
+                                  })
+                                : undefined
+                            }
+                          >
+                            {t(oauthStatusKey(p))}
+                          </Badge>
+                        ) : null}
+                      </div>
                     </Td>
                     <Td className="text-center whitespace-nowrap">
                       {p.enabled ? (
@@ -670,7 +750,8 @@ export default function Providers() {
               value={form.api_base}
               onChange={(e) => setForm({ ...form, api_base: e.target.value })}
               placeholder={
-                catalog?.find((e) => e.id === form.vendor)?.default_base_url ?? ""
+                catalog?.find((e) => e.id === form.vendor)?.default_base_url ??
+                ""
               }
               onKeyDown={(e) => {
                 if (e.key === "Tab" && !form.api_base) {
@@ -704,7 +785,8 @@ export default function Providers() {
                 if (e.key === "Tab" && !form.models_endpoint) {
                   const base =
                     form.api_base ||
-                    catalog?.find((el) => el.id === form.vendor)?.default_base_url ||
+                    catalog?.find((el) => el.id === form.vendor)
+                      ?.default_base_url ||
                     "";
                   if (base) {
                     e.preventDefault();
@@ -745,16 +827,25 @@ export default function Providers() {
                   <span className="text-sm font-medium text-text">
                     {t("providers.oauthPanel.title")}
                   </span>
-                  {hasOAuthMeta(editing) ? (
-                    <Badge tone="success">
-                      {t("providers.oauthPanel.connected")}
-                    </Badge>
-                  ) : (
-                    <Badge tone="neutral">
-                      {t("providers.oauthPanel.notConnected")}
-                    </Badge>
-                  )}
+                  <Badge tone={oauthStatusTone(editing)}>
+                    {t(oauthStatusKey(editing))}
+                  </Badge>
                 </div>
+                {editing.oauth_status?.state === "invalid" ? (
+                  <Alert tone="danger">
+                    {t("providers.oauthStatus.invalidHint")}
+                  </Alert>
+                ) : null}
+                {editing.oauth_status?.state === "error" ? (
+                  <Alert tone="warning">
+                    {t("providers.oauthStatus.errorHint")}
+                  </Alert>
+                ) : null}
+                {editing.oauth_status?.state === "connected" ? (
+                  <Alert tone="info">
+                    {t("providers.oauthStatus.connectedHint")}
+                  </Alert>
+                ) : null}
                 <div className="flex flex-wrap gap-2">
                   <Button
                     variant="primary"
@@ -762,7 +853,11 @@ export default function Providers() {
                     loading={oauthStartMutation.isPending}
                     onClick={() => oauthStartMutation.mutate()}
                   >
-                    {t("providers.oauthPanel.start")}
+                    {t(
+                      editing.oauth_status?.state === "invalid"
+                        ? "providers.oauthPanel.reauthorize"
+                        : "providers.oauthPanel.start",
+                    )}
                   </Button>
                   <Button
                     variant="secondary"
@@ -827,9 +922,7 @@ export default function Providers() {
                 ) : null}
               </div>
             ) : (
-              <Alert tone="info">
-                {t("providers.oauthPanel.saveFirst")}
-              </Alert>
+              <Alert tone="info">{t("providers.oauthPanel.saveFirst")}</Alert>
             )
           ) : null}
           {form.auth_mode !== "oauth" ? (

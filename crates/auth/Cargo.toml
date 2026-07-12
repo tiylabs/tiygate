@@ -23,5 +23,8 @@ rand.workspace = true
 dashmap.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+wiremock.workspace = true
+
 [lints]
 workspace = true

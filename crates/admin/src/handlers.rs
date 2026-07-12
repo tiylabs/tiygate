@@ -23,10 +23,13 @@ use tiygate_store::archive::{gzip_decompress, sha256_hex, PayloadArchiveManifest
 use tiygate_store::config_store::StoreError;
 use tiygate_store::model_catalog::ModelMetadata;
 use tiygate_store::models::{
-    AuthMode, ConfigExport, ImportSelection, Provider, Route, RouteTarget,
+    AuthMode, ConfigExport, ImportSelection, OAuthCredentialStatus, Provider, Route, RouteTarget,
 };
 
 use crate::state::AdminState;
+
+const OPENAI_PLATFORM_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 pub fn router() -> Router<AdminState> {
     Router::new()
@@ -149,11 +152,7 @@ async fn list_provider_models(
     });
 
     // Resolve the discovery URL.
-    let url = if !provider.models_endpoint.is_empty() {
-        provider.models_endpoint.clone()
-    } else {
-        format!("{}/models", provider.api_base.trim_end_matches('/'))
-    };
+    let url = provider_models_url(&provider);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -173,10 +172,9 @@ async fn list_provider_models(
         if let Some(oauth_config) =
             tiygate_store::config_store::build_oauth_target_config(&provider)
         {
-            // The cache is keyed by "{provider_id}:{label}".
-            // Model discovery is not tied to a specific route
-            // target, so we use a synthetic label.
-            let label = "__model_discovery__";
+            // Share one cache entry with the data plane so model discovery
+            // cannot race a routed request through refresh-token rotation.
+            let label = oauth_config.cache_label();
             cache.seed(&id, label, &oauth_config.refresh_token);
 
             let mut headers = reqwest::header::HeaderMap::new();
@@ -185,6 +183,45 @@ async fn list_provider_models(
                 .await
             {
                 Ok(()) => {
+                    if let Some(cached_refresh_token) = cache.get_refresh_token(&id, label) {
+                        match oauth_meta_after_refresh_rotation(
+                            &provider,
+                            &oauth_config.refresh_token,
+                            &cached_refresh_token,
+                        ) {
+                            Ok(Some(meta)) => {
+                                if let Err(e) =
+                                    state.store.set_provider_oauth_meta(&id, &meta).await
+                                {
+                                    tracing::warn!(
+                                        provider = %id,
+                                        error = %e,
+                                        "persisting rotated OAuth refresh token after model discovery failed; \
+                                         returning empty list"
+                                    );
+                                    return Ok(Json(ProviderModelsResponse { models: vec![] })
+                                        .into_response());
+                                }
+                                tracing::info!(
+                                    provider = %id,
+                                    "persisted rotated OAuth refresh token after model discovery"
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    provider = %id,
+                                    error = %e,
+                                    "preparing rotated OAuth refresh token metadata failed; \
+                                     returning empty list"
+                                );
+                                return Ok(
+                                    Json(ProviderModelsResponse { models: vec![] }).into_response()
+                                );
+                            }
+                        }
+                    }
+
                     // Merge the injected headers into the reqwest
                     // request builder.
                     for (name, value) in headers.iter() {
@@ -194,6 +231,7 @@ async fn list_provider_models(
                     }
                 }
                 Err(e) => {
+                    record_oauth_refresh_failure(&state, &id, &e).await;
                     tracing::warn!(
                         provider = %id,
                         error = %e,
@@ -229,6 +267,18 @@ async fn list_provider_models(
     };
 
     if !resp.status().is_success() {
+        if matches!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            record_oauth_status(
+                &state,
+                &id,
+                OAuthCredentialStatus::Invalid,
+                Some("upstream_auth_rejected"),
+            )
+            .await;
+        }
         tracing::warn!(
             provider = %id,
             url = %url,
@@ -252,7 +302,126 @@ async fn list_provider_models(
     };
 
     let models = parse_model_list(&body);
+    if matches!(provider.auth_mode, AuthMode::OAuth)
+        && provider_oauth_status(&provider).state != "healthy"
+    {
+        record_oauth_status(&state, &id, OAuthCredentialStatus::Healthy, None).await;
+    }
     Ok(Json(ProviderModelsResponse { models }).into_response())
+}
+
+async fn record_oauth_refresh_failure(state: &AdminState, provider_id: &str, error: &str) {
+    let kind = tiygate_auth::provider_oauth::classify_refresh_failure(error);
+    let status = match kind {
+        tiygate_auth::provider_oauth::OAuthRefreshFailureKind::CredentialInvalid => {
+            OAuthCredentialStatus::Invalid
+        }
+        tiygate_auth::provider_oauth::OAuthRefreshFailureKind::Transient => {
+            OAuthCredentialStatus::Error
+        }
+    };
+    record_oauth_status(state, provider_id, status, Some(kind.status_reason())).await;
+}
+
+async fn record_oauth_status(
+    state: &AdminState,
+    provider_id: &str,
+    status: OAuthCredentialStatus,
+    reason: Option<&str>,
+) {
+    if let Err(e) = state
+        .store
+        .set_provider_oauth_status(provider_id, status, reason)
+        .await
+    {
+        tracing::warn!(
+            provider = %provider_id,
+            error = %e,
+            "persisting OAuth credential status failed"
+        );
+    }
+}
+
+/// Build the OAuth metadata that must be persisted after the token cache
+/// observes refresh-token rotation. Existing fields such as `account_id` and
+/// `expires_in_s` are retained so model discovery cannot erase credential
+/// context while updating the token.
+fn oauth_meta_after_refresh_rotation(
+    provider: &Provider,
+    stored_refresh_token: &str,
+    cached_refresh_token: &str,
+) -> Result<Option<String>, String> {
+    if cached_refresh_token == stored_refresh_token {
+        return Ok(None);
+    }
+
+    let raw = provider
+        .oauth_meta_cleartext
+        .as_deref()
+        .ok_or_else(|| "decrypted OAuth metadata is unavailable".to_string())?;
+    let mut meta: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("parsing decrypted OAuth metadata: {e}"))?;
+    let object = meta
+        .as_object_mut()
+        .ok_or_else(|| "decrypted OAuth metadata must be a JSON object".to_string())?;
+    object.insert(
+        "refresh_token".to_string(),
+        serde_json::Value::String(cached_refresh_token.to_string()),
+    );
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String(OAuthCredentialStatus::Healthy.as_str().to_string()),
+    );
+    object.insert(
+        "status_checked_at".to_string(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    object.remove("status_reason");
+    serde_json::to_string(&meta)
+        .map(Some)
+        .map_err(|e| format!("serializing rotated OAuth metadata: {e}"))
+}
+
+fn is_openai_codex_oauth(provider: &Provider) -> bool {
+    provider.vendor == "openai" && matches!(provider.auth_mode, AuthMode::OAuth)
+}
+
+fn effective_provider_api_base(provider: &Provider) -> String {
+    if is_openai_codex_oauth(provider)
+        && (provider.api_base.trim().is_empty()
+            || provider.api_base.trim_end_matches('/') == OPENAI_PLATFORM_BASE_URL)
+    {
+        OPENAI_CODEX_BASE_URL.to_string()
+    } else if provider.api_base.trim().is_empty()
+        && provider.vendor == "openai"
+        && matches!(provider.auth_mode, AuthMode::ApiKey)
+    {
+        OPENAI_PLATFORM_BASE_URL.to_string()
+    } else {
+        provider.api_base.trim_end_matches('/').to_string()
+    }
+}
+
+fn provider_models_url(provider: &Provider) -> String {
+    let configured = provider.models_endpoint.trim();
+    let old_platform_default = format!("{OPENAI_PLATFORM_BASE_URL}/models");
+    let mut url = if is_openai_codex_oauth(provider)
+        && (configured.is_empty() || configured.trim_end_matches('/') == old_platform_default)
+    {
+        format!("{OPENAI_CODEX_BASE_URL}/models")
+    } else if configured.is_empty() {
+        format!("{}/models", effective_provider_api_base(provider))
+    } else {
+        configured.to_string()
+    };
+
+    if is_openai_codex_oauth(provider) && !url.contains("client_version=") {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        url.push(separator);
+        url.push_str("client_version=");
+        url.push_str(tiygate_auth::provider_oauth::CODEX_CLIENT_VERSION);
+    }
+    url
 }
 
 /// Normalize upstream model-list responses into a sorted list of
@@ -274,12 +443,24 @@ fn parse_model_list(body: &serde_json::Value) -> Vec<ProviderModelEntry> {
         }
     }
 
-    // Gemini / generic format: models[].name or models[].id
+    // Gemini / generic / Codex format: models[].name, models[].id,
+    // or Codex models[].slug.
     if ids.is_empty() {
         if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
             for item in models {
+                if item
+                    .get("visibility")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|visibility| visibility != "list")
+                {
+                    continue;
+                }
+                if let Some(slug) = item.get("slug").and_then(|n| n.as_str()) {
+                    if !slug.is_empty() {
+                        ids.push(slug.to_string());
+                    }
                 // Gemini uses "name" with a "models/" prefix
-                if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                } else if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
                     let id = name.strip_prefix("models/").unwrap_or(name);
                     if !id.is_empty() {
                         ids.push(id.to_string());
@@ -450,6 +631,13 @@ struct ProviderRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct ProviderOAuthStatusView {
+    state: String,
+    reason: Option<String>,
+    checked_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ProviderView {
     id: String,
     name: String,
@@ -459,6 +647,7 @@ struct ProviderView {
     auth_mode: String,
     encrypted_api_key: String,
     encrypted_oauth_meta: String,
+    oauth_status: Option<ProviderOAuthStatusView>,
     metadata: serde_json::Value,
     enabled: bool,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -467,12 +656,17 @@ struct ProviderView {
 
 impl From<Provider> for ProviderView {
     fn from(p: Provider) -> Self {
+        let api_base = normalized_api_base(&p.vendor, p.auth_mode, &p.api_base);
+        let models_endpoint =
+            normalized_models_endpoint(&p.vendor, p.auth_mode, &p.models_endpoint, &api_base);
+        let oauth_status =
+            matches!(p.auth_mode, AuthMode::OAuth).then(|| provider_oauth_status(&p));
         Self {
             id: p.id,
             name: p.name,
             vendor: p.vendor,
-            api_base: p.api_base,
-            models_endpoint: p.models_endpoint,
+            api_base,
+            models_endpoint,
             auth_mode: p.auth_mode.as_str().to_string(),
             encrypted_api_key: tiygate_store::encryption::KeyEncryption::redact(
                 &p.encrypted_api_key,
@@ -480,12 +674,135 @@ impl From<Provider> for ProviderView {
             encrypted_oauth_meta: tiygate_store::encryption::KeyEncryption::redact(
                 &p.encrypted_oauth_meta,
             ),
+            oauth_status,
             metadata: p.metadata_json,
             enabled: p.enabled,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
     }
+}
+
+fn provider_oauth_status(provider: &Provider) -> ProviderOAuthStatusView {
+    if provider.encrypted_oauth_meta.trim().is_empty() {
+        return ProviderOAuthStatusView {
+            state: "not_connected".to_string(),
+            reason: None,
+            checked_at: None,
+        };
+    }
+    let Some(raw) = provider.oauth_meta_cleartext.as_deref() else {
+        return ProviderOAuthStatusView {
+            state: "error".to_string(),
+            reason: Some("metadata_unavailable".to_string()),
+            checked_at: None,
+        };
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return ProviderOAuthStatusView {
+            state: "error".to_string(),
+            reason: Some("metadata_invalid".to_string()),
+            checked_at: None,
+        };
+    };
+    if meta
+        .get("refresh_token")
+        .and_then(|value| value.as_str())
+        .is_none_or(str::is_empty)
+    {
+        return ProviderOAuthStatusView {
+            state: "not_connected".to_string(),
+            reason: None,
+            checked_at: None,
+        };
+    }
+    let state = meta
+        .get("status")
+        .and_then(|value| value.as_str())
+        .filter(|state| matches!(*state, "healthy" | "invalid" | "error"))
+        .unwrap_or("connected")
+        .to_string();
+    ProviderOAuthStatusView {
+        state,
+        reason: meta
+            .get("status_reason")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        checked_at: meta
+            .get("status_checked_at")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    }
+}
+
+fn normalized_api_base(vendor: &str, auth_mode: AuthMode, configured: &str) -> String {
+    let configured = configured.trim_end_matches('/');
+    if vendor == "openai" && matches!(auth_mode, AuthMode::OAuth) {
+        if configured.is_empty() || configured == OPENAI_PLATFORM_BASE_URL {
+            return OPENAI_CODEX_BASE_URL.to_string();
+        }
+    } else if vendor == "openai"
+        && matches!(auth_mode, AuthMode::ApiKey)
+        && (configured.is_empty() || configured == OPENAI_CODEX_BASE_URL)
+    {
+        return OPENAI_PLATFORM_BASE_URL.to_string();
+    }
+    configured.to_string()
+}
+
+fn normalized_models_endpoint(
+    vendor: &str,
+    auth_mode: AuthMode,
+    configured: &str,
+    api_base: &str,
+) -> String {
+    let configured = configured.trim_end_matches('/');
+    let platform_models = format!("{OPENAI_PLATFORM_BASE_URL}/models");
+    let codex_models = format!("{OPENAI_CODEX_BASE_URL}/models");
+    if vendor == "openai" && matches!(auth_mode, AuthMode::OAuth) {
+        if configured.is_empty() || configured == platform_models {
+            return codex_models;
+        }
+    } else if vendor == "openai"
+        && matches!(auth_mode, AuthMode::ApiKey)
+        && (configured.is_empty() || configured == codex_models)
+    {
+        return platform_models;
+    }
+    if configured.is_empty() && !api_base.is_empty() {
+        format!("{}/models", api_base.trim_end_matches('/'))
+    } else {
+        configured.to_string()
+    }
+}
+
+fn normalized_provider_metadata(
+    vendor: &str,
+    auth_mode: AuthMode,
+    metadata: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut metadata = metadata.unwrap_or_else(|| json!({}));
+    if !matches!(auth_mode, AuthMode::OAuth) {
+        return metadata;
+    }
+    let Some(preset) = tiygate_auth::provider_oauth::preset_for_vendor(vendor) else {
+        return metadata;
+    };
+    let refresh_scopes = if preset.send_scopes_in_token_requests {
+        preset.scopes
+    } else {
+        Vec::new()
+    };
+    metadata["oauth"] = json!({
+        "token_url": preset.token_url,
+        "client_id": preset.client_id,
+        "scopes": refresh_scopes,
+        "token_request_style": match preset.refresh_request_style {
+            tiygate_core::provider::oauth::TokenRequestStyle::Form => "form",
+            tiygate_core::provider::oauth::TokenRequestStyle::Json => "json",
+        },
+    });
+    metadata
 }
 
 #[derive(Debug, Deserialize)]
@@ -528,18 +845,26 @@ async fn create_provider(
         .as_deref()
         .and_then(AuthMode::parse)
         .unwrap_or(AuthMode::ApiKey);
+    let api_base = normalized_api_base(&req.vendor, auth_mode, &req.api_base);
+    let models_endpoint = normalized_models_endpoint(
+        &req.vendor,
+        auth_mode,
+        req.models_endpoint.as_deref().unwrap_or(""),
+        &api_base,
+    );
+    let metadata = normalized_provider_metadata(&req.vendor, auth_mode, req.metadata);
     let p = state
         .store
         .upsert_provider(
             &id,
             &req.name,
             &req.vendor,
-            &req.api_base,
-            req.models_endpoint.as_deref().unwrap_or(""),
+            &api_base,
+            &models_endpoint,
             req.api_key.as_deref(),
             auth_mode,
             req.oauth_meta.as_deref(),
-            req.metadata.unwrap_or_else(|| serde_json::json!({})),
+            metadata,
             req.enabled.unwrap_or(true),
         )
         .await?;
@@ -566,6 +891,14 @@ async fn update_provider(
         .as_deref()
         .and_then(AuthMode::parse)
         .unwrap_or(AuthMode::ApiKey);
+    let api_base = normalized_api_base(&req.vendor, auth_mode, &req.api_base);
+    let models_endpoint = normalized_models_endpoint(
+        &req.vendor,
+        auth_mode,
+        req.models_endpoint.as_deref().unwrap_or(""),
+        &api_base,
+    );
+    let metadata = normalized_provider_metadata(&req.vendor, auth_mode, req.metadata);
     // Read the existing row first so we can record a field-level diff.
     // Best-effort: a read failure simply yields no `before` snapshot.
     let before = state
@@ -581,12 +914,12 @@ async fn update_provider(
             &id,
             &req.name,
             &req.vendor,
-            &req.api_base,
-            req.models_endpoint.as_deref().unwrap_or(""),
+            &api_base,
+            &models_endpoint,
             req.api_key.as_deref(),
             auth_mode,
             req.oauth_meta.as_deref(),
-            req.metadata.unwrap_or_else(|| serde_json::json!({})),
+            metadata,
             req.enabled.unwrap_or(true),
         )
         .await?;
@@ -1980,6 +2313,137 @@ mod tests {
         build_object_meta, gzip_compress, object_key, ArchiveObject, ArchiveObjectKind,
         ClientError, PayloadArchiveClient,
     };
+
+    fn openai_provider(auth_mode: AuthMode, api_base: &str, models_endpoint: &str) -> Provider {
+        let now = chrono::Utc::now();
+        Provider {
+            id: "openai-provider".to_string(),
+            name: "OpenAI".to_string(),
+            vendor: "openai".to_string(),
+            api_base: api_base.to_string(),
+            models_endpoint: models_endpoint.to_string(),
+            encrypted_api_key: String::new(),
+            auth_mode,
+            encrypted_oauth_meta: String::new(),
+            metadata_json: json!({}),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            api_key_cleartext: None,
+            oauth_meta_cleartext: None,
+        }
+    }
+
+    #[test]
+    fn openai_urls_split_platform_and_codex_products() {
+        assert_eq!(
+            normalized_api_base("openai", AuthMode::OAuth, OPENAI_PLATFORM_BASE_URL),
+            OPENAI_CODEX_BASE_URL
+        );
+        assert_eq!(
+            normalized_api_base("openai", AuthMode::ApiKey, OPENAI_CODEX_BASE_URL),
+            OPENAI_PLATFORM_BASE_URL
+        );
+        assert_eq!(
+            normalized_models_endpoint("openai", AuthMode::OAuth, "", OPENAI_CODEX_BASE_URL),
+            format!("{OPENAI_CODEX_BASE_URL}/models")
+        );
+    }
+
+    #[test]
+    fn codex_models_url_has_client_version_and_migrates_old_default() {
+        let provider = openai_provider(
+            AuthMode::OAuth,
+            OPENAI_PLATFORM_BASE_URL,
+            &format!("{OPENAI_PLATFORM_BASE_URL}/models"),
+        );
+        assert_eq!(
+            provider_models_url(&provider),
+            format!(
+                "{OPENAI_CODEX_BASE_URL}/models?client_version={}",
+                tiygate_auth::provider_oauth::CODEX_CLIENT_VERSION
+            )
+        );
+        assert_ne!(
+            tiygate_auth::provider_oauth::CODEX_CLIENT_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            "Codex protocol compatibility must not follow TiyGate's package version"
+        );
+    }
+
+    #[test]
+    fn parses_visible_codex_model_slugs() {
+        let body = json!({
+            "models": [
+                {"slug": "gpt-visible", "visibility": "list", "supported_in_api": false},
+                {"slug": "gpt-hidden", "visibility": "hide", "supported_in_api": true}
+            ]
+        });
+        let models = parse_model_list(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-visible");
+    }
+
+    #[test]
+    fn rotated_model_discovery_token_preserves_oauth_metadata() {
+        let mut provider = openai_provider(AuthMode::OAuth, OPENAI_CODEX_BASE_URL, "");
+        provider.oauth_meta_cleartext = Some(
+            json!({
+                "refresh_token": "refresh-old",
+                "account_id": "workspace-123",
+                "expires_in_s": 864_000,
+                "future_field": { "preserved": true }
+            })
+            .to_string(),
+        );
+
+        let updated =
+            oauth_meta_after_refresh_rotation(&provider, "refresh-old", "refresh-rotated")
+                .expect("valid OAuth metadata")
+                .expect("rotated token must produce an update");
+        let updated: serde_json::Value = serde_json::from_str(&updated).expect("JSON");
+
+        assert_eq!(updated["refresh_token"], "refresh-rotated");
+        assert_eq!(updated["account_id"], "workspace-123");
+        assert_eq!(updated["expires_in_s"], 864_000);
+        assert_eq!(updated["future_field"]["preserved"], true);
+        assert_eq!(updated["status"], "healthy");
+        assert!(updated["status_checked_at"].is_string());
+        assert!(updated.get("status_reason").is_none());
+    }
+
+    #[test]
+    fn unchanged_model_discovery_token_skips_oauth_metadata_write() {
+        let mut provider = openai_provider(AuthMode::OAuth, OPENAI_CODEX_BASE_URL, "");
+        provider.oauth_meta_cleartext = Some(json!({ "refresh_token": "same" }).to_string());
+
+        assert!(oauth_meta_after_refresh_rotation(&provider, "same", "same")
+            .expect("valid OAuth metadata")
+            .is_none());
+    }
+
+    #[test]
+    fn provider_view_exposes_sanitized_invalid_oauth_status() {
+        let mut provider = openai_provider(AuthMode::OAuth, OPENAI_CODEX_BASE_URL, "");
+        provider.encrypted_oauth_meta = "encrypted-secret".to_string();
+        provider.oauth_meta_cleartext = Some(
+            json!({
+                "refresh_token": "never-return-this",
+                "status": "invalid",
+                "status_reason": "credential_rejected",
+                "status_checked_at": "2026-07-12T06:00:00Z",
+            })
+            .to_string(),
+        );
+
+        let view = ProviderView::from(provider);
+        let status = view.oauth_status.as_ref().expect("OAuth status");
+        assert_eq!(status.state, "invalid");
+        assert_eq!(status.reason.as_deref(), Some("credential_rejected"));
+        assert_eq!(status.checked_at.as_deref(), Some("2026-07-12T06:00:00Z"));
+        let serialized = serde_json::to_string(&view).expect("serialize provider view");
+        assert!(!serialized.contains("never-return-this"));
+    }
 
     #[derive(Default)]
     struct MemoryArchiveClient {

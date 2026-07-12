@@ -190,6 +190,20 @@ const en = {
       staticKey: "Static Key",
       oauth: "OAuth",
     },
+    oauthStatus: {
+      not_connected: "Not authorized",
+      connected: "Pending check",
+      healthy: "Credential valid",
+      invalid: "Authorization expired",
+      error: "Refresh error",
+      checkedAt: "Last checked: {{time}}",
+      invalidHint:
+        "The refresh credential has expired, was revoked, or was rejected. Reauthorize to continue.",
+      errorHint:
+        "The latest refresh failed because of a possible network or upstream service error. Retry later.",
+      connectedHint:
+        "The credential is stored and will be verified by the first model discovery or proxy request.",
+    },
     unsupported: "Not supported yet",
     unsupportedVendor: "Vendor not supported",
     oauthPanel: {
@@ -199,6 +213,7 @@ const en = {
       notConnected: "Not authorized yet",
       connected: "Authorized",
       start: "Start flow",
+      reauthorize: "Reauthorize",
       refresh: "Refresh token",
       authorizeUrl: "Authorization URL",
       openUrl: "Open",

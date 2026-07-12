@@ -40,9 +40,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use tiygate_auth::provider_oauth::{
-    build_authorize_url, do_refresh_token, exchange_code, generate_pkce, preset_for_vendor,
+    build_authorize_url, classify_refresh_failure, do_refresh_token, exchange_code, generate_pkce,
+    preset_for_vendor, OAuthRefreshFailureKind,
 };
-use tiygate_store::models::AuthMode;
+use tiygate_store::models::{AuthMode, OAuthCredentialStatus};
 
 use crate::state::{AdminState, OAuthPendingFlow};
 
@@ -216,16 +217,29 @@ async fn callback_oauth_inner(
         })?;
 
     let access_token = result.access_token;
-    let refresh_token = result.refresh_token;
+    let refresh_token = result.refresh_token.ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "oauth exchange returned no refresh_token".to_string(),
+    ))?;
     let expires_in = result.expires_in;
+    let account_id = result.account_id;
+    if provider.vendor == "openai" && account_id.is_none() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OpenAI OAuth token did not include a ChatGPT account/workspace id".to_string(),
+        ));
+    }
 
     // Persist the refresh-token metadata (encrypted at rest by
     // the `DbConfigStore`). The access token itself is *not*
     // persisted — it lives in the in-memory cache of the
     // `OAuthTokenCache` held by the data plane.
     let meta_json = json!({
-        "refresh_token": refresh_token,
+        "refresh_token": &refresh_token,
+        "account_id": account_id.as_deref(),
         "expires_in_s": expires_in.map(|d| d.as_secs()),
+        "status": OAuthCredentialStatus::Healthy.as_str(),
+        "status_checked_at": chrono::Utc::now().to_rfc3339(),
     });
     let meta_str = serde_json::to_string(&meta_json).map_err(|e| {
         (
@@ -243,6 +257,17 @@ async fn callback_oauth_inner(
                 format!("persist oauth meta: {e}"),
             )
         })?;
+
+    // Keep the freshly exchanged access token hot. Without this seed the
+    // first model discovery/API request immediately spends the refresh token.
+    let cache_label = account_id.as_deref().unwrap_or("__provider__");
+    tiygate_auth::provider_oauth::OAuthTokenCache::global().seed_tokens(
+        &pending.provider_id,
+        cache_label,
+        &access_token,
+        &refresh_token,
+        expires_in,
+    );
 
     Ok(OauthCallbackResponse {
         provider_id: pending.provider_id,
@@ -297,33 +322,69 @@ async fn refresh_oauth(
         &preset.token_url,
         &preset.client_id,
         refresh_token,
-        &preset.scopes,
-        &preset.token_request_style,
+        if preset.send_scopes_in_token_requests {
+            &preset.scopes
+        } else {
+            &[]
+        },
+        &preset.refresh_request_style,
         &http_client,
     )
-    .await
-    .map_err(|e| ApiError::internal(format!("oauth refresh failed: {e}")))?;
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let kind = classify_refresh_failure(&error);
+            let status = match kind {
+                OAuthRefreshFailureKind::CredentialInvalid => OAuthCredentialStatus::Invalid,
+                OAuthRefreshFailureKind::Transient => OAuthCredentialStatus::Error,
+            };
+            if let Err(status_error) = state
+                .store
+                .set_provider_oauth_status(&req.provider_id, status, Some(kind.status_reason()))
+                .await
+            {
+                tracing::warn!(
+                    provider = %req.provider_id,
+                    error = %status_error,
+                    "persisting OAuth refresh failure status failed"
+                );
+            }
+            return Err(ApiError::internal(format!("oauth refresh failed: {error}")));
+        }
+    };
 
     let access_token = result.access_token;
     let new_refresh_token = result.refresh_token;
     let expires_in = result.expires_in;
+    let stored_account_id = oauth_meta.get("account_id").and_then(|v| v.as_str());
+    let account_id = result.account_id.as_deref().or(stored_account_id);
+    let effective_refresh_token = new_refresh_token.as_deref().unwrap_or(refresh_token);
 
-    // If the refresh token was rotated, persist the new one.
-    if let Some(new_rt) = &new_refresh_token {
-        if new_rt != refresh_token {
-            let meta_json = json!({
-                "refresh_token": new_rt,
-                "expires_in_s": expires_in.map(|d| d.as_secs()),
-            });
-            let meta_str = serde_json::to_string(&meta_json)
-                .map_err(|e| ApiError::internal(format!("serialise oauth meta: {e}")))?;
-            state
-                .store
-                .set_provider_oauth_meta(&req.provider_id, &meta_str)
-                .await
-                .map_err(|e| ApiError::internal(format!("persist oauth meta: {e}")))?;
-        }
-    }
+    // Persist both rotated tokens and account identity. Keeping the identity
+    // alongside the refresh token makes cold-start request scoping reliable.
+    let meta_json = json!({
+        "refresh_token": effective_refresh_token,
+        "account_id": account_id,
+        "expires_in_s": expires_in.map(|d| d.as_secs()),
+        "status": OAuthCredentialStatus::Healthy.as_str(),
+        "status_checked_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let meta_str = serde_json::to_string(&meta_json)
+        .map_err(|e| ApiError::internal(format!("serialise oauth meta: {e}")))?;
+    state
+        .store
+        .set_provider_oauth_meta(&req.provider_id, &meta_str)
+        .await
+        .map_err(|e| ApiError::internal(format!("persist oauth meta: {e}")))?;
+
+    tiygate_auth::provider_oauth::OAuthTokenCache::global().seed_tokens(
+        &req.provider_id,
+        account_id.unwrap_or("__provider__"),
+        &access_token,
+        effective_refresh_token,
+        expires_in,
+    );
 
     Ok(Json(RefreshOauthResponse {
         provider_id: req.provider_id,

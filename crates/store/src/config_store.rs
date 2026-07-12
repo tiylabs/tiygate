@@ -29,9 +29,12 @@ use crate::keys;
 use crate::model_catalog::ModelMetadata;
 use crate::models::{
     ApiKey, ApiKeyStatus, AuthMode, ConfigEpoch, ConfigExport, ConfigSnapshot, ExportSetting,
-    ImportReport, ImportSelection, Provider, Route, RouteTarget,
+    ImportReport, ImportSelection, OAuthCredentialStatus, Provider, Route, RouteTarget,
 };
 use crate::settings_keys::is_encrypted_key;
+
+const OPENAI_PLATFORM_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 /// Convenience error for store operations.
 #[derive(Debug, Error)]
@@ -259,6 +262,19 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
                 .api_base_override
                 .clone()
                 .unwrap_or_else(|| provider.api_base.clone());
+            // ChatGPT/Codex OAuth is a different product surface from the
+            // usage-based OpenAI Platform API. Transparently migrate the old
+            // broken default for existing OAuth provider rows while retaining
+            // explicit custom proxy endpoints.
+            let raw_base = if provider.vendor == "openai"
+                && matches!(provider.auth_mode, AuthMode::OAuth)
+                && (raw_base.trim().is_empty()
+                    || raw_base.trim_end_matches('/') == OPENAI_PLATFORM_BASE_URL)
+            {
+                OPENAI_CODEX_BASE_URL.to_string()
+            } else {
+                raw_base
+            };
             let (api_protocol, api_base) =
                 provider_egress_for_target(provider, &t.model_id, &raw_base);
             targets.push(RoutingTarget {
@@ -314,7 +330,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let scopes: Vec<String> = oauth_meta
+    let mut scopes: Vec<String> = oauth_meta
         .get("scopes")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -323,6 +339,11 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
                 .collect()
         })
         .unwrap_or_default();
+    // The Codex refresh endpoint expects only grant_type, refresh_token,
+    // and client_id. Authorization scopes belong on the authorize URL.
+    if provider.vendor == "openai" {
+        scopes.clear();
+    }
     let authorization_header = oauth_meta
         .get("authorization_header")
         .and_then(|v| v.as_str())
@@ -332,11 +353,21 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    // Determine token request style from vendor.
-    let token_request_style = match provider.vendor.as_str() {
-        "anthropic" => TokenRequestStyle::Json,
-        _ => TokenRequestStyle::Form,
-    };
+    // Codex and Anthropic refresh tokens with JSON. Codex still exchanges
+    // authorization codes as form data; that distinction lives in the admin
+    // OAuth preset and is intentionally separate from this refresh setting.
+    let token_request_style = oauth_meta
+        .get("token_request_style")
+        .and_then(|value| value.as_str())
+        .and_then(|style| match style {
+            "form" => Some(TokenRequestStyle::Form),
+            "json" => Some(TokenRequestStyle::Json),
+            _ => None,
+        })
+        .unwrap_or(match provider.vendor.as_str() {
+            "openai" | "anthropic" => TokenRequestStyle::Json,
+            _ => TokenRequestStyle::Form,
+        });
 
     // Extract extra headers from metadata, if present.
     let mut extra_headers: Vec<(String, String)> = oauth_meta
@@ -373,6 +404,43 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
                 .map(str::to_string)
         })
         .unwrap_or_default();
+    let account_id = provider
+        .oauth_meta_cleartext
+        .as_deref()
+        .and_then(|meta_str| serde_json::from_str::<serde_json::Value>(meta_str).ok())
+        .and_then(|meta| {
+            meta.get("account_id")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+
+    if provider.vendor == "openai" {
+        // ChatGPT OAuth requests are scoped to the selected workspace.
+        if let Some(account_id) = account_id.as_deref() {
+            if !extra_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+            {
+                extra_headers.push(("chatgpt-account-id".to_string(), account_id.to_string()));
+            }
+        }
+        if !extra_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("originator"))
+        {
+            extra_headers.push(("originator".to_string(), "tiygate".to_string()));
+        }
+        if !extra_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            extra_headers.push((
+                "user-agent".to_string(),
+                format!("tiygate/{}", env!("CARGO_PKG_VERSION")),
+            ));
+        }
+    }
 
     if token_url.is_empty() || client_id.is_empty() {
         debug!(
@@ -392,6 +460,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         authorization_header,
         authorization_prefix,
         extra_headers,
+        account_id,
     })
 }
 
@@ -629,7 +698,11 @@ impl DbConfigStore {
     // --- Provider CRUD ---
 
     pub async fn list_providers(&self) -> Result<Vec<Provider>, StoreError> {
-        self.load_providers().await
+        let mut providers = self.load_providers().await?;
+        for provider in &mut providers {
+            populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
+        }
+        Ok(providers)
     }
 
     pub async fn get_provider(&self, id: &str) -> Result<Option<Provider>, StoreError> {
@@ -871,6 +944,50 @@ impl DbConfigStore {
         // from the data plane see the new metadata.
         self.refresh().await?;
         Ok(())
+    }
+
+    /// Record the last observed OAuth credential health without replacing the
+    /// stored refresh token, account identity, or future metadata fields.
+    pub async fn set_provider_oauth_status(
+        &self,
+        id: &str,
+        status: OAuthCredentialStatus,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let provider = self
+            .get_provider(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("provider {id}")))?;
+        let raw = provider
+            .oauth_meta_cleartext
+            .as_deref()
+            .filter(|meta| !meta.trim().is_empty())
+            .ok_or_else(|| StoreError::Invalid("provider has no OAuth metadata".to_string()))?;
+        let mut meta: serde_json::Value = serde_json::from_str(raw)?;
+        let object = meta.as_object_mut().ok_or_else(|| {
+            StoreError::Invalid("provider OAuth metadata must be a JSON object".to_string())
+        })?;
+        object.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.as_str().to_string()),
+        );
+        object.insert(
+            "status_checked_at".to_string(),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        match reason.filter(|value| !value.is_empty()) {
+            Some(reason) => {
+                object.insert(
+                    "status_reason".to_string(),
+                    serde_json::Value::String(reason.to_string()),
+                );
+            }
+            None => {
+                object.remove("status_reason");
+            }
+        }
+        let serialized = serde_json::to_string(&meta)?;
+        self.set_provider_oauth_meta(id, &serialized).await
     }
 
     async fn load_providers(&self) -> Result<Vec<Provider>, StoreError> {
@@ -2014,6 +2131,106 @@ mod tests {
             provider.oauth_meta_cleartext.as_deref(),
             Some(meta_str.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn oauth_status_update_preserves_encrypted_credential_metadata() {
+        let key = KeyEncryption::from_secret(&master_key_hex()).expect("key");
+        let store = boot_store(Some(Arc::new(key))).await;
+        let meta = serde_json::json!({
+            "refresh_token": "rt-test",
+            "account_id": "workspace-123",
+            "future_field": { "preserved": true },
+        });
+        store
+            .upsert_provider(
+                "oauth-status",
+                "OAuth Status",
+                "openai",
+                OPENAI_CODEX_BASE_URL,
+                "",
+                None,
+                AuthMode::OAuth,
+                Some(&meta.to_string()),
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("upsert oauth provider");
+
+        store
+            .set_provider_oauth_status(
+                "oauth-status",
+                OAuthCredentialStatus::Invalid,
+                Some("credential_rejected"),
+            )
+            .await
+            .expect("persist OAuth status");
+
+        let providers = store.list_providers().await.expect("list providers");
+        let provider = providers
+            .into_iter()
+            .find(|provider| provider.id == "oauth-status")
+            .expect("provider exists");
+        assert!(!provider.encrypted_oauth_meta.contains("rt-test"));
+        let stored: serde_json::Value = serde_json::from_str(
+            provider
+                .oauth_meta_cleartext
+                .as_deref()
+                .expect("decrypted metadata"),
+        )
+        .expect("valid JSON");
+        assert_eq!(stored["refresh_token"], "rt-test");
+        assert_eq!(stored["account_id"], "workspace-123");
+        assert_eq!(stored["future_field"]["preserved"], true);
+        assert_eq!(stored["status"], "invalid");
+        assert_eq!(stored["status_reason"], "credential_rejected");
+        assert!(stored["status_checked_at"].is_string());
+    }
+
+    #[test]
+    fn openai_oauth_config_uses_workspace_scoped_json_refresh() {
+        let now = chrono::Utc::now();
+        let provider = Provider {
+            id: "oauth-openai".to_string(),
+            name: "OAuth OpenAI".to_string(),
+            vendor: "openai".to_string(),
+            api_base: OPENAI_PLATFORM_BASE_URL.to_string(),
+            models_endpoint: String::new(),
+            encrypted_api_key: String::new(),
+            auth_mode: AuthMode::OAuth,
+            encrypted_oauth_meta: String::new(),
+            metadata_json: serde_json::json!({
+                "oauth": {
+                    "token_url": "https://auth.openai.com/oauth/token",
+                    "client_id": "client",
+                    "scopes": ["openid", "offline_access"],
+                }
+            }),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            api_key_cleartext: None,
+            oauth_meta_cleartext: Some(
+                serde_json::json!({
+                    "refresh_token": "refresh",
+                    "account_id": "workspace-123",
+                })
+                .to_string(),
+            ),
+        };
+
+        let oauth = build_oauth_target_config(&provider).expect("oauth config");
+        assert_eq!(oauth.token_request_style, TokenRequestStyle::Json);
+        assert!(oauth.scopes.is_empty());
+        assert_eq!(oauth.cache_label(), "workspace-123");
+        assert!(oauth.extra_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("chatgpt-account-id") && value == "workspace-123"
+        }));
+        assert!(oauth
+            .extra_headers
+            .iter()
+            .any(|(name, value)| name == "originator" && value == "tiygate"));
     }
 
     fn test_model_metadata(id: &str) -> ModelMetadata {

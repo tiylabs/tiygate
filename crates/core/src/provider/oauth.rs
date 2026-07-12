@@ -70,6 +70,11 @@ pub struct OAuthTargetConfig {
     /// for Claude OAuth).
     #[serde(default)]
     pub extra_headers: Vec<(String, String)>,
+    /// Stable upstream account/workspace identifier associated with
+    /// this credential. OAuth access tokens are cached per provider
+    /// credential (not per routed model), using this value when present.
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 impl OAuthTargetConfig {
@@ -85,6 +90,13 @@ impl OAuthTargetConfig {
     /// to `"Bearer "`.
     pub fn bearer_prefix(&self) -> &str {
         self.authorization_prefix.as_deref().unwrap_or("Bearer ")
+    }
+
+    /// Cache label shared by every route using this provider credential.
+    /// A provider row owns one OAuth credential, so model or route labels
+    /// must not split refresh-token rotation into independent caches.
+    pub fn cache_label(&self) -> &str {
+        self.account_id.as_deref().unwrap_or("__provider__")
     }
 }
 
@@ -119,6 +131,7 @@ mod tests {
             authorization_header: None,
             authorization_prefix: None,
             extra_headers: vec![],
+            account_id: None,
         };
         let json = serde_json::to_value(&cfg).unwrap();
         // refresh_token must not appear in serialised output.
@@ -142,8 +155,10 @@ mod tests {
             authorization_header: None,
             authorization_prefix: None,
             extra_headers: vec![],
+            account_id: None,
         };
         assert_eq!(cfg.header_name(), "authorization");
         assert_eq!(cfg.bearer_prefix(), "Bearer ");
+        assert_eq!(cfg.cache_label(), "__provider__");
     }
 }

@@ -20,9 +20,12 @@ use std::sync::Arc;
 
 use http::HeaderMap;
 use serde_json::json;
-use tiygate_auth::provider_oauth::OAuthTokenCache;
+use tiygate_auth::provider_oauth::{
+    classify_refresh_failure, OAuthRefreshFailureKind, OAuthTokenCache,
+};
 use tiygate_core::RoutingTarget;
 use tiygate_store::config_store::DbConfigStore;
+use tiygate_store::models::OAuthCredentialStatus;
 use tracing::warn;
 
 /// Manages OAuth token lifecycle for the data plane.
@@ -66,7 +69,10 @@ impl OAuthTokenManager {
             None => return Ok(false),
         };
 
-        let label = target.account_label.as_deref().unwrap_or(&target.model_id);
+        // A provider row owns one OAuth credential. Cache it by the upstream
+        // account/workspace rather than by route/model so refresh-token
+        // rotation is single-flight across every model using the credential.
+        let label = oauth.cache_label();
 
         // Seed the cache with the refresh token from the routing
         // target. The `seed` method is idempotent — it only writes
@@ -77,7 +83,8 @@ impl OAuthTokenManager {
             .seed(&target.provider_id, label, &oauth.refresh_token);
 
         // Apply the token (refresh if needed, inject header).
-        self.cache
+        if let Err(error) = self
+            .cache
             .apply(
                 headers,
                 &target.provider_id,
@@ -85,7 +92,11 @@ impl OAuthTokenManager {
                 oauth,
                 &self.http_client,
             )
-            .await?;
+            .await
+        {
+            self.persist_refresh_failure(&target.provider_id, &error);
+            return Err(error);
+        }
 
         // Best-effort persistence of the (possibly rotated) refresh
         // token. The cache may have updated its refresh_token during
@@ -93,7 +104,11 @@ impl OAuthTokenManager {
         // target carried, persist the new one to the DB.
         if let Some(new_rt) = self.cache.get_refresh_token(&target.provider_id, label) {
             if new_rt != oauth.refresh_token {
-                self.persist_refresh_token(&target.provider_id, &new_rt);
+                self.persist_refresh_token(
+                    &target.provider_id,
+                    &new_rt,
+                    oauth.account_id.as_deref(),
+                );
             }
         }
 
@@ -107,15 +122,26 @@ impl OAuthTokenManager {
     /// a process restart will lose the rotated token (the operator
     /// must re-run the OAuth flow). The warning log surfaces the
     /// failure for visibility.
-    fn persist_refresh_token(&self, provider_id: &str, refresh_token: &str) {
+    fn persist_refresh_token(
+        &self,
+        provider_id: &str,
+        refresh_token: &str,
+        account_id: Option<&str>,
+    ) {
         let store = match &self.store {
             Some(s) => s.clone(),
             None => return,
         };
         let pid = provider_id.to_string();
         let rt = refresh_token.to_string();
+        let account_id = account_id.map(str::to_string);
         tokio::spawn(async move {
-            let meta = json!({ "refresh_token": rt });
+            let meta = json!({
+                "refresh_token": rt,
+                "account_id": account_id,
+                "status": OAuthCredentialStatus::Healthy.as_str(),
+                "status_checked_at": chrono::Utc::now().to_rfc3339(),
+            });
             let meta_str = match serde_json::to_string(&meta) {
                 Ok(s) => s,
                 Err(e) => {
@@ -133,6 +159,34 @@ impl OAuthTokenManager {
                     error = %e,
                     "failed to persist rotated OAuth refresh token; \
                      a restart may require re-authorization"
+                );
+            }
+        });
+    }
+
+    /// Persist a sanitized failure classification off the request hot path so
+    /// the Admin Console can distinguish invalid credentials from transient
+    /// refresh errors.
+    fn persist_refresh_failure(&self, provider_id: &str, error: &str) {
+        let store = match &self.store {
+            Some(store) => store.clone(),
+            None => return,
+        };
+        let provider_id = provider_id.to_string();
+        let kind = classify_refresh_failure(error);
+        let status = match kind {
+            OAuthRefreshFailureKind::CredentialInvalid => OAuthCredentialStatus::Invalid,
+            OAuthRefreshFailureKind::Transient => OAuthCredentialStatus::Error,
+        };
+        tokio::spawn(async move {
+            if let Err(status_error) = store
+                .set_provider_oauth_status(&provider_id, status, Some(kind.status_reason()))
+                .await
+            {
+                warn!(
+                    provider = %provider_id,
+                    error = %status_error,
+                    "failed to persist OAuth refresh failure status"
                 );
             }
         });
@@ -156,6 +210,7 @@ mod tests {
             authorization_header: None,
             authorization_prefix: None,
             extra_headers: vec![],
+            account_id: None,
         }
     }
 
@@ -194,5 +249,34 @@ mod tests {
         let mut headers = HeaderMap::new();
         let result = manager.apply(&target, &mut headers).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn different_models_share_one_account_token_cache() {
+        let manager = OAuthTokenManager::new(None, reqwest::Client::new());
+        let mut oauth = make_oauth_config("refresh");
+        oauth.account_id = Some("workspace-shared".to_string());
+        let mut first = make_target(Some(oauth.clone()));
+        first.provider_id = "provider-shared-model-test".to_string();
+        first.model_id = "model-a".to_string();
+        let mut second = first.clone();
+        second.model_id = "model-b".to_string();
+
+        OAuthTokenCache::global().seed_tokens(
+            &first.provider_id,
+            oauth.cache_label(),
+            "access",
+            "refresh",
+            Some(std::time::Duration::from_secs(3600)),
+        );
+
+        let mut first_headers = HeaderMap::new();
+        let mut second_headers = HeaderMap::new();
+        assert!(manager.apply(&first, &mut first_headers).await.unwrap());
+        assert!(manager.apply(&second, &mut second_headers).await.unwrap());
+        assert_eq!(
+            first_headers.get("authorization"),
+            second_headers.get("authorization")
+        );
     }
 }

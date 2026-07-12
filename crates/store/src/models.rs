@@ -39,6 +39,31 @@ impl AuthMode {
     }
 }
 
+/// Last observed health of a provider's stored OAuth credential.
+///
+/// This reflects an actual token exchange or refresh attempt; it does not
+/// predict when a refresh token will expire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthCredentialStatus {
+    /// A token exchange or refresh completed successfully.
+    Healthy,
+    /// The authorization server rejected the stored credential.
+    Invalid,
+    /// Refresh could not be verified because of a transient/internal error.
+    Error,
+}
+
+impl OAuthCredentialStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Invalid => "invalid",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// A registered upstream provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
