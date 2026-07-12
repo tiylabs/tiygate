@@ -35,6 +35,14 @@ use crate::settings_keys::is_encrypted_key;
 
 const OPENAI_PLATFORM_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+/// Stable originator paired with the Codex Desktop user agent for OpenAI OAuth
+/// egress when a provider does not define its own originator.
+const OPENAI_CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
+/// Stable desktop identity used for OpenAI OAuth egress when a provider does
+/// not define its own user agent. This keeps Codex OAuth traffic compatible
+/// with desktop-oriented upstream endpoints.
+const OPENAI_CODEX_DESKTOP_USER_AGENT: &str =
+    "Codex Desktop/0.144.0-alpha.4 (Mac OS 26.5.2; arm64) unknown (Codex Desktop; 26.707.41301)";
 
 /// Convenience error for store operations.
 #[derive(Debug, Error)]
@@ -429,7 +437,10 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("originator"))
         {
-            extra_headers.push(("originator".to_string(), "tiygate".to_string()));
+            extra_headers.push((
+                "originator".to_string(),
+                OPENAI_CODEX_DESKTOP_ORIGINATOR.to_string(),
+            ));
         }
         if !extra_headers
             .iter()
@@ -437,7 +448,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         {
             extra_headers.push((
                 "user-agent".to_string(),
-                format!("tiygate/{}", env!("CARGO_PKG_VERSION")),
+                OPENAI_CODEX_DESKTOP_USER_AGENT.to_string(),
             ));
         }
     }
@@ -2227,10 +2238,12 @@ mod tests {
         assert!(oauth.extra_headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("chatgpt-account-id") && value == "workspace-123"
         }));
-        assert!(oauth
-            .extra_headers
-            .iter()
-            .any(|(name, value)| name == "originator" && value == "tiygate"));
+        assert!(oauth.extra_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("originator") && value == OPENAI_CODEX_DESKTOP_ORIGINATOR
+        }));
+        assert!(oauth.extra_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("user-agent") && value == OPENAI_CODEX_DESKTOP_USER_AGENT
+        }));
     }
 
     fn test_model_metadata(id: &str) -> ModelMetadata {

@@ -40,6 +40,10 @@ const REFRESH_LEEWAY: Duration = Duration::from_secs(60);
 /// returns an empty model list for obsolete client versions.
 pub const CODEX_CLIENT_VERSION: &str = "0.144.0-alpha.4";
 
+/// Stable originator paired with the Codex Desktop user-agent for OpenAI OAuth
+/// authorization and Responses API requests.
+pub const CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
+
 /// Stable, non-secret classification of a failed OAuth refresh. Callers may
 /// persist these values for operator-facing health without exposing the raw
 /// authorization-server response.
@@ -165,7 +169,10 @@ pub fn codex_preset() -> OAuthProviderPreset {
         extra_authorize_params: vec![
             ("id_token_add_organizations".to_string(), "true".to_string()),
             ("codex_cli_simplified_flow".to_string(), "true".to_string()),
-            ("originator".to_string(), "tiygate".to_string()),
+            (
+                "originator".to_string(),
+                CODEX_DESKTOP_ORIGINATOR.to_string(),
+            ),
         ],
     }
 }
@@ -742,7 +749,7 @@ mod tests {
         assert!(!p.send_scopes_in_token_requests);
         assert!(p
             .extra_authorize_params
-            .contains(&("originator".into(), "tiygate".into())));
+            .contains(&("originator".into(), CODEX_DESKTOP_ORIGINATOR.into())));
     }
 
     #[test]
@@ -814,7 +821,7 @@ mod tests {
         assert!(url.contains("code_challenge=mychallenge"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("codex_cli_simplified_flow=true"));
-        assert!(url.contains("originator=tiygate"));
+        assert!(url.contains("originator=Codex+Desktop"));
     }
 
     #[test]
