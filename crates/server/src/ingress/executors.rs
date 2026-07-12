@@ -5,8 +5,13 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message;
 
+use tiygate_core::provider::oauth::UpstreamTransport;
 use tiygate_core::tracing_ctx::TraceContext;
 use tiygate_core::{EndpointCodec, IrRequest, UsageAccumulator};
 use tiygate_protocols::chat_completions::ChatCompletionsCodec;
@@ -24,7 +29,8 @@ use super::headers::{
 };
 use super::response_model::ResponseModelOverride;
 use super::streaming::{
-    drive_upstream_stream, StreamCapture, StreamTranscode, DEFAULT_SSE_KEEPALIVE_INTERVAL,
+    drive_upstream_stream, StreamCapture, StreamTranscode, UpstreamByteStream,
+    DEFAULT_SSE_KEEPALIVE_INTERVAL,
 };
 use super::{apply_provider_auth, AppError, AppState};
 
@@ -33,6 +39,169 @@ use super::{apply_provider_auth, AppError, AppState};
 /// upstream), so we use a dedicated budget that is independent of the
 /// global `request_read_timeout` (which defaults to 30s for chat).
 const IMAGES_NONSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Required by the Codex Responses WebSocket endpoint. This is a transport
+/// negotiation header, not a client-supplied preference, so it is injected
+/// after header forwarding and OAuth auth have run.
+const CODEX_RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+
+fn uses_codex_responses_websocket(target: &tiygate_core::RoutingTarget) -> bool {
+    matches!(
+        target.oauth.as_ref().map(|oauth| oauth.upstream_transport),
+        Some(UpstreamTransport::CodexResponsesWebSocket)
+    )
+}
+
+fn codex_websocket_url(upstream_url: &str) -> Result<String, AppError> {
+    let mut url = url::Url::parse(upstream_url).map_err(|error| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("invalid Codex upstream URL: {error}"),
+        )
+    })?;
+    match url.scheme() {
+        "https" => url.set_scheme("wss").map_err(|_| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to convert Codex HTTPS URL to WSS".to_string(),
+            )
+        })?,
+        "http" => url.set_scheme("ws").map_err(|_| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to convert Codex HTTP URL to WS".to_string(),
+            )
+        })?,
+        "ws" | "wss" => {}
+        scheme => {
+            return Err(AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unsupported Codex WebSocket URL scheme: {scheme}"),
+            ));
+        }
+    }
+    Ok(url.into())
+}
+
+fn codex_response_create(mut body: Value) -> Result<Value, AppError> {
+    let object = body.as_object_mut().ok_or_else(|| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Codex Responses request body must be a JSON object".to_string(),
+        )
+    })?;
+    // The WebSocket endpoint uses an event envelope instead of an HTTP body.
+    // Always overwrite a forwarded value: clients may not select arbitrary
+    // command types through the gateway.
+    object.insert("type".to_string(), json!("response.create"));
+    Ok(body)
+}
+
+fn codex_websocket_handshake_request(
+    websocket_url: &str,
+    headers: &http::HeaderMap,
+) -> Result<http::Request<()>, AppError> {
+    // Start from tungstenite's client request builder so the mandatory
+    // Upgrade / Connection / Sec-WebSocket-* headers are present. A plain
+    // `http::Request::builder()` looks valid but fails the handshake because
+    // it omits the generated Sec-WebSocket-Key.
+    let mut request = websocket_url.into_client_request().map_err(|error| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("build Codex WebSocket handshake request: {error}"),
+        )
+    })?;
+    for (name, value) in headers {
+        request.headers_mut().insert(name.clone(), value.clone());
+    }
+    Ok(request)
+}
+
+fn websocket_event_stream(
+    mut socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> UpstreamByteStream {
+    use async_stream::stream;
+
+    Box::pin(stream! {
+        while let Some(frame) = socket.next().await {
+            match frame {
+                Ok(Message::Text(text)) => {
+                    // Codex sends one Responses event per text message. The
+                    // existing stream bridge consumes SSE, so retain the
+                    // event JSON verbatim and add only the SSE envelope.
+                    yield Ok(Bytes::from(format!("data: {text}\n\n")));
+                }
+                Ok(Message::Binary(bytes)) => match String::from_utf8(bytes.to_vec()) {
+                    Ok(text) => yield Ok(Bytes::from(format!("data: {text}\n\n"))),
+                    Err(error) => {
+                        yield Err(format!("Codex WebSocket sent non-UTF-8 event: {error}"));
+                        break;
+                    }
+                },
+                Ok(Message::Ping(payload)) => {
+                    if let Err(error) = socket.send(Message::Pong(payload)).await {
+                        yield Err(format!("failed to send Codex WebSocket pong: {error}"));
+                        break;
+                    }
+                }
+                Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+                Ok(Message::Close(_)) => break,
+                Err(error) => {
+                    yield Err(format!("Codex WebSocket read error: {error}"));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+async fn collect_codex_websocket_response(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Result<Value, String> {
+    while let Some(frame) = socket.next().await {
+        let text = match frame {
+            Ok(Message::Text(text)) => text.to_string(),
+            Ok(Message::Binary(bytes)) => String::from_utf8(bytes.to_vec())
+                .map_err(|error| format!("Codex WebSocket sent non-UTF-8 event: {error}"))?,
+            Ok(Message::Ping(payload)) => {
+                socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(|error| format!("failed to send Codex WebSocket pong: {error}"))?;
+                continue;
+            }
+            Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => continue,
+            Ok(Message::Close(_)) => {
+                return Err("Codex WebSocket closed before response.completed".to_string());
+            }
+            Err(error) => return Err(format!("Codex WebSocket read error: {error}")),
+        };
+        let event: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("invalid Codex WebSocket event JSON: {error}"))?;
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => {
+                return event
+                    .get("response")
+                    .cloned()
+                    .ok_or_else(|| "Codex response.completed lacks response payload".to_string());
+            }
+            Some("response.failed") | Some("response.incomplete") => {
+                let message = event
+                    .pointer("/response/error/message")
+                    .or_else(|| event.pointer("/response/incomplete_details/reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex response did not complete");
+                return Err(message.to_string());
+            }
+            Some(_) | None => {}
+        }
+    }
+    Err("Codex WebSocket reached EOF before response.completed".to_string())
+}
 
 /// Execute a reqwest request with an optional TTFB (time-to-first-byte)
 /// timeout. When `ttfb_timeout_secs` is non-zero, the `client.execute()`
@@ -382,7 +551,11 @@ pub(super) async fn execute_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            response,
+            Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|result| result.map_err(|error| error.to_string())),
+            ),
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -846,7 +1019,11 @@ pub(super) async fn execute_messages_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            response,
+            Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|result| result.map_err(|error| error.to_string())),
+            ),
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -1468,6 +1645,31 @@ pub(super) async fn execute_responses_upstream(
         )
     })?;
 
+    // ChatGPT/Codex OAuth Responses uses a WebSocket control plane rather
+    // than HTTP POST + SSE. Keep this provider-specific transport outside of
+    // the generic HTTP executor, while sharing the same canonical stream
+    // bridge and response codecs below it.
+    if uses_codex_responses_websocket(target)
+        && egress_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses
+    {
+        return execute_codex_responses_websocket(
+            state,
+            codec,
+            ingress_protocol,
+            &egress_protocol,
+            ir_request,
+            target,
+            is_stream,
+            upstream_url,
+            upstream_body,
+            upstream_headers,
+            trace,
+            request_id,
+            is_same_protocol,
+        )
+        .await;
+    }
+
     if is_stream {
         let mut stream_req = crate::ingress::observability::inject_trace(
             state
@@ -1554,7 +1756,11 @@ pub(super) async fn execute_responses_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            response,
+            Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|result| result.map_err(|error| error.to_string())),
+            ),
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -1788,6 +1994,291 @@ pub(super) async fn execute_responses_upstream(
     Ok((resp, ttfb_ms))
 }
 
+/// Execute OpenAI Codex Responses over its WebSocket transport.
+///
+/// The public gateway contract remains HTTP JSON/SSE. This adapter performs
+/// the Codex handshake and `response.create` command, then normalizes each
+/// JSON WebSocket frame into the Responses SSE shape consumed by the shared
+/// stream bridge.
+#[allow(clippy::too_many_arguments)]
+async fn execute_codex_responses_websocket(
+    state: &AppState,
+    codec: &ResponsesCodec,
+    ingress_protocol: &tiygate_core::ProtocolEndpoint,
+    egress_protocol: &tiygate_core::ProtocolEndpoint,
+    ir_request: &IrRequest,
+    target: &tiygate_core::RoutingTarget,
+    is_stream: bool,
+    upstream_url: String,
+    mut upstream_body: Value,
+    mut upstream_headers: http::HeaderMap,
+    trace: &TraceContext,
+    request_id: &str,
+    is_same_protocol: bool,
+) -> Result<(Response, Option<u64>), AppError> {
+    upstream_body = codex_response_create(upstream_body)?;
+
+    // The payload lives exclusively in the first WebSocket message. Keeping
+    // HTTP entity headers on the upgrade request can make strict proxies
+    // treat it as an unsupported HTTP POST-style content type.
+    upstream_headers.remove(http::header::CONTENT_TYPE);
+    upstream_headers.remove(http::header::CONTENT_LENGTH);
+    upstream_headers.remove(http::header::TRANSFER_ENCODING);
+    upstream_headers.insert(
+        http::HeaderName::from_static("openai-beta"),
+        http::HeaderValue::from_static(CODEX_RESPONSES_WEBSOCKET_BETA),
+    );
+    let trace_value = http::HeaderValue::from_str(&trace.to_traceparent()).map_err(|error| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("invalid traceparent header: {error}"),
+        )
+    })?;
+    upstream_headers.insert(http::HeaderName::from_static("traceparent"), trace_value);
+
+    let websocket_url = codex_websocket_url(&upstream_url)?;
+    let request = codex_websocket_handshake_request(&websocket_url, &upstream_headers)?;
+    let egress_path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let egress_headers_capture = header_map_to_vec(&upstream_headers);
+    let egress_body_capture = serde_json::to_string(&upstream_body).ok();
+    let request_id_capture = request_id.to_string();
+
+    let connect_started = std::time::Instant::now();
+    let connect = tokio_tungstenite::connect_async(request);
+    let connection = if state.tunables().upstream_ttfb_timeout_secs > 0 {
+        match tokio::time::timeout(
+            Duration::from_secs(state.tunables().upstream_ttfb_timeout_secs),
+            connect,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let mut error = AppError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Codex WebSocket handshake timeout".to_string(),
+                )
+                .with_class(tiygate_core::ErrorClass::DeadlineExceeded);
+                error.upstream_status = Some(504);
+                spawn_capture(
+                    state,
+                    tiygate_core::ExchangeCapture {
+                        request_id: request_id_capture,
+                        egress_method: "GET".to_string(),
+                        egress_path,
+                        egress_headers: egress_headers_capture,
+                        egress_body: egress_body_capture,
+                        upstream_status: Some(504),
+                        upstream_resp_headers: Vec::new(),
+                        upstream_resp_body: Some("Codex WebSocket handshake timeout".to_string()),
+                        client_resp_headers: Vec::new(),
+                        client_resp_body: None,
+                        is_stream,
+                        truncation_reason: None,
+                        stream_duration_ms: None,
+                        upstream_error: None,
+                        upstream_error_class: None,
+                    },
+                );
+                return Err(error);
+            }
+        }
+    } else {
+        connect.await
+    };
+    let (mut socket, handshake_response) = match connection {
+        Ok(connection) => connection,
+        Err(error) => {
+            let message = format!("Codex WebSocket handshake error: {error}");
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id_capture,
+                    egress_method: "GET".to_string(),
+                    egress_path,
+                    egress_headers: egress_headers_capture,
+                    egress_body: egress_body_capture,
+                    upstream_status: None,
+                    upstream_resp_headers: Vec::new(),
+                    upstream_resp_body: Some(message.clone()),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                    upstream_error: None,
+                    upstream_error_class: None,
+                },
+            );
+            return Err(AppError::new(StatusCode::BAD_GATEWAY, message));
+        }
+    };
+    let ttfb_ms = Some(connect_started.elapsed().as_millis() as u64);
+    let handshake_status = handshake_response.status().as_u16();
+    let handshake_headers_capture = header_map_to_vec(handshake_response.headers());
+    let create_message = serde_json::to_string(&upstream_body).map_err(|error| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize Codex response.create: {error}"),
+        )
+    })?;
+    if let Err(error) = socket.send(Message::Text(create_message.into())).await {
+        let message = format!("send Codex response.create: {error}");
+        spawn_capture(
+            state,
+            tiygate_core::ExchangeCapture {
+                request_id: request_id_capture,
+                egress_method: "GET".to_string(),
+                egress_path,
+                egress_headers: egress_headers_capture,
+                egress_body: egress_body_capture,
+                upstream_status: Some(handshake_status),
+                upstream_resp_headers: handshake_headers_capture,
+                upstream_resp_body: Some(message.clone()),
+                client_resp_headers: Vec::new(),
+                client_resp_body: None,
+                is_stream,
+                truncation_reason: None,
+                stream_duration_ms: None,
+                upstream_error: None,
+                upstream_error_class: None,
+            },
+        );
+        return Err(AppError::new(StatusCode::BAD_GATEWAY, message));
+    }
+
+    if is_stream {
+        let accum = std::sync::Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        let mut end_enc = codec.stream_encoder();
+        let mut err_enc = codec.stream_encoder();
+        let end_marker = end_enc.encode_done();
+        let error_marker = err_enc.encode_error(
+            "upstream stream truncated by gateway",
+            tiygate_core::ErrorClass::DeadlineExceeded,
+            None,
+        );
+        let mut response = drive_upstream_stream(
+            state,
+            accum,
+            websocket_event_stream(socket),
+            end_marker,
+            error_marker,
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_total_timeout_secs),
+            DEFAULT_SSE_KEEPALIVE_INTERVAL,
+            Some(StreamCapture {
+                request_id: request_id_capture,
+                telemetry: state.telemetry.clone(),
+                health: Some(state.health.clone()),
+                health_key: Some(target.health_key()),
+                egress_method: "GET".to_string(),
+                egress_path,
+                egress_headers: egress_headers_capture,
+                egress_body: egress_body_capture,
+                upstream_status: Some(handshake_status),
+                upstream_resp_headers: handshake_headers_capture,
+                // A WebSocket upgrade response is not a downstream HTTP
+                // response; never forward its upgrade/connection headers.
+                client_resp_headers: super::headers::forwarded_resp_headers_for_capture(
+                    &Vec::new(),
+                    &state.tunables().header_policy,
+                    request_id,
+                ),
+            }),
+            build_stream_transcode(ingress_protocol, egress_protocol),
+            Some(ResponseModelOverride::new(
+                ingress_protocol.suite,
+                &ir_request.model,
+            )),
+        );
+        super::headers::set_gateway_request_id_header(&mut response, request_id);
+        return Ok((response, ttfb_ms));
+    }
+
+    let upstream_response = match collect_codex_websocket_response(&mut socket).await {
+        Ok(response) => response,
+        Err(message) => {
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id_capture,
+                    egress_method: "GET".to_string(),
+                    egress_path,
+                    egress_headers: egress_headers_capture,
+                    egress_body: egress_body_capture,
+                    upstream_status: Some(handshake_status),
+                    upstream_resp_headers: handshake_headers_capture,
+                    upstream_resp_body: Some(message.clone()),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: false,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                    upstream_error: None,
+                    upstream_error_class: None,
+                },
+            );
+            return Err(AppError::new(StatusCode::BAD_GATEWAY, message));
+        }
+    };
+
+    let upstream_resp_body_capture = serde_json::to_string(&upstream_response).ok();
+    let mut response_body = if is_same_protocol {
+        upstream_response
+    } else {
+        let egress_codec = get_egress_codec(egress_protocol).ok_or_else(|| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("No egress codec found: {egress_protocol:?}"),
+            )
+        })?;
+        let ir_response = egress_codec
+            .decode_response(upstream_response)
+            .map_err(|error| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Decode response error: {error}"),
+                )
+            })?;
+        codec.encode_response(&ir_response).map_err(|error| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Encode response error: {error}"),
+            )
+        })?
+    };
+    ResponseModelOverride::new(ingress_protocol.suite, &ir_request.model)
+        .apply_json(&mut response_body);
+    let client_body_capture = serde_json::to_string(&response_body).ok();
+    let mut response = Json(response_body).into_response();
+    super::headers::set_gateway_request_id_header(&mut response, request_id);
+    spawn_capture(
+        state,
+        tiygate_core::ExchangeCapture {
+            request_id: request_id_capture,
+            egress_method: "GET".to_string(),
+            egress_path,
+            egress_headers: egress_headers_capture,
+            egress_body: egress_body_capture,
+            upstream_status: Some(handshake_status),
+            upstream_resp_headers: handshake_headers_capture,
+            upstream_resp_body: upstream_resp_body_capture,
+            client_resp_headers: header_map_to_vec(response.headers()),
+            client_resp_body: client_body_capture,
+            is_stream: false,
+            truncation_reason: None,
+            stream_duration_ms: None,
+            upstream_error: None,
+            upstream_error_class: None,
+        },
+    );
+    Ok((response, ttfb_ms))
+}
+
 /// Handle POST /v1/embeddings.
 ///
 /// Wiring (§4.7 + §4.1 + §4.8):
@@ -1991,7 +2482,11 @@ pub(super) async fn execute_gemini_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            response,
+            Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|result| result.map_err(|error| error.to_string())),
+            ),
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -2395,7 +2890,11 @@ pub(super) async fn execute_images_generations_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            response,
+            Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|result| result.map_err(|error| error.to_string())),
+            ),
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -2761,7 +3260,11 @@ pub(super) async fn execute_images_edits_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            response,
+            Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|result| result.map_err(|error| error.to_string())),
+            ),
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -2972,6 +3475,7 @@ pub(super) async fn execute_images_edits_upstream(
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use futures::{SinkExt, StreamExt};
 
     #[test]
     fn check_nonstream_error_body_detects_pure_error() {
@@ -3016,5 +3520,152 @@ mod tests {
         assert!(result.is_some());
         let err = result.unwrap();
         assert_eq!(err.retry_after_header, Some("30".to_string()));
+    }
+
+    #[test]
+    fn codex_websocket_url_preserves_responses_path() {
+        let result =
+            codex_websocket_url("https://chatgpt.com/backend-api/codex/responses?foo=bar").unwrap();
+        assert_eq!(
+            result,
+            "wss://chatgpt.com/backend-api/codex/responses?foo=bar"
+        );
+        assert_eq!(
+            codex_websocket_url("http://127.0.0.1:8080/responses").unwrap(),
+            "ws://127.0.0.1:8080/responses"
+        );
+        assert!(codex_websocket_url("ftp://example.test/responses").is_err());
+    }
+
+    #[test]
+    fn codex_response_create_preserves_responses_payload() {
+        let event = codex_response_create(json!({
+            "model": "gpt-5-codex",
+            "input": [{"role": "user", "content": "hello"}],
+            "additional_tools": [{"type": "computer"}],
+            "type": "untrusted.client.command"
+        }))
+        .unwrap();
+
+        assert_eq!(event["type"], "response.create");
+        assert_eq!(event["model"], "gpt-5-codex");
+        assert_eq!(event["additional_tools"][0]["type"], "computer");
+    }
+
+    #[test]
+    fn codex_handshake_keeps_auth_and_client_request_id() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer test-token"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-client-request-id"),
+            http::HeaderValue::from_static("client-request-id"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("openai-beta"),
+            http::HeaderValue::from_static(CODEX_RESPONSES_WEBSOCKET_BETA),
+        );
+
+        let request = codex_websocket_handshake_request(
+            "wss://chatgpt.com/backend-api/codex/responses",
+            &headers,
+        )
+        .unwrap();
+        assert_eq!(request.method(), http::Method::GET);
+        assert_eq!(request.uri().path(), "/backend-api/codex/responses");
+        assert_eq!(
+            request.headers().get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer test-token"
+        );
+        assert_eq!(
+            request.headers().get("x-client-request-id").unwrap(),
+            "client-request-id"
+        );
+        assert_eq!(
+            request.headers().get("openai-beta").unwrap(),
+            CODEX_RESPONSES_WEBSOCKET_BETA
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_events_are_normalized_to_sse() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (command_tx, command_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let command = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let _ = command_tx.send(command.to_string());
+            socket
+                .send(Message::Text(
+                    json!({"type": "response.created", "response": {"id": "resp-test"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {"id": "resp-test", "status": "completed"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+        });
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::HeaderName::from_static("openai-beta"),
+            http::HeaderValue::from_static(CODEX_RESPONSES_WEBSOCKET_BETA),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-client-request-id"),
+            http::HeaderValue::from_static("client-request-id"),
+        );
+        let request = codex_websocket_handshake_request(
+            &format!("ws://{address}/backend-api/codex/responses"),
+            &headers,
+        )
+        .unwrap();
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let command = codex_response_create(json!({
+            "model": "gpt-5-codex",
+            "additional_tools": [{"type": "computer"}]
+        }))
+        .unwrap();
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&command).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+
+        let frames = websocket_event_stream(socket)
+            .collect::<Vec<Result<Bytes, String>>>()
+            .await;
+        let frames: Vec<String> = frames
+            .into_iter()
+            .map(|frame| String::from_utf8(frame.unwrap().to_vec()).unwrap())
+            .collect();
+        let sent_command: Value = serde_json::from_str(&command_rx.await.unwrap()).unwrap();
+        server.await.unwrap();
+
+        assert_eq!(sent_command["type"], "response.create");
+        assert_eq!(sent_command["additional_tools"][0]["type"], "computer");
+        assert_eq!(
+            frames,
+            vec![
+                "data: {\"response\":{\"id\":\"resp-test\"},\"type\":\"response.created\"}\n\n",
+                "data: {\"response\":{\"id\":\"resp-test\",\"status\":\"completed\"},\"type\":\"response.completed\"}\n\n",
+            ]
+        );
     }
 }

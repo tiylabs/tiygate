@@ -857,6 +857,7 @@ mod tests {
     fn cache_apply_no_refresh_token_returns_error() {
         let cache = OAuthTokenCache::new();
         let oauth = OAuthTargetConfig {
+            upstream_transport: tiygate_core::provider::oauth::UpstreamTransport::Http,
             token_url: "https://example.com/token".to_string(),
             client_id: "test".to_string(),
             client_secret: None,
@@ -893,6 +894,7 @@ mod tests {
         );
 
         let oauth = OAuthTargetConfig {
+            upstream_transport: tiygate_core::provider::oauth::UpstreamTransport::Http,
             token_url: "https://example.com/token".to_string(),
             client_id: "test".to_string(),
             client_secret: None,

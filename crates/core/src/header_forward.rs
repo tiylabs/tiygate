@@ -40,11 +40,9 @@ use std::collections::HashSet;
 ///   `content-type`, `content-encoding`, `accept-encoding`, `expect`
 /// - hop-by-hop headers (RFC 7230 §6.1) that proxies must not forward:
 ///   `connection`, `keep-alive`, `proxy-connection`, `te`, `trailer`,
-///   `transfer-encoding`, `upgrade`
+///   `transfer-encoding`, `upgrade`, `sec-websocket-*`
 /// - trace context the gateway re-mints and re-injects:
 ///   `traceparent`, `tracestate`
-/// - request-id headers from clients — the gateway mints its own:
-///   `*request-id` (glob)
 const DEFAULT_REQUEST_DENY: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -64,10 +62,10 @@ const DEFAULT_REQUEST_DENY: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "sec-websocket-*",
     "traceparent",
     "tracestate",
     "expect",
-    "*request-id",
 ];
 
 /// Response-direction default denylist (provider → client).
@@ -107,6 +105,7 @@ const DEFAULT_RESPONSE_DENY: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "sec-websocket-*",
     "content-length",
     "content-encoding",
     "content-type",
@@ -355,6 +354,7 @@ mod tests {
         // Hop-by-hop.
         assert!(!p.should_forward_request("connection"));
         assert!(!p.should_forward_request("transfer-encoding"));
+        assert!(!p.should_forward_request("sec-websocket-key"));
         // Trace.
         assert!(!p.should_forward_request("traceparent"));
         // Normal custom header is forwarded.
@@ -363,13 +363,12 @@ mod tests {
     }
 
     #[test]
-    fn default_request_denylist_blocks_request_id_glob() {
+    fn default_request_denylist_forwards_client_request_ids() {
         let p = HeaderForwardPolicy::with_defaults();
-        assert!(!p.should_forward_request("x-request-id"));
-        assert!(!p.should_forward_request("x-oneapi-request-id"));
-        assert!(!p.should_forward_request("X-Stainless-Request-Id"));
-        assert!(!p.should_forward_request("request-id"));
-        // Non-matching headers still forwarded.
+        assert!(p.should_forward_request("x-request-id"));
+        assert!(p.should_forward_request("x-oneapi-request-id"));
+        assert!(p.should_forward_request("X-Stainless-Request-Id"));
+        assert!(p.should_forward_request("request-id"));
         assert!(p.should_forward_request("x-debug-id"));
         assert!(p.should_forward_request("x-correlation-id"));
     }
@@ -382,6 +381,7 @@ mod tests {
         assert!(!p.should_forward_response("content-length"));
         assert!(!p.should_forward_response("content-type"));
         assert!(!p.should_forward_response("connection"));
+        assert!(!p.should_forward_response("sec-websocket-accept"));
         assert!(!p.should_forward_response("date"));
         // Infrastructure / topology.
         assert!(!p.should_forward_response("server"));

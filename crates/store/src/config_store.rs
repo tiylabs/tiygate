@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use tiygate_core::protocol::{ProtocolEndpoint, ProtocolSuite};
 use tiygate_core::provider::find_provider;
-use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle};
+use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle, UpstreamTransport};
 use tiygate_core::routing::{RouteEntry, RoutingTable, RoutingTarget};
 
 use crate::db::DbPool;
@@ -42,7 +42,7 @@ const OPENAI_CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
 /// not define its own user agent. This keeps Codex OAuth traffic compatible
 /// with desktop-oriented upstream endpoints.
 const OPENAI_CODEX_DESKTOP_USER_AGENT: &str =
-    "Codex Desktop/0.144.0-alpha.4 (Mac OS 26.5.2; arm64) unknown (Codex Desktop; 26.707.41301)";
+    "Codex Desktop/0.144.0-alpha.4 (Mac OS 26.5.2; arm64) unknown (Codex Desktop; 26.707.51957)";
 
 /// Convenience error for store operations.
 #[derive(Debug, Error)]
@@ -360,6 +360,22 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         .get("authorization_prefix")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // Codex's ChatGPT Responses API creates responses through a WebSocket
+    // session. The provider metadata offers an explicit escape hatch for
+    // custom OpenAI-compatible OAuth endpoints; established OpenAI OAuth
+    // rows default to the Codex transport so they work after an upgrade.
+    let upstream_transport = provider
+        .metadata_json
+        .get("upstream_transport")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_else(|| {
+            if provider.vendor == "openai" {
+                UpstreamTransport::CodexResponsesWebSocket
+            } else {
+                UpstreamTransport::Http
+            }
+        });
 
     // Codex and Anthropic refresh tokens with JSON. Codex still exchanges
     // authorization codes as form data; that distinction lives in the admin
@@ -462,6 +478,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
     }
 
     Some(OAuthTargetConfig {
+        upstream_transport,
         token_url,
         client_id,
         client_secret: None,
@@ -2233,6 +2250,10 @@ mod tests {
 
         let oauth = build_oauth_target_config(&provider).expect("oauth config");
         assert_eq!(oauth.token_request_style, TokenRequestStyle::Json);
+        assert_eq!(
+            oauth.upstream_transport,
+            UpstreamTransport::CodexResponsesWebSocket
+        );
         assert!(oauth.scopes.is_empty());
         assert_eq!(oauth.cache_label(), "workspace-123");
         assert!(oauth.extra_headers.iter().any(|(name, value)| {

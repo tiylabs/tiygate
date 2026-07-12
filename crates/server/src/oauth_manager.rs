@@ -197,10 +197,11 @@ impl OAuthTokenManager {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle};
+    use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle, UpstreamTransport};
 
     fn make_oauth_config(refresh_token: &str) -> OAuthTargetConfig {
         OAuthTargetConfig {
+            upstream_transport: UpstreamTransport::Http,
             token_url: "https://example.com/token".to_string(),
             client_id: "test-client".to_string(),
             client_secret: None,

@@ -47,6 +47,7 @@ parking_lot = "0.12"
 # HTTP & Server
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 http = "1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout"] }

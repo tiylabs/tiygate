@@ -1,6 +1,7 @@
 //! SSE streaming helpers — keepalive wrapper, upstream stream driver,
 //! and cross-protocol transcode support.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,12 @@ use super::AppState;
 /// (`:keepalive\n\n` is a single SSE comment line) and short enough to
 /// keep corporate proxies from killing the connection on idle.
 pub(super) const DEFAULT_SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Unified byte stream used by the downstream SSE bridge. HTTP/SSE and
+/// WebSocket transports both normalize into this form before they reach the
+/// protocol codec layer.
+pub(super) type UpstreamByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send + 'static>>;
 
 /// Wraps an inner event stream and emits an SSE comment frame every
 /// `interval` while the inner stream is still pending. Once the
@@ -142,8 +149,9 @@ impl<S: Stream<Item = Result<Bytes, axum::Error>>> Stream for SseKeepaliveStream
     }
 }
 
-/// Drive an upstream HTTP response body to the downstream client as an
-/// SSE stream. Adds:
+/// Drive an upstream byte stream to the downstream client as an SSE stream.
+/// HTTP SSE and WebSocket JSON event frames both reach this bridge after the
+/// transport executor has normalized them into complete SSE frames. Adds:
 ///
 /// 1. An **idle timer** (default 120s). Every time a chunk is forwarded
 ///    the timer resets. If no chunk arrives for the full window, the
@@ -649,7 +657,7 @@ fn split_sse_lines(buf: &str) -> (Vec<String>, String) {
 pub(super) fn drive_upstream_stream(
     _state: &AppState,
     accum: Arc<std::sync::Mutex<UsageAccumulator>>,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     // Protocol-native end frame (e.g. `data: [DONE]\n\n`). Emitted on a
     // clean upstream EOF **only** when the upstream delivered an error
     // frame but no terminal signal — this lets the client SDK close the
@@ -668,7 +676,6 @@ pub(super) fn drive_upstream_stream(
 
     let total_budget_enabled = !total_timeout.is_zero();
     let capture_guard = StreamCaptureGuard::new(capture, accum.clone());
-    let mut upstream = response.bytes_stream();
     // Streaming response-body accumulators for the request-log detail
     // view live in `capture_guard` instead of plain locals. The guard's
     // Drop path persists a best-effort capture when the downstream
@@ -903,41 +910,25 @@ pub(super) fn drive_upstream_stream(
                                 }
                             }
                         }
-                        Some(Err(_e)) => {
+                        Some(Err(error)) => {
                             capture_guard.set_reason(Some(TruncationReason::UpstreamError));
                             log_truncation(
                                 TruncationReason::UpstreamError,
                                 transcode.is_some(),
                                 &capture_guard,
                             );
-                            // Log the underlying reqwest/hyper error with
-                            // its full source chain. This is the single
-                            // point where the real reason for a mid-stream
-                            // truncation (connection reset, incomplete
-                            // message body, h2 GOAWAY, decode error, …) is
-                            // observable — without it the gateway only
-                            // knows "the stream ended early" but not why,
-                            // which makes "works direct, fails via gateway"
-                            // bugs impossible to diagnose.
-                            {
-                                let mut detail = format!("{_e}");
-                                let mut src = std::error::Error::source(&_e);
-                                while let Some(s) = src {
-                                    detail.push_str(" -> ");
-                                    detail.push_str(&s.to_string());
-                                    src = s.source();
-                                }
-                                let rid = capture_guard.request_id();
-                                tracing::warn!(
-                                    request_id = %rid,
-                                    error = %detail,
-                                    is_timeout = _e.is_timeout(),
-                                    is_body = _e.is_body(),
-                                    is_decode = _e.is_decode(),
-                                    bytes_received = capture_guard.upstream_len(),
-                                    "upstream SSE stream errored mid-stream"
-                                );
-                            }
+                            // Transport executors preserve the original error
+                            // text when normalizing their byte stream. Logging
+                            // it here covers both reqwest body failures and
+                            // WebSocket close/read errors without coupling the
+                            // canonical bridge to a concrete I/O client.
+                            let rid = capture_guard.request_id();
+                            tracing::warn!(
+                                request_id = %rid,
+                                error = %error,
+                                bytes_received = capture_guard.upstream_len(),
+                                "upstream stream errored mid-stream"
+                            );
                             // Mark the accumulator as truncated BEFORE
                             // yielding the error marker so disconnect-
                             // billing sees the right state.

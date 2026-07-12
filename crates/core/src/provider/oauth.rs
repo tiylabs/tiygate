@@ -10,6 +10,22 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Transport used for an OAuth provider's data-plane requests.
+///
+/// OAuth providers normally use HTTP. Codex's ChatGPT Responses surface is
+/// an exception: requests are created through a WebSocket session while the
+/// gateway continues to expose the normal HTTP/SSE API to its own clients.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamTransport {
+    /// Conventional HTTP request, optionally followed by an SSE response.
+    #[default]
+    Http,
+    /// OpenAI Codex Responses WebSocket (`response.create`) transport.
+    #[serde(rename = "codex_responses_websocket")]
+    CodexResponsesWebSocket,
+}
+
 /// How the token endpoint expects the refresh / exchange request body.
 ///
 /// Most providers (OpenAI/Codex, xAI) use the standard
@@ -39,6 +55,11 @@ pub enum TokenRequestStyle {
 /// serialised into logs, snapshots, or debug output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTargetConfig {
+    /// Data-plane transport selected for this OAuth provider. Kept here so
+    /// the routing core remains pure data while the server owns all socket
+    /// I/O. Existing persisted configurations deserialize to HTTP.
+    #[serde(default)]
+    pub upstream_transport: UpstreamTransport,
     /// Token endpoint URL for refresh / exchange.
     pub token_url: String,
     /// OAuth client identifier (public client — no secret needed
@@ -122,6 +143,7 @@ mod tests {
     #[test]
     fn oauth_target_config_skip_serializing_refresh_token() {
         let cfg = OAuthTargetConfig {
+            upstream_transport: UpstreamTransport::Http,
             token_url: "https://example.com/token".to_string(),
             client_id: "test-client".to_string(),
             client_secret: None,
@@ -146,6 +168,7 @@ mod tests {
     #[test]
     fn oauth_target_config_defaults() {
         let cfg = OAuthTargetConfig {
+            upstream_transport: UpstreamTransport::Http,
             token_url: String::new(),
             client_id: String::new(),
             client_secret: None,
