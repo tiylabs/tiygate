@@ -820,7 +820,14 @@ fn inject_token(
         .map_err(|e| format!("invalid header name for OAuth token: {e}"))?;
     headers.insert(hn, hv);
 
-    // Inject extra provider-specific headers.
+    // Inject extra provider-specific headers. The presence of the ChatGPT
+    // account header is also the explicit signal that this target uses the
+    // Codex workspace-scoping contract; a generic OAuth `account_id` must not
+    // leak an OpenAI-specific header to Anthropic, xAI, or custom providers.
+    let uses_chatgpt_account_header = oauth
+        .extra_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"));
     for (name, value) in &oauth.extra_headers {
         let hv = http::HeaderValue::from_str(value)
             .map_err(|e| format!("invalid header value for '{name}': {e}"))?;
@@ -829,7 +836,10 @@ fn inject_token(
         headers.insert(hn, hv);
     }
 
-    if let Some(account_id) = account_id.filter(|account_id| !account_id.is_empty()) {
+    if uses_chatgpt_account_header {
+        let Some(account_id) = account_id.filter(|account_id| !account_id.is_empty()) else {
+            return Ok(());
+        };
         let value = http::HeaderValue::from_str(account_id)
             .map_err(|e| format!("invalid ChatGPT account header value: {e}"))?;
         headers.insert(http::HeaderName::from_static("chatgpt-account-id"), value);
@@ -1023,6 +1033,44 @@ mod tests {
         let result = rt.block_on(cache.apply(&mut headers, "prov3", "label3", &oauth, &client));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no refresh_token"));
+    }
+
+    #[test]
+    fn account_identity_only_sets_header_for_explicit_chatgpt_targets() {
+        let mut oauth = OAuthTargetConfig {
+            upstream_transport: tiygate_core::provider::oauth::UpstreamTransport::Http,
+            token_url: "https://example.com/token".to_string(),
+            client_id: "test".to_string(),
+            client_secret: None,
+            refresh_token: "refresh".to_string(),
+            scopes: vec![],
+            token_request_style: TokenRequestStyle::Form,
+            authorization_header: None,
+            authorization_prefix: None,
+            extra_headers: vec![],
+            account_id: Some("workspace-new".to_string()),
+        };
+
+        let mut generic_headers = HeaderMap::new();
+        inject_token(
+            &mut generic_headers,
+            "access",
+            Some("workspace-new"),
+            &oauth,
+        )
+        .unwrap();
+        assert!(!generic_headers.contains_key("chatgpt-account-id"));
+
+        oauth.extra_headers.push((
+            "chatgpt-account-id".to_string(),
+            "workspace-old".to_string(),
+        ));
+        let mut codex_headers = HeaderMap::new();
+        inject_token(&mut codex_headers, "access", Some("workspace-new"), &oauth).unwrap();
+        assert_eq!(
+            codex_headers["chatgpt-account-id"],
+            http::HeaderValue::from_static("workspace-new")
+        );
     }
 
     #[tokio::test]

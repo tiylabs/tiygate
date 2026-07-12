@@ -176,6 +176,24 @@ function isOAuthProvider(provider: Provider): boolean {
   return provider.auth_mode === "oauth";
 }
 
+const PLAN_TYPE_LABELS: Record<string, string> = {
+  free: "Free",
+  go: "Go",
+  plus: "Plus",
+  pro: "Pro",
+  pro_lite: "Pro Lite",
+  business: "Business",
+  enterprise: "Enterprise",
+  education: "Education",
+  edu: "Education",
+};
+
+function formatPlanType(planType: string | null | undefined): string | null {
+  const normalized = planType?.trim().toLowerCase();
+  if (!normalized) return null;
+  return PLAN_TYPE_LABELS[normalized] ?? planType?.trim() ?? null;
+}
+
 function formatUsageResetTime(
   resetAt: number | null | undefined,
   t: (key: string, options?: Record<string, unknown>) => string,
@@ -754,9 +772,19 @@ export default function Providers() {
                             const usageQuery = usageByProvider.get(p.id);
                             const usage = usageQuery?.data;
                             const accountEmail = usage?.account_email;
+                            const planType = formatPlanType(usage?.plan_type);
                             return (
                               <>
                                 <div className="col-span-2 flex min-w-0 items-center gap-1 text-[10px] leading-4">
+                                  {planType ? (
+                                    <Badge
+                                      tone="primary"
+                                      className="shrink-0 px-1.5 py-0 text-[10px]"
+                                      title={usage?.plan_type ?? undefined}
+                                    >
+                                      {planType}
+                                    </Badge>
+                                  ) : null}
                                   <span
                                     className="min-w-0 truncate font-mono text-[10px] text-text-muted"
                                     title={accountEmail ?? undefined}

@@ -130,11 +130,20 @@ struct ProviderUsageResponse {
     five_hour: Option<ProviderUsageWindow>,
     seven_day: Option<ProviderUsageWindow>,
     account_email: Option<String>,
+    plan_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiUsageResponse {
+    plan_type: Option<String>,
     rate_limit: Option<OpenAiRateLimit>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedOpenAiUsage {
+    plan_type: Option<String>,
+    five_hour: Option<ProviderUsageWindow>,
+    seven_day: Option<ProviderUsageWindow>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +175,7 @@ fn provider_usage_response(
         five_hour,
         seven_day,
         account_email: account_email.map(str::to_string),
+        plan_type: None,
     }
 }
 
@@ -183,19 +193,20 @@ fn map_openai_usage_window(
     })
 }
 
-fn parse_openai_usage(
-    body: &str,
-    now_unix: i64,
-) -> Result<(Option<ProviderUsageWindow>, Option<ProviderUsageWindow>), String> {
+fn parse_openai_usage(body: &str, now_unix: i64) -> Result<ParsedOpenAiUsage, String> {
     let response: OpenAiUsageResponse =
         serde_json::from_str(body).map_err(|error| format!("invalid usage response: {error}"))?;
+    let plan_type = response
+        .plan_type
+        .filter(|plan_type| !plan_type.trim().is_empty());
     let Some(rate_limit) = response.rate_limit else {
         return Err("usage response has no rate_limit".to_string());
     };
-    Ok((
-        map_openai_usage_window(rate_limit.primary_window, now_unix),
-        map_openai_usage_window(rate_limit.secondary_window, now_unix),
-    ))
+    Ok(ParsedOpenAiUsage {
+        plan_type,
+        five_hour: map_openai_usage_window(rate_limit.primary_window, now_unix),
+        seven_day: map_openai_usage_window(rate_limit.secondary_window, now_unix),
+    })
 }
 
 fn provider_oauth_account_email(provider: &Provider) -> Option<String> {
@@ -366,8 +377,8 @@ async fn provider_usage(
         .text()
         .await
         .map_err(|error| AdminError::Internal(format!("read usage response: {error}")))?;
-    let (five_hour, seven_day) = match parse_openai_usage(&body, chrono::Utc::now().timestamp()) {
-        Ok(windows) => windows,
+    let parsed_usage = match parse_openai_usage(&body, chrono::Utc::now().timestamp()) {
+        Ok(usage) => usage,
         Err(error) => {
             tracing::warn!(provider = %id, error = %error, "OpenAI usage response parse failed");
             return Ok(Json(provider_usage_response(
@@ -381,14 +392,15 @@ async fn provider_usage(
             .into_response());
         }
     };
-    let usage = provider_usage_response(
+    let mut usage = provider_usage_response(
         &id,
         "available",
         None,
-        five_hour,
-        seven_day,
+        parsed_usage.five_hour,
+        parsed_usage.seven_day,
         account_email.as_deref(),
     );
+    usage.plan_type = parsed_usage.plan_type;
     Ok(Json(usage).into_response())
 }
 
@@ -2717,6 +2729,7 @@ mod tests {
     #[test]
     fn parses_openai_usage_windows() {
         let body = json!({
+            "plan_type": "plus",
             "rate_limit": {
                 "primary_window": {
                     "used_percent": 27,
@@ -2732,21 +2745,28 @@ mod tests {
         })
         .to_string();
 
-        let (five_hour, seven_day) = parse_openai_usage(&body, 1_000_000).expect("usage JSON");
+        let parsed = parse_openai_usage(&body, 1_000_000).expect("usage JSON");
+        assert_eq!(parsed.plan_type.as_deref(), Some("plus"));
         assert_eq!(
-            five_hour.as_ref().and_then(|window| window.used_percent),
+            parsed
+                .five_hour
+                .as_ref()
+                .and_then(|window| window.used_percent),
             Some(27.0)
         );
         assert_eq!(
-            five_hour.as_ref().and_then(|window| window.reset_at),
+            parsed.five_hour.as_ref().and_then(|window| window.reset_at),
             Some(1_782_770_922)
         );
         assert_eq!(
-            seven_day.as_ref().and_then(|window| window.used_percent),
+            parsed
+                .seven_day
+                .as_ref()
+                .and_then(|window| window.used_percent),
             Some(4.0)
         );
         assert_eq!(
-            seven_day.as_ref().and_then(|window| window.reset_at),
+            parsed.seven_day.as_ref().and_then(|window| window.reset_at),
             Some(1_000_600)
         );
     }
@@ -2760,12 +2780,15 @@ mod tests {
             }
         }"#;
 
-        let (five_hour, seven_day) = parse_openai_usage(body, 1_000_000).expect("usage JSON");
+        let parsed = parse_openai_usage(body, 1_000_000).expect("usage JSON");
         assert_eq!(
-            five_hour.and_then(|window| window.used_percent),
+            parsed.five_hour.and_then(|window| window.used_percent),
             Some(100.0)
         );
-        assert_eq!(seven_day.and_then(|window| window.used_percent), Some(0.0));
+        assert_eq!(
+            parsed.seven_day.and_then(|window| window.used_percent),
+            Some(0.0)
+        );
     }
 
     #[test]

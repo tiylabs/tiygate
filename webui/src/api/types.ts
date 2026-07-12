@@ -75,6 +75,7 @@ export interface ProviderUsage {
   reason?: string | null;
   checked_at?: string | null;
   account_email?: string | null;
+  plan_type?: string | null;
   five_hour?: ProviderUsageWindow | null;
   seven_day?: ProviderUsageWindow | null;
 }

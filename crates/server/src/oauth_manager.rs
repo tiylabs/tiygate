@@ -349,6 +349,10 @@ mod tests {
         let mut oauth = make_oauth_config("old-refresh");
         oauth.token_url = format!("{}/token", server.uri());
         oauth.account_id = Some("workspace-old".to_string());
+        oauth.extra_headers.push((
+            "chatgpt-account-id".to_string(),
+            "workspace-old".to_string(),
+        ));
         let mut target = make_target(Some(oauth.clone()));
         target.provider_id = "provider-401-refresh-test".to_string();
         OAuthTokenCache::global().seed_tokens_with_identity(

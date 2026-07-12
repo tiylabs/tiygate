@@ -959,6 +959,35 @@ impl DbConfigStore {
         Ok(())
     }
 
+    /// Replace OAuth metadata only when the encrypted value has not changed
+    /// since it was read. This protects read-modify-write metadata patches
+    /// from overwriting a concurrently rotated refresh token, including when
+    /// multiple gateway instances share the same database.
+    async fn set_provider_oauth_meta_if_unchanged(
+        &self,
+        id: &str,
+        expected_encrypted: &str,
+        meta_plain: &str,
+    ) -> Result<bool, StoreError> {
+        let encrypted = match self.encryption.as_ref() {
+            Some(enc) => keys::encrypt_oauth_meta(enc, meta_plain)
+                .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+            None => meta_plain.to_string(),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE providers SET encrypted_oauth_meta = $1, updated_at = $2 \
+             WHERE id = $3 AND encrypted_oauth_meta = $4",
+        )
+        .bind(&encrypted)
+        .bind(&now)
+        .bind(id)
+        .bind(expected_encrypted)
+        .execute(self.pool.any())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Record the last observed OAuth credential health without replacing the
     /// stored refresh token, account identity, or future metadata fields.
     pub async fn set_provider_oauth_status(
@@ -967,40 +996,58 @@ impl DbConfigStore {
         status: OAuthCredentialStatus,
         reason: Option<&str>,
     ) -> Result<(), StoreError> {
-        let provider = self
-            .get_provider(id)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("provider {id}")))?;
-        let raw = provider
-            .oauth_meta_cleartext
-            .as_deref()
-            .filter(|meta| !meta.trim().is_empty())
-            .ok_or_else(|| StoreError::Invalid("provider has no OAuth metadata".to_string()))?;
-        let mut meta: serde_json::Value = serde_json::from_str(raw)?;
-        let object = meta.as_object_mut().ok_or_else(|| {
-            StoreError::Invalid("provider OAuth metadata must be a JSON object".to_string())
-        })?;
-        object.insert(
-            "status".to_string(),
-            serde_json::Value::String(status.as_str().to_string()),
-        );
-        object.insert(
-            "status_checked_at".to_string(),
-            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-        );
-        match reason.filter(|value| !value.is_empty()) {
-            Some(reason) => {
-                object.insert(
-                    "status_reason".to_string(),
-                    serde_json::Value::String(reason.to_string()),
-                );
+        const MAX_CAS_ATTEMPTS: usize = 4;
+
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let provider = self
+                .get_provider(id)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("provider {id}")))?;
+            let raw = provider
+                .oauth_meta_cleartext
+                .as_deref()
+                .filter(|meta| !meta.trim().is_empty())
+                .ok_or_else(|| StoreError::Invalid("provider has no OAuth metadata".to_string()))?;
+            let mut meta: serde_json::Value = serde_json::from_str(raw)?;
+            let object = meta.as_object_mut().ok_or_else(|| {
+                StoreError::Invalid("provider OAuth metadata must be a JSON object".to_string())
+            })?;
+            object.insert(
+                "status".to_string(),
+                serde_json::Value::String(status.as_str().to_string()),
+            );
+            object.insert(
+                "status_checked_at".to_string(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+            match reason.filter(|value| !value.is_empty()) {
+                Some(reason) => {
+                    object.insert(
+                        "status_reason".to_string(),
+                        serde_json::Value::String(reason.to_string()),
+                    );
+                }
+                None => {
+                    object.remove("status_reason");
+                }
             }
-            None => {
-                object.remove("status_reason");
+            let serialized = serde_json::to_string(&meta)?;
+            if self
+                .set_provider_oauth_meta_if_unchanged(
+                    id,
+                    &provider.encrypted_oauth_meta,
+                    &serialized,
+                )
+                .await?
+            {
+                self.refresh().await?;
+                return Ok(());
             }
         }
-        let serialized = serde_json::to_string(&meta)?;
-        self.set_provider_oauth_meta(id, &serialized).await
+
+        Err(StoreError::Invalid(format!(
+            "provider {id} OAuth metadata changed repeatedly while updating status"
+        )))
     }
 
     async fn load_providers(&self) -> Result<Vec<Provider>, StoreError> {
@@ -2199,6 +2246,85 @@ mod tests {
         assert_eq!(stored["status"], "invalid");
         assert_eq!(stored["status_reason"], "credential_rejected");
         assert!(stored["status_checked_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn oauth_status_cas_does_not_overwrite_rotated_refresh_token() {
+        let key = KeyEncryption::from_secret(&master_key_hex()).expect("key");
+        let store = boot_store(Some(Arc::new(key))).await;
+        let initial_meta = serde_json::json!({
+            "refresh_token": "refresh-old",
+            "account_id": "workspace-123",
+        });
+        store
+            .upsert_provider(
+                "oauth-status-cas",
+                "OAuth Status CAS",
+                "openai",
+                OPENAI_CODEX_BASE_URL,
+                "",
+                None,
+                AuthMode::OAuth,
+                Some(&initial_meta.to_string()),
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("upsert oauth provider");
+
+        let stale = store
+            .get_provider("oauth-status-cas")
+            .await
+            .expect("get provider")
+            .expect("provider exists");
+        let rotated_meta = serde_json::json!({
+            "refresh_token": "refresh-new",
+            "account_id": "workspace-123",
+        });
+        store
+            .set_provider_oauth_meta("oauth-status-cas", &rotated_meta.to_string())
+            .await
+            .expect("rotate refresh token");
+
+        let stale_status_meta = serde_json::json!({
+            "refresh_token": "refresh-old",
+            "account_id": "workspace-123",
+            "status": "invalid",
+        });
+        assert!(
+            !store
+                .set_provider_oauth_meta_if_unchanged(
+                    "oauth-status-cas",
+                    &stale.encrypted_oauth_meta,
+                    &stale_status_meta.to_string(),
+                )
+                .await
+                .expect("stale CAS attempt"),
+            "a stale status patch must not replace rotated credentials"
+        );
+
+        store
+            .set_provider_oauth_status(
+                "oauth-status-cas",
+                OAuthCredentialStatus::Invalid,
+                Some("credential_rejected"),
+            )
+            .await
+            .expect("retry status update against latest metadata");
+        let current = store
+            .get_provider("oauth-status-cas")
+            .await
+            .expect("get current provider")
+            .expect("provider exists");
+        let current_meta: serde_json::Value = serde_json::from_str(
+            current
+                .oauth_meta_cleartext
+                .as_deref()
+                .expect("decrypted metadata"),
+        )
+        .expect("valid metadata");
+        assert_eq!(current_meta["refresh_token"], "refresh-new");
+        assert_eq!(current_meta["status"], "invalid");
     }
 
     #[test]
