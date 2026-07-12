@@ -159,7 +159,7 @@ pub struct AppState {
     tunables: Arc<arc_swap::ArcSwap<RuntimeTunables>>,
     /// OAuth token manager. Handles OAuth token refresh and
     /// injection for providers configured with `AuthMode::OAuth`.
-    pub oauth_manager: crate::oauth_manager::OAuthTokenManager,
+    pub oauth_manager: Arc<crate::oauth_manager::OAuthTokenManager>,
 }
 
 impl AppState {
@@ -258,6 +258,35 @@ pub fn router_with_telemetry_full(
     db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
     model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
 ) -> Router {
+    let oauth_manager = Arc::new(crate::oauth_manager::OAuthTokenManager::new(
+        db_store.clone(),
+        build_http_client(server_config),
+    ));
+    router_with_telemetry_full_and_oauth(
+        config,
+        health,
+        server_config,
+        telemetry,
+        quota,
+        embedding_cache,
+        db_store,
+        model_catalog,
+        oauth_manager,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn router_with_telemetry_full_and_oauth(
+    config: ConfigStore,
+    health: Arc<HealthRegistry>,
+    server_config: &ServerConfig,
+    telemetry: Arc<dyn TelemetryBus>,
+    quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
+    embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
+    db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
+    model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
+    oauth_manager: Arc<crate::oauth_manager::OAuthTokenManager>,
+) -> Router {
     build_data_plane_router(
         config,
         health,
@@ -267,13 +296,14 @@ pub fn router_with_telemetry_full(
         embedding_cache,
         db_store,
         model_catalog,
+        oauth_manager,
     )
 }
 
 /// Build a `reqwest::Client` from the upstream tuning parameters in
 /// `ServerConfig`. Used at startup and by the tunables reloader when
 /// TCP keepalive, pool idle timeout, or tcp_nodelay settings change.
-fn build_http_client(server_config: &ServerConfig) -> reqwest::Client {
+pub(crate) fn build_http_client(server_config: &ServerConfig) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .pool_max_idle_per_host(32)
@@ -333,6 +363,7 @@ fn build_data_plane_router(
     embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
     db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
     model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
+    oauth_manager: Arc<crate::oauth_manager::OAuthTokenManager>,
 ) -> Router {
     let semaphore = Arc::new(Semaphore::new(server_config.max_inflight_requests));
     // Clone the db_store before it is moved into AppState so we can
@@ -369,10 +400,7 @@ fn build_data_plane_router(
         redactor: Arc::new(tiygate_core::redaction::Redactor::with_defaults()),
         model_catalog,
         tunables: Arc::new(arc_swap::ArcSwap::from_pointee(tunables)),
-        oauth_manager: crate::oauth_manager::OAuthTokenManager::new(
-            db_store,
-            build_http_client(server_config),
-        ),
+        oauth_manager,
     };
 
     Router::new()

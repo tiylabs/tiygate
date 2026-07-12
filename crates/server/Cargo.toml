@@ -95,6 +95,8 @@ async-trait.workspace = true
 clap.workspace = true
 sha2.workspace = true
 hex.workspace = true
+dashmap.workspace = true
+sqlx.workspace = true
 
 # Optional runtime helpers (see [features] above).
 tracing-subscriber = { workspace = true, optional = true }

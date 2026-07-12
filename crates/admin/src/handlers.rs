@@ -280,13 +280,17 @@ async fn provider_usage(
         .map_err(|error| AdminError::Internal(format!("http client build: {error}")))?;
     let cache = tiygate_auth::provider_oauth::OAuthTokenCache::global();
     let label = oauth_config.cache_label();
-    cache.seed(&id, label, &oauth_config.refresh_token);
-
     let mut headers = reqwest::header::HeaderMap::new();
-    if let Err(error) = cache
-        .apply(&mut headers, &id, label, &oauth_config, &client)
-        .await
-    {
+    let coordinated = state.oauth_service.is_some();
+    let apply_result = if let Some(service) = state.oauth_service.as_ref() {
+        service.apply_provider_headers(&id, &mut headers).await
+    } else {
+        cache.seed(&id, label, &oauth_config.refresh_token);
+        cache
+            .apply(&mut headers, &id, label, &oauth_config, &client)
+            .await
+    };
+    if let Err(error) = apply_result {
         record_oauth_refresh_failure(&state, &id, &error).await;
         tracing::warn!(provider = %id, error = %error, "OpenAI OAuth usage token unavailable");
         return Ok(Json(provider_usage_response(
@@ -303,29 +307,31 @@ async fn provider_usage(
     let account_email = cache
         .get_account_email(&id, label)
         .or_else(|| stored_account_email.clone());
-    if let Some(cached_refresh_token) = cache.get_refresh_token(&id, label) {
-        match oauth_meta_after_cache_update(
-            &provider,
-            &oauth_config.refresh_token,
-            &cached_refresh_token,
-            account_email.as_deref(),
-        ) {
-            Ok(Some(meta)) => {
-                if let Err(error) = state.store.set_provider_oauth_meta(&id, &meta).await {
+    if !coordinated {
+        if let Some(cached_refresh_token) = cache.get_refresh_token(&id, label) {
+            match oauth_meta_after_cache_update(
+                &provider,
+                &oauth_config.refresh_token,
+                &cached_refresh_token,
+                account_email.as_deref(),
+            ) {
+                Ok(Some(meta)) => {
+                    if let Err(error) = state.store.set_provider_oauth_meta(&id, &meta).await {
+                        tracing::warn!(
+                            provider = %id,
+                            error = %error,
+                            "persisting OpenAI OAuth identity after usage request failed"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
                     tracing::warn!(
                         provider = %id,
                         error = %error,
-                        "persisting OpenAI OAuth identity after usage request failed"
+                        "preparing OpenAI OAuth identity metadata failed"
                     );
                 }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    provider = %id,
-                    error = %error,
-                    "preparing OpenAI OAuth identity metadata failed"
-                );
             }
         }
     }
@@ -460,88 +466,100 @@ async fn list_provider_models(
     // process-global OAuthTokenCache instead of using a static API
     // key (which is empty for OAuth providers).
     if matches!(provider.auth_mode, tiygate_store::models::AuthMode::OAuth) {
-        let cache = tiygate_auth::provider_oauth::OAuthTokenCache::global();
-        // Build the OAuth target config from the provider's
-        // metadata + decrypted refresh token.
-        if let Some(oauth_config) =
-            tiygate_store::config_store::build_oauth_target_config(&provider)
-        {
-            // Share one cache entry with the data plane so model discovery
-            // cannot race a routed request through refresh-token rotation.
-            let label = oauth_config.cache_label();
-            cache.seed(&id, label, &oauth_config.refresh_token);
-
+        if let Some(service) = state.oauth_service.as_ref() {
             let mut headers = reqwest::header::HeaderMap::new();
-            match cache
-                .apply(&mut headers, &id, label, &oauth_config, &client)
-                .await
+            if let Err(error) = service.apply_provider_headers(&id, &mut headers).await {
+                tracing::warn!(provider = %id, error = %error, "OAuth token unavailable for model discovery; returning empty list");
+                return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
+            }
+            for (name, value) in &headers {
+                req = req.header(name, value);
+            }
+        } else {
+            let cache = tiygate_auth::provider_oauth::OAuthTokenCache::global();
+            // Build the OAuth target config from the provider's
+            // metadata + decrypted refresh token.
+            if let Some(oauth_config) =
+                tiygate_store::config_store::build_oauth_target_config(&provider)
             {
-                Ok(()) => {
-                    if let Some(cached_refresh_token) = cache.get_refresh_token(&id, label) {
-                        match oauth_meta_after_refresh_rotation(
-                            &provider,
-                            &oauth_config.refresh_token,
-                            &cached_refresh_token,
-                        ) {
-                            Ok(Some(meta)) => {
-                                if let Err(e) =
-                                    state.store.set_provider_oauth_meta(&id, &meta).await
-                                {
+                // Share one cache entry with the data plane so model discovery
+                // cannot race a routed request through refresh-token rotation.
+                let label = oauth_config.cache_label();
+                cache.seed(&id, label, &oauth_config.refresh_token);
+
+                let mut headers = reqwest::header::HeaderMap::new();
+                match cache
+                    .apply(&mut headers, &id, label, &oauth_config, &client)
+                    .await
+                {
+                    Ok(()) => {
+                        if let Some(cached_refresh_token) = cache.get_refresh_token(&id, label) {
+                            match oauth_meta_after_refresh_rotation(
+                                &provider,
+                                &oauth_config.refresh_token,
+                                &cached_refresh_token,
+                            ) {
+                                Ok(Some(meta)) => {
+                                    if let Err(e) =
+                                        state.store.set_provider_oauth_meta(&id, &meta).await
+                                    {
+                                        tracing::warn!(
+                                            provider = %id,
+                                            error = %e,
+                                            "persisting rotated OAuth refresh token after model discovery failed; \
+                                             returning empty list"
+                                        );
+                                        return Ok(Json(ProviderModelsResponse { models: vec![] })
+                                            .into_response());
+                                    }
+                                    tracing::info!(
+                                        provider = %id,
+                                        "persisted rotated OAuth refresh token after model discovery"
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
                                     tracing::warn!(
                                         provider = %id,
                                         error = %e,
-                                        "persisting rotated OAuth refresh token after model discovery failed; \
+                                        "preparing rotated OAuth refresh token metadata failed; \
                                          returning empty list"
                                     );
                                     return Ok(Json(ProviderModelsResponse { models: vec![] })
                                         .into_response());
                                 }
-                                tracing::info!(
-                                    provider = %id,
-                                    "persisted rotated OAuth refresh token after model discovery"
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    provider = %id,
-                                    error = %e,
-                                    "preparing rotated OAuth refresh token metadata failed; \
-                                     returning empty list"
-                                );
-                                return Ok(
-                                    Json(ProviderModelsResponse { models: vec![] }).into_response()
-                                );
                             }
                         }
-                    }
 
-                    // Merge the injected headers into the reqwest
-                    // request builder.
-                    for (name, value) in headers.iter() {
-                        if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
-                            req = req.header(name.as_str(), v);
+                        // Merge the injected headers into the reqwest
+                        // request builder.
+                        for (name, value) in headers.iter() {
+                            if let Ok(v) =
+                                reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+                            {
+                                req = req.header(name.as_str(), v);
+                            }
                         }
                     }
+                    Err(e) => {
+                        record_oauth_refresh_failure(&state, &id, &e).await;
+                        tracing::warn!(
+                            provider = %id,
+                            error = %e,
+                            "OAuth token refresh failed for model discovery; \
+                             returning empty list"
+                        );
+                        return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
+                    }
                 }
-                Err(e) => {
-                    record_oauth_refresh_failure(&state, &id, &e).await;
-                    tracing::warn!(
-                        provider = %id,
-                        error = %e,
-                        "OAuth token refresh failed for model discovery; \
-                         returning empty list"
-                    );
-                    return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
-                }
+            } else {
+                tracing::warn!(
+                    provider = %id,
+                    "OAuth provider missing OAuth config for model discovery; \
+                     returning empty list"
+                );
+                return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
             }
-        } else {
-            tracing::warn!(
-                provider = %id,
-                "OAuth provider missing OAuth config for model discovery; \
-                 returning empty list"
-            );
-            return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
         }
     } else if !api_key.is_empty() {
         req = req.bearer_auth(&api_key);
@@ -1243,13 +1261,8 @@ async fn update_provider(
     let metadata = normalized_provider_metadata(&req.vendor, auth_mode, req.metadata);
     // Read the existing row first so we can record a field-level diff.
     // Best-effort: a read failure simply yields no `before` snapshot.
-    let before = state
-        .store
-        .get_provider(&id)
-        .await
-        .ok()
-        .flatten()
-        .map(|p| provider_snapshot(&p));
+    let before_provider = state.store.get_provider(&id).await.ok().flatten();
+    let before = before_provider.as_ref().map(provider_snapshot);
     let p = state
         .store
         .upsert_provider(
@@ -1265,6 +1278,27 @@ async fn update_provider(
             req.enabled.unwrap_or(true),
         )
         .await?;
+    let credential_changed = before_provider.as_ref().is_some_and(|previous| {
+        previous.auth_mode != p.auth_mode
+            || previous.vendor != p.vendor
+            || previous.metadata_json.get("oauth") != p.metadata_json.get("oauth")
+            || req.oauth_meta.is_some()
+    });
+    if credential_changed {
+        if let Some(service) = state.oauth_service.as_ref() {
+            service
+                .reset_provider_tokens(&id, req.oauth_meta.clone())
+                .await
+                .map_err(AdminError::Internal)?;
+        } else {
+            state
+                .store
+                .oauth_token_store()
+                .reset(&id, req.oauth_meta.as_deref())
+                .await?;
+            state.store.refresh().await?;
+        }
+    }
     let snap = provider_snapshot(&p);
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),

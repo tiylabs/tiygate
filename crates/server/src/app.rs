@@ -70,6 +70,11 @@ pub struct App {
     /// Shared payload archive client for worker uploads and admin
     /// replay reads.
     pub payload_archive_client: Option<Arc<dyn tiygate_store::archive::PayloadArchiveClient>>,
+    /// Shared OAuth manager used by the data plane, Admin API, and keepalive worker.
+    pub oauth_manager: Arc<crate::oauth_manager::OAuthTokenManager>,
+    /// Stateless OAuth keepalive task. None without a control-plane database.
+    #[allow(dead_code)]
+    pub oauth_refresh: Option<crate::oauth_refresh_worker::OAuthRefreshWorkerHandle>,
 }
 
 /// State attached to the control plane — held so the binary can
@@ -163,6 +168,13 @@ impl App {
         };
 
         let model_catalog = Some(tiygate_store::model_catalog::ModelCatalogStore::load_embedded()?);
+        let oauth_manager = Arc::new(crate::oauth_manager::OAuthTokenManager::new(
+            control_plane.as_ref().map(|cp| cp.store.clone()),
+            crate::ingress::build_http_client(&server_config),
+        ));
+        let oauth_refresh = control_plane
+            .as_ref()
+            .map(|cp| crate::oauth_refresh_worker::spawn(oauth_manager.clone(), cp.store.clone()));
         let model_catalog_refresh = match (&control_plane, &model_catalog) {
             (Some(_), Some(store)) => Some(store.spawn_refresh()),
             _ => None,
@@ -214,6 +226,8 @@ impl App {
             payload_archive_client,
             model_catalog,
             model_catalog_refresh,
+            oauth_manager,
+            oauth_refresh,
         })
     }
 
@@ -228,7 +242,7 @@ impl App {
         // `admin` nor `webui` feature is enabled, those reassignments
         // are compiled out, so silence the spurious unused_mut.
         #[allow(unused_mut)]
-        let mut router = crate::ingress::router_with_telemetry_full(
+        let mut router = crate::ingress::router_with_telemetry_full_and_oauth(
             self.config.clone(),
             self.health.clone(),
             &self.server_config,
@@ -240,6 +254,7 @@ impl App {
             None,
             db_store,
             self.model_catalog.clone(),
+            self.oauth_manager.clone(),
         );
         if let Some(cp) = &self.control_plane {
             // Mount the admin router under `/admin`. Phase 4 splits
@@ -257,6 +272,7 @@ impl App {
                             cp.pool.clone(),
                             Some(self.health.clone()),
                         )
+                        .with_oauth_service(self.oauth_manager.clone())
                         .with_quota(self.quota.clone())
                         .with_payload_archive(self.payload_archive_client.clone())
                         .with_model_catalog(self.model_catalog.clone())
@@ -389,6 +405,12 @@ async fn bootstrap_settings(store: &Arc<DbConfigStore>, cfg: &ServerConfig) {
         &env_or("TIYGATE_TOKEN_STATS_LOOKBACK_DAYS", "400"),
     )
     .await;
+
+    // OAuth credential keepalive
+    let _ = ensure_setting(store, sk::OAUTH_KEEPALIVE_ENABLED, "true").await;
+    let _ = ensure_setting(store, sk::OAUTH_KEEPALIVE_SCAN_INTERVAL_SECS, "60").await;
+    let _ = ensure_setting(store, sk::OAUTH_KEEPALIVE_INTERVAL_SECS, "604800").await;
+    let _ = ensure_setting(store, sk::OAUTH_KEEPALIVE_CONCURRENCY, "4").await;
 
     // Payload archive
     let archive = &cfg.payload_archive;

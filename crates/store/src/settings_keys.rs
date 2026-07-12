@@ -27,6 +27,12 @@ pub const EPOCH_POLL_INTERVAL_SECS: &str = "gateway.epoch_poll.interval_secs";
 pub const TOKEN_STATS_INTERVAL_SECS: &str = "gateway.token_stats.interval_secs";
 pub const TOKEN_STATS_LOOKBACK_DAYS: &str = "gateway.token_stats.lookback_days";
 
+// --- OAuth credential keepalive ---
+pub const OAUTH_KEEPALIVE_ENABLED: &str = "gateway.oauth.keepalive.enabled";
+pub const OAUTH_KEEPALIVE_SCAN_INTERVAL_SECS: &str = "gateway.oauth.keepalive.scan_interval_secs";
+pub const OAUTH_KEEPALIVE_INTERVAL_SECS: &str = "gateway.oauth.keepalive.interval_secs";
+pub const OAUTH_KEEPALIVE_CONCURRENCY: &str = "gateway.oauth.keepalive.concurrency";
+
 // --- Payload archive ---
 pub const ARCHIVE_ENABLED: &str = "gateway.archive.enabled";
 pub const ARCHIVE_S3_ENDPOINT: &str = "gateway.archive.s3_endpoint";
@@ -83,6 +89,10 @@ pub const PLAIN_KEYS: &[&str] = &[
     EPOCH_POLL_INTERVAL_SECS,
     TOKEN_STATS_INTERVAL_SECS,
     TOKEN_STATS_LOOKBACK_DAYS,
+    OAUTH_KEEPALIVE_ENABLED,
+    OAUTH_KEEPALIVE_SCAN_INTERVAL_SECS,
+    OAUTH_KEEPALIVE_INTERVAL_SECS,
+    OAUTH_KEEPALIVE_CONCURRENCY,
     ARCHIVE_ENABLED,
     ARCHIVE_S3_ENDPOINT,
     ARCHIVE_S3_REGION,

@@ -727,6 +727,18 @@ const en = {
       tokenStatsIntervalHint: "How often to aggregate token statistics.",
       tokenStatsLookback: "Token Stats Lookback (days)",
       tokenStatsLookbackHint: "How many past days to include in aggregation.",
+      oauthKeepaliveEnabled: "OAuth Credential Keepalive",
+      oauthKeepaliveEnabledHint:
+        "Use refresh credentials on schedule even when there is no user traffic.",
+      oauthKeepaliveScanInterval: "OAuth Scan Interval (seconds)",
+      oauthKeepaliveScanIntervalHint:
+        "How often each instance checks for due OAuth credentials.",
+      oauthKeepaliveInterval: "Default OAuth Keepalive (seconds)",
+      oauthKeepaliveIntervalHint:
+        "Time between background keepalives when a provider has no override.",
+      oauthKeepaliveConcurrency: "OAuth Keepalive Concurrency",
+      oauthKeepaliveConcurrencyHint:
+        "Maximum OAuth credentials processed concurrently per instance.",
     },
     sqliteMaintenance: {
       title: "SQLite Maintenance",

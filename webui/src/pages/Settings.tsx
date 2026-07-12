@@ -30,6 +30,10 @@ const KEYS = {
   epochPollInterval: "gateway.epoch_poll.interval_secs",
   tokenStatsInterval: "gateway.token_stats.interval_secs",
   tokenStatsLookback: "gateway.token_stats.lookback_days",
+  oauthKeepaliveEnabled: "gateway.oauth.keepalive.enabled",
+  oauthKeepaliveScanInterval: "gateway.oauth.keepalive.scan_interval_secs",
+  oauthKeepaliveInterval: "gateway.oauth.keepalive.interval_secs",
+  oauthKeepaliveConcurrency: "gateway.oauth.keepalive.concurrency",
   sqliteMaintenanceEnabled: "gateway.sqlite_maintenance.enabled",
   sqliteMaintenanceInterval: "gateway.sqlite_maintenance.interval_secs",
   sqliteMaintenanceVacuumEnabled: "gateway.sqlite_maintenance.vacuum_enabled",
@@ -322,6 +326,53 @@ export default function SettingsPage() {
               value={getField(KEYS.tokenStatsLookback, "400")}
               onChange={(e) =>
                 updateField(KEYS.tokenStatsLookback, e.target.value)
+              }
+            />
+          </Field>
+          <Field
+            label={t("settings.backgroundTasks.oauthKeepaliveEnabled")}
+            hint={t("settings.backgroundTasks.oauthKeepaliveEnabledHint")}
+          >
+            <Switch
+              checked={getField(KEYS.oauthKeepaliveEnabled, "true") === "true"}
+              onCheckedChange={(checked: boolean) =>
+                updateField(KEYS.oauthKeepaliveEnabled, String(checked))
+              }
+            />
+          </Field>
+          <Field
+            label={t("settings.backgroundTasks.oauthKeepaliveScanInterval")}
+            hint={t("settings.backgroundTasks.oauthKeepaliveScanIntervalHint")}
+          >
+            <Input
+              type="number"
+              value={getField(KEYS.oauthKeepaliveScanInterval, "60")}
+              onChange={(e) =>
+                updateField(KEYS.oauthKeepaliveScanInterval, e.target.value)
+              }
+            />
+          </Field>
+          <Field
+            label={t("settings.backgroundTasks.oauthKeepaliveInterval")}
+            hint={t("settings.backgroundTasks.oauthKeepaliveIntervalHint")}
+          >
+            <Input
+              type="number"
+              value={getField(KEYS.oauthKeepaliveInterval, "604800")}
+              onChange={(e) =>
+                updateField(KEYS.oauthKeepaliveInterval, e.target.value)
+              }
+            />
+          </Field>
+          <Field
+            label={t("settings.backgroundTasks.oauthKeepaliveConcurrency")}
+            hint={t("settings.backgroundTasks.oauthKeepaliveConcurrencyHint")}
+          >
+            <Input
+              type="number"
+              value={getField(KEYS.oauthKeepaliveConcurrency, "4")}
+              onChange={(e) =>
+                updateField(KEYS.oauthKeepaliveConcurrency, e.target.value)
               }
             />
           </Field>

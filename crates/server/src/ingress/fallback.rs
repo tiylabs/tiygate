@@ -1,5 +1,6 @@
 //! Unified fallback / circuit-breaker / retry loop.
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -111,6 +112,7 @@ where
     let mut target_index = 0usize;
     let mut last_error: Option<AppError> = None;
     let bytes_emitted: u64 = 0;
+    let mut oauth_recovered = HashSet::new();
 
     // Strategy ordering — per-route override takes precedence over the
     // gateway-wide default.
@@ -212,7 +214,28 @@ where
         scope.set_egress(target.api_protocol.clone());
         scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
 
-        match execute_one(target).await {
+        let rejected_access_token = (!oauth_recovered.contains(&health_key))
+            .then(|| state.oauth_manager.cached_access_token(target))
+            .flatten();
+        let mut execution = execute_one(target).await;
+        if execution
+            .as_ref()
+            .is_err_and(|error| error.http_status() == StatusCode::UNAUTHORIZED)
+        {
+            if let Some(rejected_access_token) = rejected_access_token {
+                oauth_recovered.insert(health_key.clone());
+                if state
+                    .oauth_manager
+                    .refresh_after_unauthorized(target, &rejected_access_token)
+                    .await
+                    .unwrap_or(false)
+                {
+                    execution = execute_one(target).await;
+                }
+            }
+        }
+
+        match execution {
             Ok((response, ttfb_ms)) => {
                 let hop_elapsed_ms = (Utc::now() - hop_started).num_milliseconds().max(0) as u64;
                 state.health.record_success(&health_key);

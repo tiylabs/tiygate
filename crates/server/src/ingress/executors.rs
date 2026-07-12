@@ -1791,73 +1791,6 @@ pub(super) async fn execute_responses_upstream(
     client_headers: &http::HeaderMap,
     api_key_id: &str,
 ) -> Result<(Response, Option<u64>), AppError> {
-    let mut rejected_access_token = None;
-    let first = execute_responses_upstream_once(
-        state,
-        codec,
-        ingress_protocol,
-        ir_request,
-        target,
-        is_stream,
-        raw_passthrough_body,
-        trace,
-        request_id,
-        client_headers,
-        api_key_id,
-        &mut rejected_access_token,
-    )
-    .await;
-    let Err(first_error) = first else {
-        return first;
-    };
-    if first_error.http_status() != StatusCode::UNAUTHORIZED {
-        return Err(first_error);
-    }
-    let Some(rejected_access_token) = rejected_access_token else {
-        return Err(first_error);
-    };
-    match state
-        .oauth_manager
-        .refresh_after_unauthorized(target, &rejected_access_token)
-        .await
-    {
-        Ok(true) => {
-            let mut retry_token = None;
-            execute_responses_upstream_once(
-                state,
-                codec,
-                ingress_protocol,
-                ir_request,
-                target,
-                is_stream,
-                raw_passthrough_body,
-                trace,
-                request_id,
-                client_headers,
-                api_key_id,
-                &mut retry_token,
-            )
-            .await
-        }
-        Ok(false) | Err(_) => Err(first_error),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_responses_upstream_once(
-    state: &AppState,
-    codec: &ResponsesCodec,
-    ingress_protocol: &tiygate_core::ProtocolEndpoint,
-    ir_request: &IrRequest,
-    target: &tiygate_core::RoutingTarget,
-    is_stream: bool,
-    raw_passthrough_body: Option<&str>,
-    trace: &TraceContext,
-    request_id: &str,
-    client_headers: &http::HeaderMap,
-    api_key_id: &str,
-    used_oauth_access_token: &mut Option<String>,
-) -> Result<(Response, Option<u64>), AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
     let is_pass_through = raw_passthrough_body.is_some() && is_same_protocol;
@@ -1919,11 +1852,6 @@ async fn execute_responses_upstream_once(
     if codex_oauth {
         ensure_codex_request_headers(&mut upstream_headers);
     }
-    *used_oauth_access_token = upstream_headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_string);
 
     let mut egress_body_capture = if pass_through_verbatim {
         raw_passthrough_body.map(|s| s.to_string())

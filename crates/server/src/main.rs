@@ -25,6 +25,7 @@ mod drain;
 mod ingress;
 mod models;
 mod oauth_manager;
+mod oauth_refresh_worker;
 mod telemetry;
 mod trace;
 #[cfg(feature = "webui")]
@@ -199,7 +200,7 @@ async fn run_migrate_status() -> anyhow::Result<()> {
 }
 
 async fn run(_args: cli::RunArgs) -> anyhow::Result<()> {
-    let app = app::App::new().await?;
+    let mut app = app::App::new().await?;
     let server_config = config::ServerConfig::from_env();
     tracing::info!(
         "Starting in {:?} mode on {} (control_plane={})",
@@ -263,6 +264,9 @@ async fn run(_args: cli::RunArgs) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(handle) = app.oauth_refresh.take() {
+        handle.stop().await;
+    }
     tracing::info!("TiyGate shutdown complete");
     Ok(())
 }

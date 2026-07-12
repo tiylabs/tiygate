@@ -7,6 +7,7 @@ pub mod drain;
 pub mod ingress;
 pub mod models;
 pub mod oauth_manager;
+pub mod oauth_refresh_worker;
 pub mod telemetry;
 #[cfg(feature = "webui")]
 pub mod webui;

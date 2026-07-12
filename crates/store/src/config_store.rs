@@ -572,8 +572,8 @@ pub struct ProviderDeleteOutcome {
 /// encryption key; the data plane sees a `ConfigStore` rebuilt from
 /// [`Self::snapshot`] on every epoch tick.
 pub struct DbConfigStore {
-    pool: DbPool,
-    encryption: Option<Arc<KeyEncryption>>,
+    pub(crate) pool: DbPool,
+    pub(crate) encryption: Option<Arc<KeyEncryption>>,
     /// In-memory copy of the latest snapshot, used by readers that
     /// want a `ConfigStore` view. Held in an `ArcSwap` so the data
     /// plane can read the latest snapshot lock-free (a single
@@ -890,6 +890,12 @@ impl DbConfigStore {
             }
         }
 
+        // SQLite foreign-key enforcement is connection-configurable, so remove
+        // volatile OAuth state explicitly instead of relying only on CASCADE.
+        sqlx::query("DELETE FROM oauth_access_tokens WHERE provider_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         let res = sqlx::query("DELETE FROM providers WHERE id = $1")
             .bind(id)
             .execute(&mut *tx)

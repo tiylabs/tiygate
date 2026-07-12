@@ -215,6 +215,35 @@ async fn callback_oauth_inner(
             )
         })?;
 
+    if result.refresh_token.is_none() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "oauth exchange returned no refresh_token".to_string(),
+        ));
+    }
+    if provider.vendor == "openai" && result.account_id.is_none() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OpenAI OAuth token did not include a ChatGPT account/workspace id".to_string(),
+        ));
+    }
+
+    if let Some(service) = state.oauth_service.as_ref() {
+        let summary = service
+            .install_provider_tokens(&pending.provider_id, result)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("persist OAuth tokens: {error}"),
+                )
+            })?;
+        return Ok(OauthCallbackResponse {
+            provider_id: pending.provider_id,
+            expires_in_s: summary.expires_in.map(|duration| duration.as_secs()),
+        });
+    }
+
     let access_token = result.access_token;
     let refresh_token = result.refresh_token.ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -223,12 +252,6 @@ async fn callback_oauth_inner(
     let expires_in = result.expires_in;
     let account_id = result.account_id;
     let account_email = result.account_email;
-    if provider.vendor == "openai" && account_id.is_none() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "OpenAI OAuth token did not include a ChatGPT account/workspace id".to_string(),
-        ));
-    }
 
     // Persist the refresh-token metadata (encrypted at rest by
     // the `DbConfigStore`). The access token itself is *not*
@@ -298,6 +321,17 @@ async fn refresh_oauth(
         return Err(ApiError::bad_request(
             "provider is not configured for OAuth",
         ));
+    }
+
+    if let Some(service) = state.oauth_service.as_ref() {
+        let summary = service
+            .force_refresh_provider(&req.provider_id)
+            .await
+            .map_err(|error| ApiError::internal(format!("oauth refresh failed: {error}")))?;
+        return Ok(Json(RefreshOauthResponse {
+            provider_id: req.provider_id,
+            expires_in_s: summary.expires_in.map(|duration| duration.as_secs()),
+        }));
     }
 
     let preset = preset_for_vendor(&provider.vendor).ok_or_else(|| {

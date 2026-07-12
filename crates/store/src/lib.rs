@@ -23,6 +23,7 @@ pub mod keys;
 pub mod log_sink;
 pub mod model_catalog;
 pub mod models;
+pub mod oauth_token;
 pub mod retention;
 pub mod settings_keys;
 pub mod sqlite_maintenance;

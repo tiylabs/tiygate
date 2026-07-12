@@ -305,6 +305,46 @@ pub struct TokenResult {
     pub account_email: Option<String>,
 }
 
+/// Sanitized result returned to control-plane callers. Access and refresh
+/// token values deliberately never cross this interface.
+#[derive(Debug, Clone, Copy)]
+pub struct OAuthCredentialRefreshSummary {
+    pub expires_in: Option<Duration>,
+}
+
+/// Shared control-plane surface implemented by the server's cluster-aware
+/// token manager. Keeping the trait in `auth` avoids an `admin -> server`
+/// dependency while ensuring Admin handlers cannot bypass refresh coordination.
+#[async_trait::async_trait]
+pub trait OAuthCredentialService: Send + Sync {
+    async fn apply_provider_headers(
+        &self,
+        provider_id: &str,
+        headers: &mut HeaderMap,
+    ) -> Result<(), String>;
+
+    async fn force_refresh_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<OAuthCredentialRefreshSummary, String>;
+
+    async fn install_provider_tokens(
+        &self,
+        provider_id: &str,
+        tokens: TokenResult,
+    ) -> Result<OAuthCredentialRefreshSummary, String>;
+
+    /// Clear access-token state after an OAuth credential configuration edit.
+    /// When supplied, `oauth_meta_plain` is restored while holding the same
+    /// provider lock so an in-flight refresh cannot overwrite newly submitted
+    /// metadata with an older rotated refresh token.
+    async fn reset_provider_tokens(
+        &self,
+        provider_id: &str,
+        oauth_meta_plain: Option<String>,
+    ) -> Result<(), String>;
+}
+
 // -----------------------------------------------------------------------
 // Token exchange / refresh
 // -----------------------------------------------------------------------
@@ -566,6 +606,13 @@ impl OAuthTokenCache {
         format!("{provider_id}:{label}")
     }
 
+    /// Remove every cached token and refresh mutex for one provider.
+    pub fn invalidate_provider(&self, provider_id: &str) {
+        let prefix = format!("{provider_id}:");
+        self.tokens().retain(|key, _| !key.starts_with(&prefix));
+        self.inflight().retain(|key, _| !key.starts_with(&prefix));
+    }
+
     /// Get the mutex for a given key, creating one if it doesn't
     /// exist. All concurrent refreshes for the same key will queue
     /// on this mutex (single-flight).
@@ -745,6 +792,33 @@ impl OAuthTokenCache {
 
         inject_token(headers, &result.access_token, account_id.as_deref(), oauth)?;
         Ok(())
+    }
+
+    /// Inject a cached access token only when it is present and not within the
+    /// refresh leeway. This never calls the token endpoint. Cluster-aware
+    /// managers use it as their zero-I/O fast path before consulting shared
+    /// database state and refresh coordination.
+    pub fn apply_cached(
+        &self,
+        headers: &mut HeaderMap,
+        provider_id: &str,
+        label: &str,
+        oauth: &OAuthTargetConfig,
+    ) -> Result<bool, String> {
+        let key = Self::key(provider_id, label);
+        let Some(cached) = self.tokens().get(&key) else {
+            return Ok(false);
+        };
+        if cached.is_expiring() || cached.access_token.is_empty() {
+            return Ok(false);
+        }
+        inject_token(
+            headers,
+            &cached.access_token,
+            cached.account_id.as_deref().or(oauth.account_id.as_deref()),
+            oauth,
+        )?;
+        Ok(true)
     }
 
     /// Return the current refresh token from the cache for a given

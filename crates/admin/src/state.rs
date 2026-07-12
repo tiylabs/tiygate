@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
+use tiygate_auth::provider_oauth::OAuthCredentialService;
 use tiygate_store::archive::PayloadArchiveClient;
 use tiygate_store::config_store::DbConfigStore;
 use tiygate_store::db::DbPool;
@@ -42,6 +43,10 @@ pub struct AdminState {
     /// because the admin handlers are async and the lock must
     /// be `Send + Sync` across `.await` points.
     pub oauth_pending: Arc<Mutex<HashMap<String, OAuthPendingFlow>>>,
+    /// Cluster-aware OAuth token service injected by the server. Production
+    /// refresh paths use this service so Admin requests cannot bypass the same
+    /// coordination used by the data plane and background worker.
+    pub oauth_service: Option<Arc<dyn OAuthCredentialService>>,
     /// Brute-force protection limiter. Defaults to an in-memory
     /// limiter; the server binary may inject a Redis-backed one via
     /// [`AdminState::with_bf_limiter`] when `TIYGATE_REDIS_URL` is
@@ -80,6 +85,7 @@ impl AdminState {
             payload_archive: None,
             model_catalog: None,
             oauth_pending: Arc::new(Mutex::new(HashMap::new())),
+            oauth_service: None,
             bf_limiter: Arc::new(InMemoryBruteForceLimiter::new(BruteForceConfig::default())),
         }
     }
@@ -103,6 +109,11 @@ impl AdminState {
         catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
     ) -> Self {
         self.model_catalog = catalog;
+        self
+    }
+
+    pub fn with_oauth_service(mut self, service: Arc<dyn OAuthCredentialService>) -> Self {
+        self.oauth_service = Some(service);
         self
     }
 
