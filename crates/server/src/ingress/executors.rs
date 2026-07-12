@@ -1,13 +1,16 @@
 //! Upstream executors and codec/URL builders for each protocol.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -44,6 +47,36 @@ const IMAGES_NONSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 /// negotiation header, not a client-supplied preference, so it is injected
 /// after header forwarding and OAuth auth have run.
 const CODEX_RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+const CODEX_WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_WEBSOCKET_EVENT_BUFFER: usize = 16;
+
+type CodexWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Receiver half of a Codex WebSocket bridge. Dropping the downstream HTTP
+/// body drops this stream too, which signals the worker that owns the socket
+/// to perform a graceful WebSocket close instead of leaving upstream work to
+/// run until a TCP reset or idle timeout.
+struct CancelableCodexWebSocketStream {
+    receiver: mpsc::Receiver<Result<Bytes, String>>,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+impl Stream for CancelableCodexWebSocketStream {
+    type Item = Result<Bytes, String>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+impl Drop for CancelableCodexWebSocketStream {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
 
 fn uses_codex_responses_websocket(target: &tiygate_core::RoutingTarget) -> bool {
     matches!(
@@ -117,51 +150,152 @@ fn codex_websocket_handshake_request(
     Ok(request)
 }
 
-fn websocket_event_stream(
-    mut socket: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) -> UpstreamByteStream {
-    use async_stream::stream;
+/// Normalize terminal variants emitted by Codex's WebSocket surface.
+///
+/// `response.done` is wire-compatible with `response.completed`, but the
+/// standard Responses SSE decoder only understands the latter. Codex also
+/// uses a top-level `error` event as a terminal event. A WebSocket session can
+/// remain open after any of these, while a gateway HTTP request cannot.
+fn normalize_codex_websocket_event(text: String) -> (String, bool) {
+    let Ok(mut event) = serde_json::from_str::<Value>(&text) else {
+        return (text, false);
+    };
+    let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+        return (text, false);
+    };
+    if event_type == "response.done" {
+        event["type"] = json!("response.completed");
+        let normalized = serde_json::to_string(&event).unwrap_or(text);
+        return (normalized, true);
+    }
+    let terminal = matches!(
+        event_type,
+        "response.completed" | "response.failed" | "response.incomplete" | "error"
+    );
+    (text, terminal)
+}
 
-    Box::pin(stream! {
-        while let Some(frame) = socket.next().await {
+async fn close_codex_websocket(socket: &mut CodexWebSocket, reason: &'static str) {
+    match tokio::time::timeout(CODEX_WEBSOCKET_CLOSE_TIMEOUT, socket.close(None)).await {
+        Ok(Ok(())) => {
+            tracing::debug!(reason, "Codex WebSocket closed");
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(error = %error, reason, "Codex WebSocket close failed");
+        }
+        Err(_) => {
+            tracing::debug!(reason, "Codex WebSocket close timed out");
+        }
+    }
+}
+
+async fn send_codex_websocket_event(
+    sender: &mpsc::Sender<Result<Bytes, String>>,
+    cancel: &mut oneshot::Receiver<()>,
+    event: Result<Bytes, String>,
+) -> bool {
+    tokio::select! {
+        result = sender.send(event) => result.is_ok(),
+        _ = cancel => false,
+    }
+}
+
+fn websocket_event_stream(socket: CodexWebSocket) -> UpstreamByteStream {
+    let (sender, receiver) = mpsc::channel(CODEX_WEBSOCKET_EVENT_BUFFER);
+    let (cancel_sender, mut cancel_receiver) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let mut socket = socket;
+        loop {
+            let frame = tokio::select! {
+                _ = &mut cancel_receiver => {
+                    close_codex_websocket(&mut socket, "downstream_cancelled").await;
+                    return;
+                }
+                frame = socket.next() => frame,
+            };
             match frame {
-                Ok(Message::Text(text)) => {
+                Some(Ok(Message::Text(text))) => {
                     // Codex sends one Responses event per text message. The
                     // existing stream bridge consumes SSE, so retain the
                     // event JSON verbatim and add only the SSE envelope.
-                    yield Ok(Bytes::from(format!("data: {text}\n\n")));
+                    let (text, terminal) = normalize_codex_websocket_event(text.to_string());
+                    if !send_codex_websocket_event(
+                        &sender,
+                        &mut cancel_receiver,
+                        Ok(Bytes::from(format!("data: {text}\n\n"))),
+                    )
+                    .await
+                    {
+                        close_codex_websocket(&mut socket, "downstream_cancelled").await;
+                        return;
+                    }
+                    if terminal {
+                        close_codex_websocket(&mut socket, "terminal_event").await;
+                        return;
+                    }
                 }
-                Ok(Message::Binary(bytes)) => match String::from_utf8(bytes.to_vec()) {
-                    Ok(text) => yield Ok(Bytes::from(format!("data: {text}\n\n"))),
+                Some(Ok(Message::Binary(bytes))) => match String::from_utf8(bytes.to_vec()) {
+                    Ok(text) => {
+                        let (text, terminal) = normalize_codex_websocket_event(text);
+                        if !send_codex_websocket_event(
+                            &sender,
+                            &mut cancel_receiver,
+                            Ok(Bytes::from(format!("data: {text}\n\n"))),
+                        )
+                        .await
+                        {
+                            close_codex_websocket(&mut socket, "downstream_cancelled").await;
+                            return;
+                        }
+                        if terminal {
+                            close_codex_websocket(&mut socket, "terminal_event").await;
+                            return;
+                        }
+                    }
                     Err(error) => {
-                        yield Err(format!("Codex WebSocket sent non-UTF-8 event: {error}"));
-                        break;
+                        let _ = send_codex_websocket_event(
+                            &sender,
+                            &mut cancel_receiver,
+                            Err(format!("Codex WebSocket sent non-UTF-8 event: {error}")),
+                        )
+                        .await;
+                        return;
                     }
                 },
-                Ok(Message::Ping(payload)) => {
+                Some(Ok(Message::Ping(payload))) => {
                     if let Err(error) = socket.send(Message::Pong(payload)).await {
-                        yield Err(format!("failed to send Codex WebSocket pong: {error}"));
-                        break;
+                        let _ = send_codex_websocket_event(
+                            &sender,
+                            &mut cancel_receiver,
+                            Err(format!("failed to send Codex WebSocket pong: {error}")),
+                        )
+                        .await;
+                        return;
                     }
                 }
-                Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
-                Ok(Message::Close(_)) => break,
-                Err(error) => {
-                    yield Err(format!("Codex WebSocket read error: {error}"));
-                    break;
+                Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                Some(Ok(Message::Close(_))) | None => return,
+                Some(Err(error)) => {
+                    let _ = send_codex_websocket_event(
+                        &sender,
+                        &mut cancel_receiver,
+                        Err(format!("Codex WebSocket read error: {error}")),
+                    )
+                    .await;
+                    return;
                 }
             }
         }
+    });
+
+    Box::pin(CancelableCodexWebSocketStream {
+        receiver,
+        cancel: Some(cancel_sender),
     })
 }
 
-async fn collect_codex_websocket_response(
-    socket: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) -> Result<Value, String> {
+async fn collect_codex_websocket_response(socket: &mut CodexWebSocket) -> Result<Value, String> {
     while let Some(frame) = socket.next().await {
         let text = match frame {
             Ok(Message::Text(text)) => text.to_string(),
@@ -3553,6 +3687,21 @@ mod tests {
     }
 
     #[test]
+    fn codex_websocket_normalizes_all_terminal_variants() {
+        let (completed, is_terminal) = normalize_codex_websocket_event(
+            json!({"type": "response.done", "response": {"id": "resp-test"}}).to_string(),
+        );
+        assert!(is_terminal);
+        assert_eq!(
+            serde_json::from_str::<Value>(&completed).unwrap()["type"],
+            "response.completed"
+        );
+        let (_, is_terminal) =
+            normalize_codex_websocket_event(json!({"type": "error"}).to_string());
+        assert!(is_terminal);
+    }
+
+    #[test]
     fn codex_handshake_keeps_auth_and_client_request_id() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -3594,6 +3743,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (command_tx, command_rx) = tokio::sync::oneshot::channel();
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
@@ -3610,7 +3760,7 @@ mod tests {
             socket
                 .send(Message::Text(
                     json!({
-                        "type": "response.completed",
+                        "type": "response.done",
                         "response": {"id": "resp-test", "status": "completed"}
                     })
                     .to_string()
@@ -3618,7 +3768,11 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            socket.close(None).await.unwrap();
+            let saw_client_close = matches!(
+                tokio::time::timeout(Duration::from_secs(1), socket.next()).await,
+                Ok(Some(Ok(Message::Close(_))))
+            );
+            let _ = close_tx.send(saw_client_close);
         });
 
         let mut headers = http::HeaderMap::new();
@@ -3648,6 +3802,7 @@ mod tests {
             .await
             .unwrap();
 
+        let stream_started = std::time::Instant::now();
         let frames = websocket_event_stream(socket)
             .collect::<Vec<Result<Bytes, String>>>()
             .await;
@@ -3656,8 +3811,11 @@ mod tests {
             .map(|frame| String::from_utf8(frame.unwrap().to_vec()).unwrap())
             .collect();
         let sent_command: Value = serde_json::from_str(&command_rx.await.unwrap()).unwrap();
+        let saw_client_close = close_rx.await.unwrap();
         server.await.unwrap();
 
+        assert!(stream_started.elapsed() < Duration::from_millis(500));
+        assert!(saw_client_close);
         assert_eq!(sent_command["type"], "response.create");
         assert_eq!(sent_command["additional_tools"][0]["type"], "computer");
         assert_eq!(
@@ -3667,5 +3825,32 @@ mod tests {
                 "data: {\"response\":{\"id\":\"resp-test\",\"status\":\"completed\"},\"type\":\"response.completed\"}\n\n",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_codex_websocket_stream_closes_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let saw_client_close = matches!(
+                tokio::time::timeout(Duration::from_secs(1), socket.next()).await,
+                Ok(Some(Ok(Message::Close(_))))
+            );
+            let _ = close_tx.send(saw_client_close);
+        });
+
+        let request = codex_websocket_handshake_request(
+            &format!("ws://{address}/backend-api/codex/responses"),
+            &http::HeaderMap::new(),
+        )
+        .unwrap();
+        let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        drop(websocket_event_stream(socket));
+
+        assert!(close_rx.await.unwrap());
+        server.await.unwrap();
     }
 }

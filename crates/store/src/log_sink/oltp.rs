@@ -183,10 +183,10 @@ impl EventSink for OltpSink {
                 egress_protocol = excluded.egress_protocol, \
                 lossy = excluded.lossy, \
                 cache_hit = excluded.cache_hit, \
-                status = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error') THEN request_logs.status ELSE excluded.status END, \
-                error_class = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error') THEN request_logs.error_class ELSE excluded.error_class END, \
-                http_status = excluded.http_status, \
-                error_source = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error') THEN request_logs.error_source ELSE excluded.error_source END, \
+                status = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error', 'client_disconnect') THEN request_logs.status ELSE excluded.status END, \
+                error_class = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error', 'client_disconnect') THEN request_logs.error_class ELSE excluded.error_class END, \
+                http_status = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error', 'client_disconnect') THEN request_logs.http_status ELSE excluded.http_status END, \
+                error_source = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error', 'client_disconnect') THEN request_logs.error_source ELSE excluded.error_source END, \
                 total_latency_ms = excluded.total_latency_ms, \
                 upstream_latency_ms = excluded.upstream_latency_ms, \
                 queue_latency_ms = excluded.queue_latency_ms, \
@@ -392,6 +392,22 @@ impl EventSink for OltpSink {
                         error = %e,
                         request_id = %capture.request_id,
                         "oltp sink: failure status write-back failed"
+                    );
+                }
+            }
+            // The client left before the stream reached a terminal event.
+            // This is not an upstream failure and must not affect routing
+            // health, but it is an abnormal request outcome rather than the
+            // optimistic success emitted when the upstream handshake opened.
+            if reason == "client_disconnect" {
+                if let Err(e) = self
+                    .update_request_client_disconnect(&capture.request_id)
+                    .await
+                {
+                    warn!(
+                        error = %e,
+                        request_id = %capture.request_id,
+                        "oltp sink: client-disconnect write-back failed"
                     );
                 }
             }
@@ -841,6 +857,34 @@ impl OltpSink {
         .bind(now)
         .bind(error_class)
         .bind(error_source)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    /// Persist a client-cancelled stream as an abnormal HTTP 499 outcome.
+    /// The capture can race with the optimistic success RequestEvent, so this
+    /// uses the same upsert strategy as [`Self::update_request_failure`].
+    /// Unlike an upstream failure, this status must never feed the health
+    /// registry or trigger a routing fallback.
+    async fn update_request_client_disconnect(&self, request_id: &str) -> Result<(), sqlx::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO request_logs (\
+                request_id, ts, virtual_model, ingress_protocol, status, \
+                total_latency_ms, upstream_latency_ms, queue_latency_ms, lossy, \
+                error_class, http_status, error_source, truncation_reason) \
+             VALUES ($1, $2, '', '', 'abnormal', 0, 0, 0, 0, 'client_disconnect', 499, \
+                     'client disconnected before stream completed', 'client_disconnect') \
+             ON CONFLICT(request_id) DO UPDATE SET \
+                status = excluded.status, \
+                error_class = excluded.error_class, \
+                http_status = excluded.http_status, \
+                error_source = excluded.error_source, \
+                truncation_reason = excluded.truncation_reason",
+        )
+        .bind(request_id)
+        .bind(now)
         .execute(self.pool.any())
         .await?;
         Ok(())
@@ -2767,7 +2811,8 @@ pub struct RequestLogEntry {
     /// `request_payloads.truncation_reason`. `Some("idle" | "total" |
     /// "upstream_error" | "client_disconnect")` when a streaming
     /// response ended before a clean natural completion; `None` for a
-    /// clean end / non-stream. Note `status` stays "ok" in this case.
+    /// clean end / non-stream. Client disconnects are recorded as an
+    /// `abnormal` HTTP 499 outcome; upstream/gateway truncations are failed.
     pub truncation_reason: Option<String>,
     /// Upstream model finish / stop reason extracted from the response
     /// body during capture. Normalised to snake_case (e.g. `stop`,
@@ -4924,7 +4969,7 @@ data: [DONE]\n";
         sink.write_capture(&capture).await.expect("write capture");
 
         let row = sqlx::query(
-            "SELECT status, error_class, error_source, truncation_reason \
+            "SELECT status, error_class, http_status, error_source, truncation_reason \
              FROM request_logs WHERE request_id = $1",
         )
         .bind("req-1")
@@ -4997,7 +5042,7 @@ data: [DONE]\n";
     }
 
     #[tokio::test]
-    async fn write_capture_client_disconnect_does_not_mark_failed() {
+    async fn write_capture_client_disconnect_marks_request_abnormal() {
         let pool = db::open_pool("sqlite::memory:").await.expect("pool");
         db::run_migrations(&pool).await.expect("migrate");
         let sink = OltpSink::new(Arc::new(pool.clone()));
@@ -5026,18 +5071,77 @@ data: [DONE]\n";
         sink.write_capture(&capture).await.expect("write capture");
 
         let row = sqlx::query(
-            "SELECT status, error_class, error_source, truncation_reason \
+            "SELECT status, error_class, http_status, error_source, truncation_reason \
              FROM request_logs WHERE request_id = $1",
         )
         .bind("req-1")
         .fetch_one(pool.any())
         .await
         .expect("query");
-        // Status stays success — client_disconnect is not a gateway
-        // failure.
-        assert_eq!(row.get::<String, _>("status"), "success");
-        assert!(row.get::<Option<String>, _>("error_class").is_none());
-        assert!(row.get::<Option<String>, _>("error_source").is_none());
+        // A client disconnect is not an upstream failure, but it is not a
+        // completed success either. Dashboard state must expose it as an
+        // abnormal 499 outcome.
+        assert_eq!(row.get::<String, _>("status"), "abnormal");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_class"),
+            Some("client_disconnect".to_string())
+        );
+        assert_eq!(row.get::<Option<i64>, _>("http_status"), Some(499));
+        assert_eq!(
+            row.get::<Option<String>, _>("error_source"),
+            Some("client disconnected before stream completed".to_string())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("truncation_reason"),
+            Some("client_disconnect".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_capture_is_not_overridden_by_later_success_event() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        let capture = ExchangeCapture {
+            request_id: "req-client-disconnect-race".to_string(),
+            egress_method: "GET".to_string(),
+            egress_path: "/backend-api/codex/responses".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(101),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: None,
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: true,
+            truncation_reason: Some("client_disconnect".to_string()),
+            stream_duration_ms: Some(12),
+            upstream_error: None,
+            upstream_error_class: None,
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        let mut event = dummy_request_event();
+        event.request_id = "req-client-disconnect-race".to_string();
+        sink.write_request_event(&event)
+            .await
+            .expect("write later success event");
+
+        let row = sqlx::query(
+            "SELECT status, error_class, http_status, truncation_reason \
+             FROM request_logs WHERE request_id = $1",
+        )
+        .bind("req-client-disconnect-race")
+        .fetch_one(pool.any())
+        .await
+        .expect("query");
+        assert_eq!(row.get::<String, _>("status"), "abnormal");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_class"),
+            Some("client_disconnect".to_string())
+        );
+        assert_eq!(row.get::<Option<i64>, _>("http_status"), Some(499));
         assert_eq!(
             row.get::<Option<String>, _>("truncation_reason"),
             Some("client_disconnect".to_string())
