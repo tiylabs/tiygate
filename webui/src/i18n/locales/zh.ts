@@ -180,6 +180,12 @@ const zh: Translation = {
     vendorLoading: "正在加载厂商…",
     vendorLoadError: "无法获取厂商列表",
     apiBase: "API 地址",
+    usage: {
+      loading: "加载中…",
+      resetAt: "重置：{{time}}",
+      notConnected: "未授权",
+      unavailable: "暂不可用",
+    },
     modelsEndpoint: "模型列表地址（选填）",
     authMode: "鉴权方式",
     authModes: {

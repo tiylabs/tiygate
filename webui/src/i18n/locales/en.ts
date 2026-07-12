@@ -184,6 +184,12 @@ const en = {
     vendorLoading: "Loading vendors…",
     vendorLoadError: "Failed to load vendors",
     apiBase: "API base",
+    usage: {
+      loading: "Loading…",
+      resetAt: "Reset {{time}}",
+      notConnected: "Not authorized",
+      unavailable: "Unavailable",
+    },
     modelsEndpoint: "Models endpoint (optional)",
     authMode: "Auth mode",
     authModes: {

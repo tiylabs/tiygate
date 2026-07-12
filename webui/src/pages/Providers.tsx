@@ -1,6 +1,11 @@
 import { useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   Plus,
   Pencil,
@@ -15,6 +20,8 @@ import type {
   Provider,
   ProviderDeleteImpact,
   ProviderInput,
+  ProviderUsage,
+  ProviderUsageWindow,
 } from "@/api/types";
 import {
   Badge,
@@ -163,6 +170,90 @@ function oauthStatusKey(provider: Provider): string {
   return `providers.oauthStatus.${provider.oauth_status?.state ?? "not_connected"}`;
 }
 
+function isOpenAiOAuth(provider: Provider): boolean {
+  return provider.vendor === "openai" && provider.auth_mode === "oauth";
+}
+
+function isOAuthProvider(provider: Provider): boolean {
+  return provider.auth_mode === "oauth";
+}
+
+function formatUsageResetTime(resetAt: number | null | undefined): string {
+  if (resetAt == null) return "—";
+  return fmtTime(new Date(resetAt * 1000).toISOString());
+}
+
+function usageWindowPercent(window: ProviderUsageWindow | null | undefined) {
+  const value = window?.used_percent;
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(100, Math.max(0, value))
+    : null;
+}
+
+function UsageWindow({
+  label,
+  window,
+  loading,
+  state,
+  t,
+}: {
+  label: string;
+  window?: ProviderUsageWindow | null;
+  loading: boolean;
+  state?: ProviderUsage["state"];
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const percent = usageWindowPercent(window);
+  const isAvailable = state === "available" && percent != null;
+  const resetAt = formatUsageResetTime(window?.reset_at);
+
+  return (
+    <div
+      className="min-w-0"
+      title={
+        isAvailable
+          ? t("providers.usage.resetAt", { time: resetAt })
+          : undefined
+      }
+    >
+      <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-wide text-text-muted">
+        <span>{label}</span>
+        {loading ? (
+          <span className="text-text-subtle">…</span>
+        ) : isAvailable ? (
+          <span className="font-mono normal-case text-text">
+            {percent.toFixed(0)}%
+          </span>
+        ) : (
+          <span className="font-mono normal-case text-text-subtle">—</span>
+        )}
+      </div>
+      <div className="h-1.5 overflow-hidden rounded-full bg-surface-muted">
+        {loading ? (
+          <div className="h-full w-1/2 animate-pulse rounded-full bg-border-strong" />
+        ) : isAvailable ? (
+          <div
+            className={cn(
+              "h-full rounded-full transition-[width] duration-300",
+              percent >= 90 ? "bg-danger" : "bg-primary",
+            )}
+            style={{ width: `${percent}%` }}
+          />
+        ) : null}
+      </div>
+      <div className="mt-1 truncate text-[10px] text-text-subtle">
+        {loading
+          ? t("providers.usage.loading")
+          : isAvailable
+            ? t("providers.usage.resetAt", { time: resetAt })
+            : state === "not_connected"
+              ? t("providers.usage.notConnected")
+              : t("providers.usage.unavailable")}
+      </div>
+    </div>
+  );
+}
+
 export default function Providers() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -181,6 +272,16 @@ export default function Providers() {
     queryKey: ["provider-catalog"],
     queryFn: providerCatalogApi.list,
   });
+  const usageQueries = useQueries({
+    queries: (data ?? []).map((provider) => ({
+      queryKey: ["provider-usage", provider.id],
+      queryFn: () => providersApi.usage(provider.id),
+      enabled: isOpenAiOAuth(provider),
+      staleTime: 0,
+      refetchOnMount: "always" as const,
+      retry: false,
+    })),
+  });
   const { scrollRef, scrollState } = useStickyTableScroll([
     isLoading,
     data?.length ?? 0,
@@ -192,6 +293,13 @@ export default function Providers() {
     for (const e of catalog ?? []) m.set(e.id, e.display_name);
     return m;
   }, [catalog]);
+  const usageByProvider = useMemo(() => {
+    const result = new Map<string, (typeof usageQueries)[number]>();
+    for (const [index, provider] of (data ?? []).entries()) {
+      result.set(provider.id, usageQueries[index]);
+    }
+    return result;
+  }, [data, usageQueries]);
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm());
   const [editing, setEditing] = useState<Provider | null>(null);
@@ -616,11 +724,41 @@ export default function Providers() {
                         </span>
                       </div>
                     </Td>
-                    <Td
-                      className="truncate font-mono text-xs"
-                      title={p.api_base}
-                    >
-                      {p.api_base}
+                    <Td className="align-middle">
+                      {!isOAuthProvider(p) ? (
+                        <div
+                          className="truncate font-mono text-xs"
+                          title={p.api_base}
+                        >
+                          {p.api_base}
+                        </div>
+                      ) : null}
+                      {isOpenAiOAuth(p) ? (
+                        <div className="mt-2 grid min-w-[18rem] grid-cols-2 gap-3">
+                          {(() => {
+                            const usageQuery = usageByProvider.get(p.id);
+                            const usage = usageQuery?.data;
+                            return (
+                              <>
+                                <UsageWindow
+                                  label="5h"
+                                  window={usage?.five_hour}
+                                  loading={usageQuery?.isFetching ?? true}
+                                  state={usage?.state}
+                                  t={t}
+                                />
+                                <UsageWindow
+                                  label="7d"
+                                  window={usage?.seven_day}
+                                  loading={usageQuery?.isFetching ?? true}
+                                  state={usage?.state}
+                                  t={t}
+                                />
+                              </>
+                            );
+                          })()}
+                        </div>
+                      ) : null}
                     </Td>
                     <Td className="whitespace-nowrap text-xs">
                       <div className="flex flex-col items-start gap-1.5">
@@ -745,60 +883,66 @@ export default function Providers() {
               options={vendorOptions}
             />
           </Field>
-          <Field label={t("providers.apiBase")}>
-            <Input
-              value={form.api_base}
-              onChange={(e) => setForm({ ...form, api_base: e.target.value })}
-              placeholder={
-                catalog?.find((e) => e.id === form.vendor)?.default_base_url ??
-                ""
-              }
-              onKeyDown={(e) => {
-                if (e.key === "Tab" && !form.api_base) {
-                  const entry = catalog?.find((el) => el.id === form.vendor);
-                  if (entry?.default_base_url) {
-                    e.preventDefault();
-                    setForm((prev) => ({
-                      ...prev,
-                      api_base: entry.default_base_url,
-                    }));
+          {form.auth_mode !== "oauth" ? (
+            <>
+              <Field label={t("providers.apiBase")}>
+                <Input
+                  value={form.api_base}
+                  onChange={(e) =>
+                    setForm({ ...form, api_base: e.target.value })
                   }
-                }
-              }}
-            />
-          </Field>
-          <Field label={t("providers.modelsEndpoint")}>
-            <Input
-              value={form.models_endpoint}
-              onChange={(e) =>
-                setForm({ ...form, models_endpoint: e.target.value })
-              }
-              placeholder={(() => {
-                const base =
-                  form.api_base ||
-                  catalog?.find((e) => e.id === form.vendor)
-                    ?.default_base_url ||
-                  "";
-                return base ? base + "/models" : "";
-              })()}
-              onKeyDown={(e) => {
-                if (e.key === "Tab" && !form.models_endpoint) {
-                  const base =
-                    form.api_base ||
-                    catalog?.find((el) => el.id === form.vendor)
-                      ?.default_base_url ||
-                    "";
-                  if (base) {
-                    e.preventDefault();
-                    setForm((prev) => ({
-                      ...prev,
-                      models_endpoint: base + "/models",
-                    }));
+                  placeholder={
+                    catalog?.find((e) => e.id === form.vendor)
+                      ?.default_base_url ?? ""
                   }
-                }
-              }}
-            />
-          </Field>
+                  onKeyDown={(e) => {
+                    if (e.key === "Tab" && !form.api_base) {
+                      const entry = catalog?.find((el) => el.id === form.vendor);
+                      if (entry?.default_base_url) {
+                        e.preventDefault();
+                        setForm((prev) => ({
+                          ...prev,
+                          api_base: entry.default_base_url,
+                        }));
+                      }
+                    }
+                  }}
+                />
+              </Field>
+              <Field label={t("providers.modelsEndpoint")}>
+                <Input
+                  value={form.models_endpoint}
+                  onChange={(e) =>
+                    setForm({ ...form, models_endpoint: e.target.value })
+                  }
+                  placeholder={(() => {
+                    const base =
+                      form.api_base ||
+                      catalog?.find((e) => e.id === form.vendor)
+                        ?.default_base_url ||
+                      "";
+                    return base ? base + "/models" : "";
+                  })()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Tab" && !form.models_endpoint) {
+                      const base =
+                        form.api_base ||
+                        catalog?.find((el) => el.id === form.vendor)
+                          ?.default_base_url ||
+                        "";
+                      if (base) {
+                        e.preventDefault();
+                        setForm((prev) => ({
+                          ...prev,
+                          models_endpoint: base + "/models",
+                        }));
+                      }
+                    }
+                  }}
+                />
+              </Field>
+            </>
+          ) : null}
           <Field label={t("providers.authMode")}>
             <Select
               value={form.auth_mode}

@@ -30,6 +30,10 @@ use crate::state::AdminState;
 
 const OPENAI_PLATFORM_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+/// ChatGPT/Codex subscription usage endpoint. This endpoint is used only for
+/// OpenAI OAuth providers; OpenAI API-key providers have platform billing
+/// semantics rather than the ChatGPT 5-hour / 7-day windows.
+const OPENAI_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 pub fn router() -> Router<AdminState> {
     Router::new()
@@ -48,6 +52,7 @@ pub fn router() -> Router<AdminState> {
                 .put(update_provider)
                 .delete(delete_provider),
         )
+        .route("/admin/v1/providers/:id/usage", get(provider_usage))
         .route("/admin/v1/routes", get(list_routes).post(create_route))
         .route(
             "/admin/v1/routes/:id",
@@ -108,6 +113,247 @@ struct ProviderModelEntry {
 #[derive(Debug, Serialize)]
 struct ProviderModelsResponse {
     models: Vec<ProviderModelEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderUsageWindow {
+    used_percent: Option<f64>,
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderUsageResponse {
+    provider_id: String,
+    state: String,
+    reason: Option<String>,
+    checked_at: Option<String>,
+    five_hour: Option<ProviderUsageWindow>,
+    seven_day: Option<ProviderUsageWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsageResponse {
+    rate_limit: Option<OpenAiRateLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiRateLimit {
+    primary_window: Option<OpenAiUsageWindow>,
+    secondary_window: Option<OpenAiUsageWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsageWindow {
+    used_percent: Option<f64>,
+    reset_at: Option<i64>,
+    reset_after_seconds: Option<i64>,
+}
+
+fn provider_usage_response(
+    provider_id: &str,
+    state: &str,
+    reason: Option<&str>,
+    five_hour: Option<ProviderUsageWindow>,
+    seven_day: Option<ProviderUsageWindow>,
+) -> ProviderUsageResponse {
+    ProviderUsageResponse {
+        provider_id: provider_id.to_string(),
+        state: state.to_string(),
+        reason: reason.map(str::to_string),
+        checked_at: Some(chrono::Utc::now().to_rfc3339()),
+        five_hour,
+        seven_day,
+    }
+}
+
+fn map_openai_usage_window(
+    window: Option<OpenAiUsageWindow>,
+    now_unix: i64,
+) -> Option<ProviderUsageWindow> {
+    window.map(|window| ProviderUsageWindow {
+        used_percent: window.used_percent.map(|value| value.clamp(0.0, 100.0)),
+        reset_at: window.reset_at.or_else(|| {
+            window
+                .reset_after_seconds
+                .map(|seconds| now_unix.saturating_add(seconds))
+        }),
+    })
+}
+
+fn parse_openai_usage(
+    body: &str,
+    now_unix: i64,
+) -> Result<(Option<ProviderUsageWindow>, Option<ProviderUsageWindow>), String> {
+    let response: OpenAiUsageResponse =
+        serde_json::from_str(body).map_err(|error| format!("invalid usage response: {error}"))?;
+    let Some(rate_limit) = response.rate_limit else {
+        return Err("usage response has no rate_limit".to_string());
+    };
+    Ok((
+        map_openai_usage_window(rate_limit.primary_window, now_unix),
+        map_openai_usage_window(rate_limit.secondary_window, now_unix),
+    ))
+}
+
+/// Fetch the ChatGPT/Codex subscription windows for one OpenAI OAuth
+/// provider. The OAuth cache is keyed by provider/account, so multiple
+/// providers can safely use different ChatGPT accounts in one process.
+async fn provider_usage(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, AdminError> {
+    let provider = state
+        .store
+        .get_provider(&id)
+        .await?
+        .ok_or_else(|| AdminError::NotFound(format!("provider {id}")))?;
+
+    if provider.vendor != "openai" || !matches!(provider.auth_mode, AuthMode::OAuth) {
+        return Ok(Json(provider_usage_response(
+            &id,
+            "unsupported",
+            Some("openai_oauth_only"),
+            None,
+            None,
+        ))
+        .into_response());
+    }
+
+    let Some(oauth_config) = tiygate_store::config_store::build_oauth_target_config(&provider)
+    else {
+        return Ok(Json(provider_usage_response(
+            &id,
+            "not_connected",
+            Some("oauth_metadata_unavailable"),
+            None,
+            None,
+        ))
+        .into_response());
+    };
+    if oauth_config.refresh_token.is_empty() {
+        return Ok(Json(provider_usage_response(
+            &id,
+            "not_connected",
+            Some("refresh_token_missing"),
+            None,
+            None,
+        ))
+        .into_response());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| AdminError::Internal(format!("http client build: {error}")))?;
+    let cache = tiygate_auth::provider_oauth::OAuthTokenCache::global();
+    let label = oauth_config.cache_label();
+    cache.seed(&id, label, &oauth_config.refresh_token);
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Err(error) = cache
+        .apply(&mut headers, &id, label, &oauth_config, &client)
+        .await
+    {
+        record_oauth_refresh_failure(&state, &id, &error).await;
+        tracing::warn!(provider = %id, error = %error, "OpenAI OAuth usage token unavailable");
+        return Ok(Json(provider_usage_response(
+            &id,
+            "unavailable",
+            Some("oauth_token_unavailable"),
+            None,
+            None,
+        ))
+        .into_response());
+    }
+
+    if let Some(cached_refresh_token) = cache.get_refresh_token(&id, label) {
+        match oauth_meta_after_refresh_rotation(
+            &provider,
+            &oauth_config.refresh_token,
+            &cached_refresh_token,
+        ) {
+            Ok(Some(meta)) => {
+                if let Err(error) = state.store.set_provider_oauth_meta(&id, &meta).await {
+                    tracing::warn!(
+                        provider = %id,
+                        error = %error,
+                        "persisting rotated OAuth refresh token after usage request failed"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    provider = %id,
+                    error = %error,
+                    "preparing rotated OAuth refresh token metadata failed"
+                );
+            }
+        }
+    }
+
+    let mut request = client.get(OPENAI_CODEX_USAGE_URL);
+    for (name, value) in &headers {
+        request = request.header(name, value);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(provider = %id, error = %error, "OpenAI usage request failed");
+            return Ok(Json(provider_usage_response(
+                &id,
+                "unavailable",
+                Some("upstream_request_failed"),
+                None,
+                None,
+            ))
+            .into_response());
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            record_oauth_status(
+                &state,
+                &id,
+                OAuthCredentialStatus::Invalid,
+                Some("usage_auth_rejected"),
+            )
+            .await;
+        }
+        tracing::warn!(provider = %id, status = %status, "OpenAI usage endpoint returned an error");
+        return Ok(Json(provider_usage_response(
+            &id,
+            "unavailable",
+            Some("upstream_http_error"),
+            None,
+            None,
+        ))
+        .into_response());
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|error| AdminError::Internal(format!("read usage response: {error}")))?;
+    let (five_hour, seven_day) = match parse_openai_usage(&body, chrono::Utc::now().timestamp()) {
+        Ok(windows) => windows,
+        Err(error) => {
+            tracing::warn!(provider = %id, error = %error, "OpenAI usage response parse failed");
+            return Ok(Json(provider_usage_response(
+                &id,
+                "unavailable",
+                Some("invalid_upstream_response"),
+                None,
+                None,
+            ))
+            .into_response());
+        }
+    };
+    let usage = provider_usage_response(&id, "available", None, five_hour, seven_day);
+    Ok(Json(usage).into_response())
 }
 
 /// Discover models available on a provider's upstream API.
@@ -2382,6 +2628,60 @@ mod tests {
         let models = parse_model_list(&body);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-visible");
+    }
+
+    #[test]
+    fn parses_openai_usage_windows() {
+        let body = json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 27,
+                    "limit_window_seconds": 18000,
+                    "reset_at": 1_782_770_922
+                },
+                "secondary_window": {
+                    "used_percent": 4,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 600
+                }
+            }
+        })
+        .to_string();
+
+        let (five_hour, seven_day) = parse_openai_usage(&body, 1_000_000).expect("usage JSON");
+        assert_eq!(
+            five_hour.as_ref().and_then(|window| window.used_percent),
+            Some(27.0)
+        );
+        assert_eq!(
+            five_hour.as_ref().and_then(|window| window.reset_at),
+            Some(1_782_770_922)
+        );
+        assert_eq!(
+            seven_day.as_ref().and_then(|window| window.used_percent),
+            Some(4.0)
+        );
+        assert_eq!(
+            seven_day.as_ref().and_then(|window| window.reset_at),
+            Some(1_000_600)
+        );
+    }
+
+    #[test]
+    fn clamps_openai_usage_percent_to_display_range() {
+        let body = r#"{
+            "rate_limit": {
+                "primary_window": {"used_percent": 120},
+                "secondary_window": {"used_percent": -5}
+            }
+        }"#;
+
+        let (five_hour, seven_day) = parse_openai_usage(body, 1_000_000).expect("usage JSON");
+        assert_eq!(
+            five_hour.and_then(|window| window.used_percent),
+            Some(100.0)
+        );
+        assert_eq!(seven_day.and_then(|window| window.used_percent), Some(0.0));
     }
 
     #[test]

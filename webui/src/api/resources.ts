@@ -18,6 +18,7 @@ import type {
   ProviderDeleteImpact,
   ProviderInput,
   ProviderModelsResponse,
+  ProviderUsage,
   QuotaSpec,
   RequestFilterOptions,
   RequestListResponse,
@@ -50,6 +51,8 @@ export const providersApi = {
     }),
   models: (id: string) =>
     apiRequest<ProviderModelsResponse>(`/providers/${id}/models`),
+  usage: (id: string) =>
+    apiRequest<ProviderUsage>(`/providers/${id}/usage`),
 };
 
 // ---- provider catalog (server-side registered providers) ----

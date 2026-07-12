@@ -58,6 +58,26 @@ export interface ProviderModelsResponse {
   models: ProviderModelEntry[];
 }
 
+export interface ProviderUsageWindow {
+  used_percent?: number | null;
+  reset_at?: number | null;
+}
+
+export type ProviderUsageState =
+  | "available"
+  | "not_connected"
+  | "unsupported"
+  | "unavailable";
+
+export interface ProviderUsage {
+  provider_id: string;
+  state: ProviderUsageState;
+  reason?: string | null;
+  checked_at?: string | null;
+  five_hour?: ProviderUsageWindow | null;
+  seven_day?: ProviderUsageWindow | null;
+}
+
 export interface ProviderCatalogEntry {
   id: string;
   display_name: string;
