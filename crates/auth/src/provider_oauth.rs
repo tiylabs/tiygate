@@ -18,6 +18,8 @@
 //! - `OAuthTokenCache` — process-global cache keyed by
 //!   `provider_id:label`, with per-key single-flight refresh.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -312,6 +314,14 @@ pub struct OAuthCredentialRefreshSummary {
     pub expires_in: Option<Duration>,
 }
 
+/// Control-plane mutation executed while the server owns the provider's OAuth
+/// refresh lock. The boxed shape keeps [`OAuthCredentialService`] object-safe.
+pub type OAuthProviderMutation = Box<
+    dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>
+        + Send
+        + 'static,
+>;
+
 /// Shared control-plane surface implemented by the server's cluster-aware
 /// token manager. Keeping the trait in `auth` avoids an `admin -> server`
 /// dependency while ensuring Admin handlers cannot bypass refresh coordination.
@@ -334,14 +344,12 @@ pub trait OAuthCredentialService: Send + Sync {
         tokens: TokenResult,
     ) -> Result<OAuthCredentialRefreshSummary, String>;
 
-    /// Clear access-token state after an OAuth credential configuration edit.
-    /// When supplied, `oauth_meta_plain` is restored while holding the same
-    /// provider lock so an in-flight refresh cannot overwrite newly submitted
-    /// metadata with an older rotated refresh token.
-    async fn reset_provider_tokens(
+    /// Execute a provider credential edit while holding the same lock used by
+    /// token refresh, then clear the old shared and local access-token state.
+    async fn mutate_provider_credentials(
         &self,
         provider_id: &str,
-        oauth_meta_plain: Option<String>,
+        mutation: OAuthProviderMutation,
     ) -> Result<(), String>;
 }
 

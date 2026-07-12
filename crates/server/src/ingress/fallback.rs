@@ -214,13 +214,12 @@ where
         scope.set_egress(target.api_protocol.clone());
         scope.set_resolved(target.provider_id.clone(), target.model_id.clone());
 
-        let rejected_access_token = (!oauth_recovered.contains(&health_key))
-            .then(|| state.oauth_manager.cached_access_token(target))
-            .flatten();
-        let mut execution = execute_one(target).await;
+        let (mut execution, rejected_access_token) =
+            crate::oauth_manager::capture_applied_access_token(execute_one(target)).await;
         if execution
             .as_ref()
             .is_err_and(|error| error.http_status() == StatusCode::UNAUTHORIZED)
+            && !oauth_recovered.contains(&health_key)
         {
             if let Some(rejected_access_token) = rejected_access_token {
                 oauth_recovered.insert(health_key.clone());
@@ -230,7 +229,10 @@ where
                     .await
                     .unwrap_or(false)
                 {
-                    execution = execute_one(target).await;
+                    execution =
+                        crate::oauth_manager::capture_applied_access_token(execute_one(target))
+                            .await
+                            .0;
                 }
             }
         }

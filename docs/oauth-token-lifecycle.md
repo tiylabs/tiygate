@@ -60,6 +60,10 @@ leader:
 Transient failures use bounded exponential retry backoff. Credential rejection
 such as `invalid_grant` marks the provider invalid and suppresses automatic
 retries until the operator reconnects or manually refreshes it.
+Token-endpoint refresh requests have a 30-second total timeout so an
+unresponsive authorization server cannot hold a provider lock or worker slot
+indefinitely. Request-path refreshes honor the same persisted retry deadline;
+the Admin manual-refresh action deliberately bypasses it.
 
 The following settings are seeded into the `settings` table and hot-reloaded:
 

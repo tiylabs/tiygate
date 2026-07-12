@@ -1259,46 +1259,101 @@ async fn update_provider(
         &api_base,
     );
     let metadata = normalized_provider_metadata(&req.vendor, auth_mode, req.metadata);
-    // Read the existing row first so we can record a field-level diff.
-    // Best-effort: a read failure simply yields no `before` snapshot.
-    let before_provider = state.store.get_provider(&id).await.ok().flatten();
+    // This read now also decides whether OAuth refresh coordination is needed,
+    // so a database error must not be treated as a missing provider.
+    let before_provider = state.store.get_provider(&id).await?;
     let before = before_provider.as_ref().map(provider_snapshot);
-    let p = state
-        .store
-        .upsert_provider(
-            &id,
-            &req.name,
-            &req.vendor,
-            &api_base,
-            &models_endpoint,
-            req.api_key.as_deref(),
-            auth_mode,
-            req.oauth_meta.as_deref(),
-            metadata,
-            req.enabled.unwrap_or(true),
-        )
-        .await?;
     let credential_changed = before_provider.as_ref().is_some_and(|previous| {
-        previous.auth_mode != p.auth_mode
-            || previous.vendor != p.vendor
-            || previous.metadata_json.get("oauth") != p.metadata_json.get("oauth")
+        previous.auth_mode != auth_mode
+            || previous.vendor != req.vendor
+            || previous.metadata_json.get("oauth") != metadata.get("oauth")
             || req.oauth_meta.is_some()
     });
-    if credential_changed {
-        if let Some(service) = state.oauth_service.as_ref() {
+
+    let p = if credential_changed {
+        if let Some(service) = state.oauth_service.as_ref().cloned() {
+            let store = state.store.clone();
+            let mutation_id = id.clone();
+            let name = req.name.clone();
+            let vendor = req.vendor.clone();
+            let api_base = api_base.clone();
+            let models_endpoint = models_endpoint.clone();
+            let api_key = req.api_key.clone();
+            let oauth_meta = req.oauth_meta.clone();
+            let metadata = metadata.clone();
+            let enabled = req.enabled.unwrap_or(true);
             service
-                .reset_provider_tokens(&id, req.oauth_meta.clone())
+                .mutate_provider_credentials(
+                    &id,
+                    Box::new(move || {
+                        Box::pin(async move {
+                            store
+                                .upsert_provider(
+                                    &mutation_id,
+                                    &name,
+                                    &vendor,
+                                    &api_base,
+                                    &models_endpoint,
+                                    api_key.as_deref(),
+                                    auth_mode,
+                                    oauth_meta.as_deref(),
+                                    metadata,
+                                    enabled,
+                                )
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        })
+                    }),
+                )
                 .await
                 .map_err(AdminError::Internal)?;
+            state
+                .store
+                .get_provider(&id)
+                .await?
+                .ok_or_else(|| AdminError::NotFound(format!("provider {id}")))?
         } else {
+            let provider = state
+                .store
+                .upsert_provider(
+                    &id,
+                    &req.name,
+                    &req.vendor,
+                    &api_base,
+                    &models_endpoint,
+                    req.api_key.as_deref(),
+                    auth_mode,
+                    req.oauth_meta.as_deref(),
+                    metadata,
+                    req.enabled.unwrap_or(true),
+                )
+                .await?;
             state
                 .store
                 .oauth_token_store()
                 .reset(&id, req.oauth_meta.as_deref())
                 .await?;
             state.store.refresh().await?;
+            provider
         }
-    }
+    } else {
+        state
+            .store
+            .upsert_provider(
+                &id,
+                &req.name,
+                &req.vendor,
+                &api_base,
+                &models_endpoint,
+                req.api_key.as_deref(),
+                auth_mode,
+                req.oauth_meta.as_deref(),
+                metadata,
+                req.enabled.unwrap_or(true),
+            )
+            .await?
+    };
     let snap = provider_snapshot(&p);
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),

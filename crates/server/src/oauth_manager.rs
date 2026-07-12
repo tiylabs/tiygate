@@ -6,6 +6,8 @@
 //! transaction advisory lock across instances; SQLite uses a process-local
 //! mutex because it is a single-instance deployment backend.
 
+use std::cell::RefCell;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,8 +17,8 @@ use http::HeaderMap;
 use serde_json::json;
 use tiygate_auth::provider_oauth::{
     classify_refresh_failure, do_refresh_token, OAuthCredentialRefreshSummary,
-    OAuthCredentialService, OAuthRefreshFailureKind, OAuthTokenCache, OAuthTokenIdentity,
-    TokenResult,
+    OAuthCredentialService, OAuthProviderMutation, OAuthRefreshFailureKind, OAuthTokenCache,
+    OAuthTokenIdentity, TokenResult,
 };
 use tiygate_core::provider::oauth::OAuthTargetConfig;
 use tiygate_core::RoutingTarget;
@@ -30,6 +32,26 @@ const ACCESS_TOKEN_LEEWAY: Duration = Duration::from_secs(60);
 const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(5);
 const REFRESH_LOCK_POLL: Duration = Duration::from_millis(25);
+const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+tokio::task_local! {
+    static APPLIED_OAUTH_ACCESS_TOKEN: RefCell<Option<String>>;
+}
+
+/// Run one upstream attempt while capturing the exact OAuth access token
+/// injected by that attempt. The value stays task-local and is never logged.
+pub(crate) async fn capture_applied_access_token<F, T>(future: F) -> (T, Option<String>)
+where
+    F: Future<Output = T>,
+{
+    APPLIED_OAUTH_ACCESS_TOKEN
+        .scope(RefCell::new(None), async move {
+            let output = future.await;
+            let token = APPLIED_OAUTH_ACCESS_TOKEN.with(|slot| slot.borrow().clone());
+            (output, token)
+        })
+        .await
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthRefreshMode {
@@ -57,6 +79,7 @@ pub struct OAuthTokenManager {
     token_store: Option<OAuthTokenStore>,
     local_refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     http_client: reqwest::Client,
+    token_request_timeout: Duration,
 }
 
 impl OAuthTokenManager {
@@ -73,6 +96,7 @@ impl OAuthTokenManager {
             token_store,
             local_refresh_locks: Arc::new(DashMap::new()),
             http_client,
+            token_request_timeout: TOKEN_REQUEST_TIMEOUT,
         }
     }
 
@@ -89,6 +113,7 @@ impl OAuthTokenManager {
             token_store,
             local_refresh_locks: Arc::new(DashMap::new()),
             http_client,
+            token_request_timeout: TOKEN_REQUEST_TIMEOUT,
         }
     }
 
@@ -112,6 +137,7 @@ impl OAuthTokenManager {
             .cache
             .apply_cached(headers, &target.provider_id, label, oauth)?
         {
+            remember_applied_access_token(headers, oauth);
             return Ok(true);
         }
 
@@ -128,6 +154,7 @@ impl OAuthTokenManager {
                     &self.http_client,
                 )
                 .await?;
+            remember_applied_access_token(headers, oauth);
             return Ok(true);
         }
 
@@ -140,10 +167,12 @@ impl OAuthTokenManager {
         if !applied {
             return Err("OAuth refresh completed without a usable access token".to_string());
         }
+        remember_applied_access_token(headers, &config);
         Ok(true)
     }
 
     /// Return the access token currently cached for this OAuth target.
+    #[cfg(test)]
     pub(crate) fn cached_access_token(&self, target: &RoutingTarget) -> Option<String> {
         let oauth = target.oauth.as_ref()?;
         self.cache
@@ -197,10 +226,10 @@ impl OAuthTokenManager {
         self.refresh_summary(provider_id).await
     }
 
-    async fn reset_tokens(
+    async fn mutate_credentials_locked(
         &self,
         provider_id: &str,
-        oauth_meta_plain: Option<String>,
+        mutation: OAuthProviderMutation,
     ) -> Result<(), String> {
         let token_store = self
             .token_store
@@ -213,13 +242,18 @@ impl OAuthTokenManager {
             .clone();
         let _guard = local_lock.lock().await;
 
-        match token_store.kind() {
-            DbKind::Sqlite => token_store
-                .reset(provider_id, oauth_meta_plain.as_deref())
-                .await
-                .map_err(|error| error.to_string())?,
+        let mutation_result = match token_store.kind() {
+            DbKind::Sqlite => {
+                let mutation_result = mutation().await;
+                token_store
+                    .reset(provider_id, None)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                mutation_result
+            }
             DbKind::Postgres => {
                 let deadline = Instant::now() + REFRESH_LOCK_WAIT;
+                let mut mutation = Some(mutation);
                 loop {
                     match token_store
                         .try_begin_postgres_refresh(provider_id)
@@ -227,32 +261,36 @@ impl OAuthTokenManager {
                         .map_err(|error| error.to_string())?
                     {
                         Some(mut tx) => {
+                            // Stage token-state deletion before the external
+                            // mutation. The advisory lock prevents refreshers
+                            // from observing the intermediate state.
                             token_store
-                                .reset_in_transaction(
-                                    &mut tx,
-                                    provider_id,
-                                    oauth_meta_plain.as_deref(),
-                                )
+                                .reset_in_transaction(&mut tx, provider_id, None)
                                 .await
                                 .map_err(|error| error.to_string())?;
+                            let mutation = mutation.take().ok_or_else(|| {
+                                "OAuth provider mutation was already consumed".to_string()
+                            })?;
+                            let mutation_result = mutation().await;
                             tx.commit().await.map_err(|error| error.to_string())?;
-                            break;
+                            break mutation_result;
                         }
                         None if Instant::now() >= deadline => {
                             return Err(format!(
-                                "timed out resetting OAuth token state for provider {provider_id}"
+                                "timed out coordinating OAuth credential update for provider {provider_id}"
                             ));
                         }
                         None => tokio::time::sleep(REFRESH_LOCK_POLL).await,
                     }
                 }
             }
-        }
+        };
+
         self.cache.invalidate_provider(provider_id);
         if let Some(store) = self.store.as_ref() {
             store.refresh().await.map_err(|error| error.to_string())?;
         }
-        Ok(())
+        mutation_result
     }
 
     /// Non-blocking background keepalive. A busy PostgreSQL credential is
@@ -327,6 +365,20 @@ impl OAuthTokenManager {
 
         match token_store.kind() {
             DbKind::Sqlite => {
+                if mode != OAuthRefreshMode::Force {
+                    if let Some(state) = token_store
+                        .load(provider_id)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        if refresh_backoff_is_active(&state) {
+                            if mode == OAuthRefreshMode::Keepalive {
+                                return Ok((config, OAuthRefreshOutcome::Skipped));
+                            }
+                            return Err(refresh_backoff_error());
+                        }
+                    }
+                }
                 if mode == OAuthRefreshMode::Keepalive
                     && !self.keepalive_is_due(provider_id).await?
                 {
@@ -344,21 +396,30 @@ impl OAuthTokenManager {
                     {
                         Some(mut tx) => {
                             let current_config = self.load_oauth_config(provider_id).await?;
+                            let state = token_store
+                                .load_in_transaction(&mut tx, provider_id)
+                                .await
+                                .map_err(|error| error.to_string())?;
                             if mode == OAuthRefreshMode::IfNeeded {
-                                if let Some(state) = token_store
-                                    .load_in_transaction(&mut tx, provider_id)
-                                    .await
-                                    .map_err(|error| error.to_string())?
-                                {
-                                    if shared_token_is_usable(&state, rejected_access_token) {
+                                if let Some(state) = state.as_ref() {
+                                    if shared_token_is_usable(state, rejected_access_token) {
                                         tx.commit().await.map_err(|error| error.to_string())?;
-                                        self.seed_shared(provider_id, &current_config, &state);
+                                        self.seed_shared(provider_id, &current_config, state);
                                         return Ok((
                                             current_config,
                                             OAuthRefreshOutcome::ReusedShared,
                                         ));
                                     }
                                 }
+                            }
+                            if mode != OAuthRefreshMode::Force
+                                && state.as_ref().is_some_and(refresh_backoff_is_active)
+                            {
+                                tx.commit().await.map_err(|error| error.to_string())?;
+                                if mode == OAuthRefreshMode::Keepalive {
+                                    return Ok((current_config, OAuthRefreshOutcome::Skipped));
+                                }
+                                return Err(refresh_backoff_error());
                             }
                             if mode == OAuthRefreshMode::Keepalive
                                 && !self
@@ -413,15 +474,25 @@ impl OAuthTokenManager {
             return Err(format!("provider {provider_id} has no refresh token"));
         }
 
-        let result = do_refresh_token(
-            &config.token_url,
-            &config.client_id,
-            &config.refresh_token,
-            &config.scopes,
-            &config.token_request_style,
-            &self.http_client,
+        let result = tokio::time::timeout(
+            self.token_request_timeout,
+            do_refresh_token(
+                &config.token_url,
+                &config.client_id,
+                &config.refresh_token,
+                &config.scopes,
+                &config.token_request_style,
+                &self.http_client,
+            ),
         )
-        .await;
+        .await
+        .map_err(|_| {
+            format!(
+                "OAuth token refresh timed out after {} seconds",
+                self.token_request_timeout.as_secs()
+            )
+        })
+        .and_then(|result| result);
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -612,6 +683,7 @@ impl OAuthTokenManager {
         {
             return Err("OAuth access token is unavailable after refresh".to_string());
         }
+        remember_applied_access_token(headers, &config);
         Ok(())
     }
 
@@ -794,12 +866,12 @@ impl OAuthCredentialService for OAuthTokenManager {
         self.install_tokens(provider_id, tokens).await
     }
 
-    async fn reset_provider_tokens(
+    async fn mutate_provider_credentials(
         &self,
         provider_id: &str,
-        oauth_meta_plain: Option<String>,
+        mutation: OAuthProviderMutation,
     ) -> Result<(), String> {
-        self.reset_tokens(provider_id, oauth_meta_plain).await
+        self.mutate_credentials_locked(provider_id, mutation).await
     }
 }
 
@@ -818,6 +890,30 @@ fn shared_token_is_usable(
                 + chrono::Duration::from_std(ACCESS_TOKEN_LEEWAY)
                     .unwrap_or_else(|_| chrono::Duration::seconds(60))
     })
+}
+
+fn refresh_backoff_is_active(state: &OAuthAccessTokenState) -> bool {
+    state
+        .next_retry_at
+        .is_some_and(|next_retry| next_retry > Utc::now())
+}
+
+fn refresh_backoff_error() -> String {
+    "OAuth credential refresh is temporarily backed off; reconnect the credential or use the manual refresh action"
+        .to_string()
+}
+
+fn remember_applied_access_token(headers: &HeaderMap, config: &OAuthTargetConfig) {
+    let Some(token) = headers
+        .get(config.header_name())
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix(config.bearer_prefix()))
+    else {
+        return;
+    };
+    let _ = APPLIED_OAUTH_ACCESS_TOKEN.try_with(|slot| {
+        *slot.borrow_mut() = Some(token.to_string());
+    });
 }
 
 #[cfg(test)]
@@ -1113,6 +1209,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_timeout_records_backoff_and_hot_path_honors_it() {
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "access_token": "must-not-be-installed",
+                        "refresh_token": "must-not-be-rotated",
+                        "expires_in": 3600
+                    })),
+            )
+            .expect(1)
+            .mount(&token_server)
+            .await;
+
+        let pool = db::open_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let store = Arc::new(DbConfigStore::new(pool, None));
+        store.refresh().await.unwrap();
+        let provider_id = "sqlite-refresh-timeout-backoff";
+        store
+            .upsert_provider(
+                provider_id,
+                "SQLite OAuth timeout",
+                "openai",
+                "https://example.test",
+                "",
+                None,
+                AuthMode::OAuth,
+                Some(&serde_json::json!({"refresh_token": "existing-refresh"}).to_string()),
+                serde_json::json!({
+                    "oauth": {
+                        "token_url": format!("{}/token", token_server.uri()),
+                        "client_id": "test-client",
+                        "scopes": ["openid"],
+                        "token_request_style": "form"
+                    }
+                }),
+                true,
+            )
+            .await
+            .unwrap();
+        let provider = store.get_provider(provider_id).await.unwrap().unwrap();
+        let mut target = make_target(Some(build_oauth_target_config(&provider).unwrap()));
+        target.provider_id = provider_id.to_string();
+        let cache = Box::leak(Box::new(OAuthTokenCache::new()));
+        let mut manager =
+            OAuthTokenManager::new_with_cache(Some(store.clone()), reqwest::Client::new(), cache);
+        manager.token_request_timeout = Duration::from_millis(20);
+
+        assert!(manager.force_refresh(provider_id).await.is_err());
+        let state = store
+            .oauth_token_store()
+            .load(provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.failure_count, 1);
+        assert!(state.next_retry_at.is_some_and(|retry| retry > Utc::now()));
+
+        let mut headers = HeaderMap::new();
+        let error = manager.apply(&target, &mut headers).await.unwrap_err();
+        assert!(error.contains("temporarily backed off"));
+    }
+
+    #[tokio::test]
     async fn unauthorized_reuses_newer_shared_at_before_refreshing() {
         let pool = db::open_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
@@ -1159,6 +1323,17 @@ mod tests {
         let mut target = make_target(Some(oauth.clone()));
         target.provider_id = provider_id.to_string();
         let cache = Box::leak(Box::new(OAuthTokenCache::new()));
+        let manager =
+            OAuthTokenManager::new_with_cache(Some(store.clone()), reqwest::Client::new(), cache);
+
+        let (applied, used_access_token) = capture_applied_access_token(async {
+            let mut headers = HeaderMap::new();
+            manager.apply(&target, &mut headers).await
+        })
+        .await;
+        assert!(applied.unwrap());
+        assert_eq!(used_access_token.as_deref(), Some("shared-new-access"));
+
         cache.seed_tokens(
             provider_id,
             oauth.cache_label(),
@@ -1166,8 +1341,6 @@ mod tests {
             "existing-refresh",
             Some(Duration::from_secs(3600)),
         );
-        let manager =
-            OAuthTokenManager::new_with_cache(Some(store.clone()), reqwest::Client::new(), cache);
 
         assert!(manager
             .refresh_after_unauthorized(&target, "rejected-local-access")
@@ -1246,9 +1419,22 @@ mod tests {
         let manager =
             OAuthTokenManager::new_with_cache(Some(store.clone()), reqwest::Client::new(), cache);
         let new_meta = serde_json::json!({"refresh_token": "new-refresh"}).to_string();
+        let mutation_store = store.clone();
+        let mutation_provider_id = provider_id.to_string();
+        let mutation_meta = new_meta.clone();
 
         manager
-            .reset_tokens(provider_id, Some(new_meta.clone()))
+            .mutate_credentials_locked(
+                provider_id,
+                Box::new(move || {
+                    Box::pin(async move {
+                        mutation_store
+                            .set_provider_oauth_meta(&mutation_provider_id, &mutation_meta)
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                }),
+            )
             .await
             .unwrap();
 
