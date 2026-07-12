@@ -93,7 +93,7 @@ fn set_response_model(body: &mut Value, suite: ProtocolSuite, model: &str) {
 fn set_stream_response_model(body: &mut Value, suite: ProtocolSuite, model: &str) {
     // Error frames are not model responses. Preserve their wire shape so
     // provider-specific clients can continue to inspect error payloads.
-    if body.get("error").is_some() {
+    if body.get("error").is_some_and(|error| !error.is_null()) {
         return;
     }
 
@@ -251,5 +251,17 @@ mod tests {
             ResponseModelOverride::new(ProtocolSuite::OpenAiCompatible, "virtual/model")
                 .sse_rewriter();
         assert_eq!(rewriter.rewrite(input), input);
+    }
+
+    #[test]
+    fn rewrites_success_frame_with_null_error() {
+        let input =
+            b"data: {\"id\":\"c1\",\"model\":\"upstream\",\"error\":null,\"choices\":[]}\n\n";
+        let mut rewriter =
+            ResponseModelOverride::new(ProtocolSuite::OpenAiCompatible, "virtual/model")
+                .sse_rewriter();
+        let output = String::from_utf8(rewriter.rewrite(input)).unwrap_or_default();
+        assert!(output.contains("\"model\":\"virtual/model\""), "{output}");
+        assert!(output.contains("\"error\":null"), "{output}");
     }
 }

@@ -460,6 +460,19 @@ impl EndpointCodec for ChatCompletionsCodec {
         if let Some(value) = body.get("prompt_cache_retention") {
             extensions.insert("openai.prompt_cache_retention".to_string(), value.clone());
         }
+        // Preserve which Chat Completions token-limit field the caller used.
+        // This is protocol provenance, not model/routing knowledge: a later
+        // Chat encoder can replay the same field, while requests translated
+        // from another protocol fall back to the broadly-compatible legacy
+        // `max_tokens` field.
+        if body.get("max_completion_tokens").is_some() {
+            extensions.insert(
+                "openai.max_tokens_field".to_string(),
+                json!("max_completion_tokens"),
+            );
+        } else if body.get("max_tokens").is_some() {
+            extensions.insert("openai.max_tokens_field".to_string(), json!("max_tokens"));
+        }
 
         let params = tiygate_core::GenerationParams {
             // OpenAI 已弃用 max_tokens，推荐使用 max_completion_tokens（o-series 必须）
@@ -967,11 +980,17 @@ impl EndpointCodec for ChatCompletionsCodec {
             }
         }
 
-        // Generation params — OpenAI o-series / GPT-5 require
-        // max_completion_tokens; legacy max_tokens is deprecated and rejected
-        // by some upstreams, so emit only max_completion_tokens.
+        // Preserve the Chat field used at ingress. For cross-protocol requests
+        // there is no Chat provenance, so prefer the legacy field implemented
+        // by the widest set of OpenAI-compatible providers.
         if let Some(mt) = ir.params.max_tokens {
-            body["max_completion_tokens"] = json!(mt);
+            let field = ir
+                .extensions
+                .get("openai.max_tokens_field")
+                .and_then(Value::as_str)
+                .filter(|field| matches!(*field, "max_tokens" | "max_completion_tokens"))
+                .unwrap_or("max_tokens");
+            body[field] = json!(mt);
         }
         if let Some(t) = ir.params.temperature {
             body["temperature"] = json!(t);
@@ -3065,22 +3084,52 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_only_max_completion_tokens() {
+    fn test_max_token_field_provenance_is_preserved() {
         let codec = ChatCompletionsCodec::new();
         let env = make_raw_envelope();
-        let body = json!({
-            "model": "gpt-5.6",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 128
-        });
-        let ir = codec.decode_request(body, &env).unwrap();
-        assert_eq!(ir.params.max_tokens, Some(128));
+        for field in ["max_tokens", "max_completion_tokens"] {
+            let mut body = json!({
+                "model": "gpt-5.6",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            body[field] = json!(128);
+            let ir = codec.decode_request(body, &env).unwrap();
+            assert_eq!(ir.params.max_tokens, Some(128));
+            assert_eq!(
+                ir.extensions
+                    .get("openai.max_tokens_field")
+                    .and_then(Value::as_str),
+                Some(field)
+            );
+            let (encoded, _) = codec.encode_request(&ir).unwrap();
+            assert_eq!(encoded[field], 128, "{encoded}");
+            let other = if field == "max_tokens" {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            assert!(encoded.get(other).is_none(), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn test_cross_protocol_max_tokens_defaults_to_legacy_field() {
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let mut ir = codec
+            .decode_request(
+                json!({
+                    "model": "virtual-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_completion_tokens": 128
+                }),
+                &env,
+            )
+            .unwrap();
+        ir.extensions.remove("openai.max_tokens_field");
         let (encoded, _) = codec.encode_request(&ir).unwrap();
-        assert_eq!(encoded["max_completion_tokens"], 128);
-        assert!(
-            encoded.get("max_tokens").is_none(),
-            "legacy max_tokens must not be emitted: {encoded}"
-        );
+        assert_eq!(encoded["max_tokens"], 128, "{encoded}");
+        assert!(encoded.get("max_completion_tokens").is_none(), "{encoded}");
     }
 
     #[test]

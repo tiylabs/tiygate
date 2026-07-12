@@ -45,5 +45,7 @@ IrRequest {
         version: "v1",
     },
     metadata: None,
-    extensions: {},
+    extensions: {
+        "openai.max_tokens_field": String("max_tokens"),
+    },
 }

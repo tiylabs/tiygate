@@ -2185,10 +2185,10 @@ pub struct ResponsesStreamEncoder {
     /// the terminal reasoning `output_item.done` and the reconstructed
     /// `response.completed.output` item for cross-turn replay.
     reasoning_encrypted: Option<String>,
-    /// PTC (program / program_output) items emitted during the stream, in
-    /// arrival order, so `response.completed.output` can reconstruct them
-    /// for strict clients that rely on the terminal snapshot.
-    program_items: Vec<Value>,
+    /// PTC (program / program_output) items emitted during the stream, paired
+    /// with their allocated output indexes so the terminal snapshot preserves
+    /// the same ordering as incremental lifecycle events.
+    program_items: Vec<(u32, Value)>,
     /// Original Responses wire type per call_id (function_call/custom_tool_call/local_shell_call).
     tool_wire_types: HashMap<String, String>,
     /// Responses item id (fc_*) per call_id when distinct from the call id.
@@ -2419,10 +2419,10 @@ impl ResponsesStreamEncoder {
                 }
             }
         }
-        // Build the output array so clients can reconstruct items from
-        // response.completed even when incremental events were missed.
-        let mut output = Vec::<Value>::new();
-        if self.reasoning_output_index.is_some() {
+        // Build the output array in output_index order so clients reconstruct
+        // the same item sequence even when incremental events were missed.
+        let mut indexed_output = Vec::<(u32, Value)>::new();
+        if let Some(index) = self.reasoning_output_index {
             let item_id = self.reasoning_item_id();
             let summary = if self.reasoning_text.is_empty() {
                 json!([])
@@ -2438,26 +2438,27 @@ impl ResponsesStreamEncoder {
             if let Some(enc) = &self.reasoning_encrypted {
                 item["encrypted_content"] = json!(enc);
             }
-            output.push(item);
+            indexed_output.push((index, item));
         }
-        if self.text_output_index.is_some() {
+        if let Some(index) = self.text_output_index {
             let item_id = format!("{}_msg", id);
-            output.push(json!({
-                "id": item_id,
-                "type": "message",
-                "role": "assistant",
-                "status": status,
-                "content": [{
-                    "type": "output_text",
-                    "text": &self.text,
-                    "annotations": []
-                }]
-            }));
+            indexed_output.push((
+                index,
+                json!({
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": status,
+                    "content": [{
+                        "type": "output_text",
+                        "text": &self.text,
+                        "annotations": []
+                    }]
+                }),
+            ));
         }
-        // PTC items (program / program_output) in arrival order, so strict
-        // clients that reconstruct from response.completed.output see them.
-        for item in &self.program_items {
-            output.push(item.clone());
+        for (index, item) in &self.program_items {
+            indexed_output.push((*index, item.clone()));
         }
         for call_id in self.tool_output_order.clone() {
             let name = self.tool_names.get(&call_id).cloned().unwrap_or_default();
@@ -2511,8 +2512,15 @@ impl ResponsesStreamEncoder {
             if let Some(caller) = self.tool_callers.get(&call_id) {
                 item["caller"] = json!(caller);
             }
-            output.push(item);
+            let index = self
+                .tool_output_indices
+                .get(&call_id)
+                .copied()
+                .unwrap_or(u32::MAX);
+            indexed_output.push((index, item));
         }
+        indexed_output.sort_by_key(|(index, _)| *index);
+        let output: Vec<Value> = indexed_output.into_iter().map(|(_, item)| item).collect();
         if !output.is_empty() {
             response["output"] = json!(output);
         }
@@ -2638,7 +2646,7 @@ impl StreamEncoder for ResponsesStreamEncoder {
                     "code": code,
                     "fingerprint": fingerprint,
                 });
-                self.program_items.push(item.clone());
+                self.program_items.push((idx, item.clone()));
                 let mut out = self.event(json!({
                     "type": "response.output_item.added",
                     "output_index": idx,
@@ -2666,7 +2674,7 @@ impl StreamEncoder for ResponsesStreamEncoder {
                     "result": result,
                     "status": status,
                 });
-                self.program_items.push(item.clone());
+                self.program_items.push((idx, item.clone()));
                 let mut out = self.event(json!({
                     "type": "response.output_item.added",
                     "output_index": idx,
@@ -3439,6 +3447,65 @@ mod tests {
             s.contains("\"id\":\"progo_1\""),
             "completed output must carry program_output id, got: {s}"
         );
+    }
+
+    #[test]
+    fn test_stream_completed_output_preserves_output_index_order() {
+        let mut encoder = ResponsesStreamEncoder::new();
+        let _ = encoder
+            .encode_part(&StreamPart::ResponseStarted {
+                id: "resp_1".to_string(),
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::ProgramDelta {
+                id: "prog_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                code: "return 1".to_string(),
+                fingerprint: "fp".to_string(),
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::TextDelta {
+                text: "after program".to_string(),
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::ToolCallDelta {
+                id: "call_1".to_string(),
+                name: Some("lookup".to_string()),
+                arguments: "{}".to_string(),
+                wire_type: None,
+                item_id: Some("fc_1".to_string()),
+                caller: None,
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        let completed = String::from_utf8(
+            encoder
+                .encode_part(&StreamPart::Usage {
+                    usage: Usage::default(),
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let event: Value = completed
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str(payload).ok())
+            .find(|event: &Value| event["type"] == "response.completed")
+            .expect("response.completed event");
+        let types: Vec<&str> = event["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+        assert_eq!(types, vec!["program", "message", "function_call"]);
     }
 
     #[test]
