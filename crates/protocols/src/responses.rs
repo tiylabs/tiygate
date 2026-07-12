@@ -112,6 +112,24 @@ fn decode_prompt_cache_breakpoint(part: &Value) -> Option<PromptCacheBreakpoint>
     )
 }
 
+/// Chat Completions labels custom calls as `custom`, while Responses uses
+/// `custom_tool_call`. Both forms may enter the shared IR during a
+/// cross-protocol conversion.
+fn is_responses_custom_tool_call(wire_type: Option<&str>) -> bool {
+    matches!(wire_type, Some("custom") | Some("custom_tool_call"))
+}
+
+/// Recover a custom tool's free-form input from either OpenAI protocol's IR
+/// representation.
+fn responses_custom_tool_input(arguments: &Value) -> String {
+    arguments
+        .get("input")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| arguments.as_str().map(String::from))
+        .unwrap_or_else(|| arguments.to_string())
+}
+
 /// Map Responses `text.format` into the shared IR `response_format` so Chat ↔
 /// Responses Convert can carry structured-output constraints both ways.
 fn decode_text_format(text: &Value) -> Option<tiygate_core::ResponseFormat> {
@@ -1060,18 +1078,8 @@ impl EndpointCodec for ResponsesCodec {
                     // otherwise fall back to `id` (cross-protocol).
                     let wire_call_id = call_id.as_deref().unwrap_or(id);
                     let item_type = wire_type.as_deref().unwrap_or("function_call");
-                    let mut tc = if item_type == "custom_tool_call" {
-                        let input = arguments
-                            .get("input")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                            .unwrap_or_else(|| {
-                                if let Value::String(s) = arguments {
-                                    s.clone()
-                                } else {
-                                    arguments.to_string()
-                                }
-                            });
+                    let mut tc = if is_responses_custom_tool_call(wire_type.as_deref()) {
+                        let input = responses_custom_tool_input(arguments);
                         json!({
                             "type": "custom_tool_call",
                             "call_id": wire_call_id,
@@ -1392,18 +1400,9 @@ impl EndpointCodec for ResponsesCodec {
                                 flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 let wire_call_id = call_id.as_deref().unwrap_or(id);
                                 let item_type = wire_type.as_deref().unwrap_or("function_call");
-                                let mut fc = if item_type == "custom_tool_call" {
-                                    let input = arguments
-                                        .get("input")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from)
-                                        .unwrap_or_else(|| {
-                                            if let Value::String(s) = arguments {
-                                                s.clone()
-                                            } else {
-                                                arguments.to_string()
-                                            }
-                                        });
+                                let mut fc = if is_responses_custom_tool_call(wire_type.as_deref())
+                                {
+                                    let input = responses_custom_tool_input(arguments);
                                     json!({
                                         "type": "custom_tool_call",
                                         "call_id": wire_call_id,
@@ -2277,7 +2276,11 @@ impl ResponsesStreamEncoder {
             .entry(id.to_string())
             .or_insert_with(|| name.to_string());
         self.tool_arguments.entry(id.to_string()).or_default();
-        if let Some(wt) = wire_type {
+        if is_responses_custom_tool_call(wire_type) {
+            self.tool_wire_types
+                .entry(id.to_string())
+                .or_insert_with(|| "custom_tool_call".to_string());
+        } else if let Some(wt) = wire_type {
             self.tool_wire_types
                 .entry(id.to_string())
                 .or_insert_with(|| wt.to_string());
@@ -2295,7 +2298,11 @@ impl ResponsesStreamEncoder {
         if already_open {
             return String::new();
         }
-        let item_type = wire_type.unwrap_or("function_call");
+        let item_type = if is_responses_custom_tool_call(wire_type) {
+            "custom_tool_call"
+        } else {
+            wire_type.unwrap_or("function_call")
+        };
         let wire_item_id = self.tool_item_ids.get(id).map(String::as_str).unwrap_or(id);
         let mut item = if item_type == "custom_tool_call" {
             json!({"id": wire_item_id, "call_id": id, "type": "custom_tool_call", "name": name, "input": "", "status": "in_progress"})
@@ -2317,7 +2324,17 @@ impl ResponsesStreamEncoder {
             .or_default()
             .push_str(arguments);
         let item_id = self.tool_item_ids.get(id).map(String::as_str).unwrap_or(id);
-        self.event(json!({"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": idx, "delta": arguments}))
+        let item_type = self
+            .tool_wire_types
+            .get(id)
+            .map(String::as_str)
+            .unwrap_or("function_call");
+        let event_type = if item_type == "custom_tool_call" {
+            "response.custom_tool_call_input.delta"
+        } else {
+            "response.function_call_arguments.delta"
+        };
+        self.event(json!({"type": event_type, "item_id": item_id, "output_index": idx, "delta": arguments}))
     }
 
     fn close_tool_calls(&mut self, status: &str) -> String {
@@ -2349,8 +2366,9 @@ impl ResponsesStreamEncoder {
             let mut item = if item_type == "custom_tool_call" {
                 let input = serde_json::from_str::<Value>(&arguments)
                     .ok()
-                    .and_then(|v| v.get("input").and_then(|x| x.as_str()).map(str::to_string))
+                    .map(|value| responses_custom_tool_input(&value))
                     .unwrap_or(arguments);
+                out.push_str(&self.event(json!({"type": "response.custom_tool_call_input.done", "item_id": wire_item_id, "output_index": idx, "input": input.clone()})));
                 json!({"id": wire_item_id, "call_id": call_id, "type": "custom_tool_call", "name": name, "input": input, "status": status})
             } else if item_type == "local_shell_call" {
                 let action = serde_json::from_str::<Value>(&arguments).unwrap_or(json!({}));
@@ -2805,6 +2823,10 @@ pub struct ResponsesStreamDecoder {
     /// (`response.output_item.added` or `.done`). Attached to a `ReasoningDelta`
     /// once and then cleared.
     pending_reasoning_encrypted: Option<String>,
+    /// Accumulated custom-tool input by call id. The `.done` event repeats the
+    /// complete input, so this lets us forward only a suffix that was not
+    /// already delivered via `.delta`.
+    custom_tool_inputs: HashMap<String, String>,
 }
 impl Default for ResponsesStreamDecoder {
     fn default() -> Self {
@@ -2821,6 +2843,7 @@ impl ResponsesStreamDecoder {
             saw_function_call: false,
             pending_reasoning_id: None,
             pending_reasoning_encrypted: None,
+            custom_tool_inputs: HashMap::new(),
         }
     }
 }
@@ -2958,17 +2981,29 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     // Codex custom_tool_call: treat as a tool call so the
                     // streaming finish_reason is ToolCalls, not Stop.
                     self.saw_function_call = true;
+                    let item_id = item["id"].as_str().unwrap_or("").to_string();
                     let id = responses_call_id(item).unwrap_or("").to_string();
                     let name = item["name"].as_str().unwrap_or("").to_string();
                     let input_text = item["input"].as_str().unwrap_or("").to_string();
+                    let dual_item_id = if !item_id.is_empty() && item_id != id {
+                        Some(item_id.clone())
+                    } else {
+                        None
+                    };
+                    self.function_calls
+                        .insert(item_id, (id.clone(), Some(name.clone())));
+                    if !input_text.is_empty() {
+                        self.custom_tool_inputs
+                            .insert(id.clone(), input_text.clone());
+                    }
                     self.current_call_id = Some(id.clone());
                     parts.push(StreamPart::ToolCallDelta {
                         id,
                         name: Some(name),
-                        arguments: json!({"input": input_text}).to_string(),
+                        arguments: input_text,
                         wire_type: Some("custom_tool_call".to_string()),
-                        item_id: None,
-                        caller: None,
+                        item_id: dual_item_id,
+                        caller: decode_tool_caller(item),
                     });
                 }
             }
@@ -2990,6 +3025,50 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         item_id: None,
                         caller: None,
                     });
+                }
+            }
+            Some("response.custom_tool_call_input.delta") => {
+                if let Some(input) = event["delta"].as_str() {
+                    let id = event["item_id"]
+                        .as_str()
+                        .and_then(|item_id| self.function_calls.get(item_id))
+                        .map(|(call_id, _)| call_id.clone())
+                        .or_else(|| self.current_call_id.clone())
+                        .unwrap_or_default();
+                    self.custom_tool_inputs
+                        .entry(id.clone())
+                        .or_default()
+                        .push_str(input);
+                    parts.push(StreamPart::ToolCallDelta {
+                        id,
+                        name: None,
+                        arguments: input.to_string(),
+                        wire_type: Some("custom_tool_call".to_string()),
+                        item_id: None,
+                        caller: None,
+                    });
+                }
+            }
+            Some("response.custom_tool_call_input.done") => {
+                if let Some(input) = event["input"].as_str() {
+                    let id = event["item_id"]
+                        .as_str()
+                        .and_then(|item_id| self.function_calls.get(item_id))
+                        .map(|(call_id, _)| call_id.clone())
+                        .or_else(|| self.current_call_id.clone())
+                        .unwrap_or_default();
+                    let delivered = self.custom_tool_inputs.remove(&id).unwrap_or_default();
+                    let remaining = input.strip_prefix(&delivered).unwrap_or(input);
+                    if !remaining.is_empty() {
+                        parts.push(StreamPart::ToolCallDelta {
+                            id,
+                            name: None,
+                            arguments: remaining.to_string(),
+                            wire_type: Some("custom_tool_call".to_string()),
+                            item_id: None,
+                            caller: None,
+                        });
+                    }
                 }
             }
             Some("response.output_item.done") => {
@@ -3020,7 +3099,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     // Already emitted on output_item.added; ignore done to
                     // avoid duplicate ProgramDelta / ProgramOutputDelta.
                 }
-                if item["type"] == "function_call" {
+                if item["type"] == "function_call" || item["type"] == "custom_tool_call" {
                     if let Some(item_id) = item["id"].as_str() {
                         self.function_calls.remove(item_id);
                     }
@@ -5563,6 +5642,59 @@ mod tests {
             !s.contains(r#""type":"function_call""#),
             "stream re-encode must not collapse custom_tool_call to function_call: {s}"
         );
+
+        let delta = decoder
+            .feed(r#"data: {"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_1","delta":" world"}"#)
+            .unwrap();
+        assert!(matches!(
+            &delta[0],
+            StreamPart::ToolCallDelta {
+                id,
+                name: None,
+                arguments,
+                wire_type: Some(wire_type),
+                ..
+            } if id == "call_custom_1" && arguments == " world" && wire_type == "custom_tool_call"
+        ));
+        let encoded_delta = encoder.encode_part(&delta[0]).unwrap();
+        let encoded_delta = String::from_utf8_lossy(&encoded_delta);
+        assert!(
+            encoded_delta.contains(r#""type":"response.custom_tool_call_input.delta""#),
+            "custom inputs must use their native delta event: {encoded_delta}"
+        );
+        assert!(
+            !encoded_delta.contains(r#""type":"response.function_call_arguments.delta""#),
+            "custom inputs must not use function-call delta events: {encoded_delta}"
+        );
+
+        let done = encoder
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        let done = String::from_utf8_lossy(&done);
+        assert!(
+            done.contains(r#""type":"response.custom_tool_call_input.done""#),
+            "custom inputs must emit their native done event: {done}"
+        );
+
+        let mut done_only_decoder = ResponsesStreamDecoder::new();
+        done_only_decoder
+            .feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_2","call_id":"call_custom_2","name":"my_tool","input":""}}"#)
+            .unwrap();
+        let done_only = done_only_decoder
+            .feed(r#"data: {"type":"response.custom_tool_call_input.done","output_index":0,"item_id":"ctc_2","input":"final input"}"#)
+            .unwrap();
+        assert!(matches!(
+            &done_only[0],
+            StreamPart::ToolCallDelta {
+                id,
+                name: None,
+                arguments,
+                wire_type: Some(wire_type),
+                ..
+            } if id == "call_custom_2" && arguments == "final input" && wire_type == "custom_tool_call"
+        ));
     }
 
     #[test]

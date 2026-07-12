@@ -98,10 +98,10 @@
 | `budget_tokens` | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinking.budget_tokens`，enabled 类型) | ✅ → 推导 effort（`budget_to_effort`） | ✅ (Gemini 2.5 `thinkingConfig.thinkingBudget`；3+ → 推导 `thinkingLevel`) | N/A |
 | `display` (summarized/omitted) | ⚠️ → 丢弃 | ✅ (`thinking.display`) | ⚠️ → 丢弃 | ✅ → 推导 `includeThoughts` | N/A |
 | `include_thoughts` | ⚠️ → 丢弃 | ✅ → 推导 `display`（需同时有 effort 或 budget_tokens） | ⚠️ → 丢弃 | ✅ (`thinkingConfig.includeThoughts`) | N/A |
-| `mode` (e.g. `pro`) | ⚠️ → 丢弃 | ⚠️ → 丢弃 | ✅ (`reasoning.mode`) | ⚠️ → 丢弃 | N/A |
-| `context` (persisted reasoning) | ⚠️ → 丢弃 | ⚠️ → 丢弃 | ✅ (`reasoning.context`) | ⚠️ → 丢弃 | N/A |
+| `mode` (e.g. `pro`) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ (`reasoning.mode`) | ❌ 跨协议拒绝 | N/A |
+| `context` (persisted reasoning) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ (`reasoning.context`) | ❌ 跨协议拒绝 | N/A |
 
-**跨协议策略**：thinking 配置跨协议时映射或丢弃，不拒绝（thinking 配置不影响语义正确性，只影响模型行为质量）。`mode` / `context` 仅 Responses 一等支持；跨协议静默丢弃。
+**跨协议策略**：普通 thinking 配置跨协议时映射或丢弃，不拒绝（thinking 配置不影响语义正确性，只影响模型行为质量）。`mode` / `context` 是 Responses-only 的持久化推理控制；向其他协议转换会以 `LossyDimension::ExtendedReasoning` 明确拒绝，避免静默改变请求行为。
 
 **effort 级别映射**：IR 使用 7 级枚举（None/Minimal/Low/Medium/High/XHigh/Max）。各协议支持级别不同：
 - OpenAI Chat/Responses: none/minimal/low/medium/high/xhigh/**max**；server 按真实 upstream model 判定，仅 GPT-5.6 系列保留 max，旧模型降为 xhigh。

@@ -33,6 +33,28 @@ fn error_type_for_class(class: ErrorClass) -> &'static str {
     }
 }
 
+/// Whether an IR tool-call originated from either OpenAI custom-tool wire
+/// shape. Chat Completions uses `"custom"`; Responses uses
+/// `"custom_tool_call"`. Treat both as custom when crossing between the two
+/// OpenAI protocols.
+fn is_openai_custom_tool_call(wire_type: Option<&str>) -> bool {
+    matches!(wire_type, Some("custom") | Some("custom_tool_call"))
+}
+
+/// Recover the free-form input carried by an OpenAI custom tool call.
+///
+/// Chat Completions represents it as a string, while the Responses decoder
+/// may preserve it as `{ "input": "..." }`. Supporting both keeps the
+/// canonical IR usable in either direction.
+fn custom_tool_input(arguments: &Value) -> String {
+    arguments
+        .get("input")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| arguments.as_str().map(String::from))
+        .unwrap_or_else(|| arguments.to_string())
+}
+
 /// Chat Completions protocol identity.
 pub const CHAT_COMPLETIONS_ID: ProtocolEndpoint = ProtocolEndpoint {
     suite: ProtocolSuite::OpenAiCompatible,
@@ -186,25 +208,39 @@ impl EndpointCodec for ChatCompletionsCodec {
                 // unknown id (upstream 400 invalid_params).
                 if let Some(tool_calls) = msg["tool_calls"].as_array() {
                     for tc in tool_calls {
-                        let arguments = match &tc["function"]["arguments"] {
-                            // OpenAI sends arguments as a JSON string; parse to
-                            // object. If it is not valid JSON, preserve the raw
-                            // string as a JSON string value rather than dropping
-                            // it to `{}`, so non-standard payloads survive.
-                            serde_json::Value::String(s) => serde_json::from_str(s)
-                                .unwrap_or_else(|_| serde_json::Value::String(s.clone())),
-                            // Some compatible providers may already send an object.
-                            serde_json::Value::Null => json!({}),
-                            other => other.clone(),
-                        };
-                        content.push(Content::ToolCall {
-                            id: tc["id"].as_str().unwrap_or("").to_string(),
-                            name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                            arguments,
-                            call_id: None,
-                            caller: None,
-                            wire_type: None,
-                        });
+                        if tc["type"].as_str() == Some("custom") {
+                            content.push(Content::ToolCall {
+                                id: tc["id"].as_str().unwrap_or("").to_string(),
+                                name: tc["custom"]["name"].as_str().unwrap_or("").to_string(),
+                                arguments: tc["custom"]["input"]
+                                    .as_str()
+                                    .map(|input| Value::String(input.to_string()))
+                                    .unwrap_or_else(|| Value::String(String::new())),
+                                call_id: None,
+                                caller: None,
+                                wire_type: Some("custom".to_string()),
+                            });
+                        } else {
+                            let arguments = match &tc["function"]["arguments"] {
+                                // OpenAI sends arguments as a JSON string; parse to
+                                // object. If it is not valid JSON, preserve the raw
+                                // string as a JSON string value rather than dropping
+                                // it to `{}`, so non-standard payloads survive.
+                                serde_json::Value::String(s) => serde_json::from_str(s)
+                                    .unwrap_or_else(|_| serde_json::Value::String(s.clone())),
+                                // Some compatible providers may already send an object.
+                                serde_json::Value::Null => json!({}),
+                                other => other.clone(),
+                            };
+                            content.push(Content::ToolCall {
+                                id: tc["id"].as_str().unwrap_or("").to_string(),
+                                name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
+                                arguments,
+                                call_id: None,
+                                caller: None,
+                                wire_type: None,
+                            });
+                        }
                     }
                 }
 
@@ -565,17 +601,29 @@ impl EndpointCodec for ChatCompletionsCodec {
                     name,
                     arguments,
                     call_id,
+                    wire_type,
                     ..
                 } => {
                     let wire_id = call_id.as_deref().unwrap_or(id);
-                    tool_calls_json.push(json!({
-                        "id": wire_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": serde_json::to_string(arguments).unwrap_or_default(),
-                        }
-                    }));
+                    if is_openai_custom_tool_call(wire_type.as_deref()) {
+                        tool_calls_json.push(json!({
+                            "id": wire_id,
+                            "type": "custom",
+                            "custom": {
+                                "name": name,
+                                "input": custom_tool_input(arguments),
+                            }
+                        }));
+                    } else {
+                        tool_calls_json.push(json!({
+                            "id": wire_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": serde_json::to_string(arguments).unwrap_or_default(),
+                            }
+                        }));
+                    }
                 }
                 Content::Refusal { text, .. } => {
                     if !message_refusal.is_empty() {
@@ -735,6 +783,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         name,
                         arguments,
                         call_id,
+                        wire_type,
                         ..
                     } => {
                         // Prefer normalized function-call id when present
@@ -742,18 +791,29 @@ impl EndpointCodec for ChatCompletionsCodec {
                         let wire_id = call_id.as_deref().unwrap_or(id);
                         // Re-emit the tool call on the assistant message so the
                         // downstream API sees a self-consistent turn.
-                        let args_str = match arguments {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        tool_calls_json.push(json!({
-                            "id": wire_id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": args_str,
-                            }
-                        }));
+                        if is_openai_custom_tool_call(wire_type.as_deref()) {
+                            tool_calls_json.push(json!({
+                                "id": wire_id,
+                                "type": "custom",
+                                "custom": {
+                                    "name": name,
+                                    "input": custom_tool_input(arguments),
+                                }
+                            }));
+                        } else {
+                            let args_str = match arguments {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            tool_calls_json.push(json!({
+                                "id": wire_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": args_str,
+                                }
+                            }));
+                        }
                     }
                     Content::Media {
                         source,
@@ -1109,18 +1169,32 @@ impl EndpointCodec for ChatCompletionsCodec {
                 // Tool calls
                 if let Some(tc_arr) = msg["tool_calls"].as_array() {
                     for tc in tc_arr {
-                        let args: serde_json::Value = serde_json::from_str(
-                            tc["function"]["arguments"].as_str().unwrap_or("{}"),
-                        )
-                        .unwrap_or(json!({}));
-                        content.push(Content::ToolCall {
-                            id: tc["id"].as_str().unwrap_or("").to_string(),
-                            name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                            arguments: args,
-                            call_id: None,
-                            caller: None,
-                            wire_type: None,
-                        });
+                        if tc["type"].as_str() == Some("custom") {
+                            content.push(Content::ToolCall {
+                                id: tc["id"].as_str().unwrap_or("").to_string(),
+                                name: tc["custom"]["name"].as_str().unwrap_or("").to_string(),
+                                arguments: tc["custom"]["input"]
+                                    .as_str()
+                                    .map(|input| Value::String(input.to_string()))
+                                    .unwrap_or_else(|| Value::String(String::new())),
+                                call_id: None,
+                                caller: None,
+                                wire_type: Some("custom".to_string()),
+                            });
+                        } else {
+                            let args: serde_json::Value = serde_json::from_str(
+                                tc["function"]["arguments"].as_str().unwrap_or("{}"),
+                            )
+                            .unwrap_or(json!({}));
+                            content.push(Content::ToolCall {
+                                id: tc["id"].as_str().unwrap_or("").to_string(),
+                                name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
+                                arguments: args,
+                                call_id: None,
+                                caller: None,
+                                wire_type: None,
+                            });
+                        }
                     }
                 }
 
@@ -2926,6 +3000,68 @@ mod tests {
         assert_eq!(encoded["tools"][0]["type"], "custom");
         assert_eq!(encoded["tools"][0]["name"], "code_exec");
         assert_eq!(encoded["tools"][0]["format"]["type"], "text");
+    }
+
+    #[test]
+    fn test_custom_tool_calls_survive_chat_responses_conversion() {
+        let chat = ChatCompletionsCodec::new();
+        let responses = crate::responses::ResponsesCodec::new();
+        let env = make_raw_envelope();
+
+        let request = json!({
+            "model": "gpt-5.6",
+            "messages": [
+                {"role": "user", "content": "run this"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_custom_1",
+                        "type": "custom",
+                        "custom": {"name": "code_exec", "input": "print(1)"}
+                    }]
+                }
+            ]
+        });
+        let request_ir = chat.decode_request(request, &env).unwrap();
+        let (responses_request, _) = responses.encode_request(&request_ir).unwrap();
+        assert!(responses_request["input"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "custom_tool_call"
+                    && item["name"] == "code_exec"
+                    && item["input"] == "print(1)"
+            })
+        }));
+
+        let response = json!({
+            "id": "chatcmpl_1",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_custom_2",
+                        "type": "custom",
+                        "custom": {"name": "code_exec", "input": "print(2)"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response_ir = chat.decode_response(response).unwrap();
+        let chat_response = chat.encode_response(&response_ir).unwrap();
+        assert_eq!(
+            chat_response["choices"][0]["message"]["tool_calls"][0]["type"],
+            "custom"
+        );
+        assert_eq!(
+            chat_response["choices"][0]["message"]["tool_calls"][0]["custom"]["input"],
+            "print(2)"
+        );
+
+        let responses_response = responses.encode_response(&response_ir).unwrap();
+        assert_eq!(responses_response["output"][0]["type"], "custom_tool_call");
+        assert_eq!(responses_response["output"][0]["input"], "print(2)");
     }
 
     #[test]
