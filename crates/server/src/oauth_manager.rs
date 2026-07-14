@@ -302,9 +302,16 @@ impl OAuthTokenManager {
         if self.token_store.is_none() {
             return Ok(OAuthRefreshOutcome::Skipped);
         }
-        self.refresh_coordinated(provider_id, OAuthRefreshMode::Keepalive, None, false)
+        let result = self
+            .refresh_coordinated(provider_id, OAuthRefreshMode::Keepalive, None, false)
             .await
-            .map(|(_, outcome)| outcome)
+            .map(|(_, outcome)| outcome);
+        if result.is_err() {
+            if let Err(error) = self.ensure_keepalive_preflight_backoff(provider_id).await {
+                warn!(provider = %provider_id, error = %error, "failed to persist OAuth keepalive preflight backoff");
+            }
+        }
+        result
     }
 
     pub async fn due_keepalive_provider_ids(&self, limit: i64) -> Result<Vec<String>, String> {
@@ -315,6 +322,92 @@ impl OAuthTokenManager {
             .list_due_provider_ids(Utc::now(), limit)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn ensure_keepalive_preflight_backoff(&self, provider_id: &str) -> Result<(), String> {
+        let token_store = self
+            .token_store
+            .as_ref()
+            .ok_or_else(|| "OAuth token store is unavailable".to_string())?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "OAuth config store is unavailable".to_string())?;
+        let local_lock = self
+            .local_refresh_locks
+            .entry(provider_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = local_lock.lock().await;
+
+        match token_store.kind() {
+            DbKind::Sqlite => {
+                let Some(provider) = store
+                    .get_provider(provider_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(());
+                };
+                if provider_has_usable_oauth_credentials(&provider) {
+                    return Ok(());
+                }
+                let state = token_store
+                    .load(provider_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if state.as_ref().is_some_and(refresh_backoff_is_active) {
+                    return Ok(());
+                }
+                let failure_count = state.map_or(0, |state| state.failure_count);
+                token_store
+                    .record_failure(
+                        provider_id,
+                        next_retry_at(OAuthRefreshFailureKind::Transient, failure_count),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            DbKind::Postgres => {
+                let Some(mut tx) = token_store
+                    .try_begin_postgres_refresh(provider_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(());
+                };
+                let Some(provider) = store
+                    .get_provider_in_transaction(&mut tx, provider_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                else {
+                    tx.commit().await.map_err(|error| error.to_string())?;
+                    return Ok(());
+                };
+                if provider_has_usable_oauth_credentials(&provider) {
+                    tx.commit().await.map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+                let state = token_store
+                    .load_in_transaction(&mut tx, provider_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if state.as_ref().is_some_and(refresh_backoff_is_active) {
+                    tx.commit().await.map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+                let failure_count = state.map_or(0, |state| state.failure_count);
+                token_store
+                    .record_failure_in_transaction(
+                        &mut tx,
+                        provider_id,
+                        next_retry_at(OAuthRefreshFailureKind::Transient, failure_count),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tx.commit().await.map_err(|error| error.to_string())
+            }
+        }
     }
 
     async fn ensure_provider_token(
@@ -354,7 +447,7 @@ impl OAuthTokenManager {
             .clone();
         let _local_guard = local_lock.lock().await;
 
-        let config = self.load_oauth_config(provider_id).await?;
+        let (provider, config) = self.load_oauth_provider(provider_id).await?;
         if mode == OAuthRefreshMode::IfNeeded
             && self
                 .reuse_shared_token(provider_id, &config, rejected_access_token)
@@ -362,29 +455,32 @@ impl OAuthTokenManager {
         {
             return Ok((config, OAuthRefreshOutcome::ReusedShared));
         }
+        let keepalive_interval = self.keepalive_interval().await;
 
         match token_store.kind() {
             DbKind::Sqlite => {
-                if mode != OAuthRefreshMode::Force {
-                    if let Some(state) = token_store
-                        .load(provider_id)
-                        .await
-                        .map_err(|error| error.to_string())?
-                    {
-                        if refresh_backoff_is_active(&state) {
-                            if mode == OAuthRefreshMode::Keepalive {
-                                return Ok((config, OAuthRefreshOutcome::Skipped));
-                            }
-                            return Err(refresh_backoff_error());
-                        }
+                let state = token_store
+                    .load(provider_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if mode != OAuthRefreshMode::Force
+                    && state.as_ref().is_some_and(refresh_backoff_is_active)
+                {
+                    if mode == OAuthRefreshMode::Keepalive {
+                        return Ok((config, OAuthRefreshOutcome::Skipped));
                     }
+                    return Err(refresh_backoff_error());
                 }
                 if mode == OAuthRefreshMode::Keepalive
-                    && !self.keepalive_is_due(provider_id).await?
+                    && state
+                        .as_ref()
+                        .and_then(|state| state.next_keepalive_at)
+                        .is_some_and(|next| next > Utc::now())
                 {
                     return Ok((config, OAuthRefreshOutcome::Skipped));
                 }
-                self.perform_refresh(provider_id, None).await
+                self.perform_refresh(provider_id, provider, config, keepalive_interval, None)
+                    .await
             }
             DbKind::Postgres => {
                 let deadline = Instant::now() + REFRESH_LOCK_WAIT;
@@ -395,7 +491,21 @@ impl OAuthTokenManager {
                         .map_err(|error| error.to_string())?
                     {
                         Some(mut tx) => {
-                            let current_config = self.load_oauth_config(provider_id).await?;
+                            let store = self
+                                .store
+                                .as_ref()
+                                .ok_or_else(|| "OAuth config store is unavailable".to_string())?;
+                            let current_provider = store
+                                .get_provider_in_transaction(&mut tx, provider_id)
+                                .await
+                                .map_err(|error| error.to_string())?
+                                .ok_or_else(|| format!("provider {provider_id} not found"))?;
+                            let current_config = build_oauth_target_config(&current_provider)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "provider {provider_id} has no usable OAuth configuration"
+                                    )
+                                })?;
                             let state = token_store
                                 .load_in_transaction(&mut tx, provider_id)
                                 .await
@@ -422,14 +532,23 @@ impl OAuthTokenManager {
                                 return Err(refresh_backoff_error());
                             }
                             if mode == OAuthRefreshMode::Keepalive
-                                && !self
-                                    .keepalive_is_due_in_transaction(provider_id, &mut tx)
-                                    .await?
+                                && state
+                                    .as_ref()
+                                    .and_then(|state| state.next_keepalive_at)
+                                    .is_some_and(|next| next > Utc::now())
                             {
                                 tx.commit().await.map_err(|error| error.to_string())?;
                                 return Ok((current_config, OAuthRefreshOutcome::Skipped));
                             }
-                            return self.perform_refresh(provider_id, Some(tx)).await;
+                            return self
+                                .perform_refresh(
+                                    provider_id,
+                                    current_provider,
+                                    current_config,
+                                    keepalive_interval,
+                                    Some(tx),
+                                )
+                                .await;
                         }
                         None if !wait_for_lock => {
                             return Ok((config, OAuthRefreshOutcome::Skipped));
@@ -457,19 +576,11 @@ impl OAuthTokenManager {
     async fn perform_refresh(
         &self,
         provider_id: &str,
+        provider: tiygate_store::models::Provider,
+        config: OAuthTargetConfig,
+        keepalive_interval: Duration,
         tx: Option<sqlx::Transaction<'static, sqlx::Any>>,
     ) -> Result<(OAuthTargetConfig, OAuthRefreshOutcome), String> {
-        let store = self
-            .store
-            .as_ref()
-            .ok_or_else(|| "OAuth config store is unavailable".to_string())?;
-        let provider = store
-            .get_provider(provider_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("provider {provider_id} not found"))?;
-        let config = build_oauth_target_config(&provider)
-            .ok_or_else(|| format!("provider {provider_id} has no usable OAuth configuration"))?;
         if config.refresh_token.is_empty() {
             return Err(format!("provider {provider_id} has no refresh token"));
         }
@@ -497,8 +608,7 @@ impl OAuthTokenManager {
             Ok(result) => result,
             Err(error) => {
                 let kind = classify_refresh_failure(&error);
-                self.record_refresh_failure(provider_id, &error).await;
-                drop(tx);
+                self.record_refresh_failure(&provider, kind, tx).await;
                 return Err(format!(
                     "OAuth credential refresh failed: {}",
                     kind.status_reason()
@@ -506,8 +616,15 @@ impl OAuthTokenManager {
             }
         };
 
-        self.persist_token_result(provider_id, &provider, &config, result, tx)
-            .await
+        self.persist_token_result(
+            provider_id,
+            &provider,
+            &config,
+            result,
+            keepalive_interval,
+            tx,
+        )
+        .await
     }
 
     async fn persist_token_result(
@@ -516,6 +633,7 @@ impl OAuthTokenManager {
         provider: &tiygate_store::models::Provider,
         config: &OAuthTargetConfig,
         result: TokenResult,
+        keepalive_interval: Duration,
         mut tx: Option<sqlx::Transaction<'static, sqlx::Any>>,
     ) -> Result<(OAuthTargetConfig, OAuthRefreshOutcome), String> {
         let store = self
@@ -570,7 +688,6 @@ impl OAuthTokenManager {
             .expires_in
             .and_then(|duration| chrono::Duration::from_std(duration).ok())
             .map(|duration| Utc::now() + duration);
-        let keepalive_interval = self.keepalive_interval().await;
         let next_keepalive_at = Utc::now()
             + chrono::Duration::from_std(keepalive_interval)
                 .unwrap_or_else(|_| chrono::Duration::days(7));
@@ -644,6 +761,7 @@ impl OAuthTokenManager {
         let config = build_oauth_target_config(&provider)
             .ok_or_else(|| format!("provider {provider_id} has no usable OAuth configuration"))?;
         let expires_in = result.expires_in;
+        let keepalive_interval = self.keepalive_interval().await;
         let tx = if token_store.kind() == DbKind::Postgres {
             let deadline = Instant::now() + REFRESH_LOCK_WAIT;
             loop {
@@ -664,8 +782,15 @@ impl OAuthTokenManager {
         } else {
             None
         };
-        self.persist_token_result(provider_id, &provider, &config, result, tx)
-            .await?;
+        self.persist_token_result(
+            provider_id,
+            &provider,
+            &config,
+            result,
+            keepalive_interval,
+            tx,
+        )
+        .await?;
         Ok(OAuthCredentialRefreshSummary { expires_in })
     }
 
@@ -750,6 +875,15 @@ impl OAuthTokenManager {
     }
 
     async fn load_oauth_config(&self, provider_id: &str) -> Result<OAuthTargetConfig, String> {
+        self.load_oauth_provider(provider_id)
+            .await
+            .map(|(_, config)| config)
+    }
+
+    async fn load_oauth_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<(tiygate_store::models::Provider, OAuthTargetConfig), String> {
         let store = self
             .store
             .as_ref()
@@ -759,8 +893,9 @@ impl OAuthTokenManager {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("provider {provider_id} not found"))?;
-        build_oauth_target_config(&provider)
-            .ok_or_else(|| format!("provider {provider_id} has no usable OAuth configuration"))
+        let config = build_oauth_target_config(&provider)
+            .ok_or_else(|| format!("provider {provider_id} has no usable OAuth configuration"))?;
+        Ok((provider, config))
     }
 
     async fn keepalive_interval(&self) -> Duration {
@@ -776,66 +911,72 @@ impl OAuthTokenManager {
         Duration::from_secs(seconds.max(60))
     }
 
-    async fn keepalive_is_due(&self, provider_id: &str) -> Result<bool, String> {
-        let state = self
-            .token_store
-            .as_ref()
-            .ok_or_else(|| "OAuth token store is unavailable".to_string())?
-            .load(provider_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(state
-            .and_then(|state| state.next_keepalive_at)
-            .is_none_or(|next| next <= Utc::now()))
-    }
-
-    async fn keepalive_is_due_in_transaction(
+    async fn record_refresh_failure(
         &self,
-        provider_id: &str,
-        tx: &mut sqlx::Transaction<'static, sqlx::Any>,
-    ) -> Result<bool, String> {
-        let state = self
-            .token_store
-            .as_ref()
-            .ok_or_else(|| "OAuth token store is unavailable".to_string())?
-            .load_in_transaction(tx, provider_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(state
-            .and_then(|state| state.next_keepalive_at)
-            .is_none_or(|next| next <= Utc::now()))
-    }
-
-    async fn record_refresh_failure(&self, provider_id: &str, error: &str) {
-        let kind = classify_refresh_failure(error);
+        provider: &tiygate_store::models::Provider,
+        kind: OAuthRefreshFailureKind,
+        tx: Option<sqlx::Transaction<'static, sqlx::Any>>,
+    ) {
+        let provider_id = provider.id.as_str();
         let status = match kind {
             OAuthRefreshFailureKind::CredentialInvalid => OAuthCredentialStatus::Invalid,
             OAuthRefreshFailureKind::Transient => OAuthCredentialStatus::Error,
         };
+        let Some(token_store) = self.token_store.as_ref() else {
+            return;
+        };
+        let backoff_result = match tx {
+            Some(mut transaction) => {
+                let failure_count = token_store
+                    .load_in_transaction(&mut transaction, provider_id)
+                    .await
+                    .map(|state| state.map_or(0, |state| state.failure_count));
+                match failure_count {
+                    Ok(failure_count) => {
+                        let result = token_store
+                            .record_failure_in_transaction(
+                                &mut transaction,
+                                provider_id,
+                                next_retry_at(kind, failure_count),
+                            )
+                            .await;
+                        match result {
+                            Ok(()) => transaction.commit().await.map_err(Into::into),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            None => {
+                let failure_count = token_store
+                    .load(provider_id)
+                    .await
+                    .map(|state| state.map_or(0, |state| state.failure_count));
+                match failure_count {
+                    Ok(failure_count) => {
+                        token_store
+                            .record_failure(provider_id, next_retry_at(kind, failure_count))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        if let Err(store_error) = backoff_result {
+            warn!(provider = %provider_id, error = %store_error, "failed to persist OAuth refresh backoff");
+        }
+
         if let Some(store) = self.store.as_ref() {
             if let Err(status_error) = store
-                .set_provider_oauth_status(provider_id, status, Some(kind.status_reason()))
+                .set_provider_oauth_status_if_unchanged(
+                    provider,
+                    status,
+                    Some(kind.status_reason()),
+                )
                 .await
             {
                 warn!(provider = %provider_id, error = %status_error, "failed to persist OAuth refresh failure status");
-            }
-        }
-        if let Some(token_store) = self.token_store.as_ref() {
-            let failure_count = token_store
-                .load(provider_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|state| state.failure_count)
-                .unwrap_or_default();
-            let backoff_minutes = 5_i64.saturating_mul(1_i64 << failure_count.min(6));
-            let next_retry = if kind == OAuthRefreshFailureKind::CredentialInvalid {
-                Utc::now() + chrono::Duration::days(3650)
-            } else {
-                Utc::now() + chrono::Duration::minutes(backoff_minutes.min(360))
-            };
-            if let Err(store_error) = token_store.record_failure(provider_id, next_retry).await {
-                warn!(provider = %provider_id, error = %store_error, "failed to persist OAuth refresh backoff");
             }
         }
     }
@@ -898,9 +1039,22 @@ fn refresh_backoff_is_active(state: &OAuthAccessTokenState) -> bool {
         .is_some_and(|next_retry| next_retry > Utc::now())
 }
 
+fn provider_has_usable_oauth_credentials(provider: &tiygate_store::models::Provider) -> bool {
+    build_oauth_target_config(provider)
+        .is_some_and(|config| !config.refresh_token.trim().is_empty())
+}
+
 fn refresh_backoff_error() -> String {
     "OAuth credential refresh is temporarily backed off; reconnect the credential or use the manual refresh action"
         .to_string()
+}
+
+fn next_retry_at(kind: OAuthRefreshFailureKind, failure_count: i32) -> chrono::DateTime<Utc> {
+    if kind == OAuthRefreshFailureKind::CredentialInvalid {
+        return Utc::now() + chrono::Duration::days(3650);
+    }
+    let backoff_minutes = 5_i64.saturating_mul(1_i64 << failure_count.min(6));
+    Utc::now() + chrono::Duration::minutes(backoff_minutes.min(360))
 }
 
 fn remember_applied_access_token(headers: &HeaderMap, config: &OAuthTargetConfig) {
@@ -1277,6 +1431,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keepalive_preflight_failures_do_not_starve_later_candidates() {
+        let pool = db::open_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let store = Arc::new(DbConfigStore::new(pool, None));
+        store.refresh().await.unwrap();
+        let oauth_config = serde_json::json!({
+            "oauth": {
+                "token_url": "https://example.test/token",
+                "client_id": "test-client",
+                "scopes": ["openid"],
+                "token_request_style": "form"
+            }
+        });
+        let invalid_ids = [
+            "keepalive-invalid-a",
+            "keepalive-invalid-b",
+            "keepalive-invalid-c",
+        ];
+        for provider_id in invalid_ids {
+            store
+                .upsert_provider(
+                    provider_id,
+                    provider_id,
+                    "openai",
+                    "https://example.test",
+                    "",
+                    None,
+                    AuthMode::OAuth,
+                    None,
+                    oauth_config.clone(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let valid_id = "keepalive-valid-later";
+        store
+            .upsert_provider(
+                valid_id,
+                valid_id,
+                "openai",
+                "https://example.test",
+                "",
+                None,
+                AuthMode::OAuth,
+                Some(&serde_json::json!({"refresh_token": "valid-refresh"}).to_string()),
+                oauth_config,
+                true,
+            )
+            .await
+            .unwrap();
+        let manager = OAuthTokenManager::new(Some(store.clone()), reqwest::Client::new());
+
+        let mut selected_valid = false;
+        for _ in 0..3 {
+            let provider_ids = manager.due_keepalive_provider_ids(2).await.unwrap();
+            selected_valid = provider_ids
+                .iter()
+                .any(|provider_id| provider_id == valid_id);
+            for provider_id in provider_ids
+                .into_iter()
+                .filter(|provider_id| provider_id != valid_id)
+            {
+                assert!(manager.try_keepalive_provider(&provider_id).await.is_err());
+            }
+            if selected_valid {
+                break;
+            }
+        }
+
+        assert!(selected_valid, "invalid providers must leave the due batch");
+        for provider_id in invalid_ids {
+            let state = store
+                .oauth_token_store()
+                .load(provider_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.failure_count, 1);
+            assert!(state.next_retry_at.is_some_and(|retry| retry > Utc::now()));
+        }
+    }
+
+    #[tokio::test]
+    async fn keepalive_preflight_backoff_expires_and_corrected_provider_recovers() {
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "recovered-access",
+                "refresh_token": "recovered-refresh",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&token_server)
+            .await;
+
+        let pool = db::open_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let store = Arc::new(DbConfigStore::new(pool, None));
+        store.refresh().await.unwrap();
+        let provider_id = "keepalive-preflight-recovery";
+        store
+            .upsert_provider(
+                provider_id,
+                provider_id,
+                "openai",
+                "https://example.test",
+                "",
+                None,
+                AuthMode::OAuth,
+                None,
+                serde_json::json!({
+                    "oauth": {
+                        "token_url": format!("{}/token", token_server.uri()),
+                        "client_id": "test-client",
+                        "scopes": ["openid"],
+                        "token_request_style": "form"
+                    }
+                }),
+                true,
+            )
+            .await
+            .unwrap();
+        let manager = OAuthTokenManager::new(Some(store.clone()), reqwest::Client::new());
+
+        assert!(manager.try_keepalive_provider(provider_id).await.is_err());
+        store
+            .set_provider_oauth_meta(
+                provider_id,
+                &serde_json::json!({"refresh_token": "corrected-refresh"}).to_string(),
+            )
+            .await
+            .unwrap();
+        store
+            .oauth_token_store()
+            .record_failure(provider_id, Utc::now() - chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.try_keepalive_provider(provider_id).await.unwrap(),
+            OAuthRefreshOutcome::Refreshed
+        );
+        let state = store
+            .oauth_token_store()
+            .load(provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.access_token, "recovered-access");
+        assert!(state.next_retry_at.is_none());
+        assert_eq!(state.failure_count, 0);
+    }
+
+    #[tokio::test]
     async fn unauthorized_reuses_newer_shared_at_before_refreshing() {
         let pool = db::open_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
@@ -1542,6 +1852,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_single_connection_handles_preflight_and_endpoint_failures() {
+        let Ok(database_url) = std::env::var("TIYGATE_TEST_PG_URL") else {
+            return;
+        };
+        if database_url.trim().is_empty() {
+            return;
+        }
+
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("temporary failure"))
+            .expect(1)
+            .mount(&token_server)
+            .await;
+        let pool = db::open_pool_with_max_connections(&database_url, 1)
+            .await
+            .unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let store = Arc::new(DbConfigStore::new(pool, None));
+        store.refresh().await.unwrap();
+        let provider_id = format!("pg-oauth-failure-{}", uuid::Uuid::now_v7());
+        store
+            .upsert_provider(
+                &provider_id,
+                "Postgres OAuth failure",
+                "openai",
+                "https://example.test",
+                "",
+                None,
+                AuthMode::OAuth,
+                None,
+                serde_json::json!({
+                    "oauth": {
+                        "token_url": format!("{}/token", token_server.uri()),
+                        "client_id": "test-client",
+                        "scopes": ["openid"],
+                        "token_request_style": "form"
+                    }
+                }),
+                true,
+            )
+            .await
+            .unwrap();
+        let manager = OAuthTokenManager::new(Some(store.clone()), reqwest::Client::new());
+
+        let preflight = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.try_keepalive_provider(&provider_id),
+        )
+        .await
+        .expect("preflight backoff must not acquire a second pool slot");
+        assert!(preflight.is_err());
+        assert!(store
+            .oauth_token_store()
+            .load(&provider_id)
+            .await
+            .unwrap()
+            .is_some_and(|state| refresh_backoff_is_active(&state)));
+
+        let oauth_meta = serde_json::json!({"refresh_token": "postgres-refresh"}).to_string();
+        store
+            .set_provider_oauth_meta(&provider_id, &oauth_meta)
+            .await
+            .unwrap();
+        store
+            .oauth_token_store()
+            .reset(&provider_id, None)
+            .await
+            .unwrap();
+        let refresh =
+            tokio::time::timeout(Duration::from_secs(5), manager.force_refresh(&provider_id))
+                .await
+                .expect("failure persistence must not acquire a second pool slot");
+        assert!(refresh.is_err());
+        assert!(store
+            .oauth_token_store()
+            .load(&provider_id)
+            .await
+            .unwrap()
+            .is_some_and(|state| refresh_backoff_is_active(&state)));
+
+        store.delete_provider(&provider_id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_independent_instances_share_one_refresh_grant() {
         let Ok(database_url) = std::env::var("TIYGATE_TEST_PG_URL") else {
             return;
@@ -1567,9 +1963,13 @@ mod tests {
             .await;
 
         let provider_id = format!("pg-oauth-{}", uuid::Uuid::now_v7());
-        let pool_a = db::open_pool(&database_url).await.unwrap();
+        let pool_a = db::open_pool_with_max_connections(&database_url, 1)
+            .await
+            .unwrap();
         db::run_migrations(&pool_a).await.unwrap();
-        let pool_b = db::open_pool(&database_url).await.unwrap();
+        let pool_b = db::open_pool_with_max_connections(&database_url, 1)
+            .await
+            .unwrap();
         let store_a = Arc::new(DbConfigStore::new(pool_a, None));
         let store_b = Arc::new(DbConfigStore::new(pool_b, None));
         store_a.refresh().await.unwrap();
@@ -1651,8 +2051,13 @@ mod tests {
                 headers["authorization"].clone()
             })
         };
-        assert_eq!(first.await.unwrap(), "Bearer postgres-shared-access");
-        assert_eq!(second.await.unwrap(), "Bearer postgres-shared-access");
+        let (first_header, second_header) = tokio::time::timeout(Duration::from_secs(5), async {
+            (first.await.unwrap(), second.await.unwrap())
+        })
+        .await
+        .expect("single-connection refresh coordination must not acquire another pool slot");
+        assert_eq!(first_header, "Bearer postgres-shared-access");
+        assert_eq!(second_header, "Bearer postgres-shared-access");
 
         store_a.delete_provider(&provider_id).await.unwrap();
     }

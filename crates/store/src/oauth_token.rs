@@ -248,6 +248,22 @@ impl OAuthTokenStore {
         provider_id: &str,
         next_retry_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.any().begin().await?;
+        self.record_failure_in_transaction(&mut tx, provider_id, next_retry_at)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record retry state through the caller's advisory-lock transaction.
+    /// This avoids acquiring a second pooled connection while the refresh
+    /// coordinator already owns one.
+    pub async fn record_failure_in_transaction(
+        &self,
+        tx: &mut Transaction<'static, Any>,
+        provider_id: &str,
+        next_retry_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO oauth_access_tokens \
@@ -262,7 +278,7 @@ impl OAuthTokenStore {
         .bind(provider_id)
         .bind(next_retry_at.to_rfc3339())
         .bind(now)
-        .execute(self.pool.any())
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }

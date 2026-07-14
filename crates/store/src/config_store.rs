@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::Serialize;
-use sqlx::Row;
+use sqlx::{Any, Row, Transaction};
 use thiserror::Error;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -477,6 +477,42 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
     })
 }
 
+fn oauth_status_metadata(
+    provider: &Provider,
+    status: OAuthCredentialStatus,
+    reason: Option<&str>,
+) -> Result<String, StoreError> {
+    let raw = provider
+        .oauth_meta_cleartext
+        .as_deref()
+        .filter(|meta| !meta.trim().is_empty())
+        .ok_or_else(|| StoreError::Invalid("provider has no OAuth metadata".to_string()))?;
+    let mut meta: serde_json::Value = serde_json::from_str(raw)?;
+    let object = meta.as_object_mut().ok_or_else(|| {
+        StoreError::Invalid("provider OAuth metadata must be a JSON object".to_string())
+    })?;
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String(status.as_str().to_string()),
+    );
+    object.insert(
+        "status_checked_at".to_string(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    match reason.filter(|value| !value.is_empty()) {
+        Some(reason) => {
+            object.insert(
+                "status_reason".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
+        None => {
+            object.remove("status_reason");
+        }
+    }
+    serde_json::to_string(&meta).map_err(StoreError::from)
+}
+
 fn provider_egress_for_target(
     provider: &Provider,
     model_id: &str,
@@ -728,6 +764,29 @@ impl DbConfigStore {
         .fetch_optional(self.pool.any())
         .await?;
         let mut provider = rows.map(row_to_provider).transpose()?;
+        if let Some(provider) = provider.as_mut() {
+            populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
+        }
+        Ok(provider)
+    }
+
+    /// Load one provider through an existing transaction. OAuth refreshers use
+    /// this after acquiring a PostgreSQL advisory-lock transaction so they do
+    /// not retain one pool connection while waiting for another.
+    pub async fn get_provider_in_transaction(
+        &self,
+        tx: &mut Transaction<'static, Any>,
+        id: &str,
+    ) -> Result<Option<Provider>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
+                    encrypted_oauth_meta, metadata_json, enabled, \
+                    created_at, updated_at FROM providers WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let mut provider = row.map(row_to_provider).transpose()?;
         if let Some(provider) = provider.as_mut() {
             populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
         }
@@ -994,6 +1053,30 @@ impl DbConfigStore {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Record OAuth health only if the provider credential metadata still
+    /// matches the row observed by the caller. Refresh failure reporting uses
+    /// this after releasing its advisory lock so it cannot overwrite a newer
+    /// manual refresh or credential edit.
+    pub async fn set_provider_oauth_status_if_unchanged(
+        &self,
+        provider: &Provider,
+        status: OAuthCredentialStatus,
+        reason: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let serialized = oauth_status_metadata(provider, status, reason)?;
+        let updated = self
+            .set_provider_oauth_meta_if_unchanged(
+                &provider.id,
+                &provider.encrypted_oauth_meta,
+                &serialized,
+            )
+            .await?;
+        if updated {
+            self.refresh().await?;
+        }
+        Ok(updated)
+    }
+
     /// Record the last observed OAuth credential health without replacing the
     /// stored refresh token, account identity, or future metadata fields.
     pub async fn set_provider_oauth_status(
@@ -1009,35 +1092,7 @@ impl DbConfigStore {
                 .get_provider(id)
                 .await?
                 .ok_or_else(|| StoreError::NotFound(format!("provider {id}")))?;
-            let raw = provider
-                .oauth_meta_cleartext
-                .as_deref()
-                .filter(|meta| !meta.trim().is_empty())
-                .ok_or_else(|| StoreError::Invalid("provider has no OAuth metadata".to_string()))?;
-            let mut meta: serde_json::Value = serde_json::from_str(raw)?;
-            let object = meta.as_object_mut().ok_or_else(|| {
-                StoreError::Invalid("provider OAuth metadata must be a JSON object".to_string())
-            })?;
-            object.insert(
-                "status".to_string(),
-                serde_json::Value::String(status.as_str().to_string()),
-            );
-            object.insert(
-                "status_checked_at".to_string(),
-                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-            );
-            match reason.filter(|value| !value.is_empty()) {
-                Some(reason) => {
-                    object.insert(
-                        "status_reason".to_string(),
-                        serde_json::Value::String(reason.to_string()),
-                    );
-                }
-                None => {
-                    object.remove("status_reason");
-                }
-            }
-            let serialized = serde_json::to_string(&meta)?;
+            let serialized = oauth_status_metadata(&provider, status, reason)?;
             if self
                 .set_provider_oauth_meta_if_unchanged(
                     id,
@@ -2197,6 +2252,18 @@ mod tests {
             provider.oauth_meta_cleartext.as_deref(),
             Some(meta_str.as_str())
         );
+
+        let mut tx = store.pool.any().begin().await.expect("begin transaction");
+        let provider_in_tx = store
+            .get_provider_in_transaction(&mut tx, "oauth-openai")
+            .await
+            .expect("get provider in transaction")
+            .expect("provider exists in transaction");
+        tx.rollback().await.expect("rollback transaction");
+        assert_eq!(
+            provider_in_tx.oauth_meta_cleartext.as_deref(),
+            Some(meta_str.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2292,17 +2359,12 @@ mod tests {
             .await
             .expect("rotate refresh token");
 
-        let stale_status_meta = serde_json::json!({
-            "refresh_token": "refresh-old",
-            "account_id": "workspace-123",
-            "status": "invalid",
-        });
         assert!(
             !store
-                .set_provider_oauth_meta_if_unchanged(
-                    "oauth-status-cas",
-                    &stale.encrypted_oauth_meta,
-                    &stale_status_meta.to_string(),
+                .set_provider_oauth_status_if_unchanged(
+                    &stale,
+                    OAuthCredentialStatus::Invalid,
+                    Some("credential_rejected"),
                 )
                 .await
                 .expect("stale CAS attempt"),

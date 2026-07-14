@@ -90,6 +90,21 @@ impl DbPool {
 /// timeout. For PostgreSQL we use the default `PgConnectOptions`
 /// with statement-level trace logging.
 pub async fn open_pool(url: &str) -> Result<DbPool, DbError> {
+    open_pool_configured(url, None).await
+}
+
+/// Open a pool with an explicit connection ceiling. This is primarily useful
+/// for coordination tests that must prove a transaction-bound path never
+/// attempts to acquire a second pooled connection.
+#[doc(hidden)]
+pub async fn open_pool_with_max_connections(
+    url: &str,
+    max_connections: u32,
+) -> Result<DbPool, DbError> {
+    open_pool_configured(url, Some(max_connections.max(1))).await
+}
+
+async fn open_pool_configured(url: &str, max_connections: Option<u32>) -> Result<DbPool, DbError> {
     install_any_drivers();
     let kind = DbKind::from_url(url)?;
     // AnyPool::connect parses the URL, delegates to the matching
@@ -115,9 +130,11 @@ pub async fn open_pool(url: &str) -> Result<DbPool, DbError> {
         }
         DbKind::Postgres => url.to_string(),
     };
-    let pool = sqlx::any::AnyPoolOptions::new()
-        .connect(&connect_url)
-        .await?;
+    let mut options = sqlx::any::AnyPoolOptions::new();
+    if let Some(max_connections) = max_connections {
+        options = options.max_connections(max_connections);
+    }
+    let pool = options.connect(&connect_url).await?;
 
     // Apply SQLite pragmas after connect.
     if kind == DbKind::Sqlite {
