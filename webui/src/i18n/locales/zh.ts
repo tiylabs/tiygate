@@ -189,6 +189,7 @@ const zh: Translation = {
         hours: "{{hours}}小时后重置",
         minutes: "{{minutes}}分钟后重置",
       },
+      windowFallback: "限额 {{index}}",
       notConnected: "未授权",
       unavailable: "暂不可用",
     },

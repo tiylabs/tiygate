@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use tiygate_store::archive::{gzip_decompress, sha256_hex, PayloadArchiveManifest};
@@ -34,6 +34,13 @@ const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 /// OpenAI OAuth providers; OpenAI API-key providers have platform billing
 /// semantics rather than the ChatGPT 5-hour / 7-day windows.
 const OPENAI_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// Claude subscription usage endpoint. Anthropic currently exposes this only
+/// for OAuth credentials carrying the `user:profile` scope.
+const ANTHROPIC_OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// The usage endpoint assigns a substantially more permissive rate-limit
+/// bucket to clients using Claude Code's product-token shape. TiyGate's package
+/// version keeps the value stable and traceable without tracking CLI releases.
+const ANTHROPIC_OAUTH_USAGE_USER_AGENT: &str = concat!("claude-code/", env!("CARGO_PKG_VERSION"));
 
 pub fn router() -> Router<AdminState> {
     Router::new()
@@ -117,8 +124,10 @@ struct ProviderModelsResponse {
 
 #[derive(Debug, Clone, Serialize)]
 struct ProviderUsageWindow {
+    label: Option<String>,
     used_percent: Option<f64>,
     reset_at: Option<i64>,
+    limit_window_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +136,7 @@ struct ProviderUsageResponse {
     state: String,
     reason: Option<String>,
     checked_at: Option<String>,
+    windows: Vec<ProviderUsageWindow>,
     five_hour: Option<ProviderUsageWindow>,
     seven_day: Option<ProviderUsageWindow>,
     account_email: Option<String>,
@@ -140,10 +150,9 @@ struct OpenAiUsageResponse {
 }
 
 #[derive(Debug, Clone)]
-struct ParsedOpenAiUsage {
+struct ParsedProviderUsage {
     plan_type: Option<String>,
-    five_hour: Option<ProviderUsageWindow>,
-    seven_day: Option<ProviderUsageWindow>,
+    windows: Vec<ProviderUsageWindow>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,21 +166,60 @@ struct OpenAiUsageWindow {
     used_percent: Option<f64>,
     reset_at: Option<i64>,
     reset_after_seconds: Option<i64>,
+    limit_window_seconds: Option<i64>,
 }
+
+const FIVE_HOURS_SECONDS: i64 = 5 * 60 * 60;
+const SEVEN_DAYS_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 fn provider_usage_response(
     provider_id: &str,
     state: &str,
     reason: Option<&str>,
-    five_hour: Option<ProviderUsageWindow>,
-    seven_day: Option<ProviderUsageWindow>,
+    windows: Vec<ProviderUsageWindow>,
     account_email: Option<&str>,
 ) -> ProviderUsageResponse {
+    let durations_are_unknown = windows
+        .iter()
+        .all(|window| window.limit_window_seconds.is_none());
+    let five_hour = windows
+        .iter()
+        .find(|window| {
+            window.limit_window_seconds == Some(FIVE_HOURS_SECONDS) && window.label.is_none()
+        })
+        .or_else(|| {
+            windows
+                .iter()
+                .find(|window| window.limit_window_seconds == Some(FIVE_HOURS_SECONDS))
+        })
+        .cloned()
+        .or_else(|| {
+            durations_are_unknown
+                .then(|| windows.first().cloned())
+                .flatten()
+        });
+    let seven_day = windows
+        .iter()
+        .find(|window| {
+            window.limit_window_seconds == Some(SEVEN_DAYS_SECONDS) && window.label.is_none()
+        })
+        .or_else(|| {
+            windows
+                .iter()
+                .find(|window| window.limit_window_seconds == Some(SEVEN_DAYS_SECONDS))
+        })
+        .cloned()
+        .or_else(|| {
+            durations_are_unknown
+                .then(|| windows.get(1).cloned())
+                .flatten()
+        });
     ProviderUsageResponse {
         provider_id: provider_id.to_string(),
         state: state.to_string(),
         reason: reason.map(str::to_string),
         checked_at: Some(chrono::Utc::now().to_rfc3339()),
+        windows,
         five_hour,
         seven_day,
         account_email: account_email.map(str::to_string),
@@ -183,17 +231,26 @@ fn map_openai_usage_window(
     window: Option<OpenAiUsageWindow>,
     now_unix: i64,
 ) -> Option<ProviderUsageWindow> {
-    window.map(|window| ProviderUsageWindow {
-        used_percent: window.used_percent.map(|value| value.clamp(0.0, 100.0)),
-        reset_at: window.reset_at.or_else(|| {
+    window.and_then(|window| {
+        let used_percent = window.used_percent.map(|value| value.clamp(0.0, 100.0));
+        let reset_at = window.reset_at.or_else(|| {
             window
                 .reset_after_seconds
                 .map(|seconds| now_unix.saturating_add(seconds))
-        }),
+        });
+        let limit_window_seconds = window.limit_window_seconds.filter(|seconds| *seconds > 0);
+        (used_percent.is_some() || reset_at.is_some() || limit_window_seconds.is_some()).then_some(
+            ProviderUsageWindow {
+                label: None,
+                used_percent,
+                reset_at,
+                limit_window_seconds,
+            },
+        )
     })
 }
 
-fn parse_openai_usage(body: &str, now_unix: i64) -> Result<ParsedOpenAiUsage, String> {
+fn parse_openai_usage(body: &str, now_unix: i64) -> Result<ParsedProviderUsage, String> {
     let response: OpenAiUsageResponse =
         serde_json::from_str(body).map_err(|error| format!("invalid usage response: {error}"))?;
     let plan_type = response
@@ -202,11 +259,183 @@ fn parse_openai_usage(body: &str, now_unix: i64) -> Result<ParsedOpenAiUsage, St
     let Some(rate_limit) = response.rate_limit else {
         return Err("usage response has no rate_limit".to_string());
     };
-    Ok(ParsedOpenAiUsage {
-        plan_type,
-        five_hour: map_openai_usage_window(rate_limit.primary_window, now_unix),
-        seven_day: map_openai_usage_window(rate_limit.secondary_window, now_unix),
+    let windows = [rate_limit.primary_window, rate_limit.secondary_window]
+        .into_iter()
+        .filter_map(|window| map_openai_usage_window(window, now_unix))
+        .collect();
+    Ok(ParsedProviderUsage { plan_type, windows })
+}
+
+fn parse_usage_reset_at(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    value
+        .as_i64()
+        .or_else(|| {
+            value
+                .as_u64()
+                .and_then(|timestamp| i64::try_from(timestamp).ok())
+        })
+        .or_else(|| {
+            value.as_str().and_then(|raw| {
+                raw.parse::<i64>().ok().or_else(|| {
+                    chrono::DateTime::parse_from_rfc3339(raw)
+                        .ok()
+                        .map(|timestamp| timestamp.timestamp())
+                })
+            })
+        })
+}
+
+fn map_anthropic_usage_window(
+    value: Option<&Value>,
+    label: Option<String>,
+    default_window_seconds: i64,
+) -> Option<ProviderUsageWindow> {
+    let object = value?.as_object()?;
+    let used_percent = object
+        .get("utilization")
+        .or_else(|| object.get("used_percent"))
+        .or_else(|| object.get("used_percentage"))
+        .and_then(Value::as_f64)
+        .map(|value| value.clamp(0.0, 100.0))?;
+    let reset_at = parse_usage_reset_at(object.get("resets_at").or_else(|| object.get("reset_at")));
+    let limit_window_seconds = object
+        .get("limit_window_seconds")
+        .and_then(Value::as_i64)
+        .filter(|seconds| *seconds > 0)
+        .or(Some(default_window_seconds));
+    Some(ProviderUsageWindow {
+        label,
+        used_percent: Some(used_percent),
+        reset_at,
+        limit_window_seconds,
     })
+}
+
+fn push_unique_usage_window(
+    windows: &mut Vec<ProviderUsageWindow>,
+    window: Option<ProviderUsageWindow>,
+) {
+    let Some(window) = window else {
+        return;
+    };
+    if windows.iter().any(|existing| {
+        existing.label == window.label
+            && existing.limit_window_seconds == window.limit_window_seconds
+    }) {
+        return;
+    }
+    windows.push(window);
+}
+
+fn anthropic_weekly_label(key: &str) -> Option<String> {
+    match key {
+        "seven_day" => None,
+        "seven_day_sonnet" => Some("Sonnet · 7d".to_string()),
+        "seven_day_opus" => Some("Opus · 7d".to_string()),
+        "seven_day_routines" => Some("Routines · 7d".to_string()),
+        "seven_day_cowork" => Some("Cowork · 7d".to_string()),
+        _ => key.strip_prefix("seven_day_").map(|scope| {
+            let name = scope
+                .split('_')
+                .map(|part| {
+                    let mut chars = part.chars();
+                    match chars.next() {
+                        Some(first) => first.to_uppercase().chain(chars).collect(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(" ");
+            format!("{name} · 7d")
+        }),
+    }
+}
+
+fn parse_anthropic_usage(body: &str) -> Result<ParsedProviderUsage, String> {
+    let response: Value =
+        serde_json::from_str(body).map_err(|error| format!("invalid usage response: {error}"))?;
+    let object = response
+        .as_object()
+        .ok_or_else(|| "usage response is not an object".to_string())?;
+    let plan_type = ["subscription_type", "plan_type", "rate_limit_tier"]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let mut windows = Vec::new();
+    push_unique_usage_window(
+        &mut windows,
+        map_anthropic_usage_window(object.get("five_hour"), None, FIVE_HOURS_SECONDS),
+    );
+    for key in [
+        "seven_day",
+        "seven_day_sonnet",
+        "seven_day_opus",
+        "seven_day_routines",
+        "seven_day_cowork",
+    ] {
+        push_unique_usage_window(
+            &mut windows,
+            map_anthropic_usage_window(
+                object.get(key),
+                anthropic_weekly_label(key),
+                SEVEN_DAYS_SECONDS,
+            ),
+        );
+    }
+
+    // Preserve future model/feature-specific weekly fields without requiring
+    // a release for every new `seven_day_*` key Anthropic adds.
+    for (key, value) in object {
+        if key.starts_with("seven_day_")
+            && !matches!(
+                key.as_str(),
+                "seven_day_sonnet" | "seven_day_opus" | "seven_day_routines" | "seven_day_cowork"
+            )
+        {
+            push_unique_usage_window(
+                &mut windows,
+                map_anthropic_usage_window(
+                    Some(value),
+                    anthropic_weekly_label(key),
+                    SEVEN_DAYS_SECONDS,
+                ),
+            );
+        }
+    }
+
+    // Newer responses may group model-specific limits under
+    // `limits[].weekly_scoped`; normalize those into the same UI model.
+    if let Some(limits) = object.get("limits").and_then(Value::as_array) {
+        for (index, limit) in limits.iter().filter_map(Value::as_object).enumerate() {
+            let Some(window) = limit.get("weekly_scoped") else {
+                continue;
+            };
+            let name = ["display_name", "limit_name", "metered_feature", "model"]
+                .into_iter()
+                .find_map(|key| limit.get(key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Weekly limit {}", index + 1));
+            push_unique_usage_window(
+                &mut windows,
+                map_anthropic_usage_window(
+                    Some(window),
+                    Some(format!("{name} · 7d")),
+                    SEVEN_DAYS_SECONDS,
+                ),
+            );
+        }
+    }
+
+    if windows.is_empty() {
+        return Err("usage response has no supported rate-limit windows".to_string());
+    }
+    Ok(ParsedProviderUsage { plan_type, windows })
 }
 
 fn provider_oauth_account_email(provider: &Provider) -> Option<String> {
@@ -223,9 +452,18 @@ fn provider_oauth_account_email(provider: &Provider) -> Option<String> {
         })
 }
 
-/// Fetch the ChatGPT/Codex subscription windows for one OpenAI OAuth
-/// provider. The OAuth cache is keyed by provider/account, so multiple
-/// providers can safely use different ChatGPT accounts in one process.
+fn ensure_provider_usage_user_agent(vendor: &str, headers: &mut reqwest::header::HeaderMap) {
+    if vendor == "anthropic" {
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static(ANTHROPIC_OAUTH_USAGE_USER_AGENT),
+        );
+    }
+}
+
+/// Fetch subscription usage windows for one supported OAuth provider. The
+/// OAuth cache is keyed by provider/account, so multiple providers can safely
+/// use different upstream accounts in one process.
 async fn provider_usage(
     State(state): State<AdminState>,
     Path(id): Path<String>,
@@ -237,17 +475,30 @@ async fn provider_usage(
         .ok_or_else(|| AdminError::NotFound(format!("provider {id}")))?;
     let stored_account_email = provider_oauth_account_email(&provider);
 
-    if provider.vendor != "openai" || !matches!(provider.auth_mode, AuthMode::OAuth) {
+    if !matches!(provider.auth_mode, AuthMode::OAuth) {
         return Ok(Json(provider_usage_response(
             &id,
             "unsupported",
-            Some("openai_oauth_only"),
-            None,
-            None,
+            Some("oauth_only"),
+            Vec::new(),
             stored_account_email.as_deref(),
         ))
         .into_response());
     }
+    let usage_url = match provider.vendor.as_str() {
+        "openai" => OPENAI_CODEX_USAGE_URL,
+        "anthropic" => ANTHROPIC_OAUTH_USAGE_URL,
+        _ => {
+            return Ok(Json(provider_usage_response(
+                &id,
+                "unsupported",
+                Some("oauth_usage_unsupported"),
+                Vec::new(),
+                stored_account_email.as_deref(),
+            ))
+            .into_response());
+        }
+    };
 
     let Some(oauth_config) = tiygate_store::config_store::build_oauth_target_config(&provider)
     else {
@@ -255,8 +506,7 @@ async fn provider_usage(
             &id,
             "not_connected",
             Some("oauth_metadata_unavailable"),
-            None,
-            None,
+            Vec::new(),
             stored_account_email.as_deref(),
         ))
         .into_response());
@@ -266,8 +516,7 @@ async fn provider_usage(
             &id,
             "not_connected",
             Some("refresh_token_missing"),
-            None,
-            None,
+            Vec::new(),
             stored_account_email.as_deref(),
         ))
         .into_response());
@@ -292,13 +541,12 @@ async fn provider_usage(
     };
     if let Err(error) = apply_result {
         record_oauth_refresh_failure(&state, &id, &error).await;
-        tracing::warn!(provider = %id, error = %error, "OpenAI OAuth usage token unavailable");
+        tracing::warn!(provider = %id, vendor = %provider.vendor, error = %error, "OAuth usage token unavailable");
         return Ok(Json(provider_usage_response(
             &id,
             "unavailable",
             Some("oauth_token_unavailable"),
-            None,
-            None,
+            Vec::new(),
             stored_account_email.as_deref(),
         ))
         .into_response());
@@ -320,7 +568,7 @@ async fn provider_usage(
                         tracing::warn!(
                             provider = %id,
                             error = %error,
-                            "persisting OpenAI OAuth identity after usage request failed"
+                            "persisting OAuth identity after usage request failed"
                         );
                     }
                 }
@@ -329,27 +577,29 @@ async fn provider_usage(
                     tracing::warn!(
                         provider = %id,
                         error = %error,
-                        "preparing OpenAI OAuth identity metadata failed"
+                        "preparing OAuth identity metadata failed"
                     );
                 }
             }
         }
     }
 
-    let mut request = client.get(OPENAI_CODEX_USAGE_URL);
+    ensure_provider_usage_user_agent(&provider.vendor, &mut headers);
+    let mut request = client
+        .get(usage_url)
+        .header(reqwest::header::ACCEPT, "application/json");
     for (name, value) in &headers {
         request = request.header(name, value);
     }
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(provider = %id, error = %error, "OpenAI usage request failed");
+            tracing::warn!(provider = %id, vendor = %provider.vendor, error = %error, "OAuth usage request failed");
             return Ok(Json(provider_usage_response(
                 &id,
                 "unavailable",
                 Some("upstream_request_failed"),
-                None,
-                None,
+                Vec::new(),
                 account_email.as_deref(),
             ))
             .into_response());
@@ -358,7 +608,12 @@ async fn provider_usage(
 
     if !response.status().is_success() {
         let status = response.status();
-        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        // Anthropic may deny the auxiliary usage endpoint for a valid
+        // inference credential. Only a 401 proves that credential unusable;
+        // retain OpenAI's existing 403 treatment for its ChatGPT surface.
+        if status == StatusCode::UNAUTHORIZED
+            || (provider.vendor == "openai" && status == StatusCode::FORBIDDEN)
+        {
             record_oauth_status(
                 &state,
                 &id,
@@ -367,13 +622,12 @@ async fn provider_usage(
             )
             .await;
         }
-        tracing::warn!(provider = %id, status = %status, "OpenAI usage endpoint returned an error");
+        tracing::warn!(provider = %id, vendor = %provider.vendor, status = %status, "OAuth usage endpoint returned an error");
         return Ok(Json(provider_usage_response(
             &id,
             "unavailable",
             Some("upstream_http_error"),
-            None,
-            None,
+            Vec::new(),
             account_email.as_deref(),
         ))
         .into_response());
@@ -383,16 +637,20 @@ async fn provider_usage(
         .text()
         .await
         .map_err(|error| AdminError::Internal(format!("read usage response: {error}")))?;
-    let parsed_usage = match parse_openai_usage(&body, chrono::Utc::now().timestamp()) {
+    let parsed_result = match provider.vendor.as_str() {
+        "openai" => parse_openai_usage(&body, chrono::Utc::now().timestamp()),
+        "anthropic" => parse_anthropic_usage(&body),
+        _ => Err("unsupported OAuth usage provider".to_string()),
+    };
+    let parsed_usage = match parsed_result {
         Ok(usage) => usage,
         Err(error) => {
-            tracing::warn!(provider = %id, error = %error, "OpenAI usage response parse failed");
+            tracing::warn!(provider = %id, vendor = %provider.vendor, error = %error, "OAuth usage response parse failed");
             return Ok(Json(provider_usage_response(
                 &id,
                 "unavailable",
                 Some("invalid_upstream_response"),
-                None,
-                None,
+                Vec::new(),
                 account_email.as_deref(),
             ))
             .into_response());
@@ -402,8 +660,7 @@ async fn provider_usage(
         &id,
         "available",
         None,
-        parsed_usage.five_hour,
-        parsed_usage.seven_day,
+        parsed_usage.windows,
         account_email.as_deref(),
     );
     usage.plan_type = parsed_usage.plan_type;
@@ -2782,6 +3039,33 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_usage_request_uses_claude_code_user_agent() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        ensure_provider_usage_user_agent("anthropic", &mut headers);
+
+        assert_eq!(
+            headers
+                .get(reqwest::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(ANTHROPIC_OAUTH_USAGE_USER_AGENT)
+        );
+
+        let custom = reqwest::header::HeaderValue::from_static("tiygate/custom");
+        headers.insert(reqwest::header::USER_AGENT, custom);
+        ensure_provider_usage_user_agent("anthropic", &mut headers);
+        assert_eq!(
+            headers
+                .get(reqwest::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(ANTHROPIC_OAUTH_USAGE_USER_AGENT)
+        );
+
+        let mut openai_headers = reqwest::header::HeaderMap::new();
+        ensure_provider_usage_user_agent("openai", &mut openai_headers);
+        assert!(!openai_headers.contains_key(reqwest::header::USER_AGENT));
+    }
+
+    #[test]
     fn codex_models_url_has_client_version_and_migrates_old_default() {
         let provider = openai_provider(
             AuthMode::OAuth,
@@ -2836,27 +3120,158 @@ mod tests {
 
         let parsed = parse_openai_usage(&body, 1_000_000).expect("usage JSON");
         assert_eq!(parsed.plan_type.as_deref(), Some("plus"));
+        assert_eq!(parsed.windows.len(), 2);
+        let five_hour = parsed
+            .windows
+            .iter()
+            .find(|window| window.limit_window_seconds == Some(FIVE_HOURS_SECONDS));
+        let seven_day = parsed
+            .windows
+            .iter()
+            .find(|window| window.limit_window_seconds == Some(SEVEN_DAYS_SECONDS));
+        assert_eq!(five_hour.and_then(|window| window.used_percent), Some(27.0));
         assert_eq!(
-            parsed
-                .five_hour
-                .as_ref()
-                .and_then(|window| window.used_percent),
-            Some(27.0)
-        );
-        assert_eq!(
-            parsed.five_hour.as_ref().and_then(|window| window.reset_at),
+            five_hour.and_then(|window| window.reset_at),
             Some(1_782_770_922)
         );
+        assert_eq!(seven_day.and_then(|window| window.used_percent), Some(4.0));
         assert_eq!(
-            parsed
+            seven_day.and_then(|window| window.reset_at),
+            Some(1_000_600)
+        );
+    }
+
+    #[test]
+    fn maps_single_primary_weekly_window_by_duration() {
+        let body = json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 42,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 900
+                },
+                "secondary_window": null
+            }
+        })
+        .to_string();
+
+        let parsed = parse_openai_usage(&body, 1_000_000).expect("usage JSON");
+        assert_eq!(parsed.windows.len(), 1);
+        assert_eq!(
+            parsed.windows[0].limit_window_seconds,
+            Some(SEVEN_DAYS_SECONDS)
+        );
+        let response =
+            provider_usage_response("openai-oauth", "available", None, parsed.windows, None);
+        assert_eq!(response.windows.len(), 1);
+        assert!(response.five_hour.is_none());
+        assert_eq!(
+            response
                 .seven_day
                 .as_ref()
                 .and_then(|window| window.used_percent),
-            Some(4.0)
+            Some(42.0)
         );
         assert_eq!(
-            parsed.seven_day.as_ref().and_then(|window| window.reset_at),
-            Some(1_000_600)
+            response
+                .seven_day
+                .as_ref()
+                .and_then(|window| window.reset_at),
+            Some(1_000_900)
+        );
+    }
+
+    #[test]
+    fn parses_anthropic_main_and_scoped_usage_windows() {
+        let body = json!({
+            "subscription_type": "max",
+            "five_hour": {
+                "utilization": 12.5,
+                "resets_at": "2026-07-16T12:30:00Z"
+            },
+            "seven_day": {
+                "utilization": 34,
+                "resets_at": "2026-07-20T08:00:00Z"
+            },
+            "seven_day_sonnet": {
+                "utilization": 56,
+                "resets_at": "2026-07-20T09:00:00Z"
+            },
+            "seven_day_opus": null,
+            "seven_day_haiku": {
+                "utilization": 7,
+                "resets_at": "2026-07-20T10:00:00Z"
+            },
+            "limits": [{
+                "limit_name": "Research",
+                "weekly_scoped": {
+                    "utilization": 8,
+                    "resets_at": "2026-07-20T11:00:00Z"
+                }
+            }],
+            "extra_usage": {
+                "is_enabled": true,
+                "used_credits": 10
+            }
+        })
+        .to_string();
+
+        let parsed = parse_anthropic_usage(&body).expect("Anthropic usage JSON");
+        assert_eq!(parsed.plan_type.as_deref(), Some("max"));
+        assert_eq!(parsed.windows.len(), 5);
+        assert_eq!(parsed.windows[0].label, None);
+        assert_eq!(
+            parsed.windows[0].limit_window_seconds,
+            Some(FIVE_HOURS_SECONDS)
+        );
+        assert_eq!(parsed.windows[0].used_percent, Some(12.5));
+        assert_eq!(
+            parsed.windows[0].reset_at,
+            chrono::DateTime::parse_from_rfc3339("2026-07-16T12:30:00Z")
+                .ok()
+                .map(|timestamp| timestamp.timestamp())
+        );
+        assert_eq!(parsed.windows[1].label, None);
+        assert_eq!(
+            parsed.windows[1].limit_window_seconds,
+            Some(SEVEN_DAYS_SECONDS)
+        );
+        assert!(parsed
+            .windows
+            .iter()
+            .any(|window| window.label.as_deref() == Some("Sonnet · 7d")));
+        assert!(parsed
+            .windows
+            .iter()
+            .any(|window| window.label.as_deref() == Some("Haiku · 7d")));
+        assert!(parsed
+            .windows
+            .iter()
+            .any(|window| window.label.as_deref() == Some("Research · 7d")));
+    }
+
+    #[test]
+    fn anthropic_usage_omits_windows_without_utilization() {
+        let body = json!({
+            "rate_limit_tier": "default_claude_max_5x",
+            "five_hour": {
+                "utilization": null,
+                "resets_at": "2026-07-16T12:30:00Z"
+            },
+            "seven_day": {
+                "utilization": 9,
+                "resets_at": "2026-07-20T08:00:00Z"
+            }
+        })
+        .to_string();
+
+        let parsed = parse_anthropic_usage(&body).expect("Anthropic usage JSON");
+        assert_eq!(parsed.plan_type.as_deref(), Some("default_claude_max_5x"));
+        assert_eq!(parsed.windows.len(), 1);
+        assert_eq!(
+            parsed.windows[0].limit_window_seconds,
+            Some(SEVEN_DAYS_SECONDS)
         );
     }
 
@@ -2870,14 +3285,8 @@ mod tests {
         }"#;
 
         let parsed = parse_openai_usage(body, 1_000_000).expect("usage JSON");
-        assert_eq!(
-            parsed.five_hour.and_then(|window| window.used_percent),
-            Some(100.0)
-        );
-        assert_eq!(
-            parsed.seven_day.and_then(|window| window.used_percent),
-            Some(0.0)
-        );
+        assert_eq!(parsed.windows[0].used_percent, Some(100.0));
+        assert_eq!(parsed.windows[1].used_percent, Some(0.0));
     }
 
     #[test]

@@ -69,6 +69,29 @@ OAuth egress profiles never apply to API-key credentials or unrelated egress
 protocols. Profile selection does not depend on OAuth client IDs or endpoint
 URL matching.
 
+## Subscription usage windows
+
+The Admin provider list reads Codex subscription usage from
+`/backend-api/wham/usage`. The upstream `primary_window` and
+`secondary_window` fields are transport slots, not fixed 5-hour and 7-day
+semantics. TiyGate preserves each returned window and derives its display label
+from `limit_window_seconds`, so a response containing only a 7-day
+`primary_window` renders one `7d` meter instead of an unavailable `5h` meter.
+
+`GET /admin/v1/providers/:id/usage` exposes the ordered windows through
+`windows`. The legacy `five_hour` and `seven_day` fields remain available for
+API compatibility and are populated by matching window duration rather than
+field position.
+
+Anthropic OAuth providers read subscription usage from `/api/oauth/usage` with
+the same access token and `anthropic-beta` header used by the OAuth profile.
+TiyGate maps `five_hour`, `seven_day`, model-specific weekly fields such as
+`seven_day_sonnet`, future `seven_day_*` fields, and
+`limits[].weekly_scoped` into `windows`. Named scopes carry an explicit label
+so equal-duration weekly limits remain distinguishable. Null or non-applicable
+windows are omitted, and the WebUI keeps successful usage results fresh for 60
+seconds to avoid repeatedly probing the upstream endpoint during navigation.
+
 ## Background keepalive
 
 Every instance scans due OAuth providers. A scan does not elect a permanent

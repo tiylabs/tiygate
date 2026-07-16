@@ -193,6 +193,7 @@ const en = {
         hours: "Reset in {{hours}}h",
         minutes: "Reset in {{minutes}}m",
       },
+      windowFallback: "Limit {{index}}",
       notConnected: "Not authorized",
       unavailable: "Unavailable",
     },

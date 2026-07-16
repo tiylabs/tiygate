@@ -168,8 +168,11 @@ function oauthStatusKey(provider: Provider): string {
   return `providers.oauthStatus.${provider.oauth_status?.state ?? "not_connected"}`;
 }
 
-function isOpenAiOAuth(provider: Provider): boolean {
-  return provider.vendor === "openai" && provider.auth_mode === "oauth";
+function supportsOAuthUsage(provider: Provider): boolean {
+  return (
+    provider.auth_mode === "oauth" &&
+    (provider.vendor === "openai" || provider.vendor === "anthropic")
+  );
 }
 
 function isOAuthProvider(provider: Provider): boolean {
@@ -182,6 +185,10 @@ const PLAN_TYPE_LABELS: Record<string, string> = {
   plus: "Plus",
   pro: "Pro",
   pro_lite: "Pro Lite",
+  max: "Max",
+  team: "Team",
+  default_claude_max_5x: "Max 5x",
+  default_claude_max_20x: "Max 20x",
   business: "Business",
   enterprise: "Enterprise",
   education: "Education",
@@ -192,6 +199,60 @@ function formatPlanType(planType: string | null | undefined): string | null {
   const normalized = planType?.trim().toLowerCase();
   if (!normalized) return null;
   return PLAN_TYPE_LABELS[normalized] ?? planType?.trim() ?? null;
+}
+
+const FIVE_HOURS_SECONDS = 5 * 60 * 60;
+const SEVEN_DAYS_SECONDS = 7 * 24 * 60 * 60;
+
+function providerUsageWindows(
+  usage: ProviderUsage | undefined,
+): ProviderUsageWindow[] {
+  if (Array.isArray(usage?.windows)) return usage.windows;
+
+  // Backward compatibility while the WebUI may be served by an older Admin
+  // API during rolling upgrades.
+  const windows: ProviderUsageWindow[] = [];
+  if (usage?.five_hour) {
+    windows.push({
+      ...usage.five_hour,
+      limit_window_seconds:
+        usage.five_hour.limit_window_seconds ?? FIVE_HOURS_SECONDS,
+    });
+  }
+  if (usage?.seven_day) {
+    windows.push({
+      ...usage.seven_day,
+      limit_window_seconds:
+        usage.seven_day.limit_window_seconds ?? SEVEN_DAYS_SECONDS,
+    });
+  }
+  return windows;
+}
+
+function formatUsageWindowLabel(
+  window: ProviderUsageWindow | undefined,
+  index: number,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  const explicitLabel = window?.label?.trim();
+  if (explicitLabel) return explicitLabel;
+
+  const seconds = window?.limit_window_seconds;
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) {
+    return t("providers.usage.windowFallback", { index: index + 1 });
+  }
+
+  const formatAmount = (amount: number) =>
+    Number.isInteger(amount)
+      ? amount.toString()
+      : amount.toFixed(1).replace(/\.0$/, "");
+  if (seconds >= 24 * 60 * 60) {
+    return `${formatAmount(seconds / (24 * 60 * 60))}d`;
+  }
+  if (seconds >= 60 * 60) {
+    return `${formatAmount(seconds / (60 * 60))}h`;
+  }
+  return `${formatAmount(seconds / 60)}m`;
 }
 
 function formatUsageResetTime(
@@ -232,12 +293,14 @@ function UsageWindow({
   window,
   loading,
   state,
+  wide,
   t,
 }: {
   label: string;
   window?: ProviderUsageWindow | null;
   loading: boolean;
   state?: ProviderUsage["state"];
+  wide?: boolean;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
   const percent = usageWindowPercent(window);
@@ -245,7 +308,7 @@ function UsageWindow({
   const resetAt = formatUsageResetTime(window?.reset_at, t);
 
   return (
-    <div className="min-w-0">
+    <div className={cn("min-w-0", wide && "col-span-2")}>
       <div className="mb-0.5 flex min-w-0 items-center gap-1 text-[10px]">
         <span>{label}</span>
         <span
@@ -309,9 +372,8 @@ export default function Providers() {
     queries: (data ?? []).map((provider) => ({
       queryKey: ["provider-usage", provider.id],
       queryFn: () => providersApi.usage(provider.id),
-      enabled: isOpenAiOAuth(provider),
-      staleTime: 0,
-      refetchOnMount: "always" as const,
+      enabled: supportsOAuthUsage(provider),
+      staleTime: 60_000,
       retry: false,
     })),
   });
@@ -766,13 +828,16 @@ export default function Providers() {
                           {p.api_base}
                         </div>
                       ) : null}
-                      {isOpenAiOAuth(p) ? (
+                      {supportsOAuthUsage(p) ? (
                         <div className="mt-1.5 grid min-w-[16rem] grid-cols-2 gap-x-3 gap-y-1.5">
                           {(() => {
                             const usageQuery = usageByProvider.get(p.id);
                             const usage = usageQuery?.data;
                             const accountEmail = usage?.account_email;
                             const planType = formatPlanType(usage?.plan_type);
+                            const windows = providerUsageWindows(usage);
+                            const visibleWindows =
+                              windows.length > 0 ? windows : [undefined];
                             return (
                               <>
                                 <div className="col-span-2 flex min-w-0 items-center gap-1 text-[10px] leading-4">
@@ -795,20 +860,17 @@ export default function Providers() {
                                         : "—")}
                                   </span>
                                 </div>
-                                <UsageWindow
-                                  label="5h"
-                                  window={usage?.five_hour}
-                                  loading={usageQuery?.isFetching ?? true}
-                                  state={usage?.state}
-                                  t={t}
-                                />
-                                <UsageWindow
-                                  label="7d"
-                                  window={usage?.seven_day}
-                                  loading={usageQuery?.isFetching ?? true}
-                                  state={usage?.state}
-                                  t={t}
-                                />
+                                {visibleWindows.map((window, index) => (
+                                  <UsageWindow
+                                    key={`${window?.label ?? "main"}-${window?.limit_window_seconds ?? "unknown"}-${index}`}
+                                    label={formatUsageWindowLabel(window, index, t)}
+                                    window={window}
+                                    loading={usageQuery?.isFetching ?? true}
+                                    state={usage?.state}
+                                    wide={visibleWindows.length === 1}
+                                    t={t}
+                                  />
+                                ))}
                               </>
                             );
                           })()}

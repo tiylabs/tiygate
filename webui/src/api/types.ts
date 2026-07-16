@@ -59,8 +59,10 @@ export interface ProviderModelsResponse {
 }
 
 export interface ProviderUsageWindow {
+  label?: string | null;
   used_percent?: number | null;
   reset_at?: number | null;
+  limit_window_seconds?: number | null;
 }
 
 export type ProviderUsageState =
@@ -76,7 +78,10 @@ export interface ProviderUsage {
   checked_at?: string | null;
   account_email?: string | null;
   plan_type?: string | null;
+  windows?: ProviderUsageWindow[];
+  /** @deprecated Prefer windows; retained for older Admin API responses. */
   five_hour?: ProviderUsageWindow | null;
+  /** @deprecated Prefer windows; retained for older Admin API responses. */
   seven_day?: ProviderUsageWindow | null;
 }
 
