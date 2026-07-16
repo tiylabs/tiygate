@@ -95,6 +95,7 @@ async-trait.workspace = true
 clap.workspace = true
 sha2.workspace = true
 hex.workspace = true
+twox-hash.workspace = true
 dashmap.workspace = true
 sqlx.workspace = true
 

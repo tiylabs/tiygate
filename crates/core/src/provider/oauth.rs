@@ -42,6 +42,25 @@ pub enum TokenRequestStyle {
     Json,
 }
 
+/// Provider-owned egress behavior for OAuth credentials.
+///
+/// This remains a pure routing-data choice: the server owns the HTTP client,
+/// TLS settings, and request mutation that implement the selected profile.
+/// Existing persisted configurations use the standard profile.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthEgressProfile {
+    /// Use the generic upstream HTTP path.
+    #[default]
+    Standard,
+    /// Apply the OpenAI Codex OAuth Responses egress contract.
+    #[serde(rename = "openai_codex")]
+    OpenAiCodex,
+    /// Apply the isolated Anthropic OAuth Messages egress profile.
+    #[serde(rename = "anthropic_oauth")]
+    AnthropicOAuth,
+}
+
 /// OAuth configuration carried on a `RoutingTarget` when the
 /// provider is configured with `AuthMode::OAuth`.
 ///
@@ -60,6 +79,9 @@ pub struct OAuthTargetConfig {
     /// I/O. Existing persisted configurations deserialize to HTTP.
     #[serde(default)]
     pub upstream_transport: UpstreamTransport,
+    /// Provider-specific egress behavior selected from the provider identity.
+    #[serde(default)]
+    pub egress_profile: OAuthEgressProfile,
     /// Token endpoint URL for refresh / exchange.
     pub token_url: String,
     /// OAuth client identifier (public client — no secret needed
@@ -141,9 +163,22 @@ mod tests {
     }
 
     #[test]
+    fn oauth_egress_profile_serde_names_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&OAuthEgressProfile::OpenAiCodex).unwrap(),
+            "\"openai_codex\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OAuthEgressProfile::AnthropicOAuth).unwrap(),
+            "\"anthropic_oauth\""
+        );
+    }
+
+    #[test]
     fn oauth_target_config_skip_serializing_refresh_token() {
         let cfg = OAuthTargetConfig {
             upstream_transport: UpstreamTransport::Http,
+            egress_profile: OAuthEgressProfile::Standard,
             token_url: "https://example.com/token".to_string(),
             client_id: "test-client".to_string(),
             client_secret: None,
@@ -169,6 +204,7 @@ mod tests {
     fn oauth_target_config_defaults() {
         let cfg = OAuthTargetConfig {
             upstream_transport: UpstreamTransport::Http,
+            egress_profile: OAuthEgressProfile::Standard,
             token_url: String::new(),
             client_id: String::new(),
             client_secret: None,

@@ -110,6 +110,10 @@ pub struct RuntimeTunables {
     /// rebuild is debounced by the tunables reloader so frequent
     /// settings writes don't churn the connection pool.
     pub http_client: reqwest::Client,
+    /// Dedicated Rustls/HTTP2 pool for the Anthropic OAuth egress profile.
+    /// It remains separate from generic provider traffic so profile-specific
+    /// transport settings and connection reuse cannot leak across providers.
+    pub anthropic_oauth_http_client: reqwest::Client,
 }
 
 /// Shared application state.
@@ -328,6 +332,19 @@ pub(crate) fn build_http_client(server_config: &ServerConfig) -> reqwest::Client
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Build the transport used exclusively by Anthropic OAuth Messages egress.
+///
+/// Reqwest/Rustls intentionally does not expose browser TLS-fingerprint
+/// impersonation. This profile instead uses an isolated verified-Rustls pool
+/// with HTTP/2 liveness settings appropriate for long-lived Claude streams.
+pub(crate) fn build_anthropic_oauth_http_client(server_config: &ServerConfig) -> reqwest::Client {
+    build_anthropic_oauth_http_client_from_params(
+        server_config.upstream_tcp_nodelay,
+        server_config.upstream_tcp_keepalive_secs,
+        server_config.upstream_pool_idle_timeout_secs,
+    )
+}
+
 /// Build a `reqwest::Client` from raw upstream parameter values.
 /// Used by the tunables reloader which reads these from the settings
 /// table rather than from `ServerConfig`.
@@ -341,6 +358,31 @@ fn build_http_client_from_params(
         .pool_max_idle_per_host(32)
         .tcp_nodelay(tcp_nodelay)
         .redirect(reqwest::redirect::Policy::none());
+    if tcp_keepalive_secs > 0 {
+        builder = builder.tcp_keepalive(Duration::from_secs(tcp_keepalive_secs));
+    }
+    if pool_idle_timeout_secs > 0 {
+        builder = builder.pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn build_anthropic_oauth_http_client_from_params(
+    tcp_nodelay: bool,
+    tcp_keepalive_secs: u64,
+    pool_idle_timeout_secs: u64,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(8)
+        .tcp_nodelay(tcp_nodelay)
+        .redirect(reqwest::redirect::Policy::none())
+        .tls_built_in_root_certs(false)
+        .tls_built_in_webpki_certs(true)
+        .http2_adaptive_window(true)
+        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true);
     if tcp_keepalive_secs > 0 {
         builder = builder.tcp_keepalive(Duration::from_secs(tcp_keepalive_secs));
     }
@@ -386,6 +428,7 @@ fn build_data_plane_router(
         upstream_stream_total_timeout_secs: server_config.upstream_stream_total_timeout_secs,
         upstream_ttfb_timeout_secs: server_config.upstream_ttfb_timeout_secs,
         http_client: build_http_client(server_config),
+        anthropic_oauth_http_client: build_anthropic_oauth_http_client(server_config),
     };
     let state = AppState {
         config: Arc::new(config),
@@ -585,6 +628,11 @@ pub(crate) fn spawn_tunables_reloader(
                 tcp_keepalive_secs,
                 pool_idle_timeout_secs,
             );
+            let anthropic_oauth_http_client = build_anthropic_oauth_http_client_from_params(
+                tcp_nodelay,
+                tcp_keepalive_secs,
+                pool_idle_timeout_secs,
+            );
             drop(current_t);
             state.reload_tunables(RuntimeTunables {
                 routing_strategy,
@@ -599,6 +647,7 @@ pub(crate) fn spawn_tunables_reloader(
                 upstream_stream_total_timeout_secs,
                 upstream_ttfb_timeout_secs,
                 http_client,
+                anthropic_oauth_http_client,
             });
             tracing::debug!(epoch = current, "tunables reloaded from settings");
             last_seen = Some(current);

@@ -4090,6 +4090,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2 0.4.14",
  "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
@@ -5933,6 +5934,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "twox-hash",
  "url",
  "uuid",
  "wiremock",
@@ -6352,6 +6354,12 @@ dependencies = [
  "thiserror 2.0.18",
  "utf-8",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
 name = "typeid"

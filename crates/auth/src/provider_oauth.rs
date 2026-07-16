@@ -139,6 +139,9 @@ pub struct OAuthProviderPreset {
     pub refresh_request_style: TokenRequestStyle,
     /// Whether the authorization-code exchange includes scopes.
     pub send_scopes_in_exchange_request: bool,
+    /// Whether the authorization-code exchange includes the CSRF state.
+    /// Anthropic's Claude flow accepts this value at its JSON token endpoint.
+    pub send_state_in_exchange_request: bool,
     /// Scopes sent specifically during refresh. This is separate from the
     /// authorize scopes because Codex uses a smaller refresh scope set.
     pub refresh_scopes: Vec<String>,
@@ -164,6 +167,7 @@ pub fn codex_preset() -> OAuthProviderPreset {
         exchange_request_style: TokenRequestStyle::Form,
         refresh_request_style: TokenRequestStyle::Form,
         send_scopes_in_exchange_request: false,
+        send_state_in_exchange_request: false,
         refresh_scopes: vec![
             "openid".to_string(),
             "profile".to_string(),
@@ -195,6 +199,7 @@ pub fn claude_preset() -> OAuthProviderPreset {
         exchange_request_style: TokenRequestStyle::Json,
         refresh_request_style: TokenRequestStyle::Json,
         send_scopes_in_exchange_request: true,
+        send_state_in_exchange_request: true,
         refresh_scopes: vec![
             "user:profile".to_string(),
             "user:inference".to_string(),
@@ -225,6 +230,7 @@ pub fn xai_preset() -> OAuthProviderPreset {
         exchange_request_style: TokenRequestStyle::Form,
         refresh_request_style: TokenRequestStyle::Form,
         send_scopes_in_exchange_request: true,
+        send_state_in_exchange_request: false,
         refresh_scopes: vec![
             "openid".to_string(),
             "profile".to_string(),
@@ -295,6 +301,22 @@ struct TokenResponseRaw {
     account_id: Option<String>,
     email: Option<String>,
     account_email: Option<String>,
+    account: Option<AnthropicAccount>,
+    organization: Option<AnthropicOrganization>,
+}
+
+/// Anthropic nests account identity in successful OAuth token responses.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicAccount {
+    uuid: Option<String>,
+    email_address: Option<String>,
+}
+
+/// Anthropic also returns the selected organization when it is available.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicOrganization {
+    uuid: Option<String>,
+    name: Option<String>,
 }
 
 /// Normalized token response used internally.
@@ -305,6 +327,8 @@ pub struct TokenResult {
     pub expires_in: Option<Duration>,
     pub account_id: Option<String>,
     pub account_email: Option<String>,
+    pub organization_id: Option<String>,
+    pub organization_name: Option<String>,
 }
 
 /// Sanitized result returned to control-plane callers. Access and refresh
@@ -365,6 +389,7 @@ pub async fn exchange_code(
     preset: &OAuthProviderPreset,
     code: &str,
     pkce_verifier: &str,
+    csrf_state: Option<&str>,
     http_client: &reqwest::Client,
 ) -> Result<TokenResult, String> {
     let scopes = preset.scopes.join(" ");
@@ -399,9 +424,15 @@ pub async fn exchange_code(
             if preset.send_scopes_in_exchange_request {
                 body["scope"] = serde_json::json!(scopes);
             }
+            if preset.send_state_in_exchange_request {
+                if let Some(csrf_state) = csrf_state.filter(|state| !state.is_empty()) {
+                    body["state"] = serde_json::json!(csrf_state);
+                }
+            }
             let resp = http_client
                 .post(&preset.token_url)
                 .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
                 .json(&body)
                 .send()
                 .await
@@ -455,6 +486,7 @@ pub async fn do_refresh_token(
             let resp = http_client
                 .post(token_url)
                 .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
                 .json(&body)
                 .send()
                 .await
@@ -479,11 +511,25 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResult, St
     let account_id = raw
         .account_id
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            raw.account
+                .as_ref()
+                .and_then(|account| account.uuid.as_deref())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| raw.id_token.as_deref().and_then(chatgpt_account_id));
     let account_email = raw
         .account_email
         .or(raw.email)
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            raw.account
+                .as_ref()
+                .and_then(|account| account.email_address.as_deref())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| raw.id_token.as_deref().and_then(chatgpt_account_email));
     Ok(TokenResult {
         access_token: raw.access_token,
@@ -491,6 +537,18 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResult, St
         expires_in: raw.expires_in.map(Duration::from_secs),
         account_id,
         account_email,
+        organization_id: raw
+            .organization
+            .as_ref()
+            .and_then(|organization| organization.uuid.as_deref())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        organization_name: raw
+            .organization
+            .as_ref()
+            .and_then(|organization| organization.name.as_deref())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -1010,6 +1068,7 @@ mod tests {
         );
         assert_eq!(p.exchange_request_style, TokenRequestStyle::Json);
         assert_eq!(p.refresh_request_style, TokenRequestStyle::Json);
+        assert!(p.send_state_in_exchange_request);
         assert!(p
             .extra_authorize_params
             .contains(&("code".into(), "true".into())));
@@ -1064,6 +1123,50 @@ mod tests {
         assert!(!url.contains("api.connectors"));
     }
 
+    #[tokio::test]
+    async fn claude_exchange_parses_nested_account_and_organization() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "expires_in": 3600,
+                "account": {
+                    "uuid": "account-uuid",
+                    "email_address": "jorben@example.test"
+                },
+                "organization": {
+                    "uuid": "organization-uuid",
+                    "name": "Tiy Labs"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut preset = claude_preset();
+        preset.token_url = format!("{}/oauth/token", server.uri());
+        let result = exchange_code(
+            &preset,
+            "authorization-code",
+            "pkce-verifier",
+            Some("csrf-state"),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.account_id.as_deref(), Some("account-uuid"));
+        assert_eq!(result.account_email.as_deref(), Some("jorben@example.test"));
+        assert_eq!(result.organization_id.as_deref(), Some("organization-uuid"));
+        assert_eq!(result.organization_name.as_deref(), Some("Tiy Labs"));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["state"], "csrf-state");
+        assert_eq!(requests[0].headers["accept"], "application/json");
+    }
+
     #[test]
     fn cache_seed_and_get_refresh_token() {
         let cache = OAuthTokenCache::new();
@@ -1098,6 +1201,7 @@ mod tests {
         let cache = OAuthTokenCache::new();
         let oauth = OAuthTargetConfig {
             upstream_transport: tiygate_core::provider::oauth::UpstreamTransport::Http,
+            egress_profile: tiygate_core::provider::oauth::OAuthEgressProfile::Standard,
             token_url: "https://example.com/token".to_string(),
             client_id: "test".to_string(),
             client_secret: None,
@@ -1121,6 +1225,7 @@ mod tests {
     fn account_identity_only_sets_header_for_explicit_chatgpt_targets() {
         let mut oauth = OAuthTargetConfig {
             upstream_transport: tiygate_core::provider::oauth::UpstreamTransport::Http,
+            egress_profile: tiygate_core::provider::oauth::OAuthEgressProfile::Standard,
             token_url: "https://example.com/token".to_string(),
             client_id: "test".to_string(),
             client_secret: None,
@@ -1175,6 +1280,7 @@ mod tests {
 
         let oauth = OAuthTargetConfig {
             upstream_transport: tiygate_core::provider::oauth::UpstreamTransport::Http,
+            egress_profile: tiygate_core::provider::oauth::OAuthEgressProfile::Standard,
             token_url: "https://example.com/token".to_string(),
             client_id: "test".to_string(),
             client_secret: None,
@@ -1330,7 +1436,7 @@ mod tests {
 
         let mut preset = codex_preset();
         preset.token_url = format!("{}/oauth/token", server.uri());
-        let result = exchange_code(&preset, "code", "verifier", &reqwest::Client::new())
+        let result = exchange_code(&preset, "code", "verifier", None, &reqwest::Client::new())
             .await
             .unwrap();
         assert_eq!(result.account_id.as_deref(), Some("workspace-123"));

@@ -18,6 +18,7 @@
 //! configured database and exits; `migrate-status` reports the applied
 //! versions. `run` is the legacy path.
 
+mod anthropic_oauth;
 mod app;
 mod cli;
 mod config;
@@ -26,6 +27,7 @@ mod ingress;
 mod models;
 mod oauth_manager;
 mod oauth_refresh_worker;
+mod openai_codex_oauth;
 mod telemetry;
 mod trace;
 #[cfg(feature = "webui")]

@@ -206,14 +206,20 @@ async fn callback_oauth_inner(
 
     // Exchange the authorization code for tokens.
     let http_client = reqwest::Client::new();
-    let result = exchange_code(&preset, &code, &pending.verifier, &http_client)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("oauth exchange failed: {e}"),
-            )
-        })?;
+    let result = exchange_code(
+        &preset,
+        &code,
+        &pending.verifier,
+        Some(&csrf_state),
+        &http_client,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("oauth exchange failed: {e}"),
+        )
+    })?;
 
     if result.refresh_token.is_none() {
         return Err((
@@ -252,6 +258,8 @@ async fn callback_oauth_inner(
     let expires_in = result.expires_in;
     let account_id = result.account_id;
     let account_email = result.account_email;
+    let organization_id = result.organization_id;
+    let organization_name = result.organization_name;
 
     // Persist the refresh-token metadata (encrypted at rest by
     // the `DbConfigStore`). The access token itself is *not*
@@ -261,6 +269,8 @@ async fn callback_oauth_inner(
         "refresh_token": &refresh_token,
         "account_id": account_id.as_deref(),
         "account_email": account_email.as_deref(),
+        "organization_id": organization_id.as_deref(),
+        "organization_name": organization_name.as_deref(),
         "expires_in_s": expires_in.map(|d| d.as_secs()),
         "status": OAuthCredentialStatus::Healthy.as_str(),
         "status_checked_at": chrono::Utc::now().to_rfc3339(),

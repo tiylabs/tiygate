@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 use tiygate_core::protocol::{ProtocolEndpoint, ProtocolSuite};
 use tiygate_core::provider::find_provider;
-use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle, UpstreamTransport};
+use tiygate_core::provider::oauth::{
+    OAuthEgressProfile, OAuthTargetConfig, TokenRequestStyle, UpstreamTransport,
+};
 use tiygate_core::routing::{RouteEntry, RoutingTable, RoutingTarget};
 
 use crate::db::DbPool;
@@ -363,6 +365,13 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or(UpstreamTransport::Http);
+    // Built-in OAuth providers select immutable egress behavior by vendor.
+    // Other OAuth providers retain the generic standard profile.
+    let egress_profile = match provider.vendor.as_str() {
+        "openai" => OAuthEgressProfile::OpenAiCodex,
+        "anthropic" => OAuthEgressProfile::AnthropicOAuth,
+        _ => OAuthEgressProfile::Standard,
+    };
 
     // Codex refreshes with form data, matching the reference CLI client.
     let token_request_style = oauth_meta
@@ -464,6 +473,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
 
     Some(OAuthTargetConfig {
         upstream_transport,
+        egress_profile,
         token_url,
         client_id,
         client_secret: None,
@@ -2441,6 +2451,37 @@ mod tests {
         assert!(oauth.extra_headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("user-agent") && value == OPENAI_CODEX_DESKTOP_USER_AGENT
         }));
+        assert_eq!(oauth.egress_profile, OAuthEgressProfile::OpenAiCodex);
+    }
+
+    #[test]
+    fn anthropic_oauth_config_uses_isolated_egress_profile() {
+        let now = chrono::Utc::now();
+        let provider = Provider {
+            id: "oauth-anthropic".to_string(),
+            name: "OAuth Anthropic".to_string(),
+            vendor: "anthropic".to_string(),
+            api_base: "https://api.anthropic.com".to_string(),
+            models_endpoint: String::new(),
+            encrypted_api_key: String::new(),
+            auth_mode: AuthMode::OAuth,
+            encrypted_oauth_meta: String::new(),
+            metadata_json: serde_json::json!({
+                "oauth": {
+                    "token_url": "https://api.anthropic.com/v1/oauth/token",
+                    "client_id": "client",
+                }
+            }),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            api_key_cleartext: None,
+            oauth_meta_cleartext: Some(serde_json::json!({"refresh_token": "refresh"}).to_string()),
+        };
+
+        let oauth = build_oauth_target_config(&provider).expect("oauth config");
+        assert_eq!(oauth.egress_profile, OAuthEgressProfile::AnthropicOAuth);
+        assert_eq!(oauth.token_request_style, TokenRequestStyle::Json);
     }
 
     fn test_model_metadata(id: &str) -> ModelMetadata {

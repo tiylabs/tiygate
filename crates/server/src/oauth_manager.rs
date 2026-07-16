@@ -667,6 +667,12 @@ impl OAuthTokenManager {
         if let Some(account_email) = result.account_email.as_deref() {
             object.insert("account_email".to_string(), json!(account_email));
         }
+        if let Some(organization_id) = result.organization_id.as_deref() {
+            object.insert("organization_id".to_string(), json!(organization_id));
+        }
+        if let Some(organization_name) = result.organization_name.as_deref() {
+            object.insert("organization_name".to_string(), json!(organization_name));
+        }
         object.insert(
             "expires_in_s".to_string(),
             result
@@ -1083,6 +1089,7 @@ mod tests {
     fn make_oauth_config(refresh_token: &str) -> OAuthTargetConfig {
         OAuthTargetConfig {
             upstream_transport: UpstreamTransport::Http,
+            egress_profile: tiygate_core::provider::oauth::OAuthEgressProfile::Standard,
             token_url: "https://example.com/token".to_string(),
             client_id: "test-client".to_string(),
             client_secret: None,

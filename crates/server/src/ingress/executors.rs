@@ -11,10 +11,8 @@ use bytes::Bytes;
 use futures::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-use tiygate_core::provider::oauth::UpstreamTransport;
 use tiygate_core::tracing_ctx::TraceContext;
 use tiygate_core::{EndpointCodec, IrRequest, UsageAccumulator};
 use tiygate_protocols::chat_completions::ChatCompletionsCodec;
@@ -23,6 +21,8 @@ use tiygate_protocols::gemini::GeminiCodec;
 use tiygate_protocols::images::ImagesGenerationsCodec;
 use tiygate_protocols::messages::MessagesCodec;
 use tiygate_protocols::responses::ResponsesCodec;
+
+use crate::openai_codex_oauth as codex_oauth;
 
 use super::headers::{
     extract_rate_limit_headers, extract_retry_after, forward_upstream_resp_headers,
@@ -43,10 +43,6 @@ use super::{apply_provider_auth, AppError, AppState};
 /// global `request_read_timeout` (which defaults to 30s for chat).
 const IMAGES_NONSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Required by the Codex Responses WebSocket endpoint. This is a transport
-/// negotiation header, not a client-supplied preference, so it is injected
-/// after header forwarding and OAuth auth have run.
-const CODEX_RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const CODEX_WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_WEBSOCKET_EVENT_BUFFER: usize = 16;
 
@@ -78,189 +74,36 @@ impl Drop for CancelableCodexWebSocketStream {
     }
 }
 
-fn uses_codex_responses_websocket(target: &tiygate_core::RoutingTarget) -> bool {
-    matches!(
-        target.oauth.as_ref().map(|oauth| oauth.upstream_transport),
-        Some(UpstreamTransport::CodexResponsesWebSocket)
+fn uses_anthropic_oauth_egress_profile(
+    target: &tiygate_core::RoutingTarget,
+    egress_protocol: &tiygate_core::ProtocolEndpoint,
+) -> bool {
+    crate::anthropic_oauth::is_enabled(target, egress_protocol.suite)
+}
+
+fn egress_http_client(state: &AppState, anthropic_oauth_profile: bool) -> reqwest::Client {
+    let tunables = state.tunables();
+    if anthropic_oauth_profile {
+        tunables.anthropic_oauth_http_client.clone()
+    } else {
+        tunables.http_client.clone()
+    }
+}
+
+fn apply_anthropic_oauth_egress_headers(
+    target: &tiygate_core::RoutingTarget,
+    upstream_headers: &mut http::HeaderMap,
+    is_stream: bool,
+    request_id: &str,
+) -> Result<(), AppError> {
+    crate::anthropic_oauth::apply_headers(target, upstream_headers, is_stream, request_id).map_err(
+        |error| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Anthropic OAuth egress profile error: {error}"),
+            )
+        },
     )
-}
-
-fn is_codex_oauth_target(target: &tiygate_core::RoutingTarget) -> bool {
-    target.oauth.as_ref().is_some_and(|oauth| {
-        oauth.client_id == "app_EMoamEEZ73f0CkXaXp7hrann"
-            || target
-                .effective_api_base()
-                .contains("chatgpt.com/backend-api/codex")
-    })
-}
-
-fn normalize_codex_request(body: &mut Value, websocket: bool) -> bool {
-    let Some(object) = body.as_object_mut() else {
-        return false;
-    };
-    let mut changed = false;
-    if object.get("stream").and_then(Value::as_bool) != Some(true) {
-        object.insert("stream".to_string(), json!(true));
-        changed = true;
-    }
-    if object.get("instructions").is_none_or(Value::is_null) {
-        object.insert("instructions".to_string(), json!(""));
-        changed = true;
-    }
-    for field in ["prompt_cache_retention", "safety_identifier"] {
-        changed |= object.remove(field).is_some();
-    }
-    if !websocket {
-        for field in ["previous_response_id", "stream_options"] {
-            changed |= object.remove(field).is_some();
-        }
-    }
-    changed
-}
-
-fn ensure_codex_request_headers(headers: &mut http::HeaderMap) {
-    let has_session = ["session_id", "session-id"]
-        .iter()
-        .any(|name| headers.contains_key(*name));
-    let desktop_user_agent = headers
-        .get(http::header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("Mac OS"));
-    if desktop_user_agent && !has_session {
-        if let Ok(value) = http::HeaderValue::from_str(&uuid::Uuid::now_v7().to_string()) {
-            headers.insert(http::HeaderName::from_static("session_id"), value);
-        }
-    }
-}
-
-fn parse_codex_http_response(body: &str) -> Result<Value, AppError> {
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        return Ok(value);
-    }
-    let mut terminal_error = None;
-    for line in body.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.completed" | "response.done") => {
-                if let Some(response) = event.get("response") {
-                    return Ok(response.clone());
-                }
-            }
-            Some("response.failed" | "response.incomplete" | "error") => {
-                terminal_error = Some(event);
-            }
-            _ => {}
-        }
-    }
-    if let Some(error) = terminal_error {
-        return Err(AppError::new(
-            StatusCode::BAD_GATEWAY,
-            format!("Codex terminal error: {error}"),
-        ));
-    }
-    Err(AppError::new(
-        StatusCode::BAD_GATEWAY,
-        "Codex response did not contain response.completed".to_string(),
-    ))
-}
-
-fn codex_websocket_url(upstream_url: &str) -> Result<String, AppError> {
-    let mut url = url::Url::parse(upstream_url).map_err(|error| {
-        AppError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("invalid Codex upstream URL: {error}"),
-        )
-    })?;
-    match url.scheme() {
-        "https" => url.set_scheme("wss").map_err(|_| {
-            AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to convert Codex HTTPS URL to WSS".to_string(),
-            )
-        })?,
-        "http" => url.set_scheme("ws").map_err(|_| {
-            AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to convert Codex HTTP URL to WS".to_string(),
-            )
-        })?,
-        "ws" | "wss" => {}
-        scheme => {
-            return Err(AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unsupported Codex WebSocket URL scheme: {scheme}"),
-            ));
-        }
-    }
-    Ok(url.into())
-}
-
-fn codex_response_create(mut body: Value) -> Result<Value, AppError> {
-    let object = body.as_object_mut().ok_or_else(|| {
-        AppError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Codex Responses request body must be a JSON object".to_string(),
-        )
-    })?;
-    // The WebSocket endpoint uses an event envelope instead of an HTTP body.
-    // Always overwrite a forwarded value: clients may not select arbitrary
-    // command types through the gateway.
-    object.insert("type".to_string(), json!("response.create"));
-    Ok(body)
-}
-
-fn codex_websocket_handshake_request(
-    websocket_url: &str,
-    headers: &http::HeaderMap,
-) -> Result<http::Request<()>, AppError> {
-    // Start from tungstenite's client request builder so the mandatory
-    // Upgrade / Connection / Sec-WebSocket-* headers are present. A plain
-    // `http::Request::builder()` looks valid but fails the handshake because
-    // it omits the generated Sec-WebSocket-Key.
-    let mut request = websocket_url.into_client_request().map_err(|error| {
-        AppError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("build Codex WebSocket handshake request: {error}"),
-        )
-    })?;
-    for (name, value) in headers {
-        request.headers_mut().insert(name.clone(), value.clone());
-    }
-    Ok(request)
-}
-
-/// Normalize terminal variants emitted by Codex's WebSocket surface.
-///
-/// `response.done` is wire-compatible with `response.completed`, but the
-/// standard Responses SSE decoder only understands the latter. Codex also
-/// uses a top-level `error` event as a terminal event. A WebSocket session can
-/// remain open after any of these, while a gateway HTTP request cannot.
-fn normalize_codex_websocket_event(text: String) -> (String, bool) {
-    let Ok(mut event) = serde_json::from_str::<Value>(&text) else {
-        return (text, false);
-    };
-    let Some(event_type) = event.get("type").and_then(Value::as_str) else {
-        return (text, false);
-    };
-    if event_type == "response.done" {
-        event["type"] = json!("response.completed");
-        let normalized = serde_json::to_string(&event).unwrap_or(text);
-        return (normalized, true);
-    }
-    let terminal = matches!(
-        event_type,
-        "response.completed" | "response.failed" | "response.incomplete" | "error"
-    );
-    (text, terminal)
 }
 
 async fn close_codex_websocket(socket: &mut CodexWebSocket, reason: &'static str) {
@@ -307,7 +150,7 @@ fn websocket_event_stream(socket: CodexWebSocket) -> UpstreamByteStream {
                     // Codex sends one Responses event per text message. The
                     // existing stream bridge consumes SSE, so retain the
                     // event JSON verbatim and add only the SSE envelope.
-                    let (text, terminal) = normalize_codex_websocket_event(text.to_string());
+                    let (text, terminal) = codex_oauth::normalize_websocket_event(text.to_string());
                     if !send_codex_websocket_event(
                         &sender,
                         &mut cancel_receiver,
@@ -325,7 +168,7 @@ fn websocket_event_stream(socket: CodexWebSocket) -> UpstreamByteStream {
                 }
                 Some(Ok(Message::Binary(bytes))) => match String::from_utf8(bytes.to_vec()) {
                     Ok(text) => {
-                        let (text, terminal) = normalize_codex_websocket_event(text);
+                        let (text, terminal) = codex_oauth::normalize_websocket_event(text);
                         if !send_codex_websocket_event(
                             &sender,
                             &mut cancel_receiver,
@@ -599,6 +442,10 @@ pub(super) async fn execute_upstream(
         &egress_protocol.suite,
         &target.model_id,
     );
+    let anthropic_oauth_profile = uses_anthropic_oauth_egress_profile(target, &egress_protocol);
+    if anthropic_oauth_profile {
+        body_mutated |= crate::anthropic_oauth::prepare_body(&mut upstream_body);
+    }
     // Any body mutation invalidates the byte-for-byte raw body.
     let pass_through_verbatim = is_pass_through && !body_mutated;
 
@@ -615,6 +462,9 @@ pub(super) async fn execute_upstream(
         &state.tunables().header_policy,
     );
     apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    if anthropic_oauth_profile {
+        apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
+    }
 
     // Capture the egress request (headers + body) for the request-log
     // detail view. We snapshot here, *after* auth injection and just
@@ -632,7 +482,7 @@ pub(super) async fn execute_upstream(
         serde_json::to_string(&upstream_body).ok()
     };
 
-    let client = &state.tunables().http_client;
+    let client = &egress_http_client(state, anthropic_oauth_profile);
     // Address the upstream by the *egress* protocol (the target provider's
     // protocol), not the ingress entrypoint. When a chat-completions request
     // is routed to an Anthropic provider, the body is converted above and
@@ -1097,6 +947,10 @@ pub(super) async fn execute_messages_upstream(
         &egress_protocol.suite,
         &target.model_id,
     );
+    let anthropic_oauth_profile = uses_anthropic_oauth_egress_profile(target, &egress_protocol);
+    if anthropic_oauth_profile {
+        body_mutated |= crate::anthropic_oauth::prepare_body(&mut upstream_body);
+    }
     let pass_through_verbatim = is_pass_through && !body_mutated;
 
     // Apply auth via the registered provider's AuthApplier. For
@@ -1113,6 +967,9 @@ pub(super) async fn execute_messages_upstream(
         &state.tunables().header_policy,
     );
     apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    if anthropic_oauth_profile {
+        apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
+    }
 
     // Capture egress request (headers + body) for the detail view.
     let egress_body_capture = if pass_through_verbatim {
@@ -1121,7 +978,7 @@ pub(super) async fn execute_messages_upstream(
         serde_json::to_string(&upstream_body).ok()
     };
 
-    let client = &state.tunables().http_client;
+    let client = &egress_http_client(state, anthropic_oauth_profile);
     // Address the upstream by the *egress* protocol, not the ingress
     // entrypoint. A `/v1/messages` request routed to an OpenAI provider is
     // converted above and must be POSTed to `/chat/completions`. Gemini
@@ -1837,10 +1694,14 @@ pub(super) async fn execute_responses_upstream(
         &egress_protocol.suite,
         &target.model_id,
     );
-    let codex_oauth = is_codex_oauth_target(target);
-    let codex_websocket = codex_oauth && uses_codex_responses_websocket(target);
-    if codex_oauth {
-        body_mutated |= normalize_codex_request(&mut upstream_body, codex_websocket);
+    let openai_codex_profile = codex_oauth::is_enabled(target, egress_protocol.suite);
+    let codex_websocket = openai_codex_profile && codex_oauth::uses_websocket(target);
+    if openai_codex_profile {
+        body_mutated |= codex_oauth::prepare_body(&mut upstream_body, codex_websocket);
+    }
+    let anthropic_oauth_profile = uses_anthropic_oauth_egress_profile(target, &egress_protocol);
+    if anthropic_oauth_profile {
+        body_mutated |= crate::anthropic_oauth::prepare_body(&mut upstream_body);
     }
     let pass_through_verbatim = is_pass_through && !body_mutated;
     merge_client_headers(
@@ -1849,8 +1710,11 @@ pub(super) async fn execute_responses_upstream(
         &state.tunables().header_policy,
     );
     apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
-    if codex_oauth {
-        ensure_codex_request_headers(&mut upstream_headers);
+    if openai_codex_profile {
+        codex_oauth::apply_headers(&mut upstream_headers);
+    }
+    if anthropic_oauth_profile {
+        apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
     }
 
     let mut egress_body_capture = if pass_through_verbatim {
@@ -1899,18 +1763,18 @@ pub(super) async fn execute_responses_upstream(
         match websocket_result {
             Ok(response) => return Ok(response),
             Err(error) if error.http_status() == StatusCode::UPGRADE_REQUIRED => {
-                normalize_codex_request(&mut upstream_body, false);
+                codex_oauth::prepare_body(&mut upstream_body, false);
                 egress_body_capture = serde_json::to_string(&upstream_body).ok();
             }
             Err(error) => return Err(error),
         }
     }
 
+    let client = egress_http_client(state, anthropic_oauth_profile);
+
     if is_stream {
         let mut stream_req = crate::ingress::observability::inject_trace(
-            state
-                .tunables()
-                .http_client
+            client
                 .post(&upstream_url)
                 .headers(upstream_headers)
                 .header(http::header::ACCEPT, "text/event-stream"),
@@ -1930,11 +1794,10 @@ pub(super) async fn execute_responses_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let tunables = state.tunables();
         let response = execute_with_ttfb_timeout(
-            &tunables.http_client,
+            &client,
             egress_req,
-            tunables.upstream_ttfb_timeout_secs,
+            state.tunables().upstream_ttfb_timeout_secs,
         )
         .await?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
@@ -2049,14 +1912,10 @@ pub(super) async fn execute_responses_upstream(
 
     // Non-streaming path
     let mut nonstream_req = crate::ingress::observability::inject_trace(
-        state
-            .tunables()
-            .http_client
-            .post(&upstream_url)
-            .headers(upstream_headers),
+        client.post(&upstream_url).headers(upstream_headers),
         trace,
     );
-    if codex_oauth {
+    if openai_codex_profile {
         nonstream_req = nonstream_req.header(http::header::ACCEPT, "text/event-stream");
     }
     if pass_through_verbatim {
@@ -2073,9 +1932,7 @@ pub(super) async fn execute_responses_upstream(
     let (egress_req, egress_headers_capture, egress_method, egress_path) =
         crate::ingress::observability::finalize_egress(nonstream_req)?;
     let exec_started = std::time::Instant::now();
-    let response = state
-        .tunables()
-        .http_client
+    let response = client
         .execute(egress_req)
         .await
         .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
@@ -2137,8 +1994,8 @@ pub(super) async fn execute_responses_upstream(
         return Err(app_err);
     }
 
-    let response_body = if codex_oauth {
-        parse_codex_http_response(&response_text)?
+    let response_body = if openai_codex_profile {
+        codex_oauth::parse_http_response(&response_text)?
     } else {
         parsed_json.ok_or_else(|| {
             AppError::new(
@@ -2179,7 +2036,7 @@ pub(super) async fn execute_responses_upstream(
         return Err(app_err);
     }
 
-    let upstream_resp_body_capture = if codex_oauth {
+    let upstream_resp_body_capture = if openai_codex_profile {
         Some(response_text)
     } else {
         serde_json::to_string(&response_body).ok()
@@ -2274,18 +2131,12 @@ async fn execute_codex_responses_websocket(
     request_id: &str,
     is_same_protocol: bool,
 ) -> Result<(Response, Option<u64>), AppError> {
-    upstream_body = codex_response_create(upstream_body)?;
+    upstream_body = codex_oauth::websocket_request_body(upstream_body)?;
 
     // The payload lives exclusively in the first WebSocket message. Keeping
     // HTTP entity headers on the upgrade request can make strict proxies
     // treat it as an unsupported HTTP POST-style content type.
-    upstream_headers.remove(http::header::CONTENT_TYPE);
-    upstream_headers.remove(http::header::CONTENT_LENGTH);
-    upstream_headers.remove(http::header::TRANSFER_ENCODING);
-    upstream_headers.insert(
-        http::HeaderName::from_static("openai-beta"),
-        http::HeaderValue::from_static(CODEX_RESPONSES_WEBSOCKET_BETA),
-    );
+    codex_oauth::prepare_websocket_headers(&mut upstream_headers);
     let trace_value = http::HeaderValue::from_str(&trace.to_traceparent()).map_err(|error| {
         AppError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2294,8 +2145,8 @@ async fn execute_codex_responses_websocket(
     })?;
     upstream_headers.insert(http::HeaderName::from_static("traceparent"), trace_value);
 
-    let websocket_url = codex_websocket_url(&upstream_url)?;
-    let request = codex_websocket_handshake_request(&websocket_url, &upstream_headers)?;
+    let websocket_url = codex_oauth::websocket_url(&upstream_url)?;
+    let request = codex_oauth::websocket_handshake_request(&websocket_url, &upstream_headers)?;
     let egress_path = request
         .uri()
         .path_and_query()
@@ -2631,6 +2482,10 @@ pub(super) async fn execute_gemini_upstream(
         &egress_protocol.suite,
         &target.model_id,
     );
+    let anthropic_oauth_profile = uses_anthropic_oauth_egress_profile(target, &egress_protocol);
+    if anthropic_oauth_profile {
+        body_mutated |= crate::anthropic_oauth::prepare_body(&mut upstream_body);
+    }
     let pass_through_verbatim = is_pass_through && !body_mutated;
     merge_client_headers(
         client_headers,
@@ -2638,6 +2493,9 @@ pub(super) async fn execute_gemini_upstream(
         &state.tunables().header_policy,
     );
     apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    if anthropic_oauth_profile {
+        apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
+    }
 
     let egress_body_capture = if pass_through_verbatim {
         raw_passthrough_body.map(|s| s.to_string())
@@ -2645,6 +2503,7 @@ pub(super) async fn execute_gemini_upstream(
         serde_json::to_string(&upstream_body).ok()
     };
     let req_id_capture = request_id.to_string();
+    let client = egress_http_client(state, anthropic_oauth_profile);
 
     let upstream_url = if is_stream {
         upstream_stream_url_for_suite(target, egress_protocol.suite)
@@ -2663,11 +2522,7 @@ pub(super) async fn execute_gemini_upstream(
 
     if is_stream {
         let mut stream_req = crate::ingress::observability::inject_trace(
-            state
-                .tunables()
-                .http_client
-                .post(&upstream_url)
-                .headers(upstream_headers),
+            client.post(&upstream_url).headers(upstream_headers),
             trace,
         );
         if pass_through_verbatim {
@@ -2684,11 +2539,10 @@ pub(super) async fn execute_gemini_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let tunables = state.tunables();
         let response = execute_with_ttfb_timeout(
-            &tunables.http_client,
+            &client,
             egress_req,
-            tunables.upstream_ttfb_timeout_secs,
+            state.tunables().upstream_ttfb_timeout_secs,
         )
         .await?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
@@ -2803,11 +2657,7 @@ pub(super) async fn execute_gemini_upstream(
 
     // Non-streaming path
     let mut nonstream_req = crate::ingress::observability::inject_trace(
-        state
-            .tunables()
-            .http_client
-            .post(&upstream_url)
-            .headers(upstream_headers),
+        client.post(&upstream_url).headers(upstream_headers),
         trace,
     );
     if pass_through_verbatim {
@@ -2824,9 +2674,7 @@ pub(super) async fn execute_gemini_upstream(
     let (egress_req, egress_headers_capture, egress_method, egress_path) =
         crate::ingress::observability::finalize_egress(nonstream_req)?;
     let exec_started = std::time::Instant::now();
-    let response = state
-        .tunables()
-        .http_client
+    let response = client
         .execute(egress_req)
         .await
         .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
@@ -3789,21 +3637,22 @@ mod tests {
     #[test]
     fn codex_websocket_url_preserves_responses_path() {
         let result =
-            codex_websocket_url("https://chatgpt.com/backend-api/codex/responses?foo=bar").unwrap();
+            codex_oauth::websocket_url("https://chatgpt.com/backend-api/codex/responses?foo=bar")
+                .unwrap();
         assert_eq!(
             result,
             "wss://chatgpt.com/backend-api/codex/responses?foo=bar"
         );
         assert_eq!(
-            codex_websocket_url("http://127.0.0.1:8080/responses").unwrap(),
+            codex_oauth::websocket_url("http://127.0.0.1:8080/responses").unwrap(),
             "ws://127.0.0.1:8080/responses"
         );
-        assert!(codex_websocket_url("ftp://example.test/responses").is_err());
+        assert!(codex_oauth::websocket_url("ftp://example.test/responses").is_err());
     }
 
     #[test]
     fn codex_response_create_preserves_responses_payload() {
-        let event = codex_response_create(json!({
+        let event = codex_oauth::websocket_request_body(json!({
             "model": "gpt-5-codex",
             "input": [{"role": "user", "content": "hello"}],
             "additional_tools": [{"type": "computer"}],
@@ -3827,7 +3676,7 @@ mod tests {
             "prompt_cache_retention": "24h",
             "safety_identifier": "user"
         });
-        assert!(normalize_codex_request(&mut body, false));
+        assert!(codex_oauth::prepare_body(&mut body, false));
         assert_eq!(body["stream"], true);
         assert_eq!(body["instructions"], "");
         assert!(body.get("previous_response_id").is_none());
@@ -3842,7 +3691,7 @@ mod tests {
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\"}}\n\n"
         );
-        let response = parse_codex_http_response(body).unwrap();
+        let response = codex_oauth::parse_http_response(body).unwrap();
         assert_eq!(response["id"], "resp-1");
         assert_eq!(response["status"], "completed");
     }
@@ -3854,13 +3703,13 @@ mod tests {
             http::header::USER_AGENT,
             http::HeaderValue::from_static("Codex Desktop/1 (Mac OS 26; arm64)"),
         );
-        ensure_codex_request_headers(&mut headers);
+        codex_oauth::apply_headers(&mut headers);
         assert!(headers.contains_key("session_id"));
     }
 
     #[test]
     fn codex_websocket_normalizes_all_terminal_variants() {
-        let (completed, is_terminal) = normalize_codex_websocket_event(
+        let (completed, is_terminal) = codex_oauth::normalize_websocket_event(
             json!({"type": "response.done", "response": {"id": "resp-test"}}).to_string(),
         );
         assert!(is_terminal);
@@ -3869,7 +3718,7 @@ mod tests {
             "response.completed"
         );
         let (_, is_terminal) =
-            normalize_codex_websocket_event(json!({"type": "error"}).to_string());
+            codex_oauth::normalize_websocket_event(json!({"type": "error"}).to_string());
         assert!(is_terminal);
     }
 
@@ -3886,10 +3735,10 @@ mod tests {
         );
         headers.insert(
             http::HeaderName::from_static("openai-beta"),
-            http::HeaderValue::from_static(CODEX_RESPONSES_WEBSOCKET_BETA),
+            http::HeaderValue::from_static(codex_oauth::RESPONSES_WEBSOCKET_BETA),
         );
 
-        let request = codex_websocket_handshake_request(
+        let request = codex_oauth::websocket_handshake_request(
             "wss://chatgpt.com/backend-api/codex/responses",
             &headers,
         )
@@ -3906,7 +3755,7 @@ mod tests {
         );
         assert_eq!(
             request.headers().get("openai-beta").unwrap(),
-            CODEX_RESPONSES_WEBSOCKET_BETA
+            codex_oauth::RESPONSES_WEBSOCKET_BETA
         );
     }
 
@@ -3950,19 +3799,19 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::HeaderName::from_static("openai-beta"),
-            http::HeaderValue::from_static(CODEX_RESPONSES_WEBSOCKET_BETA),
+            http::HeaderValue::from_static(codex_oauth::RESPONSES_WEBSOCKET_BETA),
         );
         headers.insert(
             http::HeaderName::from_static("x-client-request-id"),
             http::HeaderValue::from_static("client-request-id"),
         );
-        let request = codex_websocket_handshake_request(
+        let request = codex_oauth::websocket_handshake_request(
             &format!("ws://{address}/backend-api/codex/responses"),
             &headers,
         )
         .unwrap();
         let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-        let command = codex_response_create(json!({
+        let command = codex_oauth::websocket_request_body(json!({
             "model": "gpt-5-codex",
             "additional_tools": [{"type": "computer"}]
         }))
@@ -4014,7 +3863,7 @@ mod tests {
             let _ = close_tx.send(saw_client_close);
         });
 
-        let request = codex_websocket_handshake_request(
+        let request = codex_oauth::websocket_handshake_request(
             &format!("ws://{address}/backend-api/codex/responses"),
             &http::HeaderMap::new(),
         )

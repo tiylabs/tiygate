@@ -1,6 +1,7 @@
 //! TiyGate server library — exposes public modules for integration tests
 //! and downstream binaries.
 
+pub(crate) mod anthropic_oauth;
 pub mod app;
 pub mod config;
 pub mod drain;
@@ -8,6 +9,7 @@ pub mod ingress;
 pub mod models;
 pub mod oauth_manager;
 pub mod oauth_refresh_worker;
+pub(crate) mod openai_codex_oauth;
 pub mod telemetry;
 #[cfg(feature = "webui")]
 pub mod webui;
