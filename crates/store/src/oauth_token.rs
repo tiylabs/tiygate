@@ -294,6 +294,7 @@ impl OAuthTokenStore {
             "SELECT p.id FROM providers p \
              LEFT JOIN oauth_access_tokens s ON s.provider_id = p.id \
              WHERE p.enabled = 1 AND p.auth_mode = 'oauth' \
+               AND LOWER(p.vendor) <> 'xai' \
                AND (s.provider_id IS NULL OR s.next_keepalive_at IS NULL OR s.next_keepalive_at <= $1) \
                AND (s.next_retry_at IS NULL OR s.next_retry_at <= $1) \
              ORDER BY COALESCE(s.next_keepalive_at, p.updated_at) ASC LIMIT $2",

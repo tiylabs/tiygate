@@ -1,10 +1,10 @@
 //! Provider OAuth 2.0 — PKCE, token exchange, refresh, and global
-//! token cache for the three supported OAuth providers:
-//! Codex (OpenAI), Claude (Anthropic), and xAI (Grok).
+//! token cache for the two supported OAuth providers: Codex (OpenAI) and
+//! Claude (Anthropic).
 //!
 //! This module replaces the `oauth2` crate's `BasicClient` with
 //! direct `reqwest` calls so we can support both form-encoded
-//! (Codex/xAI) and JSON body (Claude) token exchange formats.
+//! (Codex) and JSON body (Claude) token exchange formats.
 //!
 //! ## Architecture
 //!
@@ -120,7 +120,7 @@ fn pkce_challenge(verifier: &str) -> String {
 /// preset to use; it maps to the `providers.vendor` DB column.
 #[derive(Debug, Clone)]
 pub struct OAuthProviderPreset {
-    /// Provider vendor identifier (e.g. `"openai"`, `"anthropic"`, `"xai"`).
+    /// Provider vendor identifier (e.g. `"openai"`, `"anthropic"`).
     pub vendor: String,
     /// Authorization endpoint URL.
     pub auth_url: String,
@@ -211,41 +211,6 @@ pub fn claude_preset() -> OAuthProviderPreset {
     }
 }
 
-/// xAI (Grok) OAuth preset.
-pub fn xai_preset() -> OAuthProviderPreset {
-    OAuthProviderPreset {
-        vendor: "xai".to_string(),
-        auth_url: "https://auth.x.ai/oauth2/authorize".to_string(),
-        token_url: "https://auth.x.ai/oauth2/token".to_string(),
-        client_id: "b1a00492-073a-47ea-816f-4c329264a828".to_string(),
-        redirect_url: "http://127.0.0.1:56121/callback".to_string(),
-        scopes: vec![
-            "openid".to_string(),
-            "profile".to_string(),
-            "email".to_string(),
-            "offline_access".to_string(),
-            "grok-cli:access".to_string(),
-            "api:access".to_string(),
-        ],
-        exchange_request_style: TokenRequestStyle::Form,
-        refresh_request_style: TokenRequestStyle::Form,
-        send_scopes_in_exchange_request: true,
-        send_state_in_exchange_request: false,
-        refresh_scopes: vec![
-            "openid".to_string(),
-            "profile".to_string(),
-            "email".to_string(),
-            "offline_access".to_string(),
-            "grok-cli:access".to_string(),
-            "api:access".to_string(),
-        ],
-        extra_authorize_params: vec![
-            ("plan".to_string(), "generic".to_string()),
-            ("referrer".to_string(), "tiygate".to_string()),
-        ],
-    }
-}
-
 /// Look up the OAuth preset for a given vendor string.
 ///
 /// Returns `None` for vendors without a built-in OAuth preset;
@@ -254,7 +219,6 @@ pub fn preset_for_vendor(vendor: &str) -> Option<OAuthProviderPreset> {
     match vendor {
         "openai" => Some(codex_preset()),
         "anthropic" => Some(claude_preset()),
-        "xai" => Some(xai_preset()),
         _ => None,
     }
 }
@@ -383,7 +347,7 @@ pub trait OAuthCredentialService: Send + Sync {
 
 /// Exchange an authorization code for tokens.
 ///
-/// Uses form-encoded body for Codex/xAI and JSON body for Claude,
+/// Uses form-encoded body for Codex and JSON body for Claude,
 /// per each provider's token endpoint requirements.
 pub async fn exchange_code(
     preset: &OAuthProviderPreset,
@@ -444,7 +408,7 @@ pub async fn exchange_code(
 
 /// Refresh an access token using a refresh token.
 ///
-/// Uses form-encoded body for Codex/xAI and JSON body for Claude.
+/// Uses form-encoded body for Codex and JSON body for Claude.
 /// The returned `TokenResult` may contain a new `refresh_token`
 /// (token rotation) — the caller must persist it.
 pub async fn do_refresh_token(
@@ -963,7 +927,7 @@ fn inject_token(
     // Inject extra provider-specific headers. The presence of the ChatGPT
     // account header is also the explicit signal that this target uses the
     // Codex workspace-scoping contract; a generic OAuth `account_id` must not
-    // leak an OpenAI-specific header to Anthropic, xAI, or custom providers.
+    // leak an OpenAI-specific header to Anthropic or custom providers.
     let uses_chatgpt_account_header = oauth
         .extra_headers
         .iter()
@@ -1075,36 +1039,10 @@ mod tests {
     }
 
     #[test]
-    fn xai_preset_values() {
-        let p = xai_preset();
-        assert_eq!(p.vendor, "xai");
-        assert_eq!(p.auth_url, "https://auth.x.ai/oauth2/authorize");
-        assert_eq!(p.token_url, "https://auth.x.ai/oauth2/token");
-        assert_eq!(p.client_id, "b1a00492-073a-47ea-816f-4c329264a828");
-        assert_eq!(p.redirect_url, "http://127.0.0.1:56121/callback");
-        assert_eq!(
-            p.scopes,
-            vec![
-                "openid",
-                "profile",
-                "email",
-                "offline_access",
-                "grok-cli:access",
-                "api:access"
-            ]
-        );
-        assert_eq!(p.exchange_request_style, TokenRequestStyle::Form);
-        assert_eq!(p.refresh_request_style, TokenRequestStyle::Form);
-        assert!(p
-            .extra_authorize_params
-            .contains(&("plan".into(), "generic".into())));
-    }
-
-    #[test]
     fn preset_for_vendor_lookup() {
         assert!(preset_for_vendor("openai").is_some());
         assert!(preset_for_vendor("anthropic").is_some());
-        assert!(preset_for_vendor("xai").is_some());
+        assert!(preset_for_vendor("xai").is_none());
         assert!(preset_for_vendor("unknown").is_none());
     }
 

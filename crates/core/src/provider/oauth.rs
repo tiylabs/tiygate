@@ -28,8 +28,8 @@ pub enum UpstreamTransport {
 
 /// How the token endpoint expects the refresh / exchange request body.
 ///
-/// Most providers (OpenAI/Codex, xAI) use the standard
-/// `application/x-www-form-urlencoded` body. Anthropic (Claude)
+/// Most providers use the standard `application/x-www-form-urlencoded` body.
+/// Anthropic (Claude)
 /// requires a JSON body — a critical divergence that the `oauth2`
 /// crate does not support, which is why the auth crate implements
 /// the token exchange directly with `reqwest`.
@@ -85,10 +85,10 @@ pub struct OAuthTargetConfig {
     /// Token endpoint URL for refresh / exchange.
     pub token_url: String,
     /// OAuth client identifier (public client — no secret needed
-    /// for the three supported providers).
+    /// for the built-in OAuth providers).
     pub client_id: String,
     /// Optional client secret. `None` for public clients (Codex,
-    /// Claude, xAI all use PKCE-only public clients).
+    /// Claude use PKCE-only public clients).
     #[serde(default, skip_serializing)]
     pub client_secret: Option<String>,
     /// The current refresh token. Populated from the DB; updated

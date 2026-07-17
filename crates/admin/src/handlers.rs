@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use tiygate_store::archive::{gzip_decompress, sha256_hex, PayloadArchiveManifest};
-use tiygate_store::config_store::StoreError;
+use tiygate_store::config_store::{validate_provider_auth_mode, StoreError};
 use tiygate_store::model_catalog::ModelMetadata;
 use tiygate_store::models::{
     AuthMode, ConfigExport, ImportSelection, OAuthCredentialStatus, Provider, Route, RouteTarget,
@@ -1462,6 +1462,8 @@ async fn create_provider(
         .as_deref()
         .and_then(AuthMode::parse)
         .unwrap_or(AuthMode::ApiKey);
+    validate_provider_auth_mode(&req.vendor, auth_mode)
+        .map_err(|message| AdminError::BadRequest(message.to_string()))?;
     let api_base = normalized_api_base(&req.vendor, auth_mode, &req.api_base);
     let models_endpoint = normalized_models_endpoint(
         &req.vendor,
@@ -1508,6 +1510,8 @@ async fn update_provider(
         .as_deref()
         .and_then(AuthMode::parse)
         .unwrap_or(AuthMode::ApiKey);
+    validate_provider_auth_mode(&req.vendor, auth_mode)
+        .map_err(|message| AdminError::BadRequest(message.to_string()))?;
     let api_base = normalized_api_base(&req.vendor, auth_mode, &req.api_base);
     let models_endpoint = normalized_models_endpoint(
         &req.vendor,

@@ -58,7 +58,7 @@ const OPENAI_PLATFORM_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
 /** Vendors that have a built-in OAuth preset (crates/auth/src/provider_oauth.rs). */
-const OAUTH_VENDORS = new Set(["openai", "anthropic", "xai"]);
+const OAUTH_VENDORS = new Set(["openai", "anthropic"]);
 
 /**
  * Refresh metadata embedded into `metadata_json["oauth"]` when a provider is
@@ -90,19 +90,6 @@ const OAUTH_PRESETS: Record<
       "user:file_upload",
     ],
     token_request_style: "json",
-  },
-  xai: {
-    token_url: "https://auth.x.ai/oauth2/token",
-    client_id: "b1a00492-073a-47ea-816f-4c329264a828",
-    scopes: [
-      "openid",
-      "profile",
-      "email",
-      "offline_access",
-      "grok-cli:access",
-      "api:access",
-    ],
-    token_request_style: "form",
   },
 };
 
