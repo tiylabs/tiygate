@@ -98,6 +98,9 @@ pub struct RuntimeTunables {
     pub max_queue_depth: usize,
     /// Timeout waiting for a concurrency permit.
     pub acquire_timeout: Duration,
+    /// Total wall-clock timeout for regular non-streaming upstream requests.
+    /// 0 = disabled. Image endpoints retain their dedicated longer budget.
+    pub upstream_nonstream_timeout_secs: u64,
     /// Idle timeout (seconds) for upstream streaming responses.
     pub upstream_stream_idle_timeout_secs: u64,
     /// Total wall-clock timeout (seconds) for upstream streaming.
@@ -135,10 +138,6 @@ pub struct AppState {
     /// startup because the `RequestBodyLimitLayer` is installed
     /// at router build time.
     pub max_multimodal_body_bytes: u64,
-    /// Read timeout for the full request body. Fixed at startup
-    /// because the `RequestBodyTimeoutLayer` is installed at
-    /// router build time.
-    pub request_read_timeout: Duration,
     /// Async telemetry bus — non-blocking send.
     pub telemetry: Arc<dyn TelemetryBus>,
     /// Quota counter; `None` in the legacy in-memory path. The
@@ -424,6 +423,7 @@ fn build_data_plane_router(
         max_inflight: server_config.max_inflight_requests,
         max_queue_depth: server_config.max_queue_depth,
         acquire_timeout: Duration::from_secs(server_config.acquire_timeout_secs),
+        upstream_nonstream_timeout_secs: server_config.upstream_nonstream_timeout_secs,
         upstream_stream_idle_timeout_secs: server_config.upstream_stream_idle_timeout_secs,
         upstream_stream_total_timeout_secs: server_config.upstream_stream_total_timeout_secs,
         upstream_ttfb_timeout_secs: server_config.upstream_ttfb_timeout_secs,
@@ -436,7 +436,6 @@ fn build_data_plane_router(
         health,
         concurrency_semaphore: semaphore,
         max_multimodal_body_bytes: server_config.max_multimodal_body_bytes,
-        request_read_timeout: Duration::from_secs(server_config.request_read_timeout_secs),
         telemetry,
         quota,
         embedding_cache,
@@ -581,6 +580,12 @@ pub(crate) fn spawn_tunables_reloader(
                 )
                 .await,
             );
+            let upstream_nonstream_timeout_secs = sk::get_u64(
+                store.as_ref(),
+                sk::UPSTREAM_NONSTREAM_TIMEOUT_SECS,
+                current_t.upstream_nonstream_timeout_secs,
+            )
+            .await;
             let upstream_stream_idle_timeout_secs = sk::get_u64(
                 store.as_ref(),
                 sk::UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
@@ -643,6 +648,7 @@ pub(crate) fn spawn_tunables_reloader(
                 max_inflight,
                 max_queue_depth,
                 acquire_timeout,
+                upstream_nonstream_timeout_secs,
                 upstream_stream_idle_timeout_secs,
                 upstream_stream_total_timeout_secs,
                 upstream_ttfb_timeout_secs,

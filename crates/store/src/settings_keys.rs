@@ -60,6 +60,9 @@ pub const INGRESS_RAW_ENVELOPE_CAPTURE_MEDIA: &str = "gateway.ingress.raw_envelo
 pub const INGRESS_REQUIRE_API_KEY: &str = "gateway.ingress.require_api_key";
 
 // --- Upstream ---
+/// Total wall-clock timeout for regular non-streaming upstream requests, in
+/// seconds. Set to 0 to disable. Default: 30s.
+pub const UPSTREAM_NONSTREAM_TIMEOUT_SECS: &str = "gateway.upstream.nonstream_timeout_secs";
 pub const UPSTREAM_STREAM_IDLE_TIMEOUT_SECS: &str = "gateway.upstream.stream_idle_timeout_secs";
 pub const UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS: &str = "gateway.upstream.stream_total_timeout_secs";
 /// Time-to-first-byte timeout for upstream streaming requests, in
@@ -111,6 +114,7 @@ pub const PLAIN_KEYS: &[&str] = &[
     INGRESS_ACQUIRE_TIMEOUT_SECS,
     INGRESS_RAW_ENVELOPE_CAPTURE_MEDIA,
     INGRESS_REQUIRE_API_KEY,
+    UPSTREAM_NONSTREAM_TIMEOUT_SECS,
     UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
     UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS,
     UPSTREAM_TTFB_TIMEOUT_SECS,
@@ -203,4 +207,14 @@ pub async fn get_string_list(store: &DbConfigStore, key: &str, default: &[String
 /// returned so the caller can decide whether to abort bootstrap.
 pub async fn set_str(store: &DbConfigStore, key: &str, value: &str) -> Result<(), StoreError> {
     store.set_setting(key, value).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PLAIN_KEYS, UPSTREAM_NONSTREAM_TIMEOUT_SECS};
+
+    #[test]
+    fn nonstream_timeout_is_a_migratable_plain_setting() {
+        assert!(PLAIN_KEYS.contains(&UPSTREAM_NONSTREAM_TIMEOUT_SECS));
+    }
 }

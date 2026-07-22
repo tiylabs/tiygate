@@ -61,6 +61,7 @@ const KEYS = {
   ingressAcquireTimeout: "gateway.ingress.acquire_timeout_secs",
   ingressRawMedia: "gateway.ingress.raw_envelope_capture_media",
   ingressRequireApiKey: "gateway.ingress.require_api_key",
+  upstreamNonstreamTimeout: "gateway.upstream.nonstream_timeout_secs",
   upstreamIdleTimeout: "gateway.upstream.stream_idle_timeout_secs",
   upstreamTotalTimeout: "gateway.upstream.stream_total_timeout_secs",
   upstreamTtfbTimeout: "gateway.upstream.ttfb_timeout_secs",
@@ -707,6 +708,19 @@ export default function SettingsPage() {
       <Card>
         <CardHeader title={t("settings.upstream.title")} />
         <CardBody className="grid gap-4 sm:grid-cols-2">
+          <Field
+            label={t("settings.upstream.nonstreamTimeout")}
+            hint={t("settings.upstream.secondsHint")}
+          >
+            <Input
+              type="number"
+              min="0"
+              value={getField(KEYS.upstreamNonstreamTimeout, "30")}
+              onChange={(e) =>
+                updateField(KEYS.upstreamNonstreamTimeout, e.target.value)
+              }
+            />
+          </Field>
           <Field
             label={t("settings.upstream.streamIdleTimeout")}
             hint={t("settings.upstream.secondsHint")}

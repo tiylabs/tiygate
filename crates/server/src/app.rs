@@ -532,6 +532,12 @@ async fn bootstrap_settings(store: &Arc<DbConfigStore>, cfg: &ServerConfig) {
     // Upstream
     let _ = ensure_setting(
         store,
+        sk::UPSTREAM_NONSTREAM_TIMEOUT_SECS,
+        &cfg.upstream_nonstream_timeout_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
         sk::UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
         &cfg.upstream_stream_idle_timeout_secs.to_string(),
     )

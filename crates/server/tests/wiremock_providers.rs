@@ -185,6 +185,66 @@ async fn test_happy_path_openai_chat_completion() {
 }
 
 #[tokio::test]
+async fn test_nonstream_timeout_is_configurable_and_can_be_disabled() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(1_100))
+                .set_body_json(json!({
+                    "id": "chatcmpl-slow",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "completed"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "wait"}]
+    });
+
+    let mut timeout_config = ServerConfig::default();
+    timeout_config.require_api_key = false;
+    timeout_config.upstream_nonstream_timeout_secs = 1;
+    let timed_app = build_test_app_with_config(mock_server.uri(), "gpt-4o", timeout_config);
+    let timed_request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let timed_response = timed_app.oneshot(timed_request).await.unwrap();
+    assert_eq!(timed_response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let timed_body = axum::body::to_bytes(timed_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&timed_body).contains("upstream non-stream request timeout"));
+
+    let mut disabled_config = ServerConfig::default();
+    disabled_config.require_api_key = false;
+    disabled_config.upstream_nonstream_timeout_secs = 0;
+    let unlimited_app = build_test_app_with_config(mock_server.uri(), "gpt-4o", disabled_config);
+    let unlimited_request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let unlimited_response = unlimited_app.oneshot(unlimited_request).await.unwrap();
+    assert_eq!(unlimited_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_happy_path_anthropic_messages() {
     let mock_server = wiremock::MockServer::start().await;
 

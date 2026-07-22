@@ -798,6 +798,7 @@ const en = {
     },
     upstream: {
       title: "Upstream Tuning",
+      nonstreamTimeout: "Non-stream Total Timeout",
       streamIdleTimeout: "Stream Idle Timeout",
       streamTotalTimeout: "Stream Total Timeout",
       ttfbTimeout: "TTFB Timeout",
