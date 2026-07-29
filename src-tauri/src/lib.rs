@@ -176,9 +176,8 @@ pub fn run() {
         }
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Resumed => {
-            // Only repair tray on genuine resume/reopen after startup.
-            // During the first 5 seconds the tray is still initializing
-            // and rebuilding it can crash the app.
+            // Only repair the tray after startup: during the first five
+            // seconds macOS may still be laying out its status item.
             if app_start_time().elapsed() >= std::time::Duration::from_secs(5) {
                 repair_main_tray(app_handle);
             }
@@ -186,6 +185,7 @@ pub fn run() {
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen {
             has_visible_windows,
+            ..
         } => {
             if app_start_time().elapsed() >= std::time::Duration::from_secs(5) {
                 repair_main_tray(app_handle);
