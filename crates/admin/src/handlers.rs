@@ -637,6 +637,30 @@ async fn provider_usage(
         .text()
         .await
         .map_err(|error| AdminError::Internal(format!("read usage response: {error}")))?;
+    if provider.vendor == "openai" {
+        match serde_json::from_str::<Value>(&body) {
+            Ok(response) => {
+                let rate_limit = response
+                    .get("rate_limit")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "<missing>".to_string());
+                tracing::debug!(
+                    target: "tiygate_admin::usage",
+                    provider = %id,
+                    rate_limit = %rate_limit,
+                    "OpenAI OAuth usage rate-limit response"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(
+                    target: "tiygate_admin::usage",
+                    provider = %id,
+                    error = %error,
+                    "OpenAI OAuth usage response was not valid JSON"
+                );
+            }
+        }
+    }
     let parsed_result = match provider.vendor.as_str() {
         "openai" => parse_openai_usage(&body, chrono::Utc::now().timestamp()),
         "anthropic" => parse_anthropic_usage(&body),
