@@ -27,6 +27,12 @@ pub struct AppState {
 pub fn run() {
     init_tracing();
 
+    // Record startup before the event loop begins. The tray watchdog uses
+    // this to avoid rebuilding a status item while macOS is still laying
+    // out the menu bar during launch.
+    #[cfg(target_os = "macos")]
+    app_start_time();
+
     let app = match tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
@@ -169,12 +175,28 @@ pub fn run() {
             shutdown_sidecar(app_handle);
         }
         #[cfg(target_os = "macos")]
-        tauri::RunEvent::Resumed | tauri::RunEvent::Reopen { .. } => {
+        tauri::RunEvent::Resumed => {
             // Only repair tray on genuine resume/reopen after startup.
             // During the first 5 seconds the tray is still initializing
             // and rebuilding it can crash the app.
             if app_start_time().elapsed() >= std::time::Duration::from_secs(5) {
                 repair_main_tray(app_handle);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen {
+            has_visible_windows,
+        } => {
+            if app_start_time().elapsed() >= std::time::Duration::from_secs(5) {
+                repair_main_tray(app_handle);
+            }
+
+            // A menu-bar accessory app has no Dock or Cmd+Tab entry. If the
+            // window was hidden, reopening the app from Finder or Launchpad
+            // must therefore provide a reliable way back into the UI even
+            // when the system tray item is unavailable.
+            if !has_visible_windows {
+                show_main_window(app_handle);
             }
         }
         _ => {}
@@ -218,8 +240,7 @@ fn build_main_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     if window.is_visible().unwrap_or(false) {
                         let _ = window.hide();
                     } else {
-                        let _ = window.show();
-                        let _ = window.set_focus();
+                        show_main_window(app);
                     }
                 }
             }
@@ -232,10 +253,7 @@ fn build_main_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 fn handle_tray_menu_event(app: &tauri::AppHandle, id: &str) {
     match id {
         "show" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            show_main_window(app);
         }
         "hide" => {
             if let Some(window) = app.get_webview_window("main") {
@@ -247,6 +265,24 @@ fn handle_tray_menu_event(app: &tauri::AppHandle, id: &str) {
             app.exit(0);
         }
         _ => {}
+    }
+}
+
+/// Make the primary window visible and active, logging failures rather than
+/// silently leaving a menu-bar-only app inaccessible.
+fn show_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        tracing::warn!("main window is unavailable while attempting to show it");
+        return;
+    };
+
+    if let Err(e) = window.show() {
+        tracing::warn!("failed to show main window: {e}");
+        return;
+    }
+
+    if let Err(e) = window.set_focus() {
+        tracing::warn!("failed to focus main window: {e}");
     }
 }
 
@@ -314,13 +350,16 @@ fn tray_needs_rebuild(app: &tauri::AppHandle) -> bool {
 
     match tray.rect() {
         Ok(Some(rect)) => tray_rect_is_empty(rect),
-        Ok(None) => {
-            tracing::debug!("tray rect is None — likely still initializing; skipping rebuild");
-            false
-        }
+        // Once the startup grace period has elapsed, no rect means macOS no
+        // longer has a visible NSStatusItem. Returning false here made the
+        // watchdog permanently ignore exactly the missing-tray condition it
+        // exists to repair.
+        Ok(None) => true,
+        // Treat an unreadable status item as stale as well. Rebuilding is
+        // safer than leaving this menu-bar-only app without any UI entry.
         Err(e) => {
-            tracing::warn!("failed to read main tray icon rect: {e}");
-            false
+            tracing::warn!("failed to read main tray icon rect; rebuilding it: {e}");
+            true
         }
     }
 }
