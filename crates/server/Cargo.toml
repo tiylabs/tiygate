@@ -122,6 +122,7 @@ async-stream.workspace = true
 pin-project.workspace = true
 
 [dev-dependencies]
+serial_test.workspace = true
 wiremock.workspace = true
 
 [lints]

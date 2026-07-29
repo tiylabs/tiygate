@@ -361,3 +361,48 @@ fn parse_header_list(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+
+    const NONSTREAM_TIMEOUT_ENV: &str = "TIYGATE_UPSTREAM_NONSTREAM_TIMEOUT_SECS";
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nonstream_timeout_env_overrides_default_and_invalid_values_fall_back() {
+        let guard = EnvVarGuard::set(NONSTREAM_TIMEOUT_ENV, "0");
+        assert_eq!(ServerConfig::from_env().upstream_nonstream_timeout_secs, 0);
+
+        std::env::set_var(NONSTREAM_TIMEOUT_ENV, "not-a-number");
+        assert_eq!(
+            ServerConfig::from_env().upstream_nonstream_timeout_secs,
+            ServerConfig::default().upstream_nonstream_timeout_secs
+        );
+
+        drop(guard);
+    }
+}
