@@ -79,6 +79,27 @@ make fmt          # Format Rust and WebUI code
 
 See [AGENTS.md](AGENTS.md) for contributor rules, layering constraints, and coding standards. See [webui/README.md](webui/README.md) for Admin Console development.
 
+### Verify macOS tray recovery
+
+The desktop debug build exposes a local Unix socket to deterministically test
+its status-bar item. After the desktop client has fully started in one
+terminal, inject the failure from another:
+
+```bash
+make dev-desktop
+./scripts/inject-desktop-tray-loss.sh verify
+```
+
+`verify` hides the item and the watchdog should recreate it within 30 seconds.
+It then compares the rectangle macOS returns with the screen's usable menu-bar
+area. This matters on Macs with a camera housing: AppKit can report a non-empty,
+visible `NSStatusItem` rectangle even though the item has overflowed underneath
+the notch and is not drawn. `verify` fails in that case and reports how much
+menu-bar space must be freed. Use the optional `simulate-loss` and `status`
+arguments when inspecting each stage manually. Run only one TiyGate desktop
+client while testing; the installed and debug clients each consume a status
+item. The socket only exists in debug builds.
+
 ## Contributing
 
 Issues and pull requests are welcome. The design is opinionated, and contributions that fight the layering (e.g. adding a concrete provider dependency to `core`, or introducing `allow_lossy`) will be declined.

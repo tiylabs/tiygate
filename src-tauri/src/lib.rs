@@ -2,6 +2,8 @@ mod commands;
 mod config;
 mod sidecar;
 
+#[cfg(all(target_os = "macos", debug_assertions))]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
@@ -12,8 +14,17 @@ use tauri::{
     Manager,
 };
 
+#[cfg(all(target_os = "macos", debug_assertions))]
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixListener,
+};
+
 use crate::config::ClientConfig;
 use crate::sidecar::SidecarManager;
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+const TRAY_TEST_SOCKET_NAME: &str = "tiygate-tray-test.sock";
 
 /// Shared state managed by Tauri, holding the sidecar handle and the
 /// resolved client configuration.
@@ -121,6 +132,12 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             start_tray_watchdog(handle.clone());
 
+            // Debug builds expose a local Unix socket that can deliberately
+            // hide the tray item, allowing deterministic recovery tests
+            // without relying on a SystemUIServer or display transition.
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            start_tray_test_server(handle.clone());
+
             // The webview loads frontendDist (tauri://localhost) which
             // has Tauri IPC. The frontend uses Tauri commands to get
             // the sidecar port and makes cross-origin fetch calls to
@@ -179,25 +196,22 @@ pub fn run() {
             // Only repair the tray after startup: during the first five
             // seconds macOS may still be laying out its status item.
             if app_start_time().elapsed() >= std::time::Duration::from_secs(5) {
-                repair_main_tray(app_handle);
+                schedule_tray_repair(app_handle.clone());
             }
         }
         #[cfg(target_os = "macos")]
-        tauri::RunEvent::Reopen {
-            has_visible_windows,
-            ..
-        } => {
+        tauri::RunEvent::Reopen { .. } => {
             if app_start_time().elapsed() >= std::time::Duration::from_secs(5) {
-                repair_main_tray(app_handle);
+                schedule_tray_repair(app_handle.clone());
             }
 
-            // A menu-bar accessory app has no Dock or Cmd+Tab entry. If the
-            // window was hidden, reopening the app from Finder or Launchpad
-            // must therefore provide a reliable way back into the UI even
-            // when the system tray item is unavailable.
-            if !has_visible_windows {
-                show_main_window(app_handle);
-            }
+            // A menu-bar accessory app has no Dock or Cmd+Tab entry. Treat a
+            // Finder or Launchpad reopen as an explicit request to bring the
+            // panel forward. `has_visible_windows` is only AppKit's native
+            // visibility snapshot; it can be true while the panel is hidden
+            // behind another app or on a different Space.
+            tracing::info!("macOS requested TiyGate reopen; showing main window");
+            show_main_window(app_handle);
         }
         _ => {}
     });
@@ -213,9 +227,9 @@ fn build_main_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let quit_item = MenuItem::with_id(app, "quit", "退出 TiyGate", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
 
-    // Load the dedicated tray icon (a monochrome template PNG derived
-    // from webui/public/icon-round.svg). On macOS it is registered as a
-    // template image so the system automatically adapts it to dark/light
+    // Load the dedicated tray icon (a monochrome template PNG derived from
+    // webui/public/icon-round.svg). On macOS it is registered as a template
+    // image so the system automatically adapts it to dark/light
     // menu-bar appearance. The PNG is embedded at compile time via
     // `include_bytes!` so no filesystem access is needed at runtime.
     let tray_icon = load_tray_icon()?;
@@ -293,16 +307,19 @@ fn load_tray_icon() -> tauri::Result<tauri::image::Image<'static>> {
 #[cfg(target_os = "macos")]
 fn repair_main_tray(app: &tauri::AppHandle) {
     if tray_needs_rebuild(app) {
-        tracing::warn!("main tray icon is missing; rebuilding macOS status item");
+        tracing::warn!("main tray icon is missing; recreating macOS status item");
 
-        if let Some(old_tray) = app.remove_tray_by_id("main-tray") {
-            // Force the stale NSStatusItem wrapper to be released before
-            // creating a replacement with the same id.
-            drop(old_tray);
-        }
-
-        if let Err(e) = build_main_tray(app) {
-            tracing::warn!("failed to rebuild main tray icon: {e}");
+        if let Some(tray) = app.tray_by_id("main-tray") {
+            // Do not remove the Tauri resource here. `remove_tray_by_id`
+            // returns a native NSStatusItem wrapper whose final drop can run
+            // on a Tokio worker, but AppKit requires that destruction on the
+            // main thread. Tauri's visibility methods synchronously marshal
+            // to the main thread and recreate the underlying status item.
+            if let Err(e) = tray.set_visible(false).and_then(|_| tray.set_visible(true)) {
+                tracing::warn!("failed to recreate main tray icon: {e}");
+            }
+        } else if let Err(e) = build_main_tray(app) {
+            tracing::warn!("failed to rebuild unregistered main tray icon: {e}");
         }
     } else if let Some(tray) = app.tray_by_id("main-tray") {
         if let Err(e) =
@@ -311,6 +328,16 @@ fn repair_main_tray(app: &tauri::AppHandle) {
             tracing::warn!("failed to refresh main tray icon: {e}");
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn schedule_tray_repair(app: tauri::AppHandle) {
+    // `TrayIcon::rect` and `TrayIconBuilder::build` synchronously dispatch to
+    // the AppKit main thread. Run the health check from a worker so a macOS
+    // RunEvent handler never waits on its own event loop.
+    tauri::async_runtime::spawn(async move {
+        repair_main_tray(&app);
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -326,6 +353,114 @@ fn start_tray_watchdog(app: tauri::AppHandle) {
     });
 }
 
+/// Start the debug-only local command server used to test tray recovery.
+///
+/// The Unix socket is owned by the current user and is not present in release
+/// builds. See `scripts/inject-desktop-tray-loss.sh` for the client command.
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn start_tray_test_server(app: tauri::AppHandle) {
+    let socket_path = match app.path().app_local_data_dir() {
+        Ok(data_dir) => data_dir.join(TRAY_TEST_SOCKET_NAME),
+        Err(e) => {
+            tracing::warn!("failed to resolve desktop tray test socket path: {e}");
+            return;
+        }
+    };
+
+    tauri::async_runtime::spawn(async move {
+        match std::fs::remove_file(&socket_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!("failed to remove stale desktop tray test socket: {e}");
+                return;
+            }
+        }
+
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::warn!("failed to bind desktop tray test socket: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) =
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!("failed to restrict desktop tray test socket permissions: {e}");
+            return;
+        }
+
+        tracing::info!(
+            socket = %socket_path.display(),
+            "desktop tray test socket is ready"
+        );
+
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(e) => {
+                    tracing::warn!("desktop tray test socket accept failed: {e}");
+                    continue;
+                }
+            };
+
+            let mut buffer = [0_u8; 64];
+            let command = match stream.read(&mut buffer).await {
+                Ok(read) if read > 0 => String::from_utf8_lossy(&buffer[..read]).trim().to_owned(),
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!("desktop tray test socket read failed: {e}");
+                    continue;
+                }
+            };
+
+            let response = match command.as_str() {
+                "simulate-loss" => simulate_tray_loss(&app),
+                "status" => tray_test_status(&app),
+                _ => "error: supported commands are simulate-loss and status\n".to_owned(),
+            };
+
+            if let Err(e) = stream.write_all(response.as_bytes()).await {
+                tracing::warn!("desktop tray test socket write failed: {e}");
+            }
+        }
+    });
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn simulate_tray_loss(app: &tauri::AppHandle) -> String {
+    let Some(tray) = app.tray_by_id("main-tray") else {
+        return "ok: tray item was already absent\n".to_owned();
+    };
+
+    // This is an intentional, safe loss simulation. `set_visible` is
+    // dispatched by Tauri to the AppKit main thread, unlike dropping a
+    // `TrayIcon` resource from this Tokio socket task.
+    match tray.set_visible(false) {
+        Ok(()) => {
+            tracing::warn!(
+                "tray test command hid the status item; watchdog should recreate it within 30 seconds"
+            );
+            "ok: tray item hidden; wait up to 30 seconds for recovery\n".to_owned()
+        }
+        Err(e) => format!("error: failed to hide tray item: {e}\n"),
+    }
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn tray_test_status(app: &tauri::AppHandle) -> String {
+    match app.tray_by_id("main-tray") {
+        Some(tray) => match tray.rect() {
+            Ok(Some(rect)) => format!("status: tray registered; rect={rect:?}\n"),
+            Ok(None) => "status: tray registered; macOS returned no rect\n".to_owned(),
+            Err(e) => format!("status: tray registered; rect unavailable: {e}\n"),
+        },
+        None => "status: no tray item registered\n".to_owned(),
+    }
+}
+
 /// Track the app start time so the tray watchdog can skip rebuilds
 /// during the initial startup grace period (first 5 seconds).
 #[cfg(target_os = "macos")]
@@ -335,39 +470,73 @@ fn app_start_time() -> std::time::Instant {
 }
 
 #[cfg(target_os = "macos")]
-fn tray_needs_rebuild(app: &tauri::AppHandle) -> bool {
-    // Skip rebuilds during the first 5 seconds after launch — macOS
-    // NSStatusItem may report empty/None rect before the menu bar has
-    // finished laying out the item, and rebuilding during this window
-    // can cause a race condition that crashes the app.
-    if app_start_time().elapsed() < std::time::Duration::from_secs(5) {
-        return false;
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrayStatus {
+    Registered,
+    Missing,
+    Unreadable,
+}
 
-    let Some(tray) = app.tray_by_id("main-tray") else {
-        return true;
+#[cfg(target_os = "macos")]
+fn should_rebuild_tray(startup_complete: bool, status: TrayStatus) -> bool {
+    startup_complete && status != TrayStatus::Registered
+}
+
+#[cfg(target_os = "macos")]
+fn tray_needs_rebuild(app: &tauri::AppHandle) -> bool {
+    let status = match app.tray_by_id("main-tray") {
+        None => TrayStatus::Missing,
+        Some(tray) => match tray.rect() {
+            // A non-empty rectangle proves that AppKit registered the status
+            // item, but not that the item is unobscured. On a notched display,
+            // menu-bar overflow can leave this rect underneath the camera
+            // housing. The debug verifier compares it with NSScreen's usable
+            // menu-bar area; rebuilding cannot repair system-level overflow.
+            Ok(Some(rect)) if !tray_rect_is_empty(rect) => TrayStatus::Registered,
+            // After startup, a missing rectangle means macOS no longer has a
+            // visible NSStatusItem. This is the condition the watchdog is
+            // designed to repair.
+            Ok(Some(_)) | Ok(None) => TrayStatus::Missing,
+            Err(e) => {
+                tracing::warn!("failed to read main tray icon rect; rebuilding it: {e}");
+                TrayStatus::Unreadable
+            }
+        },
     };
 
-    match tray.rect() {
-        Ok(Some(rect)) => tray_rect_is_empty(rect),
-        // Once the startup grace period has elapsed, no rect means macOS no
-        // longer has a visible NSStatusItem. Returning false here made the
-        // watchdog permanently ignore exactly the missing-tray condition it
-        // exists to repair.
-        Ok(None) => true,
-        // Treat an unreadable status item as stale as well. Rebuilding is
-        // safer than leaving this menu-bar-only app without any UI entry.
-        Err(e) => {
-            tracing::warn!("failed to read main tray icon rect; rebuilding it: {e}");
-            true
-        }
-    }
+    should_rebuild_tray(
+        app_start_time().elapsed() >= std::time::Duration::from_secs(5),
+        status,
+    )
 }
 
 #[cfg(target_os = "macos")]
 fn tray_rect_is_empty(rect: tauri::Rect) -> bool {
     let size = rect.size.to_physical::<u32>(1.0);
     size.width == 0 || size.height == 0
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tray_tests {
+    use super::{should_rebuild_tray, TrayStatus};
+
+    #[test]
+    fn tray_recovery_waits_for_startup_grace_period() {
+        for status in [
+            TrayStatus::Registered,
+            TrayStatus::Missing,
+            TrayStatus::Unreadable,
+        ] {
+            assert!(!should_rebuild_tray(false, status));
+        }
+    }
+
+    #[test]
+    fn tray_recovery_rebuilds_missing_or_unreadable_status_items() {
+        assert!(!should_rebuild_tray(true, TrayStatus::Registered));
+        assert!(should_rebuild_tray(true, TrayStatus::Missing));
+        assert!(should_rebuild_tray(true, TrayStatus::Unreadable));
+    }
 }
 
 /// Shut down the sidecar process if it is still running. Safe to call
