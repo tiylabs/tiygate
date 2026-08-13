@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-13
+### :sparkles: New Features
+- [`30914b4`](https://github.com/tiylabs/tiygate/commit/30914b42176a1ec01bc737be3374b1deb9921968) - **protocols**: ✨ add comprehensive GPT-5.6 protocol support *(PR [#38](https://github.com/tiylabs/tiygate/pull/38) by [@jorben](https://github.com/jorben))*
+- [`bd12eb9`](https://github.com/tiylabs/tiygate/commit/bd12eb909e6964865ee7014b28c11e800f5525a4) - **auth**: ✨ Add coordinated OAuth token keepalive *(PR [#39](https://github.com/tiylabs/tiygate/pull/39) by [@jorben](https://github.com/jorben))*
+- [`2674082`](https://github.com/tiylabs/tiygate/commit/267408245bafb11b20f2bc1060ecb62eb18ec43f) - **oauth**: ✨ Add provider egress profiles and usage windows *(PR [#40](https://github.com/tiylabs/tiygate/pull/40) by [@jorben](https://github.com/jorben))*
+
+### :bug: Bug Fixes
+- [`18a6426`](https://github.com/tiylabs/tiygate/commit/18a64267b384a416ef2f927d9127994cb58a3a0c) - 🐛 Make non-stream upstream timeout configurable *(PR [#44](https://github.com/tiylabs/tiygate/pull/44) by [@jorben](https://github.com/jorben))*
+  - :arrow_lower_right: *fixes issue [#43](https://github.com/tiylabs/tiygate/issues/43) opened by [@ddmonster](https://github.com/ddmonster)*
+
+
 ## [0.2.0] - 2026-07-08
 ### :sparkles: New Features
 - [`ff89669`](https://github.com/tiylabs/tiygate/commit/ff89669d544eab545a019901d85d196f8268f15a) - **store**: ✨ Add per-request cost breakdown and route model-metadata auto-resolution *(PR [#32](https://github.com/tiylabs/tiygate/pull/32) by [@jorben](https://github.com/jorben))*
@@ -197,3 +208,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.8]: https://github.com/tiylabs/tiygate/compare/0.1.7...0.1.8
 [0.1.9]: https://github.com/tiylabs/tiygate/compare/0.1.8...0.1.9
 [0.2.0]: https://github.com/tiylabs/tiygate/compare/0.1.9...0.2.0
+[0.2.1]: https://github.com/tiylabs/tiygate/compare/0.2.0...0.2.1
