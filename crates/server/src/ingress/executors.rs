@@ -40,7 +40,7 @@ use super::{apply_provider_auth, AppError, AppState};
 /// Non-streaming timeout for image generation/edit requests. Image
 /// generation is significantly slower than text chat (typically 10–60s
 /// upstream), so we use a dedicated budget that is independent of the
-/// global `request_read_timeout` (which defaults to 30s for chat).
+/// configurable standard non-streaming budget.
 const IMAGES_NONSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
 const CODEX_WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -275,9 +275,9 @@ async fn collect_codex_websocket_response(socket: &mut CodexWebSocket) -> Result
 /// the streaming idle timer. When zero, the timeout is disabled and the
 /// call behaves as a plain `client.execute().await`.
 ///
-/// This is used **only** in streaming branches — non-streaming branches
-/// already set `.timeout()` on the `RequestBuilder` which covers the
-/// entire request lifecycle.
+/// This is used **only** in streaming branches. HTTP non-streaming branches
+/// use [`with_nonstream_timeout`] instead, which covers their entire request
+/// lifecycle.
 async fn execute_with_ttfb_timeout(
     client: &reqwest::Client,
     request: reqwest::Request,
@@ -313,6 +313,43 @@ async fn execute_with_ttfb_timeout(
             .execute(request)
             .await
             .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))
+    }
+}
+
+/// Apply the hot-reloadable total deadline for standard non-streaming upstream
+/// requests. A zero value deliberately leaves reqwest without a total deadline.
+fn with_nonstream_timeout(
+    request: reqwest::RequestBuilder,
+    timeout_secs: u64,
+) -> reqwest::RequestBuilder {
+    if timeout_secs == 0 {
+        request
+    } else {
+        request.timeout(Duration::from_secs(timeout_secs))
+    }
+}
+
+/// Construct the protocol-neutral error used when a non-streaming upstream
+/// request exceeds its configured total deadline.
+fn nonstream_timeout_error() -> AppError {
+    let mut error = AppError::new(
+        StatusCode::GATEWAY_TIMEOUT,
+        "upstream non-stream request timeout".to_string(),
+    )
+    .with_class(tiygate_core::ErrorClass::DeadlineExceeded);
+    // Preserve the structured deadline signal for fallback classification.
+    error.upstream_status = Some(StatusCode::GATEWAY_TIMEOUT.as_u16());
+    error
+}
+
+/// Normalize reqwest errors from non-streaming calls. A reqwest total timeout
+/// can surface either while obtaining response headers or while reading the
+/// body, so both paths must produce the same 504 deadline contract.
+fn map_nonstream_reqwest_error(error: reqwest::Error, context: &str) -> AppError {
+    if error.is_timeout() {
+        nonstream_timeout_error()
+    } else {
+        AppError::new(StatusCode::BAD_GATEWAY, format!("{context}: {error}"))
     }
 }
 
@@ -483,6 +520,7 @@ pub(super) async fn execute_upstream(
     };
 
     let client = &egress_http_client(state, anthropic_oauth_profile);
+    let nonstream_timeout_secs = state.tunables().upstream_nonstream_timeout_secs;
     // Address the upstream by the *egress* protocol (the target provider's
     // protocol), not the ingress entrypoint. When a chat-completions request
     // is routed to an Anthropic provider, the body is converted above and
@@ -681,10 +719,10 @@ pub(super) async fn execute_upstream(
         // `inject_trace` stamps `traceparent` on the builder so the
         // upstream service sees the same trace id as the downstream.
         let mut nonstream_req = crate::ingress::observability::inject_trace(
-            client
-                .post(&upstream_url)
-                .headers(upstream_headers)
-                .timeout(state.request_read_timeout),
+            with_nonstream_timeout(
+                client.post(&upstream_url).headers(upstream_headers),
+                nonstream_timeout_secs,
+            ),
             trace,
         );
         if pass_through_verbatim {
@@ -702,9 +740,10 @@ pub(super) async fn execute_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(nonstream_req)?;
         let exec_started = std::time::Instant::now();
-        let response = client.execute(egress_req).await.map_err(|e| {
-            AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
-        })?;
+        let response = client
+            .execute(egress_req)
+            .await
+            .map_err(|error| map_nonstream_reqwest_error(error, "Upstream error"))?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
 
         let retry_after = extract_retry_after(response.headers());
@@ -718,7 +757,7 @@ pub(super) async fn execute_upstream(
         let response_body: Value = response
             .json()
             .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+            .map_err(|error| map_nonstream_reqwest_error(error, "Parse error"))?;
 
         if !status.is_success() {
             // Capture the failed exchange (upstream error body) so the
@@ -979,6 +1018,7 @@ pub(super) async fn execute_messages_upstream(
     };
 
     let client = &egress_http_client(state, anthropic_oauth_profile);
+    let nonstream_timeout_secs = state.tunables().upstream_nonstream_timeout_secs;
     // Address the upstream by the *egress* protocol, not the ingress
     // entrypoint. A `/v1/messages` request routed to an OpenAI provider is
     // converted above and must be POSTed to `/chat/completions`. Gemini
@@ -1143,7 +1183,10 @@ pub(super) async fn execute_messages_upstream(
         Ok((response, ttfb_ms))
     } else {
         let mut nonstream_req = crate::ingress::observability::inject_trace(
-            client.post(&upstream_url).headers(upstream_headers),
+            with_nonstream_timeout(
+                client.post(&upstream_url).headers(upstream_headers),
+                nonstream_timeout_secs,
+            ),
             trace,
         );
         if pass_through_verbatim {
@@ -1161,9 +1204,10 @@ pub(super) async fn execute_messages_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(nonstream_req)?;
         let exec_started = std::time::Instant::now();
-        let response = client.execute(egress_req).await.map_err(|e| {
-            AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
-        })?;
+        let response = client
+            .execute(egress_req)
+            .await
+            .map_err(|error| map_nonstream_reqwest_error(error, "Upstream error"))?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
 
         let retry_after = extract_retry_after(response.headers());
@@ -1175,7 +1219,7 @@ pub(super) async fn execute_messages_upstream(
         let response_body: Value = response
             .json()
             .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+            .map_err(|error| map_nonstream_reqwest_error(error, "Parse error"))?;
 
         if !status.is_success() {
             spawn_capture(
@@ -1493,8 +1537,12 @@ pub(super) async fn execute_embeddings_upstream(
     let req_id_capture = request_id.to_string();
 
     let upstream_url = format!("{}/embeddings", target.effective_api_base());
+    let nonstream_timeout_secs = state.tunables().upstream_nonstream_timeout_secs;
     let builder = crate::ingress::observability::inject_trace(
-        state.tunables().http_client.post(&upstream_url),
+        with_nonstream_timeout(
+            state.tunables().http_client.post(&upstream_url),
+            nonstream_timeout_secs,
+        ),
         trace,
     )
     .headers(upstream_headers)
@@ -1507,7 +1555,7 @@ pub(super) async fn execute_embeddings_upstream(
         .http_client
         .execute(req)
         .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        .map_err(|error| map_nonstream_reqwest_error(error, "Upstream error"))?;
     let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
 
     let status = response.status();
@@ -1516,7 +1564,7 @@ pub(super) async fn execute_embeddings_upstream(
     let response_body: Value = response
         .json()
         .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {e}")))?;
+        .map_err(|error| map_nonstream_reqwest_error(error, "Parse error"))?;
 
     if !status.is_success() {
         spawn_capture(
@@ -1738,13 +1786,14 @@ pub(super) async fn execute_responses_upstream(
             ),
         )
     })?;
+    let nonstream_timeout_secs = state.tunables().upstream_nonstream_timeout_secs;
 
     // ChatGPT/Codex OAuth Responses uses a WebSocket control plane rather
     // than HTTP POST + SSE. Keep this provider-specific transport outside of
     // the generic HTTP executor, while sharing the same canonical stream
     // bridge and response codecs below it.
     if codex_websocket && egress_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses {
-        let websocket_result = execute_codex_responses_websocket(
+        let websocket_future = execute_codex_responses_websocket(
             state,
             codec,
             ingress_protocol,
@@ -1758,8 +1807,20 @@ pub(super) async fn execute_responses_upstream(
             trace,
             request_id,
             is_same_protocol,
-        )
-        .await;
+        );
+        let websocket_result = if is_stream || nonstream_timeout_secs == 0 {
+            websocket_future.await
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(nonstream_timeout_secs),
+                websocket_future,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(nonstream_timeout_error()),
+            }
+        };
         match websocket_result {
             Ok(response) => return Ok(response),
             Err(error) if error.http_status() == StatusCode::UPGRADE_REQUIRED => {
@@ -1912,7 +1973,10 @@ pub(super) async fn execute_responses_upstream(
 
     // Non-streaming path
     let mut nonstream_req = crate::ingress::observability::inject_trace(
-        client.post(&upstream_url).headers(upstream_headers),
+        with_nonstream_timeout(
+            client.post(&upstream_url).headers(upstream_headers),
+            nonstream_timeout_secs,
+        ),
         trace,
     );
     if openai_codex_profile {
@@ -1935,7 +1999,7 @@ pub(super) async fn execute_responses_upstream(
     let response = client
         .execute(egress_req)
         .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        .map_err(|error| map_nonstream_reqwest_error(error, "Upstream error"))?;
     let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
     let status = response.status();
     let retry_after = extract_retry_after(response.headers());
@@ -1946,7 +2010,7 @@ pub(super) async fn execute_responses_upstream(
     let response_text = response
         .text()
         .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Read error: {e}")))?;
+        .map_err(|error| map_nonstream_reqwest_error(error, "Read error"))?;
     let parsed_json = serde_json::from_str::<Value>(&response_text).ok();
     if !status.is_success() {
         let response_body = parsed_json.unwrap_or_else(
@@ -2519,6 +2583,7 @@ pub(super) async fn execute_gemini_upstream(
             ),
         )
     })?;
+    let nonstream_timeout_secs = state.tunables().upstream_nonstream_timeout_secs;
 
     if is_stream {
         let mut stream_req = crate::ingress::observability::inject_trace(
@@ -2657,7 +2722,10 @@ pub(super) async fn execute_gemini_upstream(
 
     // Non-streaming path
     let mut nonstream_req = crate::ingress::observability::inject_trace(
-        client.post(&upstream_url).headers(upstream_headers),
+        with_nonstream_timeout(
+            client.post(&upstream_url).headers(upstream_headers),
+            nonstream_timeout_secs,
+        ),
         trace,
     );
     if pass_through_verbatim {
@@ -2677,7 +2745,7 @@ pub(super) async fn execute_gemini_upstream(
     let response = client
         .execute(egress_req)
         .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        .map_err(|error| map_nonstream_reqwest_error(error, "Upstream error"))?;
     let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
     let status = response.status();
     let retry_after = extract_retry_after(response.headers());
@@ -2688,7 +2756,7 @@ pub(super) async fn execute_gemini_upstream(
     let response_body: Value = response
         .json()
         .await
-        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Parse error: {e}")))?;
+        .map_err(|error| map_nonstream_reqwest_error(error, "Parse error"))?;
     if !status.is_success() {
         spawn_capture(
             state,
@@ -3076,7 +3144,7 @@ pub(super) async fn execute_images_generations_upstream(
         let response = client
             .execute(egress_req)
             .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+            .map_err(|error| map_nonstream_reqwest_error(error, "Upstream error"))?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
 
         let retry_after = extract_retry_after(response.headers());
@@ -3088,7 +3156,7 @@ pub(super) async fn execute_images_generations_upstream(
         let response_text = response
             .text()
             .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Read error: {e}")))?;
+            .map_err(|error| map_nonstream_reqwest_error(error, "Read error"))?;
         let response_body: Value = serde_json::from_str(&response_text)
             .unwrap_or_else(|_| json!({"error": {"message": response_text}}));
 
@@ -3438,7 +3506,7 @@ pub(super) async fn execute_images_edits_upstream(
         let response = client
             .execute(egress_req)
             .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+            .map_err(|error| map_nonstream_reqwest_error(error, "Upstream error"))?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
 
         let retry_after = extract_retry_after(response.headers());
@@ -3450,7 +3518,7 @@ pub(super) async fn execute_images_edits_upstream(
         let response_text = response
             .text()
             .await
-            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Read error: {e}")))?;
+            .map_err(|error| map_nonstream_reqwest_error(error, "Read error"))?;
         let response_body: Value = serde_json::from_str(&response_text)
             .unwrap_or_else(|_| json!({"error": {"message": response_text}}));
 

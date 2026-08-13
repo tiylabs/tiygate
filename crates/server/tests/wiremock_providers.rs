@@ -68,6 +68,17 @@ fn build_test_app_with_config(
 
 /// Build a test app with a single Anthropic Messages route to a wiremock upstream.
 fn build_anthropic_test_app(upstream_url: String, model: &str) -> axum::Router {
+    let mut server_config = ServerConfig::default();
+    server_config.require_api_key = false;
+    build_anthropic_test_app_with_config(upstream_url, model, server_config)
+}
+
+/// Build a test app with a single Anthropic Messages route and custom config.
+fn build_anthropic_test_app_with_config(
+    upstream_url: String,
+    model: &str,
+    server_config: ServerConfig,
+) -> axum::Router {
     let mut routing_table = RoutingTable::new();
     routing_table.insert(
         model.to_string(),
@@ -91,8 +102,6 @@ fn build_anthropic_test_app(upstream_url: String, model: &str) -> axum::Router {
 
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    let mut server_config = ServerConfig::default();
-    server_config.require_api_key = false;
     ingress::router(config_store, health, &server_config)
 }
 
@@ -182,6 +191,172 @@ async fn test_happy_path_openai_chat_completion() {
     let body_str = String::from_utf8_lossy(&body_bytes);
     assert!(body_str.contains("Hello from wiremock!"));
     assert!(body_str.contains("\"prompt_tokens\":10"));
+}
+
+#[tokio::test]
+async fn test_nonstream_timeout_is_configurable_and_can_be_disabled() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(1_100))
+                .set_body_json(json!({
+                    "id": "chatcmpl-slow",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "completed"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "wait"}]
+    });
+
+    let mut timeout_config = ServerConfig::default();
+    timeout_config.require_api_key = false;
+    timeout_config.upstream_nonstream_timeout_secs = 1;
+    let timed_app = build_test_app_with_config(mock_server.uri(), "gpt-4o", timeout_config);
+    let timed_request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let timed_response = timed_app.oneshot(timed_request).await.unwrap();
+    assert_eq!(timed_response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let timed_body = axum::body::to_bytes(timed_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&timed_body).contains("upstream non-stream request timeout"));
+
+    let mut disabled_config = ServerConfig::default();
+    disabled_config.require_api_key = false;
+    disabled_config.upstream_nonstream_timeout_secs = 0;
+    let unlimited_app = build_test_app_with_config(mock_server.uri(), "gpt-4o", disabled_config);
+    let unlimited_request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let unlimited_response = unlimited_app.oneshot(unlimited_request).await.unwrap();
+    assert_eq!(unlimited_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_nonstream_timeout_covers_messages_embeddings_responses_and_gemini() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(1_100))
+                .set_body_json(json!({"id": "slow"})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let mut config = ServerConfig::default();
+    config.require_api_key = false;
+    config.upstream_nonstream_timeout_secs = 1;
+
+    let messages_app = build_anthropic_test_app_with_config(
+        mock_server.uri(),
+        "claude-3-5-sonnet-20241022",
+        config.clone(),
+    );
+    let messages_request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "wait"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        messages_app
+            .oneshot(messages_request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+
+    let embeddings_app = build_test_app_with_config(mock_server.uri(), "gpt-4o", config.clone());
+    let embeddings_request = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4o",
+                "input": "wait"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        embeddings_app
+            .oneshot(embeddings_request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+
+    let responses_app = build_responses_ingress_openai_egress_app_with_config(
+        mock_server.uri(),
+        "gpt-4o",
+        config.clone(),
+    );
+    let responses_request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"model": "gpt-4o", "input": "wait"})).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        responses_app
+            .oneshot(responses_request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+
+    let gemini_app =
+        build_gemini_ingress_openai_egress_app_with_config(mock_server.uri(), "gemini-pro", config);
+    let gemini_request = Request::builder()
+        .method("POST")
+        .uri("/v1beta/models/gemini-pro/generateContent")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "contents": [{"role": "user", "parts": [{"text": "wait"}]}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        gemini_app.oneshot(gemini_request).await.unwrap().status(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
 }
 
 #[tokio::test]
@@ -1407,6 +1582,18 @@ async fn test_slow_large_stream_not_capped_by_request_read_timeout() {
 /// Build an app whose ingress is OpenAI Responses but whose route targets an
 /// OpenAI chat-completions upstream (cross-protocol).
 fn build_responses_ingress_openai_egress_app(upstream_url: String, model: &str) -> axum::Router {
+    let mut config = ServerConfig::default();
+    config.require_api_key = false;
+    build_responses_ingress_openai_egress_app_with_config(upstream_url, model, config)
+}
+
+/// Build a Responses ingress app with an OpenAI chat-completions egress and
+/// a caller-supplied server configuration.
+fn build_responses_ingress_openai_egress_app_with_config(
+    upstream_url: String,
+    model: &str,
+    config: ServerConfig,
+) -> axum::Router {
     let mut routing_table = RoutingTable::new();
     routing_table.insert(
         model.to_string(),
@@ -1429,16 +1616,24 @@ fn build_responses_ingress_openai_egress_app(upstream_url: String, model: &str) 
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    {
-        let mut cfg = ServerConfig::default();
-        cfg.require_api_key = false;
-        ingress::router(config_store, health, &cfg)
-    }
+    ingress::router(config_store, health, &config)
 }
 
 /// Build an app whose ingress is Google Gemini but whose route targets an
 /// OpenAI chat-completions upstream (cross-protocol).
 fn build_gemini_ingress_openai_egress_app(upstream_url: String, model: &str) -> axum::Router {
+    let mut config = ServerConfig::default();
+    config.require_api_key = false;
+    build_gemini_ingress_openai_egress_app_with_config(upstream_url, model, config)
+}
+
+/// Build a Gemini ingress app with an OpenAI chat-completions egress and a
+/// caller-supplied server configuration.
+fn build_gemini_ingress_openai_egress_app_with_config(
+    upstream_url: String,
+    model: &str,
+    config: ServerConfig,
+) -> axum::Router {
     let mut routing_table = RoutingTable::new();
     routing_table.insert(
         model.to_string(),
@@ -1461,11 +1656,7 @@ fn build_gemini_ingress_openai_egress_app(upstream_url: String, model: &str) -> 
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    {
-        let mut cfg = ServerConfig::default();
-        cfg.require_api_key = false;
-        ingress::router(config_store, health, &cfg)
-    }
+    ingress::router(config_store, health, &config)
 }
 
 #[tokio::test]

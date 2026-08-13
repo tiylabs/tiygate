@@ -532,6 +532,12 @@ async fn bootstrap_settings(store: &Arc<DbConfigStore>, cfg: &ServerConfig) {
     // Upstream
     let _ = ensure_setting(
         store,
+        sk::UPSTREAM_NONSTREAM_TIMEOUT_SECS,
+        &cfg.upstream_nonstream_timeout_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
         sk::UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
         &cfg.upstream_stream_idle_timeout_secs.to_string(),
     )
@@ -702,4 +708,51 @@ async fn boot_control_plane(cfg: &ServerConfig) -> anyhow::Result<Option<Control
         store,
         encryption,
     }))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{bootstrap_settings, ServerConfig};
+    use tiygate_store::config_store::DbConfigStore;
+    use tiygate_store::{db, settings_keys};
+
+    #[tokio::test]
+    async fn bootstrap_seeds_nonstream_timeout_without_overwriting_runtime_value() {
+        let pool = Arc::new(db::open_pool("sqlite::memory:").await.expect("pool"));
+        db::run_migrations(&pool).await.expect("migrations");
+        let store = Arc::new(DbConfigStore::new((*pool).clone(), None));
+        let mut config = ServerConfig {
+            upstream_nonstream_timeout_secs: 47,
+            ..ServerConfig::default()
+        };
+
+        bootstrap_settings(&store, &config).await;
+        assert_eq!(
+            store
+                .get_setting(settings_keys::UPSTREAM_NONSTREAM_TIMEOUT_SECS)
+                .await
+                .expect("read setting")
+                .as_deref(),
+            Some("47")
+        );
+
+        store
+            .set_setting(settings_keys::UPSTREAM_NONSTREAM_TIMEOUT_SECS, "9")
+            .await
+            .expect("set runtime value");
+        config.upstream_nonstream_timeout_secs = 99;
+        bootstrap_settings(&store, &config).await;
+
+        assert_eq!(
+            store
+                .get_setting(settings_keys::UPSTREAM_NONSTREAM_TIMEOUT_SECS)
+                .await
+                .expect("read preserved setting")
+                .as_deref(),
+            Some("9")
+        );
+    }
 }

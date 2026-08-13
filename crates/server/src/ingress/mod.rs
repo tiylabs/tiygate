@@ -98,6 +98,9 @@ pub struct RuntimeTunables {
     pub max_queue_depth: usize,
     /// Timeout waiting for a concurrency permit.
     pub acquire_timeout: Duration,
+    /// Total wall-clock timeout for regular non-streaming upstream requests.
+    /// 0 = disabled. Image endpoints retain their dedicated longer budget.
+    pub upstream_nonstream_timeout_secs: u64,
     /// Idle timeout (seconds) for upstream streaming responses.
     pub upstream_stream_idle_timeout_secs: u64,
     /// Total wall-clock timeout (seconds) for upstream streaming.
@@ -135,10 +138,6 @@ pub struct AppState {
     /// startup because the `RequestBodyLimitLayer` is installed
     /// at router build time.
     pub max_multimodal_body_bytes: u64,
-    /// Read timeout for the full request body. Fixed at startup
-    /// because the `RequestBodyTimeoutLayer` is installed at
-    /// router build time.
-    pub request_read_timeout: Duration,
     /// Async telemetry bus — non-blocking send.
     pub telemetry: Arc<dyn TelemetryBus>,
     /// Quota counter; `None` in the legacy in-memory path. The
@@ -424,6 +423,7 @@ fn build_data_plane_router(
         max_inflight: server_config.max_inflight_requests,
         max_queue_depth: server_config.max_queue_depth,
         acquire_timeout: Duration::from_secs(server_config.acquire_timeout_secs),
+        upstream_nonstream_timeout_secs: server_config.upstream_nonstream_timeout_secs,
         upstream_stream_idle_timeout_secs: server_config.upstream_stream_idle_timeout_secs,
         upstream_stream_total_timeout_secs: server_config.upstream_stream_total_timeout_secs,
         upstream_ttfb_timeout_secs: server_config.upstream_ttfb_timeout_secs,
@@ -436,7 +436,6 @@ fn build_data_plane_router(
         health,
         concurrency_semaphore: semaphore,
         max_multimodal_body_bytes: server_config.max_multimodal_body_bytes,
-        request_read_timeout: Duration::from_secs(server_config.request_read_timeout_secs),
         telemetry,
         quota,
         embedding_cache,
@@ -581,6 +580,12 @@ pub(crate) fn spawn_tunables_reloader(
                 )
                 .await,
             );
+            let upstream_nonstream_timeout_secs = sk::get_u64(
+                store.as_ref(),
+                sk::UPSTREAM_NONSTREAM_TIMEOUT_SECS,
+                current_t.upstream_nonstream_timeout_secs,
+            )
+            .await;
             let upstream_stream_idle_timeout_secs = sk::get_u64(
                 store.as_ref(),
                 sk::UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
@@ -643,6 +648,7 @@ pub(crate) fn spawn_tunables_reloader(
                 max_inflight,
                 max_queue_depth,
                 acquire_timeout,
+                upstream_nonstream_timeout_secs,
                 upstream_stream_idle_timeout_secs,
                 upstream_stream_total_timeout_secs,
                 upstream_ttfb_timeout_secs,
@@ -653,6 +659,104 @@ pub(crate) fn spawn_tunables_reloader(
             last_seen = Some(current);
         }
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn test_state(
+        store: Arc<tiygate_store::config_store::DbConfigStore>,
+        config: &ServerConfig,
+    ) -> AppState {
+        let tunables = RuntimeTunables {
+            routing_strategy: config.routing_strategy,
+            raw_envelope_capture_media: config.raw_envelope_capture_media,
+            require_api_key: config.require_api_key,
+            header_policy: Arc::new(
+                tiygate_core::HeaderForwardPolicy::with_defaults()
+                    .with_request_deny_extra(config.forward_request_header_deny_extra.iter())
+                    .with_response_deny_extra(config.forward_response_header_deny_extra.iter()),
+            ),
+            max_request_body_bytes: config.max_request_body_bytes,
+            max_inflight: config.max_inflight_requests,
+            max_queue_depth: config.max_queue_depth,
+            acquire_timeout: Duration::from_secs(config.acquire_timeout_secs),
+            upstream_nonstream_timeout_secs: config.upstream_nonstream_timeout_secs,
+            upstream_stream_idle_timeout_secs: config.upstream_stream_idle_timeout_secs,
+            upstream_stream_total_timeout_secs: config.upstream_stream_total_timeout_secs,
+            upstream_ttfb_timeout_secs: config.upstream_ttfb_timeout_secs,
+            http_client: build_http_client(config),
+            anthropic_oauth_http_client: build_anthropic_oauth_http_client(config),
+        };
+        let telemetry = Arc::new(crate::telemetry::ChannelTelemetryBus::spawn(
+            Arc::new(tiygate_store::log_sink::stdout::StdoutSink::new()),
+            8,
+        ));
+
+        AppState {
+            config: Arc::new(store.config_store()),
+            db_store: Some(store.clone()),
+            health: Arc::new(HealthRegistry::with_defaults()),
+            concurrency_semaphore: Arc::new(Semaphore::new(config.max_inflight_requests)),
+            max_multimodal_body_bytes: config.max_multimodal_body_bytes,
+            telemetry,
+            quota: None,
+            embedding_cache: None,
+            redactor: Arc::new(tiygate_core::redaction::Redactor::with_defaults()),
+            model_catalog: None,
+            tunables: Arc::new(arc_swap::ArcSwap::from_pointee(tunables)),
+            oauth_manager: Arc::new(crate::oauth_manager::OAuthTokenManager::new(
+                Some(store),
+                build_http_client(config),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn nonstream_timeout_setting_hot_reloads_into_runtime_tunables() {
+        use tiygate_store::config_store::DbConfigStore;
+        use tiygate_store::{db, settings_keys};
+
+        let pool = Arc::new(db::open_pool("sqlite::memory:").await.expect("pool"));
+        db::run_migrations(&pool).await.expect("migrations");
+        let store = Arc::new(DbConfigStore::new((*pool).clone(), None));
+        store.refresh().await.expect("initial refresh");
+        store
+            .set_setting(settings_keys::EPOCH_POLL_INTERVAL_SECS, "1")
+            .await
+            .expect("set poll interval");
+        store
+            .set_setting(settings_keys::UPSTREAM_NONSTREAM_TIMEOUT_SECS, "0")
+            .await
+            .expect("set initial timeout");
+
+        let config = ServerConfig {
+            upstream_nonstream_timeout_secs: 0,
+            ..ServerConfig::default()
+        };
+        let state = test_state(store.clone(), &config);
+        let reloader = spawn_tunables_reloader(store.clone(), state.clone());
+
+        store
+            .set_setting(settings_keys::UPSTREAM_NONSTREAM_TIMEOUT_SECS, "17")
+            .await
+            .expect("update timeout");
+
+        let reloaded = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.tunables().upstream_nonstream_timeout_secs == 17 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        reloader.abort();
+
+        assert!(reloaded.is_ok(), "runtime timeout setting did not reload");
+    }
 }
 
 /// Compute the raw-passthrough body and the same-suite flag, in a

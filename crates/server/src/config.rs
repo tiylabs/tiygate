@@ -120,8 +120,14 @@ pub struct ServerConfig {
     pub max_request_body_bytes: u64,
     /// Max multimodal body size in bytes (default 32 MiB).
     pub max_multimodal_body_bytes: u64,
-    /// Request read timeout in seconds.
+    /// Inbound client request-body read timeout in seconds.
     pub request_read_timeout_secs: u64,
+    /// Total wall-clock timeout for regular non-streaming upstream requests,
+    /// in seconds. This covers Chat Completions, Messages, Responses, Gemini,
+    /// and Embeddings; image endpoints keep their dedicated longer budget.
+    /// Set to 0 to disable. Default: 30s. Set via
+    /// `TIYGATE_UPSTREAM_NONSTREAM_TIMEOUT_SECS`.
+    pub upstream_nonstream_timeout_secs: u64,
     /// Max concurrent requests.
     pub max_inflight_requests: usize,
     /// Max queue depth.
@@ -206,6 +212,7 @@ impl Default for ServerConfig {
             max_request_body_bytes: 10 * 1024 * 1024, // 10 MiB
             max_multimodal_body_bytes: 64 * 1024 * 1024, // 64 MiB
             request_read_timeout_secs: 30,
+            upstream_nonstream_timeout_secs: 30,
             max_inflight_requests: 1024,
             max_queue_depth: 256,
             acquire_timeout_secs: 5,
@@ -267,6 +274,11 @@ impl ServerConfig {
                 "latency" => RoutingStrategyName::Latency,
                 _ => RoutingStrategyName::Weighted,
             };
+        }
+        if let Ok(v) = std::env::var("TIYGATE_UPSTREAM_NONSTREAM_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse() {
+                cfg.upstream_nonstream_timeout_secs = n;
+            }
         }
         if let Ok(v) = std::env::var("TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS") {
             if let Ok(n) = v.parse() {
@@ -348,4 +360,49 @@ fn parse_header_list(raw: &str) -> Vec<String> {
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+
+    const NONSTREAM_TIMEOUT_ENV: &str = "TIYGATE_UPSTREAM_NONSTREAM_TIMEOUT_SECS";
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nonstream_timeout_env_overrides_default_and_invalid_values_fall_back() {
+        let guard = EnvVarGuard::set(NONSTREAM_TIMEOUT_ENV, "0");
+        assert_eq!(ServerConfig::from_env().upstream_nonstream_timeout_secs, 0);
+
+        std::env::set_var(NONSTREAM_TIMEOUT_ENV, "not-a-number");
+        assert_eq!(
+            ServerConfig::from_env().upstream_nonstream_timeout_secs,
+            ServerConfig::default().upstream_nonstream_timeout_secs
+        );
+
+        drop(guard);
+    }
 }

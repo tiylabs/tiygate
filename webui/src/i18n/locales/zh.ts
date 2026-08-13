@@ -761,6 +761,7 @@ const zh: Translation = {
     },
     upstream: {
       title: "上游调优",
+      nonstreamTimeout: "非流式总超时",
       streamIdleTimeout: "流空闲超时",
       streamTotalTimeout: "流总超时",
       ttfbTimeout: "TTFB 超时",
