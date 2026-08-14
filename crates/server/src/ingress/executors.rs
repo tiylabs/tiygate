@@ -3742,7 +3742,8 @@ mod tests {
             "previous_response_id": "resp-old",
             "stream_options": {"include_usage": true},
             "prompt_cache_retention": "24h",
-            "safety_identifier": "user"
+            "safety_identifier": "user",
+            "max_output_tokens": 1024
         });
         assert!(codex_oauth::prepare_body(&mut body, false));
         assert_eq!(body["stream"], true);
@@ -3751,6 +3752,10 @@ mod tests {
         assert!(body.get("stream_options").is_none());
         assert!(body.get("prompt_cache_retention").is_none());
         assert!(body.get("safety_identifier").is_none());
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "ChatGPT Codex backend rejects max_output_tokens"
+        );
     }
 
     #[test]
