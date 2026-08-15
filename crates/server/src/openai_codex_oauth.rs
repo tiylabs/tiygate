@@ -46,7 +46,17 @@ pub(crate) fn prepare_body(body: &mut Value, websocket: bool) -> bool {
         object.insert("instructions".to_string(), json!(""));
         changed = true;
     }
-    for field in ["prompt_cache_retention", "safety_identifier"] {
+    // The ChatGPT subscription backend (`/backend-api/codex/responses`,
+    // FastAPI) rejects Responses fields it does not model. The native Codex
+    // CLI never sends `max_output_tokens` (its ResponsesApiRequest has no
+    // such field), and the backend answers 400
+    // `{"detail":"Unsupported parameter: max_output_tokens"}` when it is
+    // present — strip it here so relayed clients cannot break the request.
+    for field in [
+        "prompt_cache_retention",
+        "safety_identifier",
+        "max_output_tokens",
+    ] {
         changed |= object.remove(field).is_some();
     }
     if !websocket {
@@ -262,5 +272,41 @@ mod tests {
 
         let http = target(OAuthEgressProfile::OpenAiCodex, UpstreamTransport::Http);
         assert!(!uses_websocket(&http));
+    }
+
+    #[test]
+    fn prepare_body_strips_max_output_tokens_on_both_transports() {
+        for websocket in [false, true] {
+            let mut body = json!({
+                "model": "gpt-5.6",
+                "stream": false,
+                "instructions": null,
+                "input": "hi",
+                "max_output_tokens": 4096,
+                "prompt_cache_retention": "24h",
+                "safety_identifier": "user",
+                "previous_response_id": "resp-old",
+                "stream_options": {"include_usage": true},
+            });
+            assert!(prepare_body(&mut body, websocket));
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["instructions"], "");
+            assert_eq!(body["model"], "gpt-5.6");
+            assert_eq!(body["input"], "hi");
+            assert!(
+                body.get("max_output_tokens").is_none(),
+                "ChatGPT Codex backend rejects max_output_tokens (websocket={websocket})"
+            );
+            assert!(body.get("prompt_cache_retention").is_none());
+            assert!(body.get("safety_identifier").is_none());
+            // HTTP strips these; the WebSocket transport keeps them.
+            if websocket {
+                assert_eq!(body["previous_response_id"], "resp-old");
+                assert_eq!(body["stream_options"]["include_usage"], true);
+            } else {
+                assert!(body.get("previous_response_id").is_none());
+                assert!(body.get("stream_options").is_none());
+            }
+        }
     }
 }
