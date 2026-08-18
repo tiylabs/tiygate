@@ -46,6 +46,13 @@ pub(crate) fn prepare_body(body: &mut Value, websocket: bool) -> bool {
         object.insert("instructions".to_string(), json!(""));
         changed = true;
     }
+    // The ChatGPT subscription backend requires an explicit `store: false`
+    // request. This is specific to the Codex OAuth egress profile; the
+    // public OpenAI Responses API has different storage semantics.
+    if object.get("store").and_then(Value::as_bool) != Some(false) {
+        object.insert("store".to_string(), json!(false));
+        changed = true;
+    }
     // The ChatGPT subscription backend (`/backend-api/codex/responses`,
     // FastAPI) rejects Responses fields it does not model. The native Codex
     // CLI never sends `max_output_tokens` (its ResponsesApiRequest has no
@@ -291,6 +298,7 @@ mod tests {
             assert!(prepare_body(&mut body, websocket));
             assert_eq!(body["stream"], true);
             assert_eq!(body["instructions"], "");
+            assert_eq!(body["store"], false);
             assert_eq!(body["model"], "gpt-5.6");
             assert_eq!(body["input"], "hi");
             assert!(
@@ -307,6 +315,31 @@ mod tests {
                 assert!(body.get("previous_response_id").is_none());
                 assert!(body.get("stream_options").is_none());
             }
+        }
+    }
+
+    #[test]
+    fn prepare_body_forces_store_false_for_all_codex_transports() {
+        for websocket in [false, true] {
+            let mut missing = json!({"stream": true, "instructions": ""});
+            assert!(prepare_body(&mut missing, websocket));
+            assert_eq!(missing["store"], false);
+
+            let mut enabled = json!({
+                "stream": true,
+                "instructions": "",
+                "store": true,
+            });
+            assert!(prepare_body(&mut enabled, websocket));
+            assert_eq!(enabled["store"], false);
+
+            let mut disabled = json!({
+                "stream": true,
+                "instructions": "",
+                "store": false,
+            });
+            assert!(!prepare_body(&mut disabled, websocket));
+            assert_eq!(disabled["store"], false);
         }
     }
 }
