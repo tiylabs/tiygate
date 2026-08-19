@@ -191,6 +191,8 @@ export interface ApiKey {
   name: string;
   key_hash: string;
   quota: QuotaSpec;
+  /** null/undefined = unrestricted; [] = deny every model. */
+  allowed_models?: string[] | null;
   status: string;
   created_at: string;
   updated_at: string;
@@ -205,6 +207,7 @@ export interface CreateApiKeyResponse {
   name: string;
   secret: string;
   quota: QuotaSpec;
+  allowed_models?: string[] | null;
   status: string;
   created_at: string;
 }
@@ -445,6 +448,7 @@ export interface ExportApiKey {
   name: string;
   key_hash: string;
   quota_json: Record<string, unknown>;
+  allowed_models?: string[] | null;
   status: string;
   created_at: string;
   updated_at: string;

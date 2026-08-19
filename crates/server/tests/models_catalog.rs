@@ -13,6 +13,8 @@ use tiygate_core::routing::{HealthRegistry, RoutingTable};
 use tiygate_server::config::ServerConfig;
 use tiygate_server::ingress;
 use tiygate_store::config::ConfigStore;
+use tiygate_store::config_store::DbConfigStore;
+use tiygate_store::db;
 use tiygate_store::model_catalog::{ModelCatalog, ModelCatalogStore, ModelMetadata};
 use tiygate_store::models::{AuthMode, ConfigSnapshot, Provider, Route, RouteTarget};
 
@@ -191,4 +193,112 @@ async fn models_endpoint_prefers_persisted_route_metadata_over_catalog() {
     assert_eq!(model["display_name"], json!("Saved Virtual GPT"));
     assert_eq!(model["context_window"], json!(42000));
     assert_eq!(model["family"], json!("saved-family"));
+}
+
+#[tokio::test]
+async fn models_endpoint_filters_and_rejects_by_api_key_model_access() {
+    let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+    db::run_migrations(&pool).await.expect("migrations");
+    let store = Arc::new(DbConfigStore::new(pool, None));
+    store.refresh().await.expect("refresh");
+    store
+        .upsert_provider(
+            "openai",
+            "OpenAI",
+            "openai",
+            "https://example.invalid/v1",
+            "",
+            None,
+            AuthMode::None,
+            None,
+            json!({}),
+            true,
+        )
+        .await
+        .expect("provider");
+    for model in ["allowed-model", "blocked-model"] {
+        store
+            .upsert_route(
+                &format!("route-{model}"),
+                model,
+                &[RouteTarget {
+                    provider_id: "openai".to_string(),
+                    model_id: model.to_string(),
+                    weight: 1.0,
+                    enabled: true,
+                    account_label: None,
+                    api_key_override: None,
+                    api_base_override: None,
+                }],
+                None,
+                None,
+                true,
+            )
+            .await
+            .expect("route");
+    }
+    store
+        .create_api_key(
+            "scoped",
+            "tg-scoped",
+            json!({}),
+            Some(vec!["allowed-model".to_string()]),
+        )
+        .await
+        .expect("create key");
+    let cfg = ServerConfig {
+        require_api_key: true,
+        ..Default::default()
+    };
+    let app = ingress::router_with_telemetry_full(
+        store.config_store(),
+        Arc::new(HealthRegistry::with_defaults()),
+        &cfg,
+        Arc::new(tiygate_server::telemetry::ChannelTelemetryBus::spawn(
+            Arc::new(tiygate_store::log_sink::stdout::StdoutSink::new()),
+            64,
+        )),
+        None,
+        None,
+        Some(store),
+        None,
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .header("authorization", "Bearer tg-scoped")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(value["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(value["data"][0]["id"], json!("allowed-model"));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models/blocked-model")
+                .header("authorization", "Bearer tg-scoped")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(resp.into_body(), 4096)
+        .await
+        .expect("body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(value["error"]["code"], json!("model_access_denied"));
 }

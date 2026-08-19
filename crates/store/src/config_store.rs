@@ -9,6 +9,7 @@
 //! while letting operators opt into the full control plane by
 //! setting the env var.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -1272,7 +1273,7 @@ impl DbConfigStore {
 
     pub async fn list_api_keys(&self) -> Result<Vec<ApiKey>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, name, key_hash, quota_json, status, created_at, updated_at \
+            "SELECT id, name, key_hash, quota_json, allowed_models_json, status, created_at, updated_at \
              FROM api_keys",
         )
         .fetch_all(self.pool.any())
@@ -1285,19 +1286,26 @@ impl DbConfigStore {
         name: &str,
         secret_plain: &str,
         quota: serde_json::Value,
+        allowed_models: Option<Vec<String>>,
     ) -> Result<(ApiKey, String), StoreError> {
         let id = Uuid::now_v7().to_string();
         let key_hash = hash_api_key(secret_plain);
         let now = chrono::Utc::now().to_rfc3339();
         let quota_str = serde_json::to_string(&quota)?;
+        let allowed_models = normalize_allowed_models(allowed_models)?;
+        let allowed_models_str = allowed_models
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         sqlx::query(
-            "INSERT INTO api_keys (id, name, key_hash, quota_json, status, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, 'active', $5, $6)",
+            "INSERT INTO api_keys (id, name, key_hash, quota_json, allowed_models_json, status, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, 'active', $6, $7)",
         )
         .bind(&id)
         .bind(name)
         .bind(&key_hash)
         .bind(&quota_str)
+        .bind(&allowed_models_str)
         .bind(&now)
         .bind(&now)
         .execute(self.pool.any())
@@ -1311,7 +1319,7 @@ impl DbConfigStore {
 
     pub async fn get_api_key(&self, id: &str) -> Result<Option<ApiKey>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, name, key_hash, quota_json, status, created_at, updated_at \
+            "SELECT id, name, key_hash, quota_json, allowed_models_json, status, created_at, updated_at \
              FROM api_keys WHERE id = $1",
         )
         .bind(id)
@@ -1323,7 +1331,7 @@ impl DbConfigStore {
     pub async fn find_api_key_by_secret(&self, secret: &str) -> Result<Option<ApiKey>, StoreError> {
         let key_hash = hash_api_key(secret);
         let row = sqlx::query(
-            "SELECT id, name, key_hash, quota_json, status, created_at, updated_at \
+            "SELECT id, name, key_hash, quota_json, allowed_models_json, status, created_at, updated_at \
              FROM api_keys WHERE key_hash = $1",
         )
         .bind(&key_hash)
@@ -1349,6 +1357,35 @@ impl DbConfigStore {
             .bind(id)
             .execute(self.pool.any())
             .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("api key {id}")));
+        }
+        self.get_api_key(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("api key {id}")))
+    }
+
+    /// Replace the exact virtual-model allow-list for an API key. `None`
+    /// restores unrestricted access, while an empty list denies every model.
+    pub async fn update_api_key_model_access(
+        &self,
+        id: &str,
+        allowed_models: Option<Vec<String>>,
+    ) -> Result<ApiKey, StoreError> {
+        let allowed_models = normalize_allowed_models(allowed_models)?;
+        let allowed_models_str = allowed_models
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            "UPDATE api_keys SET allowed_models_json = $1, updated_at = $2 WHERE id = $3",
+        )
+        .bind(&allowed_models_str)
+        .bind(&now)
+        .bind(id)
+        .execute(self.pool.any())
+        .await?;
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("api key {id}")));
         }
@@ -1417,7 +1454,7 @@ impl DbConfigStore {
             .collect();
         let token_daily_stats = crate::token_stats::export_token_daily_stats(&self.pool).await?;
         Ok(ConfigExport {
-            schema_version: 1,
+            schema_version: 2,
             exported_at: chrono::Utc::now().to_rfc3339(),
             encrypted: self.encryption.is_some(),
             providers,
@@ -1446,12 +1483,13 @@ impl DbConfigStore {
         master_key: &str,
         selection: &ImportSelection,
     ) -> Result<ImportReport, StoreError> {
-        // Guard against a future incompatible export format. The
-        // exporter currently emits `1`; bumping the version on the
-        // write side without updating this read side is a caller bug.
-        if data.schema_version != 1 {
+        // Version 1 predates per-key model access. It remains importable and
+        // treats every API key as unrestricted. Version 2 preserves the
+        // access policy so older importers reject it instead of silently
+        // widening access.
+        if !(1..=2).contains(&data.schema_version) {
             return Err(StoreError::Invalid(format!(
-                "unsupported export schema_version: {} (expected 1)",
+                "unsupported export schema_version: {} (expected 1 or 2)",
                 data.schema_version
             )));
         }
@@ -1618,31 +1656,45 @@ impl DbConfigStore {
                 report.api_keys_skipped += 1;
                 continue;
             }
-            let existing_hash: Option<(String,)> =
-                sqlx::query_as("SELECT key_hash FROM api_keys WHERE key_hash = $1")
+            let existing_hash_owner: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM api_keys WHERE key_hash = $1")
                     .bind(&k.key_hash)
                     .fetch_optional(&mut *tx)
                     .await?;
-            if existing_hash.is_some() {
+            if existing_hash_owner
+                .as_ref()
+                .is_some_and(|(existing_id,)| existing_id != &k.id)
+            {
                 report.api_keys_skipped += 1;
                 continue;
             }
             let quota_str = serde_json::to_string(&k.quota_json)?;
+            let allowed_models = if data.schema_version >= 2 {
+                normalize_allowed_models(k.allowed_models.clone())?
+            } else {
+                None
+            };
+            let allowed_models_str = allowed_models
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             let created_at = k.created_at.to_rfc3339();
             let updated_at = chrono::Utc::now().to_rfc3339();
             // Upsert by id: overwrite when the operator explicitly
             // selected an existing id.
             sqlx::query(
-                "INSERT INTO api_keys (id, name, key_hash, quota_json, status, created_at, \
-                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                "INSERT INTO api_keys (id, name, key_hash, quota_json, allowed_models_json, status, created_at, \
+                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                  ON CONFLICT(id) DO UPDATE SET \
                     name=excluded.name, key_hash=excluded.key_hash, quota_json=excluded.quota_json, \
-                    status=excluded.status, updated_at=excluded.updated_at",
+                    allowed_models_json=excluded.allowed_models_json, status=excluded.status, \
+                    updated_at=excluded.updated_at",
             )
             .bind(&k.id)
             .bind(&k.name)
             .bind(&k.key_hash)
             .bind(&quota_str)
+            .bind(&allowed_models_str)
             .bind(k.status.as_str())
             .bind(&created_at)
             .bind(&updated_at)
@@ -1974,15 +2026,40 @@ fn row_to_api_key(row: sqlx::any::AnyRow) -> Result<ApiKey, StoreError> {
     } else {
         serde_json::from_str(&quota_str)?
     };
+    let allowed_models_str: Option<String> = row.get("allowed_models_json");
+    let allowed_models = allowed_models_str
+        .filter(|value| !value.is_empty())
+        .map(|value| serde_json::from_str::<Vec<String>>(&value))
+        .transpose()?;
     Ok(ApiKey {
         id: row.get("id"),
         name: row.get("name"),
         key_hash: row.get("key_hash"),
         quota_json,
+        allowed_models,
         status,
         created_at: parse_dt(row.get("created_at"))?,
         updated_at: parse_dt(row.get("updated_at"))?,
     })
+}
+
+fn normalize_allowed_models(
+    allowed_models: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, StoreError> {
+    let Some(models) = allowed_models else {
+        return Ok(None);
+    };
+    let mut normalized = BTreeSet::new();
+    for model in models {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(StoreError::Invalid(
+                "allowed model names must not be empty".to_string(),
+            ));
+        }
+        normalized.insert(model.to_string());
+    }
+    Ok(Some(normalized.into_iter().collect()))
 }
 
 fn parse_dt(s: String) -> Result<chrono::DateTime<chrono::Utc>, StoreError> {
@@ -2690,22 +2767,140 @@ mod tests {
             .await
             .expect("upsert route");
         store
-            .create_api_key("key-1", "secret-1", serde_json::json!({}))
+            .create_api_key("key-1", "secret-1", serde_json::json!({}), None)
             .await
             .expect("create api key");
 
         let bundle = store.export_config().await.expect("export");
-        assert_eq!(bundle.schema_version, 1);
+        assert_eq!(bundle.schema_version, 2);
         assert!(!bundle.encrypted, "no encryption configured");
         assert_eq!(bundle.providers.len(), 1);
         assert_eq!(bundle.routes.len(), 1);
         assert_eq!(bundle.api_keys.len(), 1);
+        assert_eq!(bundle.api_keys[0].allowed_models, None);
         // The runtime-only cleartext field must never appear in an
         // export, even when the store runs without a master key.
         assert!(
             bundle.providers[0].api_key_cleartext.is_none(),
             "export must not carry decrypted api_key_cleartext"
         );
+    }
+
+    #[tokio::test]
+    async fn api_key_model_access_round_trips_and_normalizes() {
+        let store = boot_store(None).await;
+        let (key, secret) = store
+            .create_api_key(
+                "scoped",
+                "secret-scoped",
+                serde_json::json!({}),
+                Some(vec![
+                    " z-model ".to_string(),
+                    "a-model".to_string(),
+                    "a-model".to_string(),
+                ]),
+            )
+            .await
+            .expect("create key");
+        assert_eq!(
+            key.allowed_models,
+            Some(vec!["a-model".to_string(), "z-model".to_string()])
+        );
+        let lookup = store
+            .find_api_key_by_secret(&secret)
+            .await
+            .expect("lookup")
+            .expect("key");
+        assert_eq!(lookup.allowed_models, key.allowed_models);
+
+        let updated = store
+            .update_api_key_model_access(&key.id, Some(vec![]))
+            .await
+            .expect("deny all");
+        assert_eq!(updated.allowed_models, Some(vec![]));
+        let unrestricted = store
+            .update_api_key_model_access(&key.id, None)
+            .await
+            .expect("unrestricted");
+        assert_eq!(unrestricted.allowed_models, None);
+    }
+
+    #[tokio::test]
+    async fn api_key_model_access_round_trips_through_export_import() {
+        let source = boot_store(None).await;
+        let (key, _) = source
+            .create_api_key(
+                "scoped",
+                "secret-export-scoped",
+                serde_json::json!({}),
+                Some(vec!["allowed-model".to_string()]),
+            )
+            .await
+            .expect("create key");
+        let bundle = source.export_config().await.expect("export");
+        assert_eq!(bundle.schema_version, 2);
+        assert_eq!(
+            bundle.api_keys[0].allowed_models,
+            Some(vec!["allowed-model".to_string()])
+        );
+
+        let target = boot_store(None).await;
+        let selection = ImportSelection {
+            api_keys: vec![key.id.clone()],
+            ..Default::default()
+        };
+        target
+            .import_config(&bundle, "", &selection)
+            .await
+            .expect("import");
+        let imported = target
+            .get_api_key(&key.id)
+            .await
+            .expect("get imported")
+            .expect("imported key");
+        assert_eq!(imported.allowed_models, key.allowed_models);
+    }
+
+    #[tokio::test]
+    async fn schema_v1_import_defaults_api_keys_to_unrestricted() {
+        let target = boot_store(None).await;
+        let now = chrono::Utc::now();
+        let bundle = ConfigExport {
+            schema_version: 1,
+            exported_at: now.to_rfc3339(),
+            encrypted: false,
+            providers: vec![],
+            routes: vec![],
+            api_keys: vec![ApiKey {
+                id: "legacy-key".into(),
+                name: "Legacy".into(),
+                key_hash: hash_api_key("legacy-secret"),
+                quota_json: serde_json::json!({}),
+                allowed_models: Some(vec!["must-be-ignored-for-v1".to_string()]),
+                status: ApiKeyStatus::Active,
+                created_at: now,
+                updated_at: now,
+            }],
+            settings: vec![],
+            token_daily_stats: vec![],
+        };
+        target
+            .import_config(
+                &bundle,
+                "",
+                &ImportSelection {
+                    api_keys: vec!["legacy-key".to_string()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("import legacy bundle");
+        let imported = target
+            .get_api_key("legacy-key")
+            .await
+            .expect("get imported")
+            .expect("legacy key");
+        assert_eq!(imported.allowed_models, None);
     }
 
     #[tokio::test]
@@ -2895,7 +3090,7 @@ mod tests {
         let store = boot_store(None).await;
         // Pre-create an api key with the same secret.
         store
-            .create_api_key("original", "shared-secret", serde_json::json!({}))
+            .create_api_key("original", "shared-secret", serde_json::json!({}), None)
             .await
             .expect("create api key");
         let existing_hash = hash_api_key("shared-secret");
@@ -2912,6 +3107,7 @@ mod tests {
                 name: "Imported".into(),
                 key_hash: existing_hash,
                 quota_json: serde_json::json!({}),
+                allowed_models: None,
                 status: ApiKeyStatus::Active,
                 created_at: now,
                 updated_at: now,
@@ -2930,6 +3126,70 @@ mod tests {
             .expect("import");
         assert_eq!(report.api_keys_imported, 0);
         assert_eq!(report.api_keys_skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn import_config_overwrites_same_api_key_id_and_hash_when_selected() {
+        let store = boot_store(None).await;
+        let (existing, _) = store
+            .create_api_key(
+                "Original",
+                "same-secret",
+                serde_json::json!({"requests_per_minute": 10}),
+                None,
+            )
+            .await
+            .expect("create api key");
+
+        let now = chrono::Utc::now();
+        let bundle = ConfigExport {
+            schema_version: 2,
+            exported_at: now.to_rfc3339(),
+            encrypted: false,
+            providers: vec![],
+            routes: vec![],
+            api_keys: vec![ApiKey {
+                id: existing.id.clone(),
+                name: "Restored".into(),
+                key_hash: existing.key_hash.clone(),
+                quota_json: serde_json::json!({"requests_per_minute": 20}),
+                allowed_models: Some(vec!["allowed-model".to_string()]),
+                status: ApiKeyStatus::Disabled,
+                created_at: now,
+                updated_at: now,
+            }],
+            settings: vec![],
+            token_daily_stats: vec![],
+        };
+        let report = store
+            .import_config(
+                &bundle,
+                "",
+                &ImportSelection {
+                    api_keys: vec![existing.id.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("overwrite api key");
+        assert_eq!(report.api_keys_imported, 1);
+        assert_eq!(report.api_keys_skipped, 0);
+
+        let restored = store
+            .get_api_key(&existing.id)
+            .await
+            .expect("get api key")
+            .expect("restored key");
+        assert_eq!(restored.name, "Restored");
+        assert_eq!(
+            restored.quota_json,
+            serde_json::json!({"requests_per_minute": 20})
+        );
+        assert_eq!(
+            restored.allowed_models,
+            Some(vec!["allowed-model".to_string()])
+        );
+        assert_eq!(restored.status, ApiKeyStatus::Disabled);
     }
 
     #[tokio::test]

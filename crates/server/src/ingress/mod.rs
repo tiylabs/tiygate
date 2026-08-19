@@ -12,7 +12,7 @@ mod executors;
 mod fallback;
 mod handlers;
 mod headers;
-mod observability;
+pub(crate) mod observability;
 mod response_model;
 mod streaming;
 

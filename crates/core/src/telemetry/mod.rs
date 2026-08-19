@@ -128,6 +128,8 @@ pub enum RequestErrorClass {
     AuthInvalid,
     /// Inbound API key matched a disabled / revoked key.
     AuthDisabled,
+    /// Inbound API key cannot access the requested virtual model.
+    ModelAccessDenied,
     /// Gateway internal error (unexpected drop, handler panic, …).
     InternalError,
     /// Client disconnected mid-request.
@@ -155,6 +157,7 @@ impl RequestErrorClass {
             Self::AuthMissing => "auth_missing",
             Self::AuthInvalid => "auth_invalid",
             Self::AuthDisabled => "auth_disabled",
+            Self::ModelAccessDenied => "model_access_denied",
             Self::InternalError => "internal_error",
             Self::ClientDisconnect => "client_disconnect",
             Self::QuotaExceeded => "quota_exceeded",
@@ -178,6 +181,7 @@ impl RequestErrorClass {
             "auth_missing" => Some(Self::AuthMissing),
             "auth_invalid" => Some(Self::AuthInvalid),
             "auth_disabled" => Some(Self::AuthDisabled),
+            "model_access_denied" => Some(Self::ModelAccessDenied),
             "internal_error" => Some(Self::InternalError),
             "client_disconnect" => Some(Self::ClientDisconnect),
             "quota_exceeded" => Some(Self::QuotaExceeded),

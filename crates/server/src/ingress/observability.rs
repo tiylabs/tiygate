@@ -52,20 +52,24 @@ use crate::ingress::{AppError, AppState};
 // the request was authenticated; a `key_id == "anonymous"` means we
 // could not identify the caller and the spec is unlimited.
 //
-// All four ingress handlers call `resolve_api_key` at the top so the
+// Every model-serving ingress handler calls `resolve_api_key` so the
 // quota check is real (per the Phase 4 §4.6 design) — the previous
 // `QuotaSpec::default() + "anonymous"` was a placeholder that did
 // not exercise the api-key → spec wiring.
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(super) struct ResolvedApiKey {
+pub(crate) struct ResolvedApiKey {
     /// The key id (`api_keys.id`). The literal string `"anonymous"`
     /// when no credential was supplied or the lookup did not match.
     pub key_id: String,
     /// The deserialized `QuotaSpec` for this key. Default (unlimited)
     /// when the lookup did not match.
     pub spec: tiygate_core::quota::QuotaSpec,
+    /// Exact virtual-model allow-list. `None` means unrestricted; an empty
+    /// list denies every model. Anonymous and unknown credentials are
+    /// unrestricted because they have no API-key policy to apply.
+    pub allowed_models: Option<Vec<String>>,
     /// The cleartext secret (only retained for the duration of the
     /// request). Useful for upstream auth fallback paths and for the
     /// trace / audit log. Never persisted.
@@ -82,7 +86,7 @@ pub(super) struct ResolvedApiKey {
 /// valid, active key; the other variants describe the reason the
 /// request was treated as anonymous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum KeyLookupOutcome {
+pub(crate) enum KeyLookupOutcome {
     /// Credential matched an active row in `api_keys`.
     Authenticated,
     /// No `Authorization` / `x-api-key` / `x-goog-api-key` header
@@ -102,7 +106,7 @@ pub(super) enum KeyLookupOutcome {
 /// malformed, or the lookup fails. The store call is async and short
 /// (single-row index lookup), so the cost on the hot path is
 /// negligible; the lookup result is memoized in a future revision.
-pub(super) async fn resolve_api_key(
+pub(crate) async fn resolve_api_key(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> ResolvedApiKey {
@@ -114,6 +118,7 @@ pub(super) async fn resolve_api_key(
         return ResolvedApiKey {
             key_id: "anonymous".to_string(),
             spec: tiygate_core::quota::QuotaSpec::default(),
+            allowed_models: None,
             secret: None,
             outcome: KeyLookupOutcome::NoCredential,
         };
@@ -144,6 +149,7 @@ pub(super) async fn resolve_api_key(
                 return ResolvedApiKey {
                     key_id: "anonymous".to_string(),
                     spec: tiygate_core::quota::QuotaSpec::default(),
+                    allowed_models: None,
                     secret: Some(secret),
                     outcome: KeyLookupOutcome::DisabledCredential,
                 };
@@ -152,6 +158,7 @@ pub(super) async fn resolve_api_key(
             ResolvedApiKey {
                 key_id: api_key.id,
                 spec,
+                allowed_models: api_key.allowed_models,
                 secret: Some(secret),
                 outcome: KeyLookupOutcome::Authenticated,
             }
@@ -159,16 +166,43 @@ pub(super) async fn resolve_api_key(
         Ok(None) => ResolvedApiKey {
             key_id: "anonymous".to_string(),
             spec: tiygate_core::quota::QuotaSpec::default(),
+            allowed_models: None,
             secret: Some(secret),
             outcome: KeyLookupOutcome::UnknownCredential,
         },
         Err(_) => ResolvedApiKey {
             key_id: "anonymous".to_string(),
             spec: tiygate_core::quota::QuotaSpec::default(),
+            allowed_models: None,
             secret: Some(secret),
             outcome: KeyLookupOutcome::UnknownCredential,
         },
     }
+}
+
+/// Enforce the authenticated key's exact virtual-model allow-list. This is
+/// independent of `require_api_key`: when a valid key is supplied its policy
+/// always applies, while anonymous/unknown callers have no per-key policy.
+pub(crate) fn enforce_model_access(
+    api_key: &ResolvedApiKey,
+    virtual_model: &str,
+) -> Result<(), (AppError, RequestErrorClass)> {
+    if api_key
+        .allowed_models
+        .as_ref()
+        .is_none_or(|models| models.iter().any(|model| model == virtual_model))
+    {
+        return Ok(());
+    }
+    Err((
+        AppError::new(
+            http::StatusCode::FORBIDDEN,
+            format!("api key is not allowed to access model: {virtual_model}"),
+        )
+        .with_class(tiygate_core::ErrorClass::ModelAccessDenied)
+        .with_upstream_code("model_access_denied"),
+        RequestErrorClass::ModelAccessDenied,
+    ))
 }
 
 /// Enforce API key authentication when `require_api_key` is enabled
@@ -185,7 +219,7 @@ pub(super) async fn resolve_api_key(
 /// The caller is responsible for calling `scope.emit_error(class,
 /// …)` on the rejected path so the terminal `RequestEvent` is
 /// persisted.
-pub(super) fn enforce_auth(
+pub(crate) fn enforce_auth(
     state: &AppState,
     api_key: &ResolvedApiKey,
 ) -> Result<(), (AppError, RequestErrorClass)> {
@@ -397,7 +431,7 @@ impl<'a> RequestScope<'a> {
     /// Mark the scope as having emitted its terminal event. Future
     /// `Drop`s are no-ops. Call after `emit_ok` / `emit_error`.
     ///
-    /// Currently the four production handlers all go through
+    /// Production handlers go through
     /// `emit_ok` / `emit_error` and never need to disarm, but the
     /// method is kept as a safety hatch for future handlers that
     /// may want to transfer ownership of emission to another

@@ -468,6 +468,8 @@ pub enum ErrorClass {
     AuthInvalid,
     /// Inbound API key matched a disabled / revoked key (403).
     AuthDisabled,
+    /// Inbound API key is not allowed to access the requested virtual model (403).
+    ModelAccessDenied,
     /// Gateway is overloaded / queue full (503).
     Overloaded,
 }
@@ -488,6 +490,7 @@ impl ErrorClass {
             Self::AuthMissing => RequestErrorClass::AuthMissing,
             Self::AuthInvalid => RequestErrorClass::AuthInvalid,
             Self::AuthDisabled => RequestErrorClass::AuthDisabled,
+            Self::ModelAccessDenied => RequestErrorClass::ModelAccessDenied,
             Self::Overloaded => RequestErrorClass::InternalError,
         }
     }
@@ -506,6 +509,7 @@ impl ErrorClass {
             Self::AuthMissing => 401,
             Self::AuthInvalid => 401,
             Self::AuthDisabled => 403,
+            Self::ModelAccessDenied => 403,
             Self::Overloaded => 503,
         }
     }
@@ -780,6 +784,7 @@ impl FallbackPolicy for DefaultFallbackPolicy {
             | ErrorClass::AuthMissing
             | ErrorClass::AuthInvalid
             | ErrorClass::AuthDisabled
+            | ErrorClass::ModelAccessDenied
             | ErrorClass::UpstreamExhausted => {
                 // Fail immediately — retrying won't help
                 FallbackDecision::Fail

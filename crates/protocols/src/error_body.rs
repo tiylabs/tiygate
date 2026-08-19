@@ -26,6 +26,7 @@ fn openai_error_type(class: ErrorClass) -> &'static str {
         ErrorClass::AuthMissing => "authentication_error",
         ErrorClass::AuthInvalid => "authentication_error",
         ErrorClass::AuthDisabled => "permission_error",
+        ErrorClass::ModelAccessDenied => "permission_error",
         ErrorClass::Overloaded => "overloaded_error",
     }
 }
@@ -44,6 +45,7 @@ fn anthropic_error_type(class: ErrorClass) -> &'static str {
         ErrorClass::AuthMissing => "authentication_error",
         ErrorClass::AuthInvalid => "authentication_error",
         ErrorClass::AuthDisabled => "permission_error",
+        ErrorClass::ModelAccessDenied => "permission_error",
         ErrorClass::Overloaded => "overloaded_error",
     }
 }
@@ -62,6 +64,7 @@ fn gemini_error_status(class: ErrorClass) -> &'static str {
         ErrorClass::AuthMissing => "UNAUTHENTICATED",
         ErrorClass::AuthInvalid => "UNAUTHENTICATED",
         ErrorClass::AuthDisabled => "PERMISSION_DENIED",
+        ErrorClass::ModelAccessDenied => "PERMISSION_DENIED",
         ErrorClass::Overloaded => "UNAVAILABLE",
     }
 }
@@ -84,6 +87,10 @@ pub fn encode_error_body_for_suite(
     http_status: u16,
     upstream_code: Option<&str>,
 ) -> Value {
+    let error_code = upstream_code.or(match class {
+        ErrorClass::ModelAccessDenied => Some("model_access_denied"),
+        _ => None,
+    });
     match suite {
         ProtocolSuite::OpenAiCompatible | ProtocolSuite::OpenAiResponses => {
             let mut err = json!({
@@ -91,7 +98,7 @@ pub fn encode_error_body_for_suite(
                 "type": openai_error_type(class),
                 "param": null,
             });
-            if let Some(c) = upstream_code {
+            if let Some(c) = error_code {
                 err["code"] = json!(c);
             }
             json!({"error": err})
@@ -115,5 +122,24 @@ pub fn encode_error_body_for_suite(
                 }
             })
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_access_denied_has_stable_openai_code() {
+        let body = encode_error_body_for_suite(
+            ProtocolSuite::OpenAiCompatible,
+            "denied",
+            ErrorClass::ModelAccessDenied,
+            403,
+            None,
+        );
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert_eq!(body["error"]["code"], "model_access_denied");
     }
 }

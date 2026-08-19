@@ -18,10 +18,14 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
+use tiygate_core::quota::InMemoryQuota;
 use tiygate_core::{HealthRegistry, ProtocolEndpoint, ProtocolSuite, RoutingTable};
 use tiygate_server::config::ServerConfig;
 use tiygate_server::ingress;
 use tiygate_store::config::ConfigStore;
+use tiygate_store::config_store::DbConfigStore;
+use tiygate_store::db;
+use tiygate_store::models::{AuthMode, RouteTarget};
 use tower::ServiceExt;
 
 /// Build a test app with a single OpenAI-compatible route to a wiremock upstream.
@@ -2138,6 +2142,127 @@ async fn test_require_api_key_disabled_allows_anonymous() {
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_api_key_model_access_rejects_before_upstream() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+    db::run_migrations(&pool).await.expect("migrations");
+    let store = Arc::new(DbConfigStore::new(pool, None));
+    store.refresh().await.expect("refresh");
+    store
+        .upsert_provider(
+            "openai",
+            "OpenAI",
+            "openai",
+            &mock_server.uri(),
+            "",
+            Some("sk-upstream"),
+            AuthMode::ApiKey,
+            None,
+            json!({}),
+            true,
+        )
+        .await
+        .expect("provider");
+    store
+        .upsert_route(
+            "route-blocked",
+            "blocked-model",
+            &[RouteTarget {
+                provider_id: "openai".to_string(),
+                model_id: "gpt-4o".to_string(),
+                weight: 1.0,
+                enabled: true,
+                account_label: None,
+                api_key_override: None,
+                api_base_override: None,
+            }],
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("route");
+    store
+        .create_api_key(
+            "scoped",
+            "tg-scoped-chat",
+            json!({"requests_per_minute": 1}),
+            Some(vec!["allowed-model".to_string()]),
+        )
+        .await
+        .expect("create key");
+    let cfg = ServerConfig {
+        require_api_key: true,
+        ..Default::default()
+    };
+    let app = ingress::router_with_telemetry_full(
+        store.config_store(),
+        Arc::new(HealthRegistry::with_defaults()),
+        &cfg,
+        Arc::new(tiygate_server::telemetry::ChannelTelemetryBus::spawn(
+            Arc::new(tiygate_store::log_sink::stdout::StdoutSink::new()),
+            64,
+        )),
+        Some(InMemoryQuota::new()),
+        None,
+        Some(store),
+        None,
+    );
+
+    let body = json!({"model": "blocked-model", "messages": [{"role": "user", "content": "hi"}]});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer tg-scoped-chat")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(value["error"]["type"], json!("permission_error"));
+    assert_eq!(value["error"]["code"], json!("model_access_denied"));
+
+    // The rejected request still consumes request quota, so repeated denied
+    // traffic cannot bypass the API key's ingress rate limit.
+    let body =
+        json!({"model": "blocked-model", "messages": [{"role": "user", "content": "again"}]});
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer tg-scoped-chat")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 /// Regression: when the upstream does not return response headers

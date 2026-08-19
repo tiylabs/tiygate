@@ -25,6 +25,7 @@ fn error_status_for_class(class: ErrorClass) -> &'static str {
         ErrorClass::AuthMissing => "UNAUTHENTICATED",
         ErrorClass::AuthInvalid => "UNAUTHENTICATED",
         ErrorClass::AuthDisabled => "PERMISSION_DENIED",
+        ErrorClass::ModelAccessDenied => "PERMISSION_DENIED",
         ErrorClass::Overloaded => "UNAVAILABLE",
     }
 }
