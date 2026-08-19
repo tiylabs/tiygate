@@ -25,6 +25,7 @@ fn error_type_for_class(class: ErrorClass) -> &'static str {
         ErrorClass::AuthMissing => "authentication_error",
         ErrorClass::AuthInvalid => "authentication_error",
         ErrorClass::AuthDisabled => "permission_error",
+        ErrorClass::ModelAccessDenied => "permission_error",
         ErrorClass::Overloaded => "overloaded_error",
     }
 }

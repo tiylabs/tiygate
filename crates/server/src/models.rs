@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -155,6 +155,39 @@ impl ModelsError {
             code: "invalid_param",
         }
     }
+
+    fn auth(status: StatusCode) -> Self {
+        let (message, error_type, code) = if status == StatusCode::FORBIDDEN {
+            (
+                "API key is disabled",
+                "permission_error",
+                "api_key_disabled",
+            )
+        } else {
+            (
+                "Missing or invalid API key",
+                "authentication_error",
+                "invalid_api_key",
+            )
+        };
+        Self {
+            status,
+            message: message.to_string(),
+            error_type,
+            param: None,
+            code,
+        }
+    }
+
+    fn model_access_denied(model_id: &str) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: format!("API key is not allowed to access model '{model_id}'"),
+            error_type: "permission_error",
+            param: Some("model_id"),
+            code: "model_access_denied",
+        }
+    }
 }
 
 impl IntoResponse for ModelsError {
@@ -211,8 +244,12 @@ fn collect_models(state: &AppState) -> Vec<Model> {
 /// Handle `GET /v1/models`.
 pub async fn handle_list_models(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<ListModelsQuery>,
 ) -> Result<Response, ModelsError> {
+    let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
+    crate::ingress::observability::enforce_auth(&state, &api_key)
+        .map_err(|(err, _)| ModelsError::auth(err.http_status()))?;
     // Validate `order` up front so a typo surfaces as a 400 rather
     // than being silently coerced to the default.
     let descending = match query.order.as_deref() {
@@ -227,6 +264,9 @@ pub async fn handle_list_models(
     };
 
     let mut models = collect_models(&state);
+    if let Some(allowed_models) = api_key.allowed_models.as_ref() {
+        models.retain(|model| allowed_models.iter().any(|allowed| allowed == &model.id));
+    }
 
     // Optional `owned_by` filter.
     if let Some(owner) = query.owned_by.as_deref() {
@@ -283,14 +323,22 @@ pub async fn handle_list_models(
 /// the model's stored id verbatim.
 pub async fn handle_get_model(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(model_id): Path<String>,
 ) -> Result<Response, ModelsError> {
+    let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
+    crate::ingress::observability::enforce_auth(&state, &api_key)
+        .map_err(|(err, _)| ModelsError::auth(err.http_status()))?;
     let model = collect_models(&state)
         .into_iter()
         .find(|m| m.id.eq_ignore_ascii_case(&model_id));
 
     match model {
-        Some(model) => Ok(Json(model).into_response()),
+        Some(model) => {
+            crate::ingress::observability::enforce_model_access(&api_key, &model.id)
+                .map_err(|_| ModelsError::model_access_denied(&model.id))?;
+            Ok(Json(model).into_response())
+        }
         None => Err(ModelsError::not_found(&model_id)),
     }
 }

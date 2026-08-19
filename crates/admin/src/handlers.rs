@@ -7,7 +7,7 @@
 //! surface.
 
 #[allow(unused_imports)]
-use axum::routing::{post, put};
+use axum::routing::{patch, post, put};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -75,6 +75,10 @@ pub fn router() -> Router<AdminState> {
                 .delete(delete_api_key)
                 .put(disable_api_key)
                 .patch(update_api_key_quota),
+        )
+        .route(
+            "/admin/v1/api-keys/:id/model-access",
+            patch(update_api_key_model_access),
         )
         .route("/admin/v1/provider-catalog", get(list_provider_catalog))
         .route("/admin/v1/model-catalog", get(get_model_catalog))
@@ -1206,6 +1210,7 @@ fn api_key_snapshot(k: &tiygate_store::models::ApiKey) -> serde_json::Value {
         "name": k.name,
         "status": k.status.as_str(),
         "quota": k.quota_json,
+        "allowed_models": k.allowed_models,
     })
 }
 
@@ -2086,6 +2091,9 @@ struct CreateApiKeyRequest {
     secret: Option<String>,
     /// Optional quota (forwarded to the column as JSON).
     quota: Option<serde_json::Value>,
+    /// Optional exact virtual-model allow-list. Omitted/null means
+    /// unrestricted; an empty list denies every model.
+    allowed_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2094,6 +2102,7 @@ struct CreateApiKeyResponse {
     name: String,
     secret: String,
     quota: serde_json::Value,
+    allowed_models: Option<Vec<String>>,
     status: String,
     created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2104,6 +2113,7 @@ struct ApiKeyView {
     name: String,
     key_hash: String,
     quota: serde_json::Value,
+    allowed_models: Option<Vec<String>>,
     status: String,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -2116,6 +2126,7 @@ impl From<tiygate_store::models::ApiKey> for ApiKeyView {
             name: k.name,
             key_hash: k.key_hash,
             quota: k.quota_json,
+            allowed_models: k.allowed_models,
             status: k.status.as_str().to_string(),
             created_at: k.created_at,
             updated_at: k.updated_at,
@@ -2148,6 +2159,7 @@ async fn create_api_key(
             &req.name,
             &secret,
             req.quota.unwrap_or_else(|| serde_json::json!({})),
+            req.allowed_models,
         )
         .await?;
     let _ = tiygate_store::audit::record(
@@ -2164,6 +2176,7 @@ async fn create_api_key(
         name: key.name,
         secret: plain,
         quota: key.quota_json,
+        allowed_models: key.allowed_models,
         status: key.status.as_str().to_string(),
         created_at: key.created_at,
     };
@@ -2305,6 +2318,50 @@ async fn update_api_key_quota(
         state.pool.as_ref(),
         "admin",
         "update_quota",
+        "api_key",
+        &key.id,
+        &audit_details(before.as_ref(), Some(&api_key_snapshot(&key))),
+    )
+    .await;
+    Ok(Json(ApiKeyView::from(key)).into_response())
+}
+
+/// PATCH /admin/v1/api-keys/:id/model-access — replace the key's exact
+/// virtual-model allow-list without changing its quota or status.
+async fn update_api_key_model_access(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(mut req): Json<serde_json::Map<String, serde_json::Value>>,
+) -> Result<Response, AdminError> {
+    let raw_allowed_models = req.remove("allowed_models").ok_or_else(|| {
+        AdminError::BadRequest(
+            "allowed_models is required; use null for unrestricted access".into(),
+        )
+    })?;
+    let allowed_models = if raw_allowed_models.is_null() {
+        None
+    } else {
+        Some(
+            serde_json::from_value::<Vec<String>>(raw_allowed_models).map_err(|_| {
+                AdminError::BadRequest("allowed_models must be an array or null".into())
+            })?,
+        )
+    };
+    let before = state
+        .store
+        .get_api_key(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|k| api_key_snapshot(&k));
+    let key = state
+        .store
+        .update_api_key_model_access(&id, allowed_models)
+        .await?;
+    let _ = tiygate_store::audit::record(
+        state.pool.as_ref(),
+        "admin",
+        "update_model_access",
         "api_key",
         &key.id,
         &audit_details(before.as_ref(), Some(&api_key_snapshot(&key))),

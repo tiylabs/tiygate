@@ -1,8 +1,17 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, SlidersHorizontal, Ban, Trash2, Copy, Check } from "lucide-react";
-import { apiKeysApi } from "@/api/resources";
+import {
+  Plus,
+  SlidersHorizontal,
+  Ban,
+  Trash2,
+  Copy,
+  Check,
+  ShieldCheck,
+  Search,
+} from "lucide-react";
+import { apiKeysApi, routesApi } from "@/api/resources";
 import type { ApiKey, CreateApiKeyResponse, QuotaSpec } from "@/api/types";
 import {
   Alert,
@@ -44,6 +53,125 @@ function quotaSummary(q: QuotaSpec): string {
   return parts.length ? parts.join(", ") : "∞";
 }
 
+type ModelAccessMode = "all" | "selected";
+
+async function listAllVirtualModels(): Promise<string[]> {
+  const pageSize = 500;
+  let offset = 0;
+  const models: string[] = [];
+  while (true) {
+    const page = await routesApi.list({ limit: pageSize, offset });
+    models.push(...page.entries.map((route) => route.virtual_model));
+    offset += page.entries.length;
+    if (page.entries.length === 0 || offset >= page.total) break;
+  }
+  return Array.from(new Set(models)).sort((a, b) => a.localeCompare(b));
+}
+
+function ModelAccessEditor({
+  mode,
+  selected,
+  models,
+  loading,
+  search,
+  onModeChange,
+  onSearchChange,
+  onToggle,
+}: {
+  mode: ModelAccessMode;
+  selected: string[];
+  models: string[];
+  loading: boolean;
+  search: string;
+  onModeChange: (mode: ModelAccessMode) => void;
+  onSearchChange: (search: string) => void;
+  onToggle: (model: string) => void;
+}) {
+  const { t } = useTranslation();
+  const filtered = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    const candidates = Array.from(new Set([...models, ...selected])).sort((a, b) =>
+      a.localeCompare(b),
+    );
+    return needle
+      ? candidates.filter((model) => model.toLowerCase().includes(needle))
+      : candidates;
+  }, [models, search, selected]);
+
+  return (
+    <Field label={t("apiKeys.modelAccess")}>
+      <div className="inline-flex w-full rounded-md border border-border bg-surface-muted p-1 sm:w-auto">
+        {(["all", "selected"] as const).map((option) => (
+          <button
+            key={option}
+            type="button"
+            aria-pressed={mode === option}
+            className={cn(
+              "min-h-8 flex-1 rounded-sm px-3 text-sm font-medium transition-colors sm:flex-none",
+              mode === option
+                ? "bg-surface text-text shadow-xs"
+                : "text-text-muted hover:text-text",
+            )}
+            onClick={() => onModeChange(option)}
+          >
+            {t(`apiKeys.modelAccessMode_${option}`)}
+          </button>
+        ))}
+      </div>
+      {mode === "selected" ? (
+        <div className="mt-3 overflow-hidden rounded-md border border-border">
+          <div className="relative border-b border-border bg-surface px-3 py-2">
+            <Search
+              size={15}
+              className="pointer-events-none absolute left-5 top-1/2 -translate-y-1/2 text-text-subtle"
+            />
+            <Input
+              value={search}
+              onChange={(event) => onSearchChange(event.target.value)}
+              placeholder={t("apiKeys.searchModels")}
+              className="pl-8"
+            />
+          </div>
+          <div className="max-h-56 overflow-y-auto bg-surface p-1.5">
+            {loading ? (
+              <p className="px-2 py-4 text-center text-xs text-text-subtle">
+                {t("common.loading")}
+              </p>
+            ) : filtered.length === 0 ? (
+              <p className="px-2 py-4 text-center text-xs text-text-subtle">
+                {t("apiKeys.noModels")}
+              </p>
+            ) : (
+              filtered.map((model) => {
+                const checked = selected.includes(model);
+                return (
+                  <label
+                    key={model}
+                    className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-2 text-sm text-text hover:bg-surface-muted"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => onToggle(model)}
+                      className="h-4 w-4 accent-primary"
+                    />
+                    <span className="min-w-0 break-all font-mono text-xs">
+                      {model}
+                    </span>
+                  </label>
+                );
+              })
+            )}
+          </div>
+          <div className="border-t border-border bg-surface-muted px-3 py-2 text-xs text-text-muted">
+            {t("apiKeys.modelsSelected", { count: selected.length })}
+          </div>
+        </div>
+      ) : null}
+    </Field>
+  );
+}
+
 export default function ApiKeys() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -52,6 +180,11 @@ export default function ApiKeys() {
     queryKey: ["api-keys"],
     queryFn: apiKeysApi.list,
   });
+  const routesQuery = useQuery({
+    queryKey: ["routes", "api-key-model-access"],
+    queryFn: listAllVirtualModels,
+  });
+  const availableModels = routesQuery.data ?? [];
   const { scrollRef, scrollState } = useStickyTableScroll([
     isLoading,
     data?.length ?? 0,
@@ -62,15 +195,25 @@ export default function ApiKeys() {
   // ---- create ----
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState("");
+  const [createAccessMode, setCreateAccessMode] = useState<ModelAccessMode>("all");
+  const [createModels, setCreateModels] = useState<string[]>([]);
+  const [createModelSearch, setCreateModelSearch] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [secret, setSecret] = useState<CreateApiKeyResponse | null>(null);
   const [copied, setCopied] = useState(false);
 
   const createMutation = useMutation({
-    mutationFn: () => apiKeysApi.create({ name: newName }),
+    mutationFn: () =>
+      apiKeysApi.create({
+        name: newName,
+        allowed_models: createAccessMode === "all" ? null : createModels,
+      }),
     onSuccess: (res) => {
       setCreateOpen(false);
       setNewName("");
+      setCreateAccessMode("all");
+      setCreateModels([]);
+      setCreateModelSearch("");
       setSecret(res);
       toast.success(t("apiKeys.created"));
       void invalidate();
@@ -108,6 +251,25 @@ export default function ApiKeys() {
 
   const [pendingDisable, setPendingDisable] = useState<ApiKey | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ApiKey | null>(null);
+  const [accessKey, setAccessKey] = useState<ApiKey | null>(null);
+  const [accessMode, setAccessMode] = useState<ModelAccessMode>("all");
+  const [accessModels, setAccessModels] = useState<string[]>([]);
+  const [accessModelSearch, setAccessModelSearch] = useState("");
+  const [accessError, setAccessError] = useState<string | null>(null);
+
+  const accessMutation = useMutation({
+    mutationFn: () =>
+      apiKeysApi.updateModelAccess(
+        accessKey!.id,
+        accessMode === "all" ? null : accessModels,
+      ),
+    onSuccess: () => {
+      setAccessKey(null);
+      toast.success(t("common.saved"));
+      void invalidate();
+    },
+    onError: (e: Error) => setAccessError(e.message),
+  });
 
   const disableMutation = useMutation({
     mutationFn: apiKeysApi.disable,
@@ -145,6 +307,32 @@ export default function ApiKeys() {
     setQuotaForm(init);
   }
 
+  function openModelAccess(k: ApiKey) {
+    setAccessKey(k);
+    setAccessError(null);
+    setAccessModelSearch("");
+    setAccessMode(k.allowed_models == null ? "all" : "selected");
+    setAccessModels(k.allowed_models ?? []);
+  }
+
+  function toggleModel(
+    model: string,
+    selected: string[],
+    setSelected: (next: string[]) => void,
+  ) {
+    setSelected(
+      selected.includes(model)
+        ? selected.filter((item) => item !== model)
+        : [...selected, model].sort((a, b) => a.localeCompare(b)),
+    );
+  }
+
+  function modelAccessSummary(key: ApiKey): string {
+    if (key.allowed_models == null) return t("apiKeys.allModels");
+    if (key.allowed_models.length === 0) return t("apiKeys.noModelAccess");
+    return t("apiKeys.modelCount", { count: key.allowed_models.length });
+  }
+
   async function copySecret() {
     if (!secret) return;
     try {
@@ -167,6 +355,9 @@ export default function ApiKeys() {
             icon={<Plus size={16} />}
             onClick={() => {
               setNewName("");
+              setCreateAccessMode("all");
+              setCreateModels([]);
+              setCreateModelSearch("");
               setCreateError(null);
               setCreateOpen(true);
             }}
@@ -195,6 +386,9 @@ export default function ApiKeys() {
                   icon={<Plus size={16} />}
                   onClick={() => {
                     setNewName("");
+                    setCreateAccessMode("all");
+                    setCreateModels([]);
+                    setCreateModelSearch("");
                     setCreateError(null);
                     setCreateOpen(true);
                   }}
@@ -213,6 +407,7 @@ export default function ApiKeys() {
                 <col style={{ width: "20rem" }} />
                 <col style={{ width: "30%" }} />
                 <col />
+                <col style={{ width: "10rem" }} />
                 <col style={{ width: "6rem" }} />
                 <col style={{ width: "9rem" }} />
                 <col style={{ width: "3.5rem" }} />
@@ -230,6 +425,7 @@ export default function ApiKeys() {
                   </Th>
                   <Th>{t("apiKeys.keyHash")}</Th>
                   <Th>{t("apiKeys.quota")}</Th>
+                  <Th>{t("apiKeys.modelAccess")}</Th>
                   <Th className="text-center">{t("common.status")}</Th>
                   <Th>{t("common.createdAt")}</Th>
                   <Th
@@ -278,6 +474,12 @@ export default function ApiKeys() {
                     >
                       {quotaSummary(k.quota)}
                     </Td>
+                    <Td
+                      className="truncate text-xs"
+                      title={k.allowed_models?.join(", ") ?? t("apiKeys.allModels")}
+                    >
+                      {modelAccessSummary(k)}
+                    </Td>
                     <Td className="text-center whitespace-nowrap">
                       {k.status === "active" ? (
                         <Badge tone="success">{t("common.enabled")}</Badge>
@@ -298,6 +500,12 @@ export default function ApiKeys() {
                       <RowActions
                         label={t("common.rowActions")}
                         items={[
+                          {
+                            key: "model-access",
+                            label: t("apiKeys.editModelAccess"),
+                            icon: <ShieldCheck size={14} />,
+                            onSelect: () => openModelAccess(k),
+                          },
                           {
                             key: "quota",
                             label: t("apiKeys.editQuota"),
@@ -335,6 +543,7 @@ export default function ApiKeys() {
         onOpenChange={setCreateOpen}
         title={t("apiKeys.createTitle")}
         closeLabel={t("common.close")}
+        size="lg"
         footer={
           <>
             <Button variant="secondary" onClick={() => setCreateOpen(false)}>
@@ -360,6 +569,18 @@ export default function ApiKeys() {
               onChange={(e) => setNewName(e.target.value)}
             />
           </Field>
+          <ModelAccessEditor
+            mode={createAccessMode}
+            selected={createModels}
+            models={availableModels}
+            loading={routesQuery.isLoading}
+            search={createModelSearch}
+            onModeChange={setCreateAccessMode}
+            onSearchChange={setCreateModelSearch}
+            onToggle={(model) =>
+              toggleModel(model, createModels, setCreateModels)
+            }
+          />
         </div>
       </Dialog>
 
@@ -457,6 +678,44 @@ export default function ApiKeys() {
               {t("apiKeys.usageUnavailable")}
             </p>
           ) : null}
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={accessKey !== null}
+        onOpenChange={(open) => !open && setAccessKey(null)}
+        title={t("apiKeys.modelAccessTitle", { name: accessKey?.name ?? "" })}
+        closeLabel={t("common.close")}
+        size="lg"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setAccessKey(null)}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="primary"
+              loading={accessMutation.isPending}
+              onClick={() => accessMutation.mutate()}
+            >
+              {t("common.save")}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          {accessError ? <ErrorBox message={accessError} /> : null}
+          <ModelAccessEditor
+            mode={accessMode}
+            selected={accessModels}
+            models={availableModels}
+            loading={routesQuery.isLoading}
+            search={accessModelSearch}
+            onModeChange={setAccessMode}
+            onSearchChange={setAccessModelSearch}
+            onToggle={(model) =>
+              toggleModel(model, accessModels, setAccessModels)
+            }
+          />
         </div>
       </Dialog>
 

@@ -251,6 +251,49 @@ fn enforce_body_limit_or_log<'a>(
     }
 }
 
+fn enforce_model_access_or_log<'a>(
+    scope: crate::ingress::observability::RequestScope<'a>,
+    api_key: &crate::ingress::observability::ResolvedApiKey,
+    virtual_model: &str,
+    suite: tiygate_core::ProtocolSuite,
+) -> Result<crate::ingress::observability::RequestScope<'a>, AppError> {
+    match crate::ingress::observability::enforce_model_access(api_key, virtual_model) {
+        Ok(()) => Ok(scope),
+        Err((err, class)) => {
+            scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
+            Err(err.with_protocol_suite(suite))
+        }
+    }
+}
+
+async fn enforce_api_key_policy<'a>(
+    state: &AppState,
+    scope: crate::ingress::observability::RequestScope<'a>,
+    api_key: &crate::ingress::observability::ResolvedApiKey,
+    virtual_model: &str,
+    suite: tiygate_core::ProtocolSuite,
+) -> Result<crate::ingress::observability::RequestScope<'a>, AppError> {
+    match crate::ingress::observability::check_quota(state, &api_key.key_id, &api_key.spec, 1).await
+    {
+        crate::ingress::observability::QuotaOutcome::Allow => {
+            enforce_model_access_or_log(scope, api_key, virtual_model, suite)
+        }
+        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
+            let app_err =
+                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_class(tiygate_core::ErrorClass::RateLimited)
+                    .with_retry_after(retry_after.as_secs().max(1));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error(
+                RequestErrorClass::QuotaExceeded,
+                Some(&app_err.message),
+                Some(http_status),
+            );
+            Err(app_err.with_protocol_suite(suite))
+        }
+    }
+}
+
 /// Handle POST /v1/chat/completions.
 pub(super) async fn handle_chat_completions(
     State(state): State<AppState>,
@@ -313,25 +356,6 @@ pub(super) async fn handle_chat_completions(
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
     }
-    match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
-        .await
-    {
-        crate::ingress::observability::QuotaOutcome::Allow => {}
-        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
-            let app_err =
-                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
-                    .with_class(tiygate_core::ErrorClass::RateLimited)
-                    .with_retry_after(retry_after.as_secs().max(1));
-            let http_status = app_err.http_status().as_u16();
-            scope.emit_error(
-                RequestErrorClass::QuotaExceeded,
-                Some(&app_err.message),
-                Some(http_status),
-            );
-            return Err(app_err.with_protocol_suite(codec.id().suite));
-        }
-    }
-
     // Capture the original body string for passthrough before
     // `decode_request` moves `body`.
     let original_body_str = serde_json::to_string(&body).unwrap_or_default();
@@ -356,6 +380,8 @@ pub(super) async fn handle_chat_completions(
     let is_stream = ir_request.stream;
     // Re-key the scope now that we know the actual model.
     scope.set_virtual_model(virtual_model.clone());
+    let mut scope =
+        enforce_api_key_policy(&state, scope, &api_key, &virtual_model, codec.id().suite).await?;
 
     // Resolve route
     let targets = match state.current_config().routing_table.resolve(&virtual_model) {
@@ -486,25 +512,6 @@ pub(super) async fn handle_messages(
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
     }
-    match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
-        .await
-    {
-        crate::ingress::observability::QuotaOutcome::Allow => {}
-        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
-            let app_err =
-                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
-                    .with_class(tiygate_core::ErrorClass::RateLimited)
-                    .with_retry_after(retry_after.as_secs().max(1));
-            let http_status = app_err.http_status().as_u16();
-            scope.emit_error(
-                RequestErrorClass::QuotaExceeded,
-                Some(&app_err.message),
-                Some(http_status),
-            );
-            return Err(app_err.with_protocol_suite(codec.id().suite));
-        }
-    }
-
     let original_body_str = serde_json::to_string(&body).unwrap_or_default();
 
     let ir_request = match codec.decode_request(body, &raw_env) {
@@ -524,6 +531,8 @@ pub(super) async fn handle_messages(
     let virtual_model = ir_request.model.clone();
     let is_stream = ir_request.stream;
     scope.set_virtual_model(virtual_model.clone());
+    let mut scope =
+        enforce_api_key_policy(&state, scope, &api_key, &virtual_model, codec.id().suite).await?;
 
     // Resolve route
     let targets = match state.current_config().routing_table.resolve(&virtual_model) {
@@ -649,25 +658,6 @@ pub(super) async fn handle_embeddings(
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
     }
-    match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
-        .await
-    {
-        crate::ingress::observability::QuotaOutcome::Allow => {}
-        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
-            let app_err =
-                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
-                    .with_class(tiygate_core::ErrorClass::RateLimited)
-                    .with_retry_after(retry_after.as_secs().max(1));
-            let http_status = app_err.http_status().as_u16();
-            scope.emit_error(
-                RequestErrorClass::QuotaExceeded,
-                Some(&app_err.message),
-                Some(http_status),
-            );
-            return Err(app_err.with_protocol_suite(codec.id().suite));
-        }
-    }
-
     // Build the cache key from the body. We don't need to fully
     // decode the request to know the cache key — the model and
     // input are at the top level of the OpenAI embeddings schema.
@@ -678,6 +668,8 @@ pub(super) async fn handle_embeddings(
         .to_string();
     let input_for_cache = body.get("input").map(|v| v.to_string()).unwrap_or_default();
     scope.set_virtual_model(model_for_cache.clone());
+    let mut scope =
+        enforce_api_key_policy(&state, scope, &api_key, &model_for_cache, codec.id().suite).await?;
     let cache_key = tiygate_cache::embedding_cache::EmbeddingCacheKey::new(
         model_for_cache.clone(),
         input_for_cache,
@@ -868,27 +860,6 @@ pub(super) async fn handle_responses(
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
     }
-    // Phase 4 §4.6: quota enforcement on the request hot path.
-    // Parity with the chat-completions / anthropic-messages paths.
-    match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
-        .await
-    {
-        crate::ingress::observability::QuotaOutcome::Allow => {}
-        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
-            let app_err =
-                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
-                    .with_class(tiygate_core::ErrorClass::RateLimited)
-                    .with_retry_after(retry_after.as_secs().max(1));
-            let http_status = app_err.http_status().as_u16();
-            scope.emit_error(
-                RequestErrorClass::QuotaExceeded,
-                Some(&app_err.message),
-                Some(http_status),
-            );
-            return Err(app_err.with_protocol_suite(codec.id().suite));
-        }
-    }
-
     let original_body_str = serde_json::to_string(&body).unwrap_or_default();
 
     let ir_request = match codec.decode_request(body, &raw_env) {
@@ -908,6 +879,9 @@ pub(super) async fn handle_responses(
 
     let virtual_model = ir_request.model.clone();
     let is_stream = ir_request.stream;
+    scope.set_virtual_model(virtual_model.clone());
+    let mut scope =
+        enforce_api_key_policy(&state, scope, &api_key, &virtual_model, codec.id().suite).await?;
 
     let targets = match state.current_config().routing_table.resolve(&virtual_model) {
         Some(t) => t,
@@ -1057,27 +1031,6 @@ pub(super) async fn handle_gemini_generate(
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
     }
-    // Phase 4 §4.6: quota enforcement on the request hot path.
-    // Parity with the chat-completions / anthropic-messages paths.
-    match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
-        .await
-    {
-        crate::ingress::observability::QuotaOutcome::Allow => {}
-        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
-            let app_err =
-                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
-                    .with_class(tiygate_core::ErrorClass::RateLimited)
-                    .with_retry_after(retry_after.as_secs().max(1));
-            let http_status = app_err.http_status().as_u16();
-            scope.emit_error(
-                RequestErrorClass::QuotaExceeded,
-                Some(&app_err.message),
-                Some(http_status),
-            );
-            return Err(app_err.with_protocol_suite(codec.id().suite));
-        }
-    }
-
     let original_body_str = serde_json::to_string(&body).unwrap_or_default();
 
     // Inject the streaming flag from the URL method into the body so the
@@ -1105,6 +1058,8 @@ pub(super) async fn handle_gemini_generate(
 
     let virtual_model = model;
     let is_stream = ir_request.stream;
+    let mut scope =
+        enforce_api_key_policy(&state, scope, &api_key, &virtual_model, codec.id().suite).await?;
 
     let targets = match state.current_config().routing_table.resolve(&virtual_model) {
         Some(t) => t,
@@ -1229,25 +1184,6 @@ pub(super) async fn handle_images_generations(
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
     }
-    match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
-        .await
-    {
-        crate::ingress::observability::QuotaOutcome::Allow => {}
-        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
-            let app_err =
-                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
-                    .with_class(tiygate_core::ErrorClass::RateLimited)
-                    .with_retry_after(retry_after.as_secs().max(1));
-            let http_status = app_err.http_status().as_u16();
-            scope.emit_error(
-                RequestErrorClass::QuotaExceeded,
-                Some(&app_err.message),
-                Some(http_status),
-            );
-            return Err(app_err.with_protocol_suite(codec.id().suite));
-        }
-    }
-
     let original_body_str = serde_json::to_string(&body).unwrap_or_default();
 
     // Decode request — in passthrough mode this is only used to extract
@@ -1270,6 +1206,8 @@ pub(super) async fn handle_images_generations(
     let virtual_model = ir_request.model.clone();
     let is_stream = ir_request.stream;
     scope.set_virtual_model(virtual_model.clone());
+    let mut scope =
+        enforce_api_key_policy(&state, scope, &api_key, &virtual_model, codec.id().suite).await?;
 
     let targets = match state.current_config().routing_table.resolve(&virtual_model) {
         Some(t) => t,
@@ -1450,24 +1388,8 @@ pub(super) async fn handle_images_edits(
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
     }
-    match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
-        .await
-    {
-        crate::ingress::observability::QuotaOutcome::Allow => {}
-        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
-            let app_err =
-                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
-                    .with_class(tiygate_core::ErrorClass::RateLimited)
-                    .with_retry_after(retry_after.as_secs().max(1));
-            let http_status = app_err.http_status().as_u16();
-            scope.emit_error(
-                RequestErrorClass::QuotaExceeded,
-                Some(&app_err.message),
-                Some(http_status),
-            );
-            return Err(app_err.with_protocol_suite(codec.id().suite));
-        }
-    }
+    let mut scope =
+        enforce_api_key_policy(&state, scope, &api_key, &virtual_model, codec.id().suite).await?;
 
     let targets = match state.current_config().routing_table.resolve(&virtual_model) {
         Some(t) => t,

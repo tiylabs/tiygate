@@ -192,6 +192,10 @@ pub struct ApiKey {
     pub name: String,
     pub key_hash: String,
     pub quota_json: serde_json::Value,
+    /// Exact client-facing virtual model names this key may access.
+    /// `None` means unrestricted; an empty list denies every model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
     pub status: ApiKeyStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,

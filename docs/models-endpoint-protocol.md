@@ -19,7 +19,7 @@
 
 ### 2.1 通用请求约定
 
-- `Authorization: Bearer <token>` 必填。token 解析、租户隔离、配额、限流等中间件逻辑由 `tiygate` 现有鉴权层提供。
+- `Authorization: Bearer <token>` 必填。token 解析、每 API Key 模型权限、配额、限流等中间件逻辑由 `tiygate` 现有鉴权层提供。未配置模型限制的 API Key 可见全部模型；配置限制后，列表只返回允许访问的虚拟模型。
 - `Content-Type: application/json`。
 - 错误响应遵循 OpenAI 错误体（`{"error": {"message", "type", "param", "code"}}`）。鉴权失败 → `401`、权限不足 → `403`、模型不存在 → `404`、限流 → `429`、上游不可用 → `502/503`、参数错 → `400`。
 

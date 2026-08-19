@@ -97,10 +97,20 @@ export const routesApi = {
 export const apiKeysApi = {
   list: () => apiRequest<ApiKey[]>("/api-keys"),
   get: (id: string) => apiRequest<ApiKeyDetail>(`/api-keys/${id}`),
-  create: (body: { name: string; secret?: string; quota?: QuotaSpec }) =>
+  create: (body: {
+    name: string;
+    secret?: string;
+    quota?: QuotaSpec;
+    allowed_models?: string[] | null;
+  }) =>
     apiRequest<CreateApiKeyResponse>("/api-keys", { method: "POST", body }),
   updateQuota: (id: string, quota: QuotaSpec) =>
     apiRequest<ApiKey>(`/api-keys/${id}`, { method: "PATCH", body: { quota } }),
+  updateModelAccess: (id: string, allowedModels: string[] | null) =>
+    apiRequest<ApiKey>(`/api-keys/${id}/model-access`, {
+      method: "PATCH",
+      body: { allowed_models: allowedModels },
+    }),
   disable: (id: string) =>
     apiRequest<void>(`/api-keys/${id}`, { method: "PUT", allowEmpty: true }),
   remove: (id: string) =>

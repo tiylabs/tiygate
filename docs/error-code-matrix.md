@@ -23,6 +23,7 @@ This document describes how TiyGate normalizes upstream and gateway-internal err
 | `AuthMissing` | No | 401 | Inbound API key missing |
 | `AuthInvalid` | No | 401 | Inbound API key invalid |
 | `AuthDisabled` | No | 403 | Inbound API key disabled |
+| `ModelAccessDenied` | No | 403 | Inbound API key cannot access the requested virtual model |
 | `Overloaded` | Yes (backoff) | 503 | Gateway overloaded |
 
 ## ErrorClass → Protocol-Native Type Mapping
@@ -42,6 +43,7 @@ This document describes how TiyGate normalizes upstream and gateway-internal err
 | AuthMissing | `authentication_error` | 401 |
 | AuthInvalid | `authentication_error` | 401 |
 | AuthDisabled | `permission_error` | 403 |
+| ModelAccessDenied | `permission_error` | 403 |
 | Overloaded | `overloaded_error` | 503 |
 
 JSON body format: `{"error":{"message":"...","type":"...","param":null,"code":"..."}}`
@@ -61,6 +63,7 @@ JSON body format: `{"error":{"message":"...","type":"...","param":null,"code":".
 | AuthMissing | `authentication_error` | 401 |
 | AuthInvalid | `authentication_error` | 401 |
 | AuthDisabled | `permission_error` | 403 |
+| ModelAccessDenied | `permission_error` | 403 |
 | Overloaded | `overloaded_error` | 529 |
 
 JSON body format: `{"type":"error","error":{"type":"...","message":"..."}}`
@@ -80,6 +83,7 @@ JSON body format: `{"type":"error","error":{"type":"...","message":"..."}}`
 | AuthMissing | `UNAUTHENTICATED` | 401 |
 | AuthInvalid | `UNAUTHENTICATED` | 401 |
 | AuthDisabled | `PERMISSION_DENIED` | 403 |
+| ModelAccessDenied | `PERMISSION_DENIED` | 403 |
 | Overloaded | `UNAVAILABLE` | 503 |
 
 JSON body format: `{"error":{"code":<http_status>,"message":"...","status":"...","details":[]}}`

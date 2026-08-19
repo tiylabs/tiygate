@@ -864,6 +864,94 @@ async fn api_key_quota_patch_and_single_get() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn api_key_model_access_create_and_update() {
+    let (router, _store, _pool) = boot_no_auth().await;
+
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/api-keys",
+            json!({
+                "name": "model-scoped",
+                "allowed_models": [" z-model ", "a-model", "a-model"]
+            }),
+        ))
+        .await
+        .expect("create");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["allowed_models"], json!(["a-model", "z-model"]));
+
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/admin/v1/api-keys/{id}/model-access"),
+            json!({ "allowed_models": [] }),
+        ))
+        .await
+        .expect("deny all");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let updated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(updated["allowed_models"], json!([]));
+
+    // Omitting the field is a malformed PATCH, not an alias for `null`.
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/admin/v1/api-keys/{id}/model-access"),
+            json!({}),
+        ))
+        .await
+        .expect("reject missing field");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/admin/v1/api-keys/{id}"))
+                .body(Body::empty())
+                .expect("get key"),
+        )
+        .await
+        .expect("get after rejected patch");
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let unchanged: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(unchanged["allowed_models"], json!([]));
+
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/admin/v1/api-keys/{id}/model-access"),
+            json!({ "allowed_models": null }),
+        ))
+        .await
+        .expect("restore unrestricted");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let updated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(updated["allowed_models"], serde_json::Value::Null);
+
+    let resp = router
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/admin/v1/api-keys/{id}/model-access"),
+            json!({ "allowed_models": [" "] }),
+        ))
+        .await
+        .expect("reject blank model");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // ---- provider catalog: server-side registered providers ----
 
 #[tokio::test]
@@ -949,7 +1037,7 @@ async fn config_export_returns_json_with_content_disposition() {
         .await
         .expect("body");
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert!(json["providers"].is_array());
     assert!(json["routes"].is_array());
     assert!(json["api_keys"].is_array());
