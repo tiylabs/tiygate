@@ -14,10 +14,15 @@
 )]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
+use tiygate_auth::provider_oauth::OAuthTokenCache;
+use tiygate_core::provider::oauth::{
+    OAuthEgressProfile, OAuthTargetConfig, TokenRequestStyle, UpstreamTransport,
+};
 use tiygate_core::quota::InMemoryQuota;
 use tiygate_core::{HealthRegistry, ProtocolEndpoint, ProtocolSuite, RoutingTable};
 use tiygate_server::config::ServerConfig;
@@ -106,6 +111,51 @@ fn build_anthropic_test_app_with_config(
 
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
+    ingress::router(config_store, health, &server_config)
+}
+
+/// Build an Anthropic Messages ingress app whose target uses the Codex OAuth
+/// Responses profile. The access token is seeded by the test before sending a
+/// request, so no token endpoint is needed for this data-plane regression.
+fn build_anthropic_ingress_codex_egress_app(
+    upstream_url: String,
+    model: &str,
+    provider_id: &str,
+) -> axum::Router {
+    let mut routing_table = RoutingTable::new();
+    routing_table.insert(
+        model.to_string(),
+        vec![tiygate_core::RoutingTarget {
+            provider_id: provider_id.to_string(),
+            model_id: model.to_string(),
+            api_base: upstream_url,
+            api_key: String::new(),
+            api_protocol: ProtocolEndpoint::new(ProtocolSuite::OpenAiResponses, "responses", "v1"),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+            oauth: Some(OAuthTargetConfig {
+                upstream_transport: UpstreamTransport::Http,
+                egress_profile: OAuthEgressProfile::OpenAiCodex,
+                token_url: "https://example.test/token".to_string(),
+                client_id: "codex-test-client".to_string(),
+                client_secret: None,
+                refresh_token: "refresh-token".to_string(),
+                scopes: Vec::new(),
+                token_request_style: TokenRequestStyle::Form,
+                authorization_header: None,
+                authorization_prefix: None,
+                extra_headers: Vec::new(),
+                account_id: None,
+            }),
+        }],
+    );
+
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    let mut server_config = ServerConfig::default();
+    server_config.require_api_key = false;
     ingress::router(config_store, health, &server_config)
 }
 
@@ -413,6 +463,87 @@ async fn test_happy_path_anthropic_messages() {
     let body_str = String::from_utf8_lossy(&body_bytes);
     assert!(body_str.contains("Hi from Anthropic wiremock!"));
     assert!(body_str.contains("\"role\":\"assistant\""));
+}
+
+#[tokio::test]
+async fn test_anthropic_messages_to_codex_responses_strips_unsupported_metadata() {
+    let mock_server = wiremock::MockServer::start().await;
+    let provider_id = "issue-52-codex-metadata";
+    let cache = OAuthTokenCache::global();
+    cache.invalidate_provider(provider_id);
+    cache.seed_tokens(
+        provider_id,
+        "__provider__",
+        "access-token",
+        "refresh-token",
+        Some(Duration::from_secs(300)),
+    );
+
+    let upstream_sse = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_issue_52\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_issue_52\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.6-luna\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello from Codex\"}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n"
+    );
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/responses"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer access-token",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(upstream_sse),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let app =
+        build_anthropic_ingress_codex_egress_app(mock_server.uri(), "gpt-5.6-luna", provider_id);
+    let body = json!({
+        "model": "gpt-5.6-luna",
+        "max_tokens": 32000,
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "stop_sequences": ["DONE"],
+        "messages": [{"role": "user", "content": "Hello"}],
+        "metadata": {"user_id": "{\"device_id\":\"device-issue-52\",\"session_id\":\"issue-52-session\"}"}
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+    assert_eq!(response_json["type"], "message");
+    assert_eq!(response_json["content"][0]["text"], "Hello from Codex");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let upstream_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(upstream_body["model"], "gpt-5.6-luna");
+    assert_eq!(upstream_body["stream"], true);
+    assert_eq!(upstream_body["instructions"], "");
+    assert_eq!(upstream_body["store"], false);
+    assert!(
+        upstream_body["prompt_cache_key"]
+            .as_str()
+            .is_some_and(|key| uuid::Uuid::parse_str(key).is_ok()),
+        "Claude session should produce a stable Codex prompt_cache_key: {upstream_body}"
+    );
+    assert!(upstream_body.get("metadata").is_none());
+    assert!(upstream_body.get("max_output_tokens").is_none());
+    assert!(upstream_body.get("temperature").is_none());
+    assert!(upstream_body.get("top_p").is_none());
+    assert!(upstream_body.get("stop").is_none());
+
+    cache.invalidate_provider(provider_id);
 }
 
 #[tokio::test]
