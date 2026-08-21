@@ -58,6 +58,10 @@ The provider vendor selects an immutable `OAuthEgressProfile`:
   terminal-response parsing, and WebSocket negotiation. `UpstreamTransport`
   independently selects HTTP/SSE or Codex Responses WebSocket. HTTP/SSE uses
   the shared upstream client; Codex does not maintain a separate HTTP pool.
+  The profile is applied after protocol conversion on every ingress path and
+  removes fields unsupported by the ChatGPT subscription backend, including
+  `metadata` and `max_output_tokens`; public OpenAI Responses egress keeps
+  those fields unchanged.
 - Anthropic OAuth uses `anthropic_oauth` only for Anthropic Messages egress.
   The profile owns OAuth beta and client headers, summarized-thinking defaults,
   re-signing of an existing billing header, and a dedicated verified-Rustls

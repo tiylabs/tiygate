@@ -60,6 +60,7 @@ pub(crate) fn prepare_body(body: &mut Value, websocket: bool) -> bool {
     // `{"detail":"Unsupported parameter: max_output_tokens"}` when it is
     // present — strip it here so relayed clients cannot break the request.
     for field in [
+        "metadata",
         "prompt_cache_retention",
         "safety_identifier",
         "max_output_tokens",
@@ -282,13 +283,14 @@ mod tests {
     }
 
     #[test]
-    fn prepare_body_strips_max_output_tokens_on_both_transports() {
+    fn prepare_body_strips_codex_unsupported_fields_on_both_transports() {
         for websocket in [false, true] {
             let mut body = json!({
                 "model": "gpt-5.6",
                 "stream": false,
                 "instructions": null,
                 "input": "hi",
+                "metadata": {"user_id": "user-123"},
                 "max_output_tokens": 4096,
                 "prompt_cache_retention": "24h",
                 "safety_identifier": "user",
@@ -301,6 +303,7 @@ mod tests {
             assert_eq!(body["store"], false);
             assert_eq!(body["model"], "gpt-5.6");
             assert_eq!(body["input"], "hi");
+            assert!(body.get("metadata").is_none());
             assert!(
                 body.get("max_output_tokens").is_none(),
                 "ChatGPT Codex backend rejects max_output_tokens (websocket={websocket})"

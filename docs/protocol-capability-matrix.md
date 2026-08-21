@@ -153,7 +153,7 @@ Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v
 | `metadata` KV 对 | ✅ | ⚠️ → 仅保留 `user_id` | ✅ | ✅ (`labels`) | N/A |
 | `user_id` | ✅ | ✅ | ✅ | ✅ | N/A |
 
-**跨协议策略**：Anthropic 只支持 `user_id` 键，其他键静默丢弃（与官方 API 一致）。
+**跨协议策略**：Anthropic 只支持 `user_id` 键，其他键静默丢弃（与官方 API 一致）。公开 OpenAI Responses 支持顶层 `metadata`；但 `openai_codex` OAuth egress 面向 ChatGPT/Codex 私有后端，会在发送前丢弃该字段，并保留网关内部审计数据。
 
 ## 8. Annotations / Citations
 
