@@ -60,8 +60,13 @@ The provider vendor selects an immutable `OAuthEgressProfile`:
   the shared upstream client; Codex does not maintain a separate HTTP pool.
   The profile is applied after protocol conversion on every ingress path and
   removes fields unsupported by the ChatGPT subscription backend, including
-  `metadata` and `max_output_tokens`; public OpenAI Responses egress keeps
-  those fields unchanged.
+  `metadata`, `temperature`, `top_p`, `stop`, `user`, `truncation`, cache
+  options, and output-token fields; it forces `store: false`, requests
+  encrypted reasoning content, scopes Claude Code prompt-cache identity by
+  session and agent, and applies Codex session/account headers. Public OpenAI
+  Responses egress keeps those fields unchanged. TiyGate uses verified rustls
+  transport, rejects tool names over Codex's 64-byte limit with a capability
+  error, and does not impersonate a browser TLS fingerprint.
 - Anthropic OAuth uses `anthropic_oauth` only for Anthropic Messages egress.
   The profile owns OAuth beta and client headers, summarized-thinking defaults,
   re-signing of an existing billing header, and a dedicated verified-Rustls

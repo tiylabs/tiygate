@@ -502,8 +502,11 @@ async fn test_anthropic_messages_to_codex_responses_strips_unsupported_metadata(
     let body = json!({
         "model": "gpt-5.6-luna",
         "max_tokens": 32000,
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "stop_sequences": ["DONE"],
         "messages": [{"role": "user", "content": "Hello"}],
-        "metadata": {"user_id": "opaque-user-id"}
+        "metadata": {"user_id": "{\"device_id\":\"device-issue-52\",\"session_id\":\"issue-52-session\"}"}
     });
     let request = Request::builder()
         .method("POST")
@@ -528,8 +531,17 @@ async fn test_anthropic_messages_to_codex_responses_strips_unsupported_metadata(
     assert_eq!(upstream_body["stream"], true);
     assert_eq!(upstream_body["instructions"], "");
     assert_eq!(upstream_body["store"], false);
+    assert!(
+        upstream_body["prompt_cache_key"]
+            .as_str()
+            .is_some_and(|key| uuid::Uuid::parse_str(key).is_ok()),
+        "Claude session should produce a stable Codex prompt_cache_key: {upstream_body}"
+    );
     assert!(upstream_body.get("metadata").is_none());
     assert!(upstream_body.get("max_output_tokens").is_none());
+    assert!(upstream_body.get("temperature").is_none());
+    assert!(upstream_body.get("top_p").is_none());
+    assert!(upstream_body.get("stop").is_none());
 
     cache.invalidate_provider(provider_id);
 }

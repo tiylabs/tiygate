@@ -86,16 +86,34 @@ fn uses_anthropic_oauth_egress_profile(
 /// The profile is selected by the routing target, not by the ingress codec.
 /// This keeps Anthropic/Chat/Gemini ingress paths consistent when they route
 /// to the same Codex OAuth target. The returned tuple is
-/// `(profile_enabled, websocket_transport, body_changed)`.
+/// `(profile_enabled, websocket_transport, body_changed, session_key)`.
 fn prepare_codex_egress_body(
     target: &tiygate_core::RoutingTarget,
     egress_protocol: &tiygate_core::ProtocolEndpoint,
+    ingress_protocol: &tiygate_core::ProtocolEndpoint,
+    ir_request: &IrRequest,
+    client_headers: &http::HeaderMap,
     body: &mut Value,
-) -> (bool, bool, bool) {
+) -> Result<(bool, bool, bool, Option<String>), AppError> {
     let profile_enabled = codex_oauth::is_enabled(target, egress_protocol.suite);
     let websocket = profile_enabled && codex_oauth::uses_websocket(target);
-    let changed = profile_enabled && codex_oauth::prepare_body(body, websocket);
-    (profile_enabled, websocket, changed)
+    let mut changed = profile_enabled && codex_oauth::prepare_body(body, websocket);
+    let mut session_key = None;
+    if profile_enabled {
+        codex_oauth::validate_codex_tool_names(body)?;
+        changed |= codex_oauth::normalize_reasoning_and_ids(body, ir_request);
+        changed |= codex_oauth::normalize_parallel_tool_calls(body, client_headers);
+        session_key = codex_oauth::claude_prompt_cache_key(
+            ingress_protocol,
+            ir_request,
+            client_headers,
+            &target.model_id,
+        );
+        if let Some(key) = session_key.as_deref() {
+            changed |= codex_oauth::set_prompt_cache_key(body, key);
+        }
+    }
+    Ok((profile_enabled, websocket, changed, session_key))
 }
 
 fn egress_http_client(state: &AppState, anthropic_oauth_profile: bool) -> reqwest::Client {
@@ -529,8 +547,15 @@ pub(super) async fn execute_upstream(
         &egress_protocol.suite,
         &target.model_id,
     );
-    let (openai_codex_profile, codex_websocket, codex_body_changed) =
-        prepare_codex_egress_body(target, &egress_protocol, &mut upstream_body);
+    let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
+        prepare_codex_egress_body(
+            target,
+            &egress_protocol,
+            ingress_protocol,
+            ir_request,
+            client_headers,
+            &mut upstream_body,
+        )?;
     body_mutated |= codex_body_changed;
     let anthropic_oauth_profile = uses_anthropic_oauth_egress_profile(target, &egress_protocol);
     if anthropic_oauth_profile {
@@ -553,7 +578,17 @@ pub(super) async fn execute_upstream(
     );
     apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
     if openai_codex_profile {
-        codex_oauth::apply_headers(&mut upstream_headers);
+        codex_oauth::apply_request_headers(
+            &mut upstream_headers,
+            is_stream,
+            codex_websocket,
+            request_id,
+            codex_session_key.as_deref(),
+            target
+                .oauth
+                .as_ref()
+                .and_then(|oauth| oauth.account_id.as_deref()),
+        );
     }
     if anthropic_oauth_profile {
         apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
@@ -634,6 +669,17 @@ pub(super) async fn execute_upstream(
             Ok(response) => return Ok(response),
             Err(error) if error.http_status() == StatusCode::UPGRADE_REQUIRED => {
                 codex_oauth::prepare_body(&mut upstream_body, false);
+                codex_oauth::apply_request_headers(
+                    &mut upstream_headers,
+                    is_stream,
+                    false,
+                    request_id,
+                    codex_session_key.as_deref(),
+                    target
+                        .oauth
+                        .as_ref()
+                        .and_then(|oauth| oauth.account_id.as_deref()),
+                );
                 egress_body_capture = serde_json::to_string(&upstream_body).ok();
             }
             Err(error) => return Err(error),
@@ -1093,8 +1139,15 @@ pub(super) async fn execute_messages_upstream(
         &egress_protocol.suite,
         &target.model_id,
     );
-    let (openai_codex_profile, codex_websocket, codex_body_changed) =
-        prepare_codex_egress_body(target, &egress_protocol, &mut upstream_body);
+    let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
+        prepare_codex_egress_body(
+            target,
+            &egress_protocol,
+            ingress_protocol,
+            ir_request,
+            client_headers,
+            &mut upstream_body,
+        )?;
     body_mutated |= codex_body_changed;
     let anthropic_oauth_profile = uses_anthropic_oauth_egress_profile(target, &egress_protocol);
     if anthropic_oauth_profile {
@@ -1117,7 +1170,17 @@ pub(super) async fn execute_messages_upstream(
     );
     apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
     if openai_codex_profile {
-        codex_oauth::apply_headers(&mut upstream_headers);
+        codex_oauth::apply_request_headers(
+            &mut upstream_headers,
+            is_stream,
+            codex_websocket,
+            request_id,
+            codex_session_key.as_deref(),
+            target
+                .oauth
+                .as_ref()
+                .and_then(|oauth| oauth.account_id.as_deref()),
+        );
     }
     if anthropic_oauth_profile {
         apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
@@ -1184,6 +1247,17 @@ pub(super) async fn execute_messages_upstream(
             Ok(response) => return Ok(response),
             Err(error) if error.http_status() == StatusCode::UPGRADE_REQUIRED => {
                 codex_oauth::prepare_body(&mut upstream_body, false);
+                codex_oauth::apply_request_headers(
+                    &mut upstream_headers,
+                    is_stream,
+                    false,
+                    request_id,
+                    codex_session_key.as_deref(),
+                    target
+                        .oauth
+                        .as_ref()
+                        .and_then(|oauth| oauth.account_id.as_deref()),
+                );
                 egress_body_capture = serde_json::to_string(&upstream_body).ok();
             }
             Err(error) => return Err(error),
@@ -1903,11 +1977,16 @@ pub(super) async fn execute_responses_upstream(
         &egress_protocol.suite,
         &target.model_id,
     );
-    let openai_codex_profile = codex_oauth::is_enabled(target, egress_protocol.suite);
-    let codex_websocket = openai_codex_profile && codex_oauth::uses_websocket(target);
-    if openai_codex_profile {
-        body_mutated |= codex_oauth::prepare_body(&mut upstream_body, codex_websocket);
-    }
+    let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
+        prepare_codex_egress_body(
+            target,
+            &egress_protocol,
+            ingress_protocol,
+            ir_request,
+            client_headers,
+            &mut upstream_body,
+        )?;
+    body_mutated |= codex_body_changed;
     let anthropic_oauth_profile = uses_anthropic_oauth_egress_profile(target, &egress_protocol);
     if anthropic_oauth_profile {
         body_mutated |= crate::anthropic_oauth::prepare_body(&mut upstream_body);
@@ -1920,7 +1999,17 @@ pub(super) async fn execute_responses_upstream(
     );
     apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
     if openai_codex_profile {
-        codex_oauth::apply_headers(&mut upstream_headers);
+        codex_oauth::apply_request_headers(
+            &mut upstream_headers,
+            is_stream,
+            codex_websocket,
+            request_id,
+            codex_session_key.as_deref(),
+            target
+                .oauth
+                .as_ref()
+                .and_then(|oauth| oauth.account_id.as_deref()),
+        );
     }
     if anthropic_oauth_profile {
         apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
@@ -1986,6 +2075,17 @@ pub(super) async fn execute_responses_upstream(
             Ok(response) => return Ok(response),
             Err(error) if error.http_status() == StatusCode::UPGRADE_REQUIRED => {
                 codex_oauth::prepare_body(&mut upstream_body, false);
+                codex_oauth::apply_request_headers(
+                    &mut upstream_headers,
+                    is_stream,
+                    false,
+                    request_id,
+                    codex_session_key.as_deref(),
+                    target
+                        .oauth
+                        .as_ref()
+                        .and_then(|oauth| oauth.account_id.as_deref()),
+                );
                 egress_body_capture = serde_json::to_string(&upstream_body).ok();
             }
             Err(error) => return Err(error),
@@ -2709,8 +2809,15 @@ pub(super) async fn execute_gemini_upstream(
         &egress_protocol.suite,
         &target.model_id,
     );
-    let (openai_codex_profile, codex_websocket, codex_body_changed) =
-        prepare_codex_egress_body(target, &egress_protocol, &mut upstream_body);
+    let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
+        prepare_codex_egress_body(
+            target,
+            &egress_protocol,
+            ingress_protocol,
+            ir_request,
+            client_headers,
+            &mut upstream_body,
+        )?;
     body_mutated |= codex_body_changed;
     let anthropic_oauth_profile = uses_anthropic_oauth_egress_profile(target, &egress_protocol);
     if anthropic_oauth_profile {
@@ -2724,7 +2831,17 @@ pub(super) async fn execute_gemini_upstream(
     );
     apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
     if openai_codex_profile {
-        codex_oauth::apply_headers(&mut upstream_headers);
+        codex_oauth::apply_request_headers(
+            &mut upstream_headers,
+            is_stream,
+            codex_websocket,
+            request_id,
+            codex_session_key.as_deref(),
+            target
+                .oauth
+                .as_ref()
+                .and_then(|oauth| oauth.account_id.as_deref()),
+        );
     }
     if anthropic_oauth_profile {
         apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
@@ -2787,6 +2904,17 @@ pub(super) async fn execute_gemini_upstream(
             Ok(response) => return Ok(response),
             Err(error) if error.http_status() == StatusCode::UPGRADE_REQUIRED => {
                 codex_oauth::prepare_body(&mut upstream_body, false);
+                codex_oauth::apply_request_headers(
+                    &mut upstream_headers,
+                    is_stream,
+                    false,
+                    request_id,
+                    codex_session_key.as_deref(),
+                    target
+                        .oauth
+                        .as_ref()
+                        .and_then(|oauth| oauth.account_id.as_deref()),
+                );
                 egress_body_capture = serde_json::to_string(&upstream_body).ok();
             }
             Err(error) => return Err(error),
@@ -3993,8 +4121,8 @@ mod tests {
             http::header::USER_AGENT,
             http::HeaderValue::from_static("Codex Desktop/1 (Mac OS 26; arm64)"),
         );
-        codex_oauth::apply_headers(&mut headers);
-        assert!(headers.contains_key("session_id"));
+        codex_oauth::apply_request_headers(&mut headers, false, false, "", None, None);
+        assert!(headers.contains_key("session-id"));
     }
 
     #[test]

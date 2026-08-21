@@ -153,7 +153,7 @@ Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v
 | `metadata` KV 对 | ✅ | ⚠️ → 仅保留 `user_id` | ✅ | ✅ (`labels`) | N/A |
 | `user_id` | ✅ | ✅ | ✅ | ✅ | N/A |
 
-**跨协议策略**：Anthropic 只支持 `user_id` 键，其他键静默丢弃（与官方 API 一致）。公开 OpenAI Responses 支持顶层 `metadata`；但 `openai_codex` OAuth egress 面向 ChatGPT/Codex 私有后端，会在发送前丢弃该字段，并保留网关内部审计数据。
+**跨协议策略**：Anthropic 只支持 `user_id` 键，其他键静默丢弃（与官方 API 一致）。公开 OpenAI Responses 支持顶层 `metadata`；但 `openai_codex` OAuth egress 面向 ChatGPT/Codex 私有后端，会在发送前丢弃不兼容字段，并保留网关内部审计数据。Codex egress 还会清洗嵌套 cache breakpoint、校验 reasoning encrypted content，并按 Claude Code session/agent 派生 prompt-cache identity。
 
 ## 8. Annotations / Citations
 
@@ -179,7 +179,7 @@ Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v
 |------|:---:|:---:|:---:|:---:|:---:|
 | `encrypted_content` | ⚠️ → 丢弃 | ✅ (`redacted_thinking.data`) | ✅ (`reasoning.encrypted_content`) | ⚠️ → 丢弃 | N/A |
 
-**跨协议策略**：encrypted_content 仅在同协议往返时保留（Responses ↔ Responses, Anthropic ↔ Anthropic），跨协议时丢弃（加密数据是协议特定的）。
+**跨协议策略**：一般跨协议时丢弃 encrypted_content（加密数据是协议特定的）；但 `openai_codex` OAuth egress 对 Anthropic thinking signature 做 GPT/Codex 外层格式校验，只有有效 signature 才转换为 Responses `reasoning.encrypted_content`，非法或其他供应商 signature 仍会丢弃。
 
 ## 11. Stop Details
 
