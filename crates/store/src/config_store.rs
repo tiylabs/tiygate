@@ -38,6 +38,15 @@ use crate::settings_keys::is_encrypted_key;
 
 const OPENAI_PLATFORM_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_OAUTH_SCOPES: [&str; 5] = [
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+];
 /// Stable originator paired with the Codex Desktop user agent for OpenAI OAuth
 /// egress when a provider does not define its own originator.
 const OPENAI_CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
@@ -332,8 +341,10 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
 /// Build an `OAuthTargetConfig` for a provider configured with
 /// `AuthMode::OAuth`.
 ///
-/// The OAuth configuration (token_url, client_id, scopes, etc.) is
-/// read from `provider.metadata_json["oauth"]`. The refresh token is
+/// Custom OAuth metadata supplies optional non-secret transport overrides.
+/// Built-in provider grant endpoints, client IDs, scopes, and encodings come
+/// from the provider preset so legacy rows cannot keep using stale endpoints.
+/// The refresh token is
 /// extracted from `provider.oauth_meta_cleartext` (decrypted by
 /// `DbConfigStore::refresh()`). The `token_request_style` is
 /// determined by the provider's vendor: Anthropic uses JSON body,
@@ -350,26 +361,41 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         return None;
     }
     let oauth_meta = provider.metadata_json.get("oauth")?;
-
-    let token_url = oauth_meta
-        .get("token_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let client_id = oauth_meta
-        .get("client_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let scopes: Vec<String> = oauth_meta
-        .get("scopes")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let is_anthropic = provider.vendor == "anthropic";
+    let token_url = if is_anthropic {
+        ANTHROPIC_OAUTH_TOKEN_URL.to_string()
+    } else {
+        oauth_meta
+            .get("token_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let client_id = if is_anthropic {
+        ANTHROPIC_OAUTH_CLIENT_ID.to_string()
+    } else {
+        oauth_meta
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let scopes: Vec<String> = if is_anthropic {
+        ANTHROPIC_OAUTH_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect()
+    } else {
+        oauth_meta
+            .get("scopes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let authorization_header = oauth_meta
         .get("authorization_header")
         .and_then(|v| v.as_str())
@@ -394,19 +420,22 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         _ => OAuthEgressProfile::Standard,
     };
 
-    // Codex refreshes with form data, matching the reference CLI client.
-    let token_request_style = oauth_meta
-        .get("token_request_style")
-        .and_then(|value| value.as_str())
-        .and_then(|style| match style {
-            "form" => Some(TokenRequestStyle::Form),
-            "json" => Some(TokenRequestStyle::Json),
-            _ => None,
-        })
-        .unwrap_or(match provider.vendor.as_str() {
-            "anthropic" => TokenRequestStyle::Json,
-            _ => TokenRequestStyle::Form,
-        });
+    // Built-in providers own their token-grant encoding. This also repairs
+    // legacy rows whose metadata still contains the previous Anthropic
+    // endpoint or an obsolete request style.
+    let token_request_style = if is_anthropic {
+        TokenRequestStyle::Json
+    } else {
+        oauth_meta
+            .get("token_request_style")
+            .and_then(|value| value.as_str())
+            .and_then(|style| match style {
+                "form" => Some(TokenRequestStyle::Form),
+                "json" => Some(TokenRequestStyle::Json),
+                _ => None,
+            })
+            .unwrap_or(TokenRequestStyle::Form)
+    };
 
     // Extract extra headers from metadata, if present.
     let mut extra_headers: Vec<(String, String)> = oauth_meta
@@ -2583,6 +2612,11 @@ mod tests {
         let oauth = build_oauth_target_config(&provider).expect("oauth config");
         assert_eq!(oauth.egress_profile, OAuthEgressProfile::AnthropicOAuth);
         assert_eq!(oauth.token_request_style, TokenRequestStyle::Json);
+        assert_eq!(
+            oauth.token_url,
+            "https://platform.claude.com/v1/oauth/token"
+        );
+        assert_eq!(oauth.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
     }
 
     #[test]

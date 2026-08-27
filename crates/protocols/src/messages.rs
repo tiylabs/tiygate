@@ -43,21 +43,176 @@ fn flatten_anthropic_content(value: &Value) -> String {
         return s.to_string();
     }
     if let Some(arr) = value.as_array() {
+        // A text-only tool result is equivalent to a string on the wire. For
+        // mixed results, keep the complete array as JSON so image/document/
+        // search-result blocks are not collapsed into an invalid concatenation.
+        let text_only = arr.iter().all(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text")
+                && block.get("text").and_then(Value::as_str).is_some()
+        });
+        if !text_only {
+            return serde_json::to_string(arr).unwrap_or_default();
+        }
         let mut out = String::new();
         for block in arr {
             if let Some(text) = block["text"].as_str() {
                 out.push_str(text);
-            } else if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                // text block missing the field — skip gracefully
-            } else if !block.is_null() {
-                // Non-text block (image, etc.): preserve its JSON so the
-                // information is not silently discarded.
-                out.push_str(&block.to_string());
             }
         }
         return out;
     }
     String::new()
+}
+
+fn encode_tool_result_content(content: &str) -> Value {
+    let trimmed = content.trim();
+    if trimmed.starts_with('[') {
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            if value.is_array() {
+                return value;
+            }
+        }
+    }
+    Value::String(content.to_string())
+}
+
+fn decode_prompt_cache_breakpoint(block: &Value) -> Option<tiygate_core::PromptCacheBreakpoint> {
+    (block
+        .get("cache_control")
+        .and_then(Value::as_object)
+        .and_then(|cache| cache.get("type"))
+        .and_then(Value::as_str)
+        == Some("ephemeral"))
+    .then_some(tiygate_core::PromptCacheBreakpoint {
+        mode: tiygate_core::PromptCacheBreakpointMode::Explicit,
+    })
+}
+
+const ANTHROPIC_SOURCE_TYPE_KEY: &str = "anthropic_source_type";
+
+fn is_image_mime(mime_type: &str) -> bool {
+    mime_type.starts_with("image/") || mime_type == "image/*"
+}
+
+fn decode_anthropic_media(block: &Value, block_type: &str) -> Option<Content> {
+    let source = block.get("source")?.as_object()?;
+    let source_kind = source.get("type")?.as_str()?;
+    let default_mime = match (block_type, source_kind) {
+        ("image", _) => "image/*",
+        ("document", "text") => "text/plain",
+        _ => "application/pdf",
+    };
+    let mime_type = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .unwrap_or(default_mime)
+        .to_string();
+    let prompt_cache_breakpoint = decode_prompt_cache_breakpoint(block);
+    let media_source = match source_kind {
+        "base64" => Content::Media {
+            source: tiygate_core::ir::MediaSource::Inline {
+                data: source.get("data")?.as_str()?.to_string(),
+            },
+            mime_type,
+            metadata: media_metadata(block, None),
+            prompt_cache_breakpoint,
+        },
+        "text" if block_type == "document" => Content::Media {
+            source: tiygate_core::ir::MediaSource::Inline {
+                data: source.get("data")?.as_str()?.to_string(),
+            },
+            mime_type,
+            metadata: media_metadata(block, Some("text")),
+            prompt_cache_breakpoint,
+        },
+        "url" => Content::Media {
+            source: tiygate_core::ir::MediaSource::Url {
+                url: source.get("url")?.as_str()?.to_string(),
+            },
+            mime_type,
+            metadata: media_metadata(block, None),
+            prompt_cache_breakpoint,
+        },
+        "file" => Content::Media {
+            source: tiygate_core::ir::MediaSource::FileId {
+                id: source.get("file_id")?.as_str()?.to_string(),
+            },
+            mime_type,
+            metadata: media_metadata(block, None),
+            prompt_cache_breakpoint,
+        },
+        _ => return None,
+    };
+    Some(media_source)
+}
+
+fn media_metadata(
+    block: &Value,
+    source_type: Option<&str>,
+) -> std::collections::HashMap<String, Value> {
+    let mut metadata = std::collections::HashMap::new();
+    for key in ["title", "context", "citations"] {
+        if let Some(value) = block.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(source_type) = source_type {
+        metadata.insert(
+            ANTHROPIC_SOURCE_TYPE_KEY.to_string(),
+            Value::String(source_type.to_string()),
+        );
+    }
+    metadata
+}
+
+fn encode_anthropic_media(
+    source: &tiygate_core::ir::MediaSource,
+    mime_type: &str,
+    metadata: &std::collections::HashMap<String, Value>,
+    prompt_cache_breakpoint: &Option<tiygate_core::PromptCacheBreakpoint>,
+) -> Option<Value> {
+    let image = is_image_mime(mime_type);
+    let block_type = if image { "image" } else { "document" };
+    let source = match source {
+        tiygate_core::ir::MediaSource::Inline { data }
+            if !image
+                && metadata
+                    .get(ANTHROPIC_SOURCE_TYPE_KEY)
+                    .and_then(Value::as_str)
+                    == Some("text") =>
+        {
+            json!({
+                "type": "text",
+                "media_type": mime_type,
+                "data": data,
+            })
+        }
+        tiygate_core::ir::MediaSource::Inline { data } => json!({
+            "type": "base64",
+            "media_type": mime_type,
+            "data": data,
+        }),
+        // Anthropic's URL source schema contains only `type` and `url`.
+        // In particular, do not add media_type to URL image/document blocks.
+        tiygate_core::ir::MediaSource::Url { url } => json!({
+            "type": "url",
+            "url": url,
+        }),
+        tiygate_core::ir::MediaSource::FileId { id } => json!({
+            "type": "file",
+            "file_id": id,
+        }),
+    };
+    let mut block = json!({"type": block_type, "source": source});
+    for key in ["title", "context", "citations"] {
+        if let Some(value) = metadata.get(key) {
+            block[key] = value.clone();
+        }
+    }
+    if prompt_cache_breakpoint.is_some() {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
+    Some(block)
 }
 
 /// Decode Anthropic Structured Outputs into the canonical response format.
@@ -168,7 +323,34 @@ impl EndpointCodec for MessagesCodec {
         body: Value,
         _env: &RawEnvelope,
     ) -> Result<IrRequest, tiygate_core::Error> {
-        let model = body["model"].as_str().unwrap_or("unknown").to_string();
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| {
+                tiygate_core::Error::Codec(
+                    "Anthropic Messages request requires a non-empty model".to_string(),
+                )
+            })?
+            .to_string();
+        let max_tokens = body
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                tiygate_core::Error::Codec(
+                    "Anthropic Messages request requires integer max_tokens".to_string(),
+                )
+            })?;
+        if max_tokens > u32::MAX as u64 {
+            return Err(tiygate_core::Error::Codec(
+                "Anthropic Messages max_tokens exceeds the supported range".to_string(),
+            ));
+        }
+        if !body.get("messages").is_some_and(Value::is_array) {
+            return Err(tiygate_core::Error::Codec(
+                "Anthropic Messages request requires a messages array".to_string(),
+            ));
+        }
         let stream = body["stream"].as_bool().unwrap_or(false);
 
         let mut messages = Vec::new();
@@ -193,11 +375,28 @@ impl EndpointCodec for MessagesCodec {
         // Parse messages
         if let Some(arr) = body["messages"].as_array() {
             for msg in arr {
-                let role = match msg["role"].as_str().unwrap_or("user") {
-                    "user" => Role::User,
-                    "assistant" => Role::Assistant,
-                    _ => Role::User,
+                let role = match msg.get("role").and_then(Value::as_str) {
+                    Some("user") => Role::User,
+                    Some("assistant") => Role::Assistant,
+                    Some(other) => {
+                        return Err(tiygate_core::Error::Codec(format!(
+                            "unsupported Anthropic Messages role: {other}"
+                        )));
+                    }
+                    None => {
+                        return Err(tiygate_core::Error::Codec(
+                            "Anthropic Messages message requires role".to_string(),
+                        ));
+                    }
                 };
+                if !msg
+                    .get("content")
+                    .is_some_and(|content| content.is_string() || content.is_array())
+                {
+                    return Err(tiygate_core::Error::Codec(
+                        "Anthropic Messages message requires string or array content".to_string(),
+                    ));
+                }
 
                 let content = if let Some(arr) = msg["content"].as_array() {
                     let mut parts = Vec::new();
@@ -207,7 +406,7 @@ impl EndpointCodec for MessagesCodec {
                                 parts.push(Content::Text {
                                     text: block["text"].as_str().unwrap_or("").to_string(),
                                     annotations: None,
-                                    prompt_cache_breakpoint: None,
+                                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(block),
                                 });
                             }
                             Some("thinking") => {
@@ -226,10 +425,10 @@ impl EndpointCodec for MessagesCodec {
                                 // rather than plain text; keep it as reasoning
                                 // so the block survives the round-trip.
                                 parts.push(Content::Reasoning {
-                                    text: block["data"].as_str().unwrap_or("").to_string(),
+                                    text: String::new(),
                                     signature: None,
                                     id: None,
-                                    encrypted_content: None,
+                                    encrypted_content: block["data"].as_str().map(String::from),
                                 });
                             }
                             Some("tool_use") => {
@@ -262,32 +461,12 @@ impl EndpointCodec for MessagesCodec {
                                     wire_type: None,
                                 });
                             }
-                            Some("image") => {
-                                let source = block["source"].clone();
-                                if source["type"] == "url" {
-                                    parts.push(Content::Media {
-                                        source: tiygate_core::ir::MediaSource::Url {
-                                            url: source["url"].as_str().unwrap_or("").to_string(),
-                                        },
-                                        mime_type: source["media_type"]
-                                            .as_str()
-                                            .unwrap_or("image/*")
-                                            .to_string(),
-                                        metadata: Default::default(),
-                                        prompt_cache_breakpoint: None,
-                                    });
-                                } else {
-                                    parts.push(Content::Media {
-                                        source: tiygate_core::ir::MediaSource::Inline {
-                                            data: source["data"].as_str().unwrap_or("").to_string(),
-                                        },
-                                        mime_type: source["media_type"]
-                                            .as_str()
-                                            .unwrap_or("image/*")
-                                            .to_string(),
-                                        metadata: Default::default(),
-                                        prompt_cache_breakpoint: None,
-                                    });
+                            Some("image") | Some("document") => {
+                                if let Some(media) = decode_anthropic_media(
+                                    block,
+                                    block["type"].as_str().unwrap_or("image"),
+                                ) {
+                                    parts.push(media);
                                 }
                             }
                             _ => {}
@@ -308,24 +487,44 @@ impl EndpointCodec for MessagesCodec {
             }
         }
 
-        // Parse tools
+        // Parse client function tools and preserve named hosted tools as
+        // non-function IR tools. The latter are rejected by the lossy guard
+        // when crossing to a protocol that cannot execute them; treating them
+        // as nameless functions would instead emit an invalid schema.
         let tools: Vec<Tool> = body["tools"]
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|t| Tool {
-                        name: t["name"].as_str().unwrap_or("").to_string(),
-                        description: t["description"].as_str().map(|s| s.to_string()),
-                        parameters: Some(t["input_schema"].clone()),
-                        required: false,
-                        ..Default::default()
+                    .filter_map(|tool| {
+                        if let Some(tool_type) = tool["type"]
+                            .as_str()
+                            .filter(|tool_type| *tool_type != "function")
+                        {
+                            return Some(Tool {
+                                name: tool["name"].as_str().unwrap_or("").to_string(),
+                                description: tool["description"].as_str().map(String::from),
+                                tool_type: Some(tool_type.to_string()),
+                                config: Some(tool.clone()),
+                                ..Default::default()
+                            });
+                        }
+                        if let Some(name) = tool["name"].as_str() {
+                            return Some(Tool {
+                                name: name.to_string(),
+                                description: tool["description"].as_str().map(String::from),
+                                parameters: Some(tool["input_schema"].clone()),
+                                required: false,
+                                ..Default::default()
+                            });
+                        }
+                        None
                     })
                     .collect()
             })
             .unwrap_or_default();
 
         let params = tiygate_core::GenerationParams {
-            max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
+            max_tokens: Some(max_tokens as u32),
             temperature: body["temperature"].as_f64().map(|v| v as f32),
             top_p: body["top_p"].as_f64().map(|v| v as f32),
             top_k: body["top_k"].as_u64().map(|v| v as u32),
@@ -626,7 +825,17 @@ impl EndpointCodec for MessagesCodec {
             msg.content
                 .iter()
                 .filter_map(|c| match c {
-                    Content::Text { text, .. } => Some(json!({"type": "text", "text": text})),
+                    Content::Text {
+                        text,
+                        prompt_cache_breakpoint,
+                        ..
+                    } => {
+                        let mut block = json!({"type": "text", "text": text});
+                        if prompt_cache_breakpoint.is_some() {
+                            block["cache_control"] = json!({"type": "ephemeral"});
+                        }
+                        Some(block)
+                    }
                     // Preserve reasoning as an Anthropic thinking block ONLY
                     // when it carries the provider's `signature`. Anthropic
                     // rejects thinking blocks without a valid signature (400
@@ -635,10 +844,22 @@ impl EndpointCodec for MessagesCodec {
                     // has no Anthropic signature — is dropped on the request
                     // side rather than replayed.
                     Content::Reasoning {
-                        text, signature, ..
-                    } => signature
+                        text,
+                        signature,
+                        encrypted_content,
+                        ..
+                    } => encrypted_content
                         .as_ref()
-                        .map(|sig| json!({"type": "thinking", "thinking": text, "signature": sig})),
+                        .map(|data| json!({"type": "redacted_thinking", "data": data}))
+                        .or_else(|| {
+                            signature.as_ref().map(|sig| {
+                                json!({
+                                    "type": "thinking",
+                                    "thinking": text,
+                                    "signature": sig
+                                })
+                            })
+                        }),
                     Content::ToolCall {
                         id,
                         name,
@@ -659,21 +880,19 @@ impl EndpointCodec for MessagesCodec {
                     } => Some(json!({
                         "type": "tool_result",
                         "tool_use_id": tool_call_id,
-                        "content": content,
+                        "content": encode_tool_result_content(content),
                     })),
                     Content::Media {
-                        source, mime_type, ..
-                    } => match source {
-                        tiygate_core::ir::MediaSource::Url { url } => Some(json!({
-                            "type": "image",
-                            "source": {"type": "url", "url": url, "media_type": mime_type}
-                        })),
-                        tiygate_core::ir::MediaSource::Inline { data } => Some(json!({
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": mime_type, "data": data}
-                        })),
-                        _ => None,
-                    },
+                        source,
+                        mime_type,
+                        metadata,
+                        prompt_cache_breakpoint,
+                    } => encode_anthropic_media(
+                        source,
+                        mime_type,
+                        metadata,
+                        prompt_cache_breakpoint,
+                    ),
                     Content::Refusal { text, .. } => Some(json!({"type": "text", "text": text})),
                     Content::Program { .. } | Content::ProgramOutput { .. } => None,
                 })
@@ -1161,20 +1380,36 @@ impl StreamEncoder for MessagesStreamEncoder {
                 ));
                 out
             }
-            StreamPart::ReasoningDelta { text, .. } => {
-                let mut out =
-                    self.ensure_block("thinking", json!({"type": "thinking", "thinking": ""}));
-                let idx = self.current_index.unwrap_or(0);
-                let data = json!({
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": {"type": "thinking_delta", "thinking": text},
-                });
-                out.push_str(&format!(
-                    "event: content_block_delta\ndata: {}\n\n",
-                    serde_json::to_string(&data).unwrap_or_default()
-                ));
-                out
+            StreamPart::ReasoningDelta {
+                text,
+                encrypted_content,
+                ..
+            } => {
+                if let Some(data) = encrypted_content {
+                    // Redacted thinking is opaque and is carried in the
+                    // content-block opener, not as a plaintext thinking delta.
+                    let mut out = self.close_block();
+                    out.push_str(&self.open_block(
+                        "redacted_thinking",
+                        json!({"type": "redacted_thinking", "data": data}),
+                    ));
+                    out.push_str(&self.close_block());
+                    out
+                } else {
+                    let mut out =
+                        self.ensure_block("thinking", json!({"type": "thinking", "thinking": ""}));
+                    let idx = self.current_index.unwrap_or(0);
+                    let data = json!({
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "thinking_delta", "thinking": text},
+                    });
+                    out.push_str(&format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        serde_json::to_string(&data).unwrap_or_default()
+                    ));
+                    out
+                }
             }
             StreamPart::ToolCallDelta {
                 id,
@@ -1482,6 +1717,15 @@ impl StreamDecoder for MessagesStreamDecoder {
                             });
                         }
                     }
+                    Some("redacted_thinking") => {
+                        if let Some(data) = block["data"].as_str() {
+                            parts.push(StreamPart::ReasoningDelta {
+                                text: String::new(),
+                                id: None,
+                                encrypted_content: Some(data.to_string()),
+                            });
+                        }
+                    }
                     Some("image") => {
                         tracing::debug!("Anthropic image block in stream (not delta-ed)");
                     }
@@ -1513,6 +1757,15 @@ impl StreamDecoder for MessagesStreamDecoder {
                                 text: thinking.to_string(),
                                 id: None,
                                 encrypted_content: None,
+                            });
+                        }
+                    }
+                    Some("redacted_thinking_delta") => {
+                        if let Some(data) = delta["data"].as_str() {
+                            parts.push(StreamPart::ReasoningDelta {
+                                text: String::new(),
+                                id: None,
+                                encrypted_content: Some(data.to_string()),
                             });
                         }
                     }
@@ -1732,6 +1985,21 @@ mod tests {
         assert_eq!(ir.model, "claude-sonnet-4-20250514");
         assert_eq!(ir.messages.len(), 1);
         assert_eq!(ir.params.max_tokens, Some(100));
+    }
+
+    #[test]
+    fn test_decode_request_rejects_missing_required_fields() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        for body in [
+            json!({"max_tokens": 100, "messages": []}),
+            json!({"model": "claude-sonnet-4-6", "messages": []}),
+            json!({"model": "claude-sonnet-4-6", "max_tokens": 100}),
+            json!({"model": "claude-sonnet-4-6", "max_tokens": 100, "messages": [{"content": "hi"}]}),
+            json!({"model": "claude-sonnet-4-6", "max_tokens": 100, "messages": [{"role": "system", "content": "hi"}]}),
+        ] {
+            assert!(codec.decode_request(body, &env).is_err());
+        }
     }
 
     #[test]
@@ -2626,5 +2894,160 @@ mod tests {
             .find(|b| b["type"] == "thinking")
             .expect("thinking block should survive round-trip");
         assert_eq!(thinking["signature"], "sig_abc");
+    }
+
+    #[test]
+    fn test_media_sources_follow_anthropic_messages_schema() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.test/a.png"}, "cache_control": {"type": "ephemeral"}},
+                    {"type": "image", "source": {"type": "file", "file_id": "file-img"}},
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}, "title": "a.pdf"},
+                    {"type": "document", "source": {"type": "url", "url": "https://example.test/a.pdf"}},
+                    {"type": "document", "source": {"type": "file", "file_id": "file-doc"}}
+                ]
+            }]
+        });
+
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(ir.messages[0].content.len(), 5);
+        assert!(matches!(
+            ir.messages[0].content[0],
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::Url { .. },
+                prompt_cache_breakpoint: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            ir.messages[0].content[1],
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::FileId { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            ir.messages[0].content[4],
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::FileId { .. },
+                ..
+            }
+        ));
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let blocks = encoded["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0]["source"],
+            json!({
+                "type": "url",
+                "url": "https://example.test/a.png"
+            })
+        );
+        assert_eq!(
+            blocks[1]["source"],
+            json!({
+                "type": "file",
+                "file_id": "file-img"
+            })
+        );
+        assert_eq!(blocks[2]["type"], "document");
+        assert_eq!(blocks[2]["title"], "a.pdf");
+        assert_eq!(blocks[3]["source"]["type"], "url");
+        assert_eq!(blocks[4]["source"]["file_id"], "file-doc");
+        // URL sources do not carry media_type; that field belongs to base64
+        // sources and would violate the current Anthropic schema.
+        assert!(blocks[0]["source"].get("media_type").is_none());
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_redacted_thinking_request_roundtrip_preserves_opaque_data() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        let ir = codec
+            .decode_request(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "messages": [{
+                        "role": "assistant",
+                        "content": [{"type": "redacted_thinking", "data": "opaque-data"}]
+                    }]
+                }),
+                &env,
+            )
+            .unwrap();
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            Content::Reasoning {
+                text,
+                encrypted_content: Some(data),
+                ..
+            } if text.is_empty() && data == "opaque-data"
+        ));
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(
+            encoded["messages"][0]["content"][0],
+            json!({"type": "redacted_thinking", "data": "opaque-data"})
+        );
+    }
+
+    #[test]
+    fn test_tool_result_content_array_roundtrip_is_not_flattened() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        let ir = codec
+            .decode_request(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "messages": [{
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {"type": "text", "text": "output"},
+                                {"type": "image", "source": {"type": "url", "url": "https://example.test/result.png"}}
+                            ]
+                        }]
+                    }]
+                }),
+                &env,
+            )
+            .unwrap();
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let result = &encoded["messages"][0]["content"][0];
+        assert!(result["content"].is_array());
+        assert_eq!(result["content"][0]["text"], "output");
+        assert_eq!(result["content"][1]["type"], "image");
+    }
+
+    #[test]
+    fn test_hosted_tool_type_is_preserved_for_lossy_guard() {
+        let codec = MessagesCodec::new();
+        let ir = codec
+            .decode_request(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "messages": [{"role": "user", "content": "search"}]
+                }),
+                &make_raw_envelope(),
+            )
+            .unwrap();
+        assert_eq!(
+            ir.tools[0].tool_type.as_deref(),
+            Some("web_search_20250305")
+        );
+        assert!(!ir.tools[0].is_function());
     }
 }

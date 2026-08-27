@@ -9,16 +9,22 @@ use std::collections::HashSet;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tiygate_core::provider::oauth::OAuthEgressProfile;
 use tiygate_core::{ProtocolSuite, RoutingTarget};
 use twox_hash::XxHash64;
-use uuid::Uuid;
 
 const ANTHROPIC_OAUTH_BETAS: [&str; 3] = [
     "claude-code-20250219",
     "oauth-2025-04-20",
     "interleaved-thinking-2025-05-14",
+];
+/// Claude Code subscription requests historically required dated model IDs
+/// for aliases that the public Messages API accepts directly. Keep this
+/// compatibility mapping scoped to the subscription OAuth egress profile.
+const ANTHROPIC_OAUTH_MODEL_ALIASES: [(&str, &str); 3] = [
+    ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+    ("claude-opus-4-5", "claude-opus-4-5-20251101"),
+    ("claude-haiku-4-5", "claude-haiku-4-5-20251001"),
 ];
 const CCH_SEED: u64 = 0x6E52_736A_C806_831E;
 
@@ -37,14 +43,13 @@ pub(crate) fn is_enabled(target: &RoutingTarget, egress_suite: ProtocolSuite) ->
 /// summarized-thinking default and re-signs a pre-existing billing header,
 /// preserving caller intent and avoiding hidden prompt changes.
 pub(crate) fn prepare_body(body: &mut Value) -> bool {
-    ensure_thinking_display(body) | sign_existing_billing_header(body)
+    ensure_thinking_display(body) | sign_existing_billing_header(body) | normalize_model_id(body)
 }
 
 /// Apply egress-owned headers after client header forwarding and credential
 /// injection. This keeps the gateway's credentials authoritative while still
 /// preserving caller-requested beta flags.
 pub(crate) fn apply_headers(
-    target: &RoutingTarget,
     headers: &mut HeaderMap,
     is_stream: bool,
     request_id: &str,
@@ -80,12 +85,11 @@ pub(crate) fn apply_headers(
         HeaderName::from_static("x-stainless-timeout"),
         HeaderValue::from_static("600"),
     );
-    insert_header(
-        headers,
-        HeaderName::from_static("x-claude-code-session-id"),
-        HeaderValue::from_str(&stable_session_id(&target.provider_id))
-            .map_err(|error| format!("invalid Anthropic OAuth session header: {error}"))?,
-    );
+    // A Claude Code session ID is a per-client-session value, not a provider
+    // credential value. Preserve one supplied by the caller, but do not
+    // invent a provider-wide ID that would merge unrelated gateway users into
+    // one upstream session. The public Messages API does not require this
+    // private Claude Code header.
     insert_header(
         headers,
         HeaderName::from_static("x-client-request-id"),
@@ -160,6 +164,24 @@ fn ensure_thinking_display(body: &mut Value) -> bool {
     true
 }
 
+fn normalize_model_id(body: &mut Value) -> bool {
+    let Some(model) = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    let Some((_, normalized)) = ANTHROPIC_OAUTH_MODEL_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == model)
+    else {
+        return false;
+    };
+    body["model"] = Value::String((*normalized).to_string());
+    true
+}
+
 fn sign_existing_billing_header(body: &mut Value) -> bool {
     let Some(text) = body
         .pointer("/system/0/text")
@@ -210,18 +232,6 @@ fn zero_cch(text: &str) -> Option<String> {
     let mut unsigned = text.to_string();
     unsigned.replace_range(start..end, "00000");
     Some(unsigned)
-}
-
-fn stable_session_id(provider_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"tiygate/anthropic-oauth-session/");
-    hasher.update(provider_id.as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0F) | 0x50;
-    bytes[8] = (bytes[8] & 0x3F) | 0x80;
-    Uuid::from_bytes(bytes).to_string()
 }
 
 #[cfg(test)]
@@ -286,17 +296,16 @@ mod tests {
             "anthropic-beta",
             HeaderValue::from_static("custom-beta,oauth-2025-04-20"),
         );
-        apply_headers(
-            &target(OAuthEgressProfile::AnthropicOAuth),
-            &mut headers,
-            true,
-            "018f0000-0000-7000-8000-000000000000",
-        )
-        .unwrap();
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("caller-session"),
+        );
+        apply_headers(&mut headers, true, "018f0000-0000-7000-8000-000000000000").unwrap();
 
         assert_eq!(headers["authorization"], "Bearer access-token");
         assert_eq!(headers["accept"], "text/event-stream");
         assert_eq!(headers["accept-encoding"], "identity");
+        assert_eq!(headers["x-claude-code-session-id"], "caller-session");
         assert!(!headers.contains_key(http::header::CONNECTION));
         assert!(headers["anthropic-beta"]
             .to_str()
@@ -320,5 +329,16 @@ mod tests {
         let billing = body["system"][0]["text"].as_str().unwrap();
         assert!(billing.starts_with("x-anthropic-billing-header:"));
         assert!(!billing.contains("cch=00000;"));
+    }
+
+    #[test]
+    fn body_normalizes_subscription_model_aliases_only() {
+        let mut body = serde_json::json!({"model": "claude-sonnet-4-5"});
+        assert!(prepare_body(&mut body));
+        assert_eq!(body["model"], "claude-sonnet-4-5-20250929");
+
+        let mut current = serde_json::json!({"model": "claude-sonnet-4-6"});
+        assert!(!prepare_body(&mut current));
+        assert_eq!(current["model"], "claude-sonnet-4-6");
     }
 }

@@ -80,7 +80,7 @@ const OAUTH_PRESETS: Record<
     token_request_style: "form",
   },
   anthropic: {
-    token_url: "https://api.anthropic.com/v1/oauth/token",
+    token_url: "https://platform.claude.com/v1/oauth/token",
     client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
     scopes: [
       "user:profile",

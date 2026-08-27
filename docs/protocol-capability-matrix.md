@@ -31,18 +31,22 @@
 |------|:---:|:---:|:---:|:---:|:---:|
 | `multimodal` | ✅ | ✅ | ✅ | ✅ | N/A |
 | inline base64 | ✅（image） | ✅（image, document） | ✅ | ✅（image, audio, video, pdf） | N/A |
-| URL 引用 | ✅ | ⚠️ → 需要先下载转 inline | ✅ | ✅ | N/A |
-| file_id 引用 | ❌ | ❌ | ✅ | ❌ | N/A |
+| URL 引用 | ✅ | ✅（image/document） | ✅ | ✅ | N/A |
+| file_id 引用 | ❌ | ✅¹（仅原生 Anthropic workspace 文件的 PassThrough） | ✅ | ❌ | N/A |
 | audio inline | ❌ | ❌ | ✅ | ✅ | N/A |
 | video inline | ❌ | ❌ | ❌ | ✅ | N/A |
 | `image_url.detail` | ✅ | ❌（lossy：字段丢弃） | ✅ | ❌（lossy：字段丢弃） | N/A |
 
 **有损组合（阶段 1-3 已知）**：
-- URL 承载 → `messages`（Anthropic 需要 inline base64，无法传递 URL）→ **拒绝**
+- 跨 provider 的 `file_id` → `messages` → **拒绝**（文件 ID 绑定上游 workspace；原生 Anthropic Messages 的文件 ID 可透传）
 - inline audio → `chat_completions`/`messages` → **拒绝**
 - inline video → 任何非 Gemini → **拒绝**
-- file_id → 非 `responses` → **拒绝**
+- file_id → 非 `responses`/原生 `messages` → **拒绝**
 - `image_url.detail` → `messages`/`gemini` → **有损**（该字段在 IR `Content::Media.metadata` 中保留，但 messages/gemini 编解码器不读取，静默丢弃）
+
+> ¹ Anthropic Files API 的 `file_id` 绑定 workspace；TiyGate 仅在原生
+> Messages PassThrough 中保留它，跨协议转换一律拒绝，避免把其他上游的
+> file ID 发到错误 workspace。
 
 ## 3. Reasoning / 结构化输出
 

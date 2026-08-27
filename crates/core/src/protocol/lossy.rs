@@ -42,7 +42,7 @@ pub enum LossyDimension {
     /// protocol can only express it as `auto`/`any`/`required`.
     ToolChoiceSpecific,
     /// Request contains a media part whose `MediaSource` kind is not expressible
-    /// on the egress protocol (e.g. URL → Anthropic, file_id → non-Responses).
+    /// on the egress protocol (e.g. provider-scoped file_id crossings).
     MediaSourceUnsupported,
     /// Request has `response_format` constraints but the egress protocol does
     /// not support structured output.
@@ -300,7 +300,10 @@ pub fn check_lossy_conversion(
                 }
             )
         });
-    if has_breakpoint && !openai_egress {
+    if has_breakpoint
+        && !openai_egress
+        && egress.suite != crate::protocol::ProtocolSuite::AnthropicMessages
+    {
         return Err((
             LossyDimension::PromptCacheBreakpoint,
             lossy_error(
@@ -389,7 +392,9 @@ pub fn check_lossy_conversion(
 ///
 /// We follow `protocol-capability-matrix.md` §2:
 /// - `chat_completions`: inline image only; URL is fine; no audio/video; no file_id.
-/// - `messages` (Anthropic): inline image/document; URL is lossy; no audio/video/file_id.
+/// - `messages` (Anthropic): inline/URL/file media for its image/document
+///   sources; provider-scoped file IDs are preserved by native PassThrough,
+///   but cannot cross a conversion boundary.
 /// - `responses`: inline image/audio; URL; file_id; no video.
 /// - `gemini`: inline image/audio/video/pdf; URL; no file_id.
 fn media_source_dimension(
@@ -403,14 +408,16 @@ fn media_source_dimension(
     }
     match (source, egress.suite) {
         (MediaSource::Inline { .. }, _) => None, // always expressible when caps.multimodal
-        (MediaSource::Url { .. }, crate::protocol::ProtocolSuite::AnthropicMessages) => {
-            // Anthropic requires pre-downloaded inline base64; URL would be silently dropped.
-            Some(LossyDimension::MediaSourceUnsupported)
-        }
+        // The current Messages API accepts URL sources for both image and
+        // document blocks. The codec chooses the block type from mime_type.
+        (MediaSource::Url { .. }, crate::protocol::ProtocolSuite::AnthropicMessages) => None,
         (MediaSource::Url { .. }, _) => None,
         (MediaSource::FileId { .. }, crate::protocol::ProtocolSuite::OpenAiResponses) => None,
         (MediaSource::FileId { .. }, _) => {
-            // file_id is a Responses-only construct; other suites have no equivalent.
+            // File IDs are scoped to the provider workspace. The native
+            // Anthropic Messages pass-through path can preserve them, but a
+            // conversion path cannot prove that the destination workspace
+            // owns the source ID.
             Some(LossyDimension::MediaSourceUnsupported)
         }
     }

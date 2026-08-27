@@ -424,6 +424,7 @@ fn anthropic_decode_tool_result_array_content() {
     let codec = MessagesCodec::new();
     let body: Value = serde_json::json!({
         "model": "claude",
+        "max_tokens": 16,
         "messages": [{
             "role": "user",
             "content": [{

@@ -253,14 +253,10 @@ fn tool_choice_required_to_gemini_accepted() {
 // --- Dimension 5: media sources ---
 
 #[test]
-fn url_media_to_anthropic_rejected() {
+fn url_media_to_anthropic_accepted() {
     let mut req = text_only_req();
     with_media_url(&mut req);
-    let err = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps());
-    assert_eq!(
-        extract_dim(&err),
-        Some(LossyDimension::MediaSourceUnsupported)
-    );
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
 }
 
 #[test]
@@ -562,14 +558,8 @@ fn prompt_cache_breakpoint_rejected_outside_openai() {
         "Responses should accept prompt_cache_breakpoint"
     );
 
-    // Anthropic and Gemini have no equivalent carrier — reject, not silently drop.
-    let (dim, _) =
-        check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).unwrap_err();
-    assert_eq!(
-        dim,
-        LossyDimension::PromptCacheBreakpoint,
-        "Anthropic should reject prompt_cache_breakpoint"
-    );
+    // Anthropic can carry the same explicit breakpoint as cache_control.
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
     let (dim, _) = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps()).unwrap_err();
     assert_eq!(
         dim,
