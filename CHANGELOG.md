@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-08-25
+### :sparkles: New Features
+- [`1831a1b`](https://github.com/tiylabs/tiygate/commit/1831a1b2345abfe18e02cdc1318e6d50d8625225) - ✨ Add API key virtual model access controls *(PR [#51](https://github.com/tiylabs/tiygate/pull/51) by [@jorben](https://github.com/jorben))*
+  - :arrow_lower_right: *addresses issue [#49](https://github.com/tiylabs/tiygate/issues/49) opened by [@2niuhe](https://github.com/2niuhe)*
+
+### :bug: Bug Fixes
+- [`04d019c`](https://github.com/tiylabs/tiygate/commit/04d019c0544fb264667245a6a49eab680fdd1316) - 🐛 strip unsupported Codex output token parameter *(PR [#47](https://github.com/tiylabs/tiygate/pull/47) by [@jorben](https://github.com/jorben))*
+- [`7752c69`](https://github.com/tiylabs/tiygate/commit/7752c695e4991624ea6fd57d80896f0c68685d6f) - **oauth**: 🐛 force store false for Codex requests *(PR [#50](https://github.com/tiylabs/tiygate/pull/50) by [@jorben](https://github.com/jorben))*
+- [`f4f9c7e`](https://github.com/tiylabs/tiygate/commit/f4f9c7e07b1c2c3925bf9da6b19b17e58f60ffb0) - 🐛 preserve Codex OAuth metadata across provider requests *(PR [#53](https://github.com/tiylabs/tiygate/pull/53) by [@jorben](https://github.com/jorben))*
+  - :arrow_lower_right: *fixes issue [#52](https://github.com/tiylabs/tiygate/issues/52) opened by [@2niuhe](https://github.com/2niuhe)*
+
+
 ## [0.2.1] - 2026-08-13
 ### :sparkles: New Features
 - [`30914b4`](https://github.com/tiylabs/tiygate/commit/30914b42176a1ec01bc737be3374b1deb9921968) - **protocols**: ✨ add comprehensive GPT-5.6 protocol support *(PR [#38](https://github.com/tiylabs/tiygate/pull/38) by [@jorben](https://github.com/jorben))*
@@ -209,3 +221,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.9]: https://github.com/tiylabs/tiygate/compare/0.1.8...0.1.9
 [0.2.0]: https://github.com/tiylabs/tiygate/compare/0.1.9...0.2.0
 [0.2.1]: https://github.com/tiylabs/tiygate/compare/0.2.0...0.2.1
+[0.2.2]: https://github.com/tiylabs/tiygate/compare/0.2.1...0.2.2
