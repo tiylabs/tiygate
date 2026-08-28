@@ -65,6 +65,15 @@ export interface ProviderUsageWindow {
   limit_window_seconds?: number | null;
 }
 
+export interface ProviderResetCredit {
+  expires_at?: string | null;
+}
+
+export interface ProviderResetCredits {
+  available_count: number;
+  credits?: ProviderResetCredit[];
+}
+
 export type ProviderUsageState =
   | "available"
   | "not_connected"
@@ -83,6 +92,13 @@ export interface ProviderUsage {
   five_hour?: ProviderUsageWindow | null;
   /** @deprecated Prefer windows; retained for older Admin API responses. */
   seven_day?: ProviderUsageWindow | null;
+  reset_credits?: ProviderResetCredits | null;
+}
+
+export interface ProviderResetCreditsConsumeResponse {
+  provider_id: string;
+  code: string;
+  windows_reset: number | null;
 }
 
 export interface ProviderCatalogEntry {
