@@ -14,12 +14,15 @@ import {
   RefreshCw,
   Play,
   Copy,
+  Info,
+  RotateCcw,
 } from "lucide-react";
 import { providersApi, providerCatalogApi, oauthApi } from "@/api/resources";
 import type {
   Provider,
   ProviderDeleteImpact,
   ProviderInput,
+  ProviderResetCredits,
   ProviderUsage,
   ProviderUsageWindow,
 } from "@/api/types";
@@ -44,6 +47,7 @@ import {
   Th,
   Tr,
   Alert,
+  Tooltip,
   useStickyTableScroll,
   useToast,
 } from "@/components/ui";
@@ -334,6 +338,159 @@ function UsageWindow({
           ) : null}
       </div>
     </div>
+  );
+}
+
+function formatResetCreditExpiry(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function newResetCreditRequestId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function ResetCreditsControl({
+  providerId,
+  usage,
+  loading,
+  t,
+}: {
+  providerId: string;
+  usage?: ProviderUsage;
+  loading: boolean;
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const pendingRequestIdRef = useRef<string | null>(null);
+  const consumeMutation = useMutation({
+    mutationFn: (redeemRequestId: string) =>
+      providersApi.consumeResetCredits(providerId, redeemRequestId),
+    onSuccess: (result) => {
+      pendingRequestIdRef.current = null;
+      setConfirmOpen(false);
+      void queryClient.invalidateQueries({
+        queryKey: ["provider-usage", providerId],
+      });
+      toast.success(
+        t("providers.usage.resetCredits.consumeSuccess"),
+        result.windows_reset != null
+          ? t("providers.usage.resetCredits.windowsReset", {
+              count: result.windows_reset,
+            })
+          : undefined,
+      );
+    },
+    onError: (error: Error) => {
+      toast.error(t("providers.usage.resetCredits.consumeFailed"), error.message);
+    },
+  });
+
+  const resetCredits: ProviderResetCredits | undefined = usage?.reset_credits ?? undefined;
+  if (loading && !usage) {
+    return (
+      <span
+        className="text-text-subtle"
+        aria-label={t("providers.usage.resetCredits.loading")}
+        title={t("providers.usage.resetCredits.loading")}
+      >
+        …
+      </span>
+    );
+  }
+  if (usage?.state !== "available" || !resetCredits) return null;
+
+  const availableCount = Math.max(0, resetCredits.available_count);
+  const expirations = (resetCredits.credits ?? [])
+    .map((credit) => credit.expires_at?.trim() ?? "")
+    .filter((expiresAt) => expiresAt.length > 0);
+  const expiryInfo = (
+    <div className="space-y-1">
+      <div className="font-medium text-text">
+        {t("providers.usage.resetCredits.expirationTitle")}
+      </div>
+      {expirations.length > 0 ? (
+        expirations.map((expiresAt, index) => (
+          <div key={`${expiresAt}-${index}`} className="font-mono text-[10px]">
+            {formatResetCreditExpiry(expiresAt)}
+          </div>
+        ))
+      ) : (
+        <div>{t("providers.usage.resetCredits.expirationUnavailable")}</div>
+      )}
+    </div>
+  );
+
+  return (
+    <>
+      <div className="inline-flex shrink-0 items-center gap-1 text-[10px] leading-4">
+        <span className="whitespace-nowrap text-text-muted">
+          {t("providers.usage.resetCredits.label")}
+        </span>
+        <span className="font-mono font-medium text-text">{availableCount}</span>
+        <Tooltip content={expiryInfo} side="top">
+          <button
+            type="button"
+            className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={t("providers.usage.resetCredits.expirationInfo")}
+          >
+            <Info size={11} />
+          </button>
+        </Tooltip>
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="!min-h-5 !px-1.5 !py-0 whitespace-nowrap text-[10px]"
+          icon={<RotateCcw size={11} />}
+          loading={consumeMutation.isPending}
+          disabled={availableCount <= 0}
+          onClick={() => {
+            pendingRequestIdRef.current = newResetCreditRequestId();
+            setConfirmOpen(true);
+          }}
+        >
+          {t("providers.usage.resetCredits.consume")}
+        </Button>
+      </div>
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={(open) => {
+          setConfirmOpen(open);
+          if (!open) pendingRequestIdRef.current = null;
+        }}
+        title={t("providers.usage.resetCredits.confirmTitle")}
+        description={t("providers.usage.resetCredits.confirmDescription", {
+          count: availableCount,
+        })}
+        confirmLabel={t("providers.usage.resetCredits.consume")}
+        cancelLabel={t("common.cancel")}
+        destructive
+        loading={consumeMutation.isPending}
+        onConfirm={() => {
+          const redeemRequestId =
+            pendingRequestIdRef.current ?? newResetCreditRequestId();
+          pendingRequestIdRef.current = redeemRequestId;
+          consumeMutation.mutate(redeemRequestId);
+        }}
+      />
+    </>
   );
 }
 
@@ -816,18 +973,29 @@ export default function Providers() {
                         </div>
                       ) : null}
                       {supportsOAuthUsage(p) ? (
-                        <div className="mt-1.5 grid min-w-[16rem] grid-cols-2 gap-x-3 gap-y-1.5">
+                        <div className="mt-1.5 grid min-w-[16rem] grid-cols-2 gap-x-3 gap-y-1">
                           {(() => {
                             const usageQuery = usageByProvider.get(p.id);
                             const usage = usageQuery?.data;
-                            const accountEmail = usage?.account_email;
+                            const accountEmail = usage?.account_email?.trim() || undefined;
                             const planType = formatPlanType(usage?.plan_type);
                             const windows = providerUsageWindows(usage);
                             const visibleWindows =
                               windows.length > 0 ? windows : [undefined];
+                            const accountInfo = accountEmail ? (
+                              <span className="break-all font-mono text-[10px]">
+                                {accountEmail}
+                              </span>
+                            ) : (
+                              <span>
+                                {usageQuery?.isFetching
+                                  ? t("providers.usage.loading")
+                                  : t("providers.usage.unavailable")}
+                              </span>
+                            );
                             return (
                               <>
-                                <div className="col-span-2 flex min-w-0 items-center gap-1 text-[10px] leading-4">
+                                <div className="col-span-2 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[10px] leading-4">
                                   {planType ? (
                                     <Badge
                                       tone="primary"
@@ -837,15 +1005,23 @@ export default function Providers() {
                                       {planType}
                                     </Badge>
                                   ) : null}
-                                  <span
-                                    className="min-w-0 truncate font-mono text-[10px] text-text-muted"
-                                    title={accountEmail ?? undefined}
-                                  >
-                                    {accountEmail ??
-                                      (usageQuery?.isFetching
-                                        ? t("providers.usage.loading")
-                                        : "—")}
-                                  </span>
+                                  <Tooltip content={accountInfo} side="top">
+                                    <button
+                                      type="button"
+                                      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                      aria-label={t("providers.usage.accountInfo")}
+                                    >
+                                      <Info size={12} />
+                                    </button>
+                                  </Tooltip>
+                                  {p.vendor === "openai" ? (
+                                    <ResetCreditsControl
+                                      providerId={p.id}
+                                      usage={usage}
+                                      loading={usageQuery?.isFetching ?? true}
+                                      t={t}
+                                    />
+                                  ) : null}
                                 </div>
                                 {visibleWindows.map((window, index) => (
                                   <UsageWindow

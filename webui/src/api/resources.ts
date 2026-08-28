@@ -18,6 +18,7 @@ import type {
   ProviderDeleteImpact,
   ProviderInput,
   ProviderModelsResponse,
+  ProviderResetCreditsConsumeResponse,
   ProviderUsage,
   QuotaSpec,
   RequestFilterOptions,
@@ -53,6 +54,14 @@ export const providersApi = {
     apiRequest<ProviderModelsResponse>(`/providers/${id}/models`),
   usage: (id: string) =>
     apiRequest<ProviderUsage>(`/providers/${id}/usage`),
+  consumeResetCredits: (id: string, redeemRequestId: string) =>
+    apiRequest<ProviderResetCreditsConsumeResponse>(
+      `/providers/${id}/usage/reset-credits`,
+      {
+        method: "POST",
+        body: { redeem_request_id: redeemRequestId },
+      },
+    ),
 };
 
 // ---- provider catalog (server-side registered providers) ----

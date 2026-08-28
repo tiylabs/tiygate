@@ -34,6 +34,21 @@ const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 /// OpenAI OAuth providers; OpenAI API-key providers have platform billing
 /// semantics rather than the ChatGPT 5-hour / 7-day windows.
 const OPENAI_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// ChatGPT/Codex reset-credit details endpoint. This is a private ChatGPT
+/// subscription endpoint and must never be used for API-key providers.
+const OPENAI_CODEX_RESET_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+/// ChatGPT/Codex reset-credit consume endpoint. Consuming a credit is an
+/// upstream side effect, so it is exposed through a dedicated POST route.
+const OPENAI_CODEX_RESET_CREDITS_CONSUME_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
+const OPENAI_CODEX_BETA: &str = "codex-1";
+const OPENAI_CODEX_LANGUAGE: &str = "zh-CN";
+const OPENAI_CODEX_SEC_FETCH_SITE: &str = "none";
+const OPENAI_CODEX_SEC_FETCH_MODE: &str = "no-cors";
+const OPENAI_CODEX_SEC_FETCH_DEST: &str = "empty";
+const OPENAI_CODEX_PRIORITY: &str = "u=4, i";
+const OPENAI_CODEX_RESET_CREDITS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Claude subscription usage endpoint. Anthropic currently exposes this only
 /// for OAuth credentials carrying the `user:profile` scope.
 const ANTHROPIC_OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -60,6 +75,10 @@ pub fn router() -> Router<AdminState> {
                 .delete(delete_provider),
         )
         .route("/admin/v1/providers/:id/usage", get(provider_usage))
+        .route(
+            "/admin/v1/providers/:id/usage/reset-credits",
+            post(provider_usage_reset_credits),
+        )
         .route("/admin/v1/routes", get(list_routes).post(create_route))
         .route(
             "/admin/v1/routes/:id",
@@ -135,6 +154,22 @@ struct ProviderUsageWindow {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ProviderResetCredit {
+    expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderResetCredits {
+    available_count: usize,
+    credits: Vec<ProviderResetCredit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderResetCreditsConsumeRequest {
+    redeem_request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ProviderUsageResponse {
     provider_id: String,
     state: String,
@@ -145,6 +180,15 @@ struct ProviderUsageResponse {
     seven_day: Option<ProviderUsageWindow>,
     account_email: Option<String>,
     plan_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reset_credits: Option<ProviderResetCredits>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderResetCreditsConsumeResponse {
+    provider_id: String,
+    code: String,
+    windows_reset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +272,7 @@ fn provider_usage_response(
         seven_day,
         account_email: account_email.map(str::to_string),
         plan_type: None,
+        reset_credits: None,
     }
 }
 
@@ -268,6 +313,100 @@ fn parse_openai_usage(body: &str, now_unix: i64) -> Result<ParsedProviderUsage, 
         .filter_map(|window| map_openai_usage_window(window, now_unix))
         .collect();
     Ok(ParsedProviderUsage { plan_type, windows })
+}
+
+fn parse_non_negative_count(value: Option<&Value>) -> Option<usize> {
+    let value = value?;
+    if let Some(count) = value.as_u64() {
+        return usize::try_from(count).ok();
+    }
+    value
+        .as_str()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+}
+
+fn parse_reset_credit_expiration(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    object
+        .get("expires_at")
+        .or_else(|| object.get("expiresAt"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_reset_credit_list(value: &Value) -> Vec<ProviderResetCredit> {
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let object = item.as_object()?;
+            let status = object
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|status| !status.is_empty());
+            if status.is_some_and(|status| !status.eq_ignore_ascii_case("available")) {
+                return None;
+            }
+            let reset_type = object
+                .get("reset_type")
+                .or_else(|| object.get("resetType"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|reset_type| !reset_type.is_empty());
+            if reset_type
+                .is_some_and(|reset_type| !reset_type.eq_ignore_ascii_case("codex_rate_limits"))
+            {
+                return None;
+            }
+            Some(ProviderResetCredit {
+                expires_at: parse_reset_credit_expiration(item),
+            })
+        })
+        .collect()
+}
+
+fn parse_reset_credits(value: &Value) -> Option<ProviderResetCredits> {
+    if value.is_array() {
+        let credits = parse_reset_credit_list(value);
+        return Some(ProviderResetCredits {
+            available_count: credits.len(),
+            credits,
+        });
+    }
+
+    let object = value.as_object()?;
+    let available_count = object
+        .get("available_count")
+        .or_else(|| object.get("availableCount"))
+        .and_then(|value| parse_non_negative_count(Some(value)));
+    let credit_payload = ["credits", "items", "data"]
+        .into_iter()
+        .find_map(|key| object.get(key));
+    if let Some(credit_payload) = credit_payload {
+        let credits = parse_reset_credit_list(credit_payload);
+        return Some(ProviderResetCredits {
+            available_count: available_count.unwrap_or(credits.len()),
+            credits,
+        });
+    }
+
+    for key in ["rate_limit_reset_credits", "rateLimitResetCredits"] {
+        if let Some(nested) = object.get(key) {
+            if let Some(parsed) = parse_reset_credits(nested) {
+                return Some(parsed);
+            }
+        }
+    }
+
+    available_count.map(|available_count| ProviderResetCredits {
+        available_count,
+        credits: Vec::new(),
+    })
 }
 
 fn parse_usage_reset_at(value: Option<&Value>) -> Option<i64> {
@@ -465,6 +604,193 @@ fn ensure_provider_usage_user_agent(vendor: &str, headers: &mut reqwest::header:
     }
 }
 
+fn ensure_openai_codex_usage_headers(vendor: &str, headers: &mut reqwest::header::HeaderMap) {
+    if vendor != "openai" {
+        return;
+    }
+    for (name, value) in [
+        ("openai-beta", OPENAI_CODEX_BETA),
+        ("oai-language", OPENAI_CODEX_LANGUAGE),
+        ("sec-fetch-site", OPENAI_CODEX_SEC_FETCH_SITE),
+        ("sec-fetch-mode", OPENAI_CODEX_SEC_FETCH_MODE),
+        ("sec-fetch-dest", OPENAI_CODEX_SEC_FETCH_DEST),
+        ("priority", OPENAI_CODEX_PRIORITY),
+    ] {
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        headers.insert(name, reqwest::header::HeaderValue::from_static(value));
+    }
+}
+
+async fn query_openai_reset_credits(
+    client: &reqwest::Client,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<ProviderResetCredits> {
+    match tokio::time::timeout(
+        OPENAI_CODEX_RESET_CREDITS_TIMEOUT,
+        query_openai_reset_credits_inner(client, headers),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::debug!("OpenAI OAuth reset-credit query timed out; keeping usage response");
+            None
+        }
+    }
+}
+
+async fn query_openai_reset_credits_inner(
+    client: &reqwest::Client,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<ProviderResetCredits> {
+    let mut request = client
+        .get(OPENAI_CODEX_RESET_CREDITS_URL)
+        .header(reqwest::header::ACCEPT, "application/json");
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(error = %error, "OpenAI OAuth reset-credit query failed");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::debug!(status = %response.status(), "OpenAI OAuth reset-credit query returned an error");
+        return None;
+    }
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::debug!(error = %error, "OpenAI OAuth reset-credit response read failed");
+            return None;
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::debug!(error = %error, "OpenAI OAuth reset-credit response was not JSON");
+            return None;
+        }
+    };
+    parse_reset_credits(&value)
+}
+
+fn parse_reset_credits_consume_response(
+    provider_id: &str,
+    body: &str,
+) -> Result<ProviderResetCreditsConsumeResponse, String> {
+    let response_body =
+        serde_json::from_str::<Value>(body).map_err(|error| format!("invalid JSON: {error}"))?;
+    let code = response_body
+        .get("code")
+        .or_else(|| response_body.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|code| !code.trim().is_empty())
+        .ok_or_else(|| "reset-credit response has no code".to_string())?;
+    let windows_reset = response_body
+        .get("windows_reset")
+        .or_else(|| response_body.get("windowsReset"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|raw| raw.trim().parse().ok()))
+        });
+    Ok(ProviderResetCreditsConsumeResponse {
+        provider_id: provider_id.to_string(),
+        code,
+        windows_reset,
+    })
+}
+
+fn require_reset_credit_success(
+    response: ProviderResetCreditsConsumeResponse,
+) -> Result<ProviderResetCreditsConsumeResponse, AdminError> {
+    if !response.code.eq_ignore_ascii_case("reset") {
+        return Err(AdminError::Conflict(format!(
+            "OpenAI reset-credit consume returned code '{}'",
+            response.code
+        )));
+    }
+    Ok(response)
+}
+
+async fn prepare_oauth_usage_request(
+    state: &AdminState,
+    provider_id: &str,
+    provider: &Provider,
+    oauth_config: &tiygate_core::OAuthTargetConfig,
+    stored_account_email: Option<&str>,
+) -> Result<(reqwest::Client, reqwest::header::HeaderMap, Option<String>), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("http client build: {error}"))?;
+    let cache = tiygate_auth::provider_oauth::OAuthTokenCache::global();
+    let label = oauth_config.cache_label();
+    let mut headers = reqwest::header::HeaderMap::new();
+    let coordinated = state.oauth_service.is_some();
+    let apply_result = if let Some(service) = state.oauth_service.as_ref() {
+        service
+            .apply_provider_headers(provider_id, &mut headers)
+            .await
+    } else {
+        cache.seed(provider_id, label, &oauth_config.refresh_token);
+        cache
+            .apply(&mut headers, provider_id, label, oauth_config, &client)
+            .await
+    };
+    if let Err(error) = apply_result {
+        record_oauth_refresh_failure(state, provider_id, &error).await;
+        return Err(error);
+    }
+
+    let account_email = cache
+        .get_account_email(provider_id, label)
+        .or_else(|| stored_account_email.map(str::to_string));
+    if !coordinated {
+        if let Some(cached_refresh_token) = cache.get_refresh_token(provider_id, label) {
+            match oauth_meta_after_cache_update(
+                provider,
+                &oauth_config.refresh_token,
+                &cached_refresh_token,
+                account_email.as_deref(),
+            ) {
+                Ok(Some(meta)) => {
+                    if let Err(error) = state
+                        .store
+                        .set_provider_oauth_meta(provider_id, &meta)
+                        .await
+                    {
+                        tracing::warn!(
+                            provider = %provider_id,
+                            error = %error,
+                            "persisting OAuth identity after usage request failed"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %provider_id,
+                        error = %error,
+                        "preparing OAuth identity metadata failed"
+                    );
+                }
+            }
+        }
+    }
+
+    ensure_provider_usage_user_agent(&provider.vendor, &mut headers);
+    ensure_openai_codex_usage_headers(&provider.vendor, &mut headers);
+    Ok((client, headers, account_email))
+}
+
 /// Fetch subscription usage windows for one supported OAuth provider. The
 /// OAuth cache is keyed by provider/account, so multiple providers can safely
 /// use different upstream accounts in one process.
@@ -526,69 +852,28 @@ async fn provider_usage(
         .into_response());
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| AdminError::Internal(format!("http client build: {error}")))?;
-    let cache = tiygate_auth::provider_oauth::OAuthTokenCache::global();
-    let label = oauth_config.cache_label();
-    let mut headers = reqwest::header::HeaderMap::new();
-    let coordinated = state.oauth_service.is_some();
-    let apply_result = if let Some(service) = state.oauth_service.as_ref() {
-        service.apply_provider_headers(&id, &mut headers).await
-    } else {
-        cache.seed(&id, label, &oauth_config.refresh_token);
-        cache
-            .apply(&mut headers, &id, label, &oauth_config, &client)
-            .await
-    };
-    if let Err(error) = apply_result {
-        record_oauth_refresh_failure(&state, &id, &error).await;
-        tracing::warn!(provider = %id, vendor = %provider.vendor, error = %error, "OAuth usage token unavailable");
-        return Ok(Json(provider_usage_response(
-            &id,
-            "unavailable",
-            Some("oauth_token_unavailable"),
-            Vec::new(),
-            stored_account_email.as_deref(),
-        ))
-        .into_response());
-    }
-
-    let account_email = cache
-        .get_account_email(&id, label)
-        .or_else(|| stored_account_email.clone());
-    if !coordinated {
-        if let Some(cached_refresh_token) = cache.get_refresh_token(&id, label) {
-            match oauth_meta_after_cache_update(
-                &provider,
-                &oauth_config.refresh_token,
-                &cached_refresh_token,
-                account_email.as_deref(),
-            ) {
-                Ok(Some(meta)) => {
-                    if let Err(error) = state.store.set_provider_oauth_meta(&id, &meta).await {
-                        tracing::warn!(
-                            provider = %id,
-                            error = %error,
-                            "persisting OAuth identity after usage request failed"
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        provider = %id,
-                        error = %error,
-                        "preparing OAuth identity metadata failed"
-                    );
-                }
-            }
+    let (client, headers, account_email) = match prepare_oauth_usage_request(
+        &state,
+        &id,
+        &provider,
+        &oauth_config,
+        stored_account_email.as_deref(),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(provider = %id, vendor = %provider.vendor, error = %error, "OAuth usage token unavailable");
+            return Ok(Json(provider_usage_response(
+                &id,
+                "unavailable",
+                Some("oauth_token_unavailable"),
+                Vec::new(),
+                stored_account_email.as_deref(),
+            ))
+            .into_response());
         }
-    }
-
-    ensure_provider_usage_user_agent(&provider.vendor, &mut headers);
+    };
     let mut request = client
         .get(usage_url)
         .header(reqwest::header::ACCEPT, "application/json");
@@ -641,6 +926,7 @@ async fn provider_usage(
         .text()
         .await
         .map_err(|error| AdminError::Internal(format!("read usage response: {error}")))?;
+    let mut reset_credits = None;
     if provider.vendor == "openai" {
         match serde_json::from_str::<Value>(&body) {
             Ok(response) => {
@@ -654,6 +940,10 @@ async fn provider_usage(
                     rate_limit = %rate_limit,
                     "OpenAI OAuth usage rate-limit response"
                 );
+                reset_credits = response
+                    .get("rate_limit_reset_credits")
+                    .or_else(|| response.get("rateLimitResetCredits"))
+                    .and_then(parse_reset_credits);
             }
             Err(error) => {
                 tracing::debug!(
@@ -663,6 +953,9 @@ async fn provider_usage(
                     "OpenAI OAuth usage response was not valid JSON"
                 );
             }
+        }
+        if let Some(credits) = query_openai_reset_credits(&client, &headers).await {
+            reset_credits = Some(credits);
         }
     }
     let parsed_result = match provider.vendor.as_str() {
@@ -692,7 +985,89 @@ async fn provider_usage(
         account_email.as_deref(),
     );
     usage.plan_type = parsed_usage.plan_type;
+    usage.reset_credits = reset_credits;
     Ok(Json(usage).into_response())
+}
+
+async fn provider_usage_reset_credits(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(request): Json<ProviderResetCreditsConsumeRequest>,
+) -> Result<Json<ProviderResetCreditsConsumeResponse>, AdminError> {
+    let redeem_request_id = request.redeem_request_id.trim();
+    if redeem_request_id.is_empty() {
+        return Err(AdminError::BadRequest(
+            "redeem_request_id must not be empty".to_string(),
+        ));
+    }
+    let provider = state
+        .store
+        .get_provider(&id)
+        .await?
+        .ok_or_else(|| AdminError::NotFound(format!("provider {id}")))?;
+    if provider.vendor != "openai" || !matches!(provider.auth_mode, AuthMode::OAuth) {
+        return Err(AdminError::BadRequest(
+            "reset credits require an OpenAI OAuth provider".to_string(),
+        ));
+    }
+    let oauth_config = tiygate_store::config_store::build_oauth_target_config(&provider)
+        .ok_or_else(|| {
+            AdminError::BadRequest("OpenAI OAuth metadata is unavailable".to_string())
+        })?;
+    if oauth_config.refresh_token.is_empty() {
+        return Err(AdminError::BadRequest(
+            "OpenAI OAuth refresh token is missing".to_string(),
+        ));
+    }
+
+    let stored_account_email = provider_oauth_account_email(&provider);
+    let (client, headers, _) = prepare_oauth_usage_request(
+        &state,
+        &id,
+        &provider,
+        &oauth_config,
+        stored_account_email.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(provider = %id, error = %error, "OAuth token unavailable for reset-credit consume");
+        AdminError::Internal("OAuth token unavailable for reset-credit consume".to_string())
+    })?;
+
+    let mut request = client
+        .post(OPENAI_CODEX_RESET_CREDITS_CONSUME_URL)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&json!({ "redeem_request_id": redeem_request_id }));
+    for (name, value) in &headers {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| AdminError::Internal(format!("reset-credit request failed: {error}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| AdminError::Internal(format!("read reset-credit response: {error}")))?;
+    if !status.is_success() {
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            record_oauth_status(
+                &state,
+                &id,
+                OAuthCredentialStatus::Invalid,
+                Some("reset_credit_auth_rejected"),
+            )
+            .await;
+        }
+        return Err(AdminError::BadRequest(format!(
+            "OpenAI reset-credit consume failed (HTTP {status})"
+        )));
+    }
+
+    let response_body = parse_reset_credits_consume_response(&id, &body)
+        .map_err(|error| AdminError::Internal(format!("invalid reset-credit response: {error}")))?;
+    Ok(Json(require_reset_credit_success(response_body)?))
 }
 
 /// Discover models available on a provider's upstream API.
@@ -3026,6 +3401,8 @@ pub enum AdminError {
     NotFound(String),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -3058,6 +3435,10 @@ impl IntoResponse for AdminError {
             AdminError::BadRequest(_) => (
                 StatusCode::BAD_REQUEST,
                 json!({"error": {"message": self.to_string(), "type": "bad_request", "source": "gateway"}}),
+            ),
+            AdminError::Conflict(_) => (
+                StatusCode::CONFLICT,
+                json!({"error": {"message": self.to_string(), "type": "conflict", "source": "gateway"}}),
             ),
             AdminError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3224,6 +3605,94 @@ mod tests {
             seven_day.and_then(|window| window.reset_at),
             Some(1_000_600)
         );
+    }
+
+    #[test]
+    fn parses_openai_reset_credits_and_filters_unavailable_entries() {
+        let body = json!({
+            "available_count": "2",
+            "credits": [
+                {"reset_type": "codex_rate_limits", "status": "available", "expires_at": "2026-08-30T00:00:00Z"},
+                {"reset_type": "codex_rate_limits", "status": "available", "expiresAt": "2026-09-01T00:00:00Z"},
+                {"reset_type": "codex_rate_limits", "status": "redeemed", "expires_at": "2026-08-29T00:00:00Z"},
+                {"reset_type": "other_grant", "status": "available", "expires_at": "2026-09-02T00:00:00Z"}
+            ]
+        });
+
+        let parsed = parse_reset_credits(&body).expect("reset credits JSON");
+        assert_eq!(parsed.available_count, 2);
+        assert_eq!(parsed.credits.len(), 2);
+        assert_eq!(
+            parsed.credits[0].expires_at.as_deref(),
+            Some("2026-08-30T00:00:00Z")
+        );
+        assert_eq!(
+            parsed.credits[1].expires_at.as_deref(),
+            Some("2026-09-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn parses_nested_reset_credit_array_and_derives_count() {
+        let body = json!({
+            "rate_limit_reset_credits": [
+                {"status": "available", "expires_at": "2026-08-30T00:00:00Z"},
+                {"status": "available", "expires_at": "2026-09-01T00:00:00Z"}
+            ]
+        });
+
+        let parsed = parse_reset_credits(&body).expect("nested reset credits JSON");
+        assert_eq!(parsed.available_count, 2);
+        assert_eq!(parsed.credits.len(), 2);
+
+        let empty = parse_reset_credits(&json!([])).expect("empty reset credits JSON");
+        assert_eq!(empty.available_count, 0);
+        assert!(empty.credits.is_empty());
+    }
+
+    #[test]
+    fn parses_reset_credit_consume_outcomes() {
+        let reset = parse_reset_credits_consume_response(
+            "openai-provider",
+            &json!({"code": "reset", "windows_reset": 2}).to_string(),
+        )
+        .expect("reset-credit consume JSON");
+        assert_eq!(reset.provider_id, "openai-provider");
+        assert_eq!(reset.code, "reset");
+        assert_eq!(reset.windows_reset, Some(2));
+
+        let no_credit = parse_reset_credits_consume_response(
+            "openai-provider",
+            &json!({"code": "no_credit", "windows_reset": 0}).to_string(),
+        )
+        .expect("no-credit consume JSON");
+        assert_eq!(no_credit.code, "no_credit");
+        assert_eq!(no_credit.windows_reset, Some(0));
+        let error = require_reset_credit_success(no_credit).expect_err("no-credit must fail");
+        assert!(matches!(error, AdminError::Conflict(message) if message.contains("no_credit")));
+        assert!(parse_reset_credits_consume_response("openai-provider", "{}").is_err());
+    }
+
+    #[test]
+    fn openai_usage_headers_are_provider_scoped() {
+        let mut openai_headers = reqwest::header::HeaderMap::new();
+        ensure_openai_codex_usage_headers("openai", &mut openai_headers);
+        assert_eq!(
+            openai_headers.get("openai-beta").unwrap(),
+            OPENAI_CODEX_BETA
+        );
+        assert_eq!(
+            openai_headers.get("oai-language").unwrap(),
+            OPENAI_CODEX_LANGUAGE
+        );
+        assert_eq!(
+            openai_headers.get("sec-fetch-mode").unwrap(),
+            OPENAI_CODEX_SEC_FETCH_MODE
+        );
+
+        let mut anthropic_headers = reqwest::header::HeaderMap::new();
+        ensure_openai_codex_usage_headers("anthropic", &mut anthropic_headers);
+        assert!(anthropic_headers.is_empty());
     }
 
     #[test]

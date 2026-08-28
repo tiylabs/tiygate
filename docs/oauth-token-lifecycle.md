@@ -92,6 +92,21 @@ from `limit_window_seconds`, so a response containing only a 7-day
 API compatibility and are populated by matching window duration rather than
 field position.
 
+For OpenAI OAuth providers, the same usage request also probes the private
+ChatGPT reset-credit endpoint and exposes `reset_credits.available_count` plus
+the sanitized expiration list in the usage response. The optional details probe
+has an independent five-second deadline so a slow private endpoint cannot add
+the full usage-request timeout to the Admin response. `POST
+/admin/v1/providers/:id/usage/reset-credits` consumes one upstream reset credit
+through the dedicated consume endpoint. Its JSON body must contain a stable
+`redeem_request_id`; callers must reuse that value when retrying an ambiguous
+request so the upstream idempotency key is preserved. The Admin API returns a
+successful response only for the upstream `reset` outcome and returns `409`
+for outcomes such as `no_credit`, `nothing_to_reset`, and `already_redeemed`.
+These reset-credit fields and routes are provider-scoped to OpenAI OAuth and
+are best-effort compatibility behavior; they do not apply to OpenAI API-key
+providers or other OAuth vendors.
+
 Anthropic OAuth providers read subscription usage from `/api/oauth/usage` with
 the same access token and `anthropic-beta` header used by the OAuth profile.
 TiyGate maps `five_hour`, `seven_day`, model-specific weekly fields such as
