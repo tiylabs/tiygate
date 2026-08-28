@@ -918,6 +918,7 @@ mod tests {
                     signature,
                     id: None,
                     encrypted_content: None,
+                    encrypted_content_source: None,
                 }],
             }],
             tools: Vec::new(),

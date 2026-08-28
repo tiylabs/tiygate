@@ -7,9 +7,9 @@ use http::HeaderMap;
 use serde_json::{json, Value};
 
 use tiygate_core::{
-    Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
-    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, ResponseFormat, Role, StreamDecoder,
-    StreamEncoder, StreamPart, Tool, Usage,
+    Content, EncryptedReasoningSource, EndpointCapabilities, EndpointCodec, Error, ErrorClass,
+    FinishReason, IrRequest, IrResponse, Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope,
+    ResponseFormat, Role, StreamDecoder, StreamEncoder, StreamPart, Tool, Usage,
 };
 
 /// Map an `ErrorClass` to the Anthropic-native `error.type` string.
@@ -77,21 +77,152 @@ fn encode_tool_result_content(content: &str) -> Value {
 }
 
 fn decode_prompt_cache_breakpoint(block: &Value) -> Option<tiygate_core::PromptCacheBreakpoint> {
-    (block
-        .get("cache_control")
-        .and_then(Value::as_object)
-        .and_then(|cache| cache.get("type"))
+    let cache = block.get("cache_control").and_then(Value::as_object)?;
+    if cache.get("type").and_then(Value::as_str) != Some("ephemeral") {
+        return None;
+    }
+    let ttl = cache
+        .get("ttl")
         .and_then(Value::as_str)
-        == Some("ephemeral"))
-    .then_some(tiygate_core::PromptCacheBreakpoint {
+        .filter(|ttl| matches!(*ttl, "5m" | "1h"))
+        .map(str::to_string);
+    Some(tiygate_core::PromptCacheBreakpoint {
         mode: tiygate_core::PromptCacheBreakpointMode::Explicit,
+        ttl,
     })
 }
 
 const ANTHROPIC_SOURCE_TYPE_KEY: &str = "anthropic_source_type";
 
+fn anthropic_cache_control(
+    breakpoint: &Option<tiygate_core::PromptCacheBreakpoint>,
+) -> Option<Value> {
+    let breakpoint = breakpoint.as_ref()?;
+    let mut cache = json!({"type": "ephemeral"});
+    if let Some(ttl) = breakpoint.ttl.as_deref() {
+        cache["ttl"] = Value::String(ttl.to_string());
+    }
+    Some(cache)
+}
+
+fn is_supported_anthropic_image_mime(mime_type: &str) -> bool {
+    matches!(
+        mime_type.trim().to_ascii_lowercase().as_str(),
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    )
+}
+
 fn is_image_mime(mime_type: &str) -> bool {
-    mime_type.starts_with("image/") || mime_type == "image/*"
+    is_supported_anthropic_image_mime(mime_type) || mime_type.trim().eq_ignore_ascii_case("image/*")
+}
+
+fn is_supported_anthropic_media(
+    source: &tiygate_core::ir::MediaSource,
+    mime_type: &str,
+    metadata: &std::collections::HashMap<String, Value>,
+) -> bool {
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+    match source {
+        // Inline media is base64 by definition. Anthropic accepts concrete
+        // image types and PDF bytes; plain text has a distinct `text` source
+        // shape and is only valid when that provenance was preserved.
+        tiygate_core::ir::MediaSource::Inline { .. } => {
+            is_supported_anthropic_image_mime(&mime_type)
+                || mime_type == "application/pdf"
+                || (mime_type == "text/plain"
+                    && metadata
+                        .get(ANTHROPIC_SOURCE_TYPE_KEY)
+                        .and_then(Value::as_str)
+                        == Some("text"))
+        }
+        // URL sources are currently defined for images and PDFs. URL text
+        // is not a Messages document source variant.
+        tiygate_core::ir::MediaSource::Url { .. } => {
+            is_supported_anthropic_image_mime(&mime_type)
+                || mime_type == "image/*"
+                || mime_type == "application/pdf"
+        }
+        // A file ID's MIME type is established by the provider workspace;
+        // image/* is therefore a valid fallback for image file blocks.
+        tiygate_core::ir::MediaSource::FileId { .. } => {
+            is_supported_anthropic_image_mime(&mime_type)
+                || mime_type == "image/*"
+                || mime_type == "application/pdf"
+                || mime_type == "text/plain"
+        }
+    }
+}
+
+fn validate_anthropic_request(ir: &IrRequest) -> Result<(), Error> {
+    for message in &ir.messages {
+        for content in &message.content {
+            match content {
+                Content::Media {
+                    source,
+                    mime_type,
+                    metadata,
+                    prompt_cache_breakpoint,
+                } => {
+                    if !is_supported_anthropic_media(source, mime_type, metadata) {
+                        return Err(Error::Codec(format!(
+                            "unsupported Anthropic media source/mime combination: {:?} / {}",
+                            source, mime_type
+                        )));
+                    }
+                    if let Some(ttl) = prompt_cache_breakpoint
+                        .as_ref()
+                        .and_then(|breakpoint| breakpoint.ttl.as_deref())
+                    {
+                        if !matches!(ttl, "5m" | "1h") {
+                            return Err(Error::Codec(format!(
+                                "unsupported Anthropic prompt cache TTL: {ttl}"
+                            )));
+                        }
+                    }
+                }
+                Content::Text {
+                    prompt_cache_breakpoint,
+                    ..
+                } => {
+                    if let Some(ttl) = prompt_cache_breakpoint
+                        .as_ref()
+                        .and_then(|breakpoint| breakpoint.ttl.as_deref())
+                    {
+                        if !matches!(ttl, "5m" | "1h") {
+                            return Err(Error::Codec(format!(
+                                "unsupported Anthropic prompt cache TTL: {ttl}"
+                            )));
+                        }
+                    }
+                }
+                Content::Reasoning {
+                    text,
+                    encrypted_content: Some(_),
+                    encrypted_content_source,
+                    ..
+                } => {
+                    let source = encrypted_content_source.or_else(|| {
+                        (ir.ingress_protocol.suite == ProtocolSuite::AnthropicMessages)
+                            .then_some(EncryptedReasoningSource::AnthropicRedactedThinking)
+                    });
+                    if source == Some(EncryptedReasoningSource::OpenAiResponses) {
+                        return Err(Error::Codec(
+                            "OpenAI Responses encrypted reasoning cannot be sent to Anthropic Messages"
+                                .to_string(),
+                        ));
+                    }
+                    if !text.is_empty() {
+                        return Err(Error::Codec(
+                            "encrypted reasoning with visible text cannot be sent to Anthropic Messages"
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn decode_anthropic_media(block: &Value, block_type: &str) -> Option<Content> {
@@ -171,7 +302,11 @@ fn encode_anthropic_media(
     metadata: &std::collections::HashMap<String, Value>,
     prompt_cache_breakpoint: &Option<tiygate_core::PromptCacheBreakpoint>,
 ) -> Option<Value> {
-    let image = is_image_mime(mime_type);
+    if !is_supported_anthropic_media(source, mime_type, metadata) {
+        return None;
+    }
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+    let image = is_image_mime(&mime_type);
     let block_type = if image { "image" } else { "document" };
     let source = match source {
         tiygate_core::ir::MediaSource::Inline { data }
@@ -209,8 +344,8 @@ fn encode_anthropic_media(
             block[key] = value.clone();
         }
     }
-    if prompt_cache_breakpoint.is_some() {
-        block["cache_control"] = json!({"type": "ephemeral"});
+    if let Some(cache_control) = anthropic_cache_control(prompt_cache_breakpoint) {
+        block["cache_control"] = cache_control;
     }
     Some(block)
 }
@@ -418,6 +553,7 @@ impl EndpointCodec for MessagesCodec {
                                     signature: block["signature"].as_str().map(|s| s.to_string()),
                                     id: None,
                                     encrypted_content: None,
+                                    encrypted_content_source: None,
                                 });
                             }
                             Some("redacted_thinking") => {
@@ -429,6 +565,9 @@ impl EndpointCodec for MessagesCodec {
                                     signature: None,
                                     id: None,
                                     encrypted_content: block["data"].as_str().map(String::from),
+                                    encrypted_content_source: Some(
+                                        EncryptedReasoningSource::AnthropicRedactedThinking,
+                                    ),
                                 });
                             }
                             Some("tool_use") => {
@@ -654,9 +793,24 @@ impl EndpointCodec for MessagesCodec {
                     text,
                     signature,
                     encrypted_content,
+                    encrypted_content_source,
                     ..
                 } => {
                     if let Some(encrypted) = encrypted_content {
+                        if *encrypted_content_source
+                            == Some(EncryptedReasoningSource::OpenAiResponses)
+                        {
+                            return Err(Error::Codec(
+                                "OpenAI Responses encrypted reasoning cannot be encoded as Anthropic redacted_thinking"
+                                    .to_string(),
+                            ));
+                        }
+                        if !text.is_empty() {
+                            return Err(Error::Codec(
+                                "encrypted reasoning with visible text cannot be encoded as Anthropic redacted_thinking"
+                                    .to_string(),
+                            ));
+                        }
                         // Redacted thinking: emit as redacted_thinking block
                         // with the opaque encrypted data.
                         content_blocks.push(json!({
@@ -751,6 +905,7 @@ impl EndpointCodec for MessagesCodec {
         &self,
         ir: &IrRequest,
     ) -> Result<(serde_json::Value, HeaderMap), tiygate_core::Error> {
+        validate_anthropic_request(ir)?;
         tiygate_core::protocol::structured_output::validate_response_format_for_target(
             ir.response_format.as_ref(),
             self.id(),
@@ -831,8 +986,9 @@ impl EndpointCodec for MessagesCodec {
                         ..
                     } => {
                         let mut block = json!({"type": "text", "text": text});
-                        if prompt_cache_breakpoint.is_some() {
-                            block["cache_control"] = json!({"type": "ephemeral"});
+                        if let Some(cache_control) = anthropic_cache_control(prompt_cache_breakpoint)
+                        {
+                            block["cache_control"] = cache_control;
                         }
                         Some(block)
                     }
@@ -928,7 +1084,10 @@ impl EndpointCodec for MessagesCodec {
                 if inject_cache && idx + 1 == merged_count {
                     if let Some(last) = blocks.last_mut() {
                         if let Some(obj) = last.as_object_mut() {
-                            obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+                            // Do not replace an explicit breakpoint: it may
+                            // carry the caller's `ttl` (5m or 1h).
+                            obj.entry("cache_control".to_string())
+                                .or_insert_with(|| json!({ "type": "ephemeral" }));
                         }
                     }
                 }
@@ -1113,6 +1272,7 @@ impl EndpointCodec for MessagesCodec {
                             signature: block["signature"].as_str().map(|s| s.to_string()),
                             id: None,
                             encrypted_content: None,
+                            encrypted_content_source: None,
                         });
                     }
                     // Anthropic may return `redacted_thinking` blocks when portions
@@ -1127,6 +1287,9 @@ impl EndpointCodec for MessagesCodec {
                             signature: None,
                             id: None,
                             encrypted_content: encrypted,
+                            encrypted_content_source: Some(
+                                EncryptedReasoningSource::AnthropicRedactedThinking,
+                            ),
                         });
                     }
                     Some("tool_use") => {
@@ -1383,9 +1546,18 @@ impl StreamEncoder for MessagesStreamEncoder {
             StreamPart::ReasoningDelta {
                 text,
                 encrypted_content,
+                encrypted_content_source,
                 ..
             } => {
                 if let Some(data) = encrypted_content {
+                    if *encrypted_content_source == Some(EncryptedReasoningSource::OpenAiResponses)
+                        || !text.is_empty()
+                    {
+                        return Err(Error::Codec(
+                            "encrypted reasoning cannot be losslessly encoded as Anthropic redacted_thinking"
+                                .to_string(),
+                        ));
+                    }
                     // Redacted thinking is opaque and is carried in the
                     // content-block opener, not as a plaintext thinking delta.
                     let mut out = self.close_block();
@@ -1714,6 +1886,7 @@ impl StreamDecoder for MessagesStreamDecoder {
                                 text: thinking.to_string(),
                                 id: None,
                                 encrypted_content: None,
+                                encrypted_content_source: None,
                             });
                         }
                     }
@@ -1723,6 +1896,9 @@ impl StreamDecoder for MessagesStreamDecoder {
                                 text: String::new(),
                                 id: None,
                                 encrypted_content: Some(data.to_string()),
+                                encrypted_content_source: Some(
+                                    EncryptedReasoningSource::AnthropicRedactedThinking,
+                                ),
                             });
                         }
                     }
@@ -1757,6 +1933,7 @@ impl StreamDecoder for MessagesStreamDecoder {
                                 text: thinking.to_string(),
                                 id: None,
                                 encrypted_content: None,
+                                encrypted_content_source: None,
                             });
                         }
                     }
@@ -1766,6 +1943,9 @@ impl StreamDecoder for MessagesStreamDecoder {
                                 text: String::new(),
                                 id: None,
                                 encrypted_content: Some(data.to_string()),
+                                encrypted_content_source: Some(
+                                    EncryptedReasoningSource::AnthropicRedactedThinking,
+                                ),
                             });
                         }
                     }
@@ -2254,6 +2434,102 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_cache_control_ttl_roundtrip() {
+        let codec = MessagesCodec::new();
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "cached prefix",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }]
+        });
+        let ir = codec.decode_request(body, &make_raw_envelope()).unwrap();
+        let breakpoint = match &ir.messages[0].content[0] {
+            Content::Text {
+                prompt_cache_breakpoint: Some(breakpoint),
+                ..
+            } => breakpoint,
+            other => panic!("expected cached text block, got {other:?}"),
+        };
+        assert_eq!(breakpoint.ttl.as_deref(), Some("1h"));
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(
+            encoded["messages"][0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+    }
+
+    #[test]
+    fn test_anthropic_encoder_rejects_unsupported_media_mime() {
+        let codec = MessagesCodec::new();
+        let mut ir = codec
+            .decode_request(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "describe this"}]
+                }),
+                &make_raw_envelope(),
+            )
+            .unwrap();
+        ir.messages[0].content.push(Content::Media {
+            source: tiygate_core::ir::MediaSource::Inline {
+                data: "UklGRg==".to_string(),
+            },
+            mime_type: "audio/wav".to_string(),
+            metadata: std::collections::HashMap::new(),
+            prompt_cache_breakpoint: None,
+        });
+        assert!(codec.encode_request(&ir).is_err());
+    }
+
+    #[test]
+    fn test_messages_encoder_rejects_responses_encrypted_reasoning() {
+        let codec = MessagesCodec::new();
+        let mut ir = codec
+            .decode_request(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "continue"}]
+                }),
+                &make_raw_envelope(),
+            )
+            .unwrap();
+        ir.ingress_protocol =
+            ProtocolEndpoint::new(ProtocolSuite::OpenAiResponses, "responses", "v1");
+        ir.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![Content::Reasoning {
+                text: "summary".to_string(),
+                signature: None,
+                id: Some("rs_1".to_string()),
+                encrypted_content: Some("openai-encrypted".to_string()),
+                encrypted_content_source: Some(EncryptedReasoningSource::OpenAiResponses),
+            }],
+        });
+        assert!(codec.encode_request(&ir).is_err());
+    }
+
+    #[test]
+    fn test_messages_stream_encoder_rejects_responses_encrypted_reasoning() {
+        let mut encoder = MessagesStreamEncoder::new();
+        let result = encoder.encode_part(&StreamPart::ReasoningDelta {
+            text: "summary".to_string(),
+            id: None,
+            encrypted_content: Some("openai-encrypted".to_string()),
+            encrypted_content_source: Some(EncryptedReasoningSource::OpenAiResponses),
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_encode_response_non_streaming() {
         let codec = MessagesCodec::new();
         let ir = IrResponse {
@@ -2339,6 +2615,7 @@ mod tests {
                 text: "think".to_string(),
                 id: None,
                 encrypted_content: None,
+                encrypted_content_source: None,
             },
             StreamPart::ToolCallDelta {
                 id: "tc1".to_string(),
@@ -2785,6 +3062,7 @@ mod tests {
                             signature: None,
                             id: None,
                             encrypted_content: None,
+                            encrypted_content_source: None,
                         },
                         Content::Text {
                             text: "answer A".to_string(),
@@ -2802,6 +3080,7 @@ mod tests {
                             signature: Some("sig_xyz".to_string()),
                             id: None,
                             encrypted_content: None,
+                            encrypted_content_source: None,
                         },
                         Content::Text {
                             text: "answer B".to_string(),
@@ -2988,6 +3267,8 @@ mod tests {
             Content::Reasoning {
                 text,
                 encrypted_content: Some(data),
+                encrypted_content_source:
+                    Some(EncryptedReasoningSource::AnthropicRedactedThinking),
                 ..
             } if text.is_empty() && data == "opaque-data"
         ));

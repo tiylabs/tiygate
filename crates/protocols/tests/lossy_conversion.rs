@@ -10,7 +10,8 @@
 
 use std::collections::HashMap;
 use tiygate_core::ir::{
-    Content, MediaSource, PromptCacheBreakpoint, PromptCacheBreakpointMode, ResponseFormat,
+    Content, EncryptedReasoningSource, MediaSource, PromptCacheBreakpoint,
+    PromptCacheBreakpointMode, ResponseFormat,
 };
 use tiygate_core::protocol::lossy::{check_lossy_conversion, LossyDimension};
 use tiygate_core::{
@@ -143,6 +144,17 @@ fn with_reasoning(req: &mut IrRequest) {
         signature: None,
         id: None,
         encrypted_content: None,
+        encrypted_content_source: None,
+    });
+}
+
+fn with_encrypted_reasoning(req: &mut IrRequest, source: EncryptedReasoningSource) {
+    req.messages[0].content.push(Content::Reasoning {
+        text: String::new(),
+        signature: None,
+        id: None,
+        encrypted_content: Some("opaque".to_string()),
+        encrypted_content_source: Some(source),
     });
 }
 
@@ -270,7 +282,20 @@ fn url_media_to_chat_completions_accepted() {
 fn file_id_media_to_responses_accepted() {
     let mut req = text_only_req();
     with_file_id_media(&mut req);
+    req.ingress_protocol = responses_endpoint();
     assert!(check_lossy_conversion(&req, &responses_endpoint(), &responses_caps()).is_ok());
+}
+
+#[test]
+fn anthropic_file_id_media_to_responses_rejected() {
+    let mut req = text_only_req();
+    with_file_id_media(&mut req);
+    req.ingress_protocol = anthropic_endpoint();
+    let err = check_lossy_conversion(&req, &responses_endpoint(), &responses_caps());
+    assert_eq!(
+        extract_dim(&err),
+        Some(LossyDimension::MediaSourceUnsupported)
+    );
 }
 
 #[test]
@@ -300,6 +325,24 @@ fn data_url_parsed_as_inline_passes_anthropic_lossy() {
     let mut req = text_only_req();
     with_data_url_media(&mut req);
     assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
+}
+
+#[test]
+fn unsupported_inline_audio_to_anthropic_is_rejected() {
+    let mut req = text_only_req();
+    req.messages[0].content.push(Content::Media {
+        source: MediaSource::Inline {
+            data: "UklGRg==".to_string(),
+        },
+        mime_type: "audio/wav".to_string(),
+        metadata: HashMap::new(),
+        prompt_cache_breakpoint: None,
+    });
+    let err = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps());
+    assert_eq!(
+        extract_dim(&err),
+        Some(LossyDimension::MediaSourceUnsupported)
+    );
 }
 
 // --- Dimension 6: structured output ---
@@ -368,6 +411,27 @@ fn reasoning_to_anthropic_passes() {
     assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
 }
 
+#[test]
+fn responses_encrypted_reasoning_to_anthropic_rejected() {
+    let mut req = text_only_req();
+    req.ingress_protocol = responses_endpoint();
+    with_encrypted_reasoning(&mut req, EncryptedReasoningSource::OpenAiResponses);
+    let err = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps());
+    assert_eq!(extract_dim(&err), Some(LossyDimension::ExtendedReasoning));
+}
+
+#[test]
+fn anthropic_redacted_reasoning_to_responses_rejected() {
+    let mut req = text_only_req();
+    req.ingress_protocol = anthropic_endpoint();
+    with_encrypted_reasoning(
+        &mut req,
+        EncryptedReasoningSource::AnthropicRedactedThinking,
+    );
+    let err = check_lossy_conversion(&req, &responses_endpoint(), &responses_caps());
+    assert_eq!(extract_dim(&err), Some(LossyDimension::ExtendedReasoning));
+}
+
 // --- Sanity ---
 
 #[test]
@@ -411,7 +475,36 @@ fn hosted_and_programmatic_tools_are_rejected_outside_responses() {
     let (dimension, _) =
         check_lossy_conversion(&hosted, &chat_endpoint(), &chat_caps()).unwrap_err();
     assert_eq!(dimension, LossyDimension::HostedTools);
-    assert!(check_lossy_conversion(&hosted, &responses_endpoint(), &responses_caps()).is_ok());
+    let (dimension, _) =
+        check_lossy_conversion(&hosted, &responses_endpoint(), &responses_caps()).unwrap_err();
+    assert_eq!(
+        dimension,
+        LossyDimension::HostedTools,
+        "hosted tool types are only portable within the Responses protocol"
+    );
+
+    let anthropic = MessagesCodec::new();
+    let ir = anthropic
+        .decode_request(
+            serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 100,
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "messages": [{"role": "user", "content": "search"}]
+            }),
+            &tiygate_core::RawEnvelope {
+                method: "POST".to_string(),
+                path: "/v1/messages".to_string(),
+                headers: HashMap::new(),
+                body: None,
+                original_body_size: 0,
+                timestamp: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+    let (dimension, _) =
+        check_lossy_conversion(&ir, &responses_endpoint(), &responses_caps()).unwrap_err();
+    assert_eq!(dimension, LossyDimension::HostedTools);
 
     let mut allowed_callers = text_only_req();
     allowed_callers.tools.push(Tool {
@@ -545,6 +638,7 @@ fn prompt_cache_breakpoint_rejected_outside_openai() {
         annotations: None,
         prompt_cache_breakpoint: Some(PromptCacheBreakpoint {
             mode: PromptCacheBreakpointMode::Explicit,
+            ttl: None,
         }),
     });
 
