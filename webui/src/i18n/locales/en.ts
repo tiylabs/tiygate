@@ -186,6 +186,7 @@ const en = {
     apiBase: "API base",
     usage: {
       loading: "Loading…",
+      accountInfo: "Show account information",
       resetAfter: {
         daysHours: "Reset in {{days}}d {{hours}}h",
         days: "Reset in {{days}}d",

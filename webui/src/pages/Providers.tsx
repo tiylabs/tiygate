@@ -391,9 +391,13 @@ function ResetCreditsControl({
   const resetCredits: ProviderResetCredits | undefined = usage?.reset_credits ?? undefined;
   if (loading && !usage) {
     return (
-      <div className="col-span-2 text-[10px] text-text-subtle">
-        {t("providers.usage.resetCredits.loading")}
-      </div>
+      <span
+        className="text-text-subtle"
+        aria-label={t("providers.usage.resetCredits.loading")}
+        title={t("providers.usage.resetCredits.loading")}
+      >
+        …
+      </span>
     );
   }
   if (usage?.state !== "available" || !resetCredits) return null;
@@ -421,15 +425,15 @@ function ResetCreditsControl({
 
   return (
     <>
-      <div className="col-span-2 flex min-w-0 items-center gap-1 text-[10px] leading-4">
-        <span className="text-text-muted">
+      <div className="inline-flex shrink-0 items-center gap-1 text-[10px] leading-4">
+        <span className="whitespace-nowrap text-text-muted">
           {t("providers.usage.resetCredits.label")}
         </span>
         <span className="font-mono font-medium text-text">{availableCount}</span>
         <Tooltip content={expiryInfo} side="top">
           <button
             type="button"
-            className="inline-flex h-4 w-4 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             aria-label={t("providers.usage.resetCredits.expirationInfo")}
           >
             <Info size={11} />
@@ -439,7 +443,7 @@ function ResetCreditsControl({
           type="button"
           size="sm"
           variant="ghost"
-          className="!min-h-5 !px-1.5 !py-0 text-[10px]"
+          className="!min-h-5 !px-1.5 !py-0 whitespace-nowrap text-[10px]"
           icon={<RotateCcw size={11} />}
           loading={consumeMutation.isPending}
           disabled={availableCount <= 0}
@@ -944,18 +948,29 @@ export default function Providers() {
                         </div>
                       ) : null}
                       {supportsOAuthUsage(p) ? (
-                        <div className="mt-1.5 grid min-w-[16rem] grid-cols-2 gap-x-3 gap-y-1.5">
+                        <div className="mt-1.5 grid min-w-[16rem] grid-cols-2 gap-x-3 gap-y-1">
                           {(() => {
                             const usageQuery = usageByProvider.get(p.id);
                             const usage = usageQuery?.data;
-                            const accountEmail = usage?.account_email;
+                            const accountEmail = usage?.account_email?.trim() || undefined;
                             const planType = formatPlanType(usage?.plan_type);
                             const windows = providerUsageWindows(usage);
                             const visibleWindows =
                               windows.length > 0 ? windows : [undefined];
+                            const accountInfo = accountEmail ? (
+                              <span className="break-all font-mono text-[10px]">
+                                {accountEmail}
+                              </span>
+                            ) : (
+                              <span>
+                                {usageQuery?.isFetching
+                                  ? t("providers.usage.loading")
+                                  : t("providers.usage.unavailable")}
+                              </span>
+                            );
                             return (
                               <>
-                                <div className="col-span-2 flex min-w-0 items-center gap-1 text-[10px] leading-4">
+                                <div className="col-span-2 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[10px] leading-4">
                                   {planType ? (
                                     <Badge
                                       tone="primary"
@@ -965,15 +980,23 @@ export default function Providers() {
                                       {planType}
                                     </Badge>
                                   ) : null}
-                                  <span
-                                    className="min-w-0 truncate font-mono text-[10px] text-text-muted"
-                                    title={accountEmail ?? undefined}
-                                  >
-                                    {accountEmail ??
-                                      (usageQuery?.isFetching
-                                        ? t("providers.usage.loading")
-                                        : "—")}
-                                  </span>
+                                  <Tooltip content={accountInfo} side="top">
+                                    <button
+                                      type="button"
+                                      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                      aria-label={t("providers.usage.accountInfo")}
+                                    >
+                                      <Info size={12} />
+                                    </button>
+                                  </Tooltip>
+                                  {p.vendor === "openai" ? (
+                                    <ResetCreditsControl
+                                      providerId={p.id}
+                                      usage={usage}
+                                      loading={usageQuery?.isFetching ?? true}
+                                      t={t}
+                                    />
+                                  ) : null}
                                 </div>
                                 {visibleWindows.map((window, index) => (
                                   <UsageWindow
@@ -986,14 +1009,6 @@ export default function Providers() {
                                     t={t}
                                   />
                                 ))}
-                                {p.vendor === "openai" ? (
-                                  <ResetCreditsControl
-                                    providerId={p.id}
-                                    usage={usage}
-                                    loading={usageQuery?.isFetching ?? true}
-                                    t={t}
-                                  />
-                                ) : null}
                               </>
                             );
                           })()}
