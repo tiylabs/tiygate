@@ -481,12 +481,14 @@ function UsageWindowSummary({
   window,
   loading,
   state,
+  index,
   t,
 }: {
   label: string;
   window?: ProviderUsageWindow | null;
   loading: boolean;
   state?: ProviderUsage["state"];
+  index: number;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
   const remaining = usageWindowRemainingPercent(window);
@@ -502,17 +504,26 @@ function UsageWindowSummary({
     : "—";
 
   return (
-    <div className="min-w-0">
-      <div className="flex min-w-0 items-center text-[10px] leading-4">
-        <span className="min-w-0 truncate font-medium text-text">
-          {label} · {remainingLabel}
-        </span>
-      </div>
-      <div
-        className="truncate text-[9px] leading-3 text-text-subtle"
-        title={isAvailable ? resetAt : undefined}
-      >
-        {isAvailable ? resetAt : fallback}
+    <div className="flex min-w-0 items-start gap-2">
+      <span
+        className={cn(
+          "mt-1 h-2 w-2 shrink-0 rounded-full",
+          index === 0 ? "bg-primary" : "bg-info",
+        )}
+        aria-hidden="true"
+      />
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center text-[10px] leading-4">
+          <span className="min-w-0 truncate font-medium text-text">
+            {label} · {remainingLabel}
+          </span>
+        </div>
+        <div
+          className="truncate text-[9px] leading-3 text-text-subtle"
+          title={isAvailable ? resetAt : undefined}
+        >
+          {isAvailable ? resetAt : fallback}
+        </div>
       </div>
     </div>
   );
@@ -561,10 +572,6 @@ function OpenAiUsageLayout({
   const hasMultipleWindows = ringWindows.length > 1;
   const firstUsed = usageWindowPercent(ringWindows[0]);
   const secondUsed = usageWindowPercent(ringWindows[1]);
-  const firstStroke =
-    firstUsed != null && firstUsed >= 90 ? "var(--danger)" : "var(--primary)";
-  const secondStroke =
-    secondUsed != null && secondUsed >= 90 ? "var(--danger)" : "var(--info)";
   const accountInfo = accountEmail ? (
     <span className="break-all font-mono text-[10px]">{accountEmail}</span>
   ) : (
@@ -573,7 +580,7 @@ function OpenAiUsageLayout({
 
   return (
     <div className="flex min-w-0 items-center gap-2.5">
-      <div className="relative grid h-[4.5rem] w-[4.5rem] shrink-0 place-items-center">
+      <div className="relative grid h-16 w-16 shrink-0 place-items-center">
         <svg
           viewBox="0 0 80 80"
           className="pointer-events-none absolute inset-0 h-full w-full -rotate-90"
@@ -595,7 +602,7 @@ function OpenAiUsageLayout({
                 cy="40"
                 r="31"
                 fill="none"
-                stroke={firstStroke}
+                stroke="var(--primary)"
                 strokeWidth="5"
                 strokeLinecap="round"
                 pathLength="100"
@@ -617,7 +624,7 @@ function OpenAiUsageLayout({
                 cy="40"
                 r="22"
                 fill="none"
-                stroke={secondStroke}
+                stroke="var(--info)"
                 strokeWidth="6"
                 strokeLinecap="round"
                 pathLength="100"
@@ -642,7 +649,7 @@ function OpenAiUsageLayout({
                 cy="40"
                 r="29"
                 fill="none"
-                stroke={firstStroke}
+                stroke="var(--primary)"
                 strokeWidth="5"
                 strokeLinecap="round"
                 pathLength="100"
@@ -689,6 +696,7 @@ function OpenAiUsageLayout({
               window={window}
               loading={loading}
               state={usage?.state}
+              index={index}
               t={t}
             />
           ))}
