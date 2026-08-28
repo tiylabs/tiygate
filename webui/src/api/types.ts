@@ -97,8 +97,8 @@ export interface ProviderUsage {
 
 export interface ProviderResetCreditsConsumeResponse {
   provider_id: string;
-  code?: string | null;
-  windows_reset?: number | null;
+  code: string;
+  windows_reset: number | null;
 }
 
 export interface ProviderCatalogEntry {

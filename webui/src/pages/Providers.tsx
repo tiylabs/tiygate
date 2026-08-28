@@ -353,6 +353,17 @@ function formatResetCreditExpiry(value: string): string {
   }).format(date);
 }
 
+function newResetCreditRequestId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function ResetCreditsControl({
   providerId,
   usage,
@@ -367,9 +378,12 @@ function ResetCreditsControl({
   const queryClient = useQueryClient();
   const toast = useToast();
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const pendingRequestIdRef = useRef<string | null>(null);
   const consumeMutation = useMutation({
-    mutationFn: () => providersApi.consumeResetCredits(providerId),
+    mutationFn: (redeemRequestId: string) =>
+      providersApi.consumeResetCredits(providerId, redeemRequestId),
     onSuccess: (result) => {
+      pendingRequestIdRef.current = null;
       setConfirmOpen(false);
       void queryClient.invalidateQueries({
         queryKey: ["provider-usage", providerId],
@@ -447,14 +461,20 @@ function ResetCreditsControl({
           icon={<RotateCcw size={11} />}
           loading={consumeMutation.isPending}
           disabled={availableCount <= 0}
-          onClick={() => setConfirmOpen(true)}
+          onClick={() => {
+            pendingRequestIdRef.current = newResetCreditRequestId();
+            setConfirmOpen(true);
+          }}
         >
           {t("providers.usage.resetCredits.consume")}
         </Button>
       </div>
       <ConfirmDialog
         open={confirmOpen}
-        onOpenChange={setConfirmOpen}
+        onOpenChange={(open) => {
+          setConfirmOpen(open);
+          if (!open) pendingRequestIdRef.current = null;
+        }}
         title={t("providers.usage.resetCredits.confirmTitle")}
         description={t("providers.usage.resetCredits.confirmDescription", {
           count: availableCount,
@@ -463,7 +483,12 @@ function ResetCreditsControl({
         cancelLabel={t("common.cancel")}
         destructive
         loading={consumeMutation.isPending}
-        onConfirm={() => consumeMutation.mutate()}
+        onConfirm={() => {
+          const redeemRequestId =
+            pendingRequestIdRef.current ?? newResetCreditRequestId();
+          pendingRequestIdRef.current = redeemRequestId;
+          consumeMutation.mutate(redeemRequestId);
+        }}
       />
     </>
   );

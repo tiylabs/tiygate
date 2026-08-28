@@ -48,6 +48,7 @@ const OPENAI_CODEX_SEC_FETCH_SITE: &str = "none";
 const OPENAI_CODEX_SEC_FETCH_MODE: &str = "no-cors";
 const OPENAI_CODEX_SEC_FETCH_DEST: &str = "empty";
 const OPENAI_CODEX_PRIORITY: &str = "u=4, i";
+const OPENAI_CODEX_RESET_CREDITS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Claude subscription usage endpoint. Anthropic currently exposes this only
 /// for OAuth credentials carrying the `user:profile` scope.
 const ANTHROPIC_OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -163,6 +164,11 @@ struct ProviderResetCredits {
     credits: Vec<ProviderResetCredit>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProviderResetCreditsConsumeRequest {
+    redeem_request_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ProviderUsageResponse {
     provider_id: String,
@@ -181,7 +187,7 @@ struct ProviderUsageResponse {
 #[derive(Debug, Clone, Serialize)]
 struct ProviderResetCreditsConsumeResponse {
     provider_id: String,
-    code: Option<String>,
+    code: String,
     windows_reset: Option<i64>,
 }
 
@@ -621,6 +627,24 @@ async fn query_openai_reset_credits(
     client: &reqwest::Client,
     headers: &reqwest::header::HeaderMap,
 ) -> Option<ProviderResetCredits> {
+    match tokio::time::timeout(
+        OPENAI_CODEX_RESET_CREDITS_TIMEOUT,
+        query_openai_reset_credits_inner(client, headers),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::debug!("OpenAI OAuth reset-credit query timed out; keeping usage response");
+            None
+        }
+    }
+}
+
+async fn query_openai_reset_credits_inner(
+    client: &reqwest::Client,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<ProviderResetCredits> {
     let mut request = client
         .get(OPENAI_CODEX_RESET_CREDITS_URL)
         .header(reqwest::header::ACCEPT, "application/json");
@@ -653,6 +677,46 @@ async fn query_openai_reset_credits(
         }
     };
     parse_reset_credits(&value)
+}
+
+fn parse_reset_credits_consume_response(
+    provider_id: &str,
+    body: &str,
+) -> Result<ProviderResetCreditsConsumeResponse, String> {
+    let response_body =
+        serde_json::from_str::<Value>(body).map_err(|error| format!("invalid JSON: {error}"))?;
+    let code = response_body
+        .get("code")
+        .or_else(|| response_body.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|code| !code.trim().is_empty())
+        .ok_or_else(|| "reset-credit response has no code".to_string())?;
+    let windows_reset = response_body
+        .get("windows_reset")
+        .or_else(|| response_body.get("windowsReset"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|raw| raw.trim().parse().ok()))
+        });
+    Ok(ProviderResetCreditsConsumeResponse {
+        provider_id: provider_id.to_string(),
+        code,
+        windows_reset,
+    })
+}
+
+fn require_reset_credit_success(
+    response: ProviderResetCreditsConsumeResponse,
+) -> Result<ProviderResetCreditsConsumeResponse, AdminError> {
+    if !response.code.eq_ignore_ascii_case("reset") {
+        return Err(AdminError::Conflict(format!(
+            "OpenAI reset-credit consume returned code '{}'",
+            response.code
+        )));
+    }
+    Ok(response)
 }
 
 async fn prepare_oauth_usage_request(
@@ -928,7 +992,14 @@ async fn provider_usage(
 async fn provider_usage_reset_credits(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    Json(request): Json<ProviderResetCreditsConsumeRequest>,
 ) -> Result<Json<ProviderResetCreditsConsumeResponse>, AdminError> {
+    let redeem_request_id = request.redeem_request_id.trim();
+    if redeem_request_id.is_empty() {
+        return Err(AdminError::BadRequest(
+            "redeem_request_id must not be empty".to_string(),
+        ));
+    }
     let provider = state
         .store
         .get_provider(&id)
@@ -963,7 +1034,6 @@ async fn provider_usage_reset_credits(
         AdminError::Internal("OAuth token unavailable for reset-credit consume".to_string())
     })?;
 
-    let redeem_request_id = Uuid::now_v7().to_string();
     let mut request = client
         .post(OPENAI_CODEX_RESET_CREDITS_CONSUME_URL)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -995,26 +1065,9 @@ async fn provider_usage_reset_credits(
         )));
     }
 
-    let response_body = serde_json::from_str::<Value>(&body)
+    let response_body = parse_reset_credits_consume_response(&id, &body)
         .map_err(|error| AdminError::Internal(format!("invalid reset-credit response: {error}")))?;
-    let code = response_body
-        .get("code")
-        .or_else(|| response_body.get("status"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let windows_reset = response_body
-        .get("windows_reset")
-        .or_else(|| response_body.get("windowsReset"))
-        .and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_str().and_then(|raw| raw.trim().parse().ok()))
-        });
-    Ok(Json(ProviderResetCreditsConsumeResponse {
-        provider_id: id,
-        code,
-        windows_reset,
-    }))
+    Ok(Json(require_reset_credit_success(response_body)?))
 }
 
 /// Discover models available on a provider's upstream API.
@@ -3348,6 +3401,8 @@ pub enum AdminError {
     NotFound(String),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -3380,6 +3435,10 @@ impl IntoResponse for AdminError {
             AdminError::BadRequest(_) => (
                 StatusCode::BAD_REQUEST,
                 json!({"error": {"message": self.to_string(), "type": "bad_request", "source": "gateway"}}),
+            ),
+            AdminError::Conflict(_) => (
+                StatusCode::CONFLICT,
+                json!({"error": {"message": self.to_string(), "type": "conflict", "source": "gateway"}}),
             ),
             AdminError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3589,6 +3648,29 @@ mod tests {
         let empty = parse_reset_credits(&json!([])).expect("empty reset credits JSON");
         assert_eq!(empty.available_count, 0);
         assert!(empty.credits.is_empty());
+    }
+
+    #[test]
+    fn parses_reset_credit_consume_outcomes() {
+        let reset = parse_reset_credits_consume_response(
+            "openai-provider",
+            &json!({"code": "reset", "windows_reset": 2}).to_string(),
+        )
+        .expect("reset-credit consume JSON");
+        assert_eq!(reset.provider_id, "openai-provider");
+        assert_eq!(reset.code, "reset");
+        assert_eq!(reset.windows_reset, Some(2));
+
+        let no_credit = parse_reset_credits_consume_response(
+            "openai-provider",
+            &json!({"code": "no_credit", "windows_reset": 0}).to_string(),
+        )
+        .expect("no-credit consume JSON");
+        assert_eq!(no_credit.code, "no_credit");
+        assert_eq!(no_credit.windows_reset, Some(0));
+        let error = require_reset_credit_success(no_credit).expect_err("no-credit must fail");
+        assert!(matches!(error, AdminError::Conflict(message) if message.contains("no_credit")));
+        assert!(parse_reset_credits_consume_response("openai-provider", "{}").is_err());
     }
 
     #[test]
