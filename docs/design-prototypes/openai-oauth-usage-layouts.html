@@ -1,0 +1,1093 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light-warm">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>TiyGate · OpenAI OAuth Usage 语义化提案</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f3eee5;
+        --surface: #fffdf9;
+        --surface-raised: #ffffff;
+        --surface-muted: #f3ede2;
+        --surface-quiet: #faf6ef;
+        --border: #e5dac9;
+        --border-strong: #cfc0aa;
+        --text: #291f16;
+        --text-muted: #5e5141;
+        --text-subtle: #81725e;
+        --primary: #ad4d0a;
+        --primary-strong: #843b08;
+        --primary-soft: #f7e5d1;
+        --success: #287643;
+        --success-soft: #e6f3e8;
+        --warning: #a75b08;
+        --warning-soft: #f9ecd5;
+        --danger: #bb3525;
+        --danger-soft: #f8e3de;
+        --info: #1e688f;
+        --info-soft: #e3f0f6;
+        --ring: rgb(173 77 10 / 0.28);
+        --shadow-sm: 0 1px 2px rgb(50 35 18 / 0.06);
+        --shadow-lg: 0 18px 48px rgb(72 49 24 / 0.11);
+        --font-display: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+          "PingFang SC", "Noto Sans SC", Helvetica, Arial, sans-serif;
+        --font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+          "PingFang SC", "Noto Sans SC", Helvetica, Arial, sans-serif;
+        --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+          "Liberation Mono", monospace;
+        --short-used: 15;
+        --week-used: 9;
+      }
+
+      html[data-theme="dark"] {
+        color-scheme: dark;
+        --bg: #15110d;
+        --surface: #211b15;
+        --surface-raised: #292119;
+        --surface-muted: #31281e;
+        --surface-quiet: #261f18;
+        --border: #44372a;
+        --border-strong: #5c4a38;
+        --text: #f3ece2;
+        --text-muted: #c5b9a8;
+        --text-subtle: #9f907b;
+        --primary: #f08c4e;
+        --primary-strong: #f5ae7e;
+        --primary-soft: #49301f;
+        --success: #58c982;
+        --success-soft: #183123;
+        --warning: #efb35e;
+        --warning-soft: #392a15;
+        --danger: #f07b70;
+        --danger-soft: #3b201c;
+        --info: #5dbce9;
+        --info-soft: #162c38;
+        --ring: rgb(240 140 78 / 0.34);
+        --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.22);
+        --shadow-lg: 0 22px 54px rgb(0 0 0 / 0.3);
+      }
+
+      body[data-scenario="pressure"] {
+        --short-used: 92;
+        --week-used: 78;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+        background:
+          linear-gradient(90deg, transparent 0 49.8%, rgb(173 77 10 / 0.035) 50%, transparent 50.2%),
+          radial-gradient(circle at 12% -10%, rgb(173 77 10 / 0.13), transparent 32rem),
+          var(--bg);
+        color: var(--text);
+        font-family: var(--font-body);
+        font-size: 14px;
+        line-height: 1.5;
+      }
+
+      button, summary { font: inherit; }
+      button { color: inherit; }
+
+      button:focus-visible,
+      summary:focus-visible {
+        outline: 3px solid var(--ring);
+        outline-offset: 3px;
+      }
+
+      .page {
+        width: min(1420px, calc(100% - 48px));
+        margin: 0 auto;
+        padding: 42px 0 76px;
+      }
+
+      .page-header {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: end;
+        gap: 32px;
+        margin-bottom: 30px;
+      }
+
+      .eyebrow {
+        color: var(--primary);
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 750;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        max-width: 760px;
+        margin: 7px 0 8px;
+        font-family: var(--font-display);
+        font-size: clamp(30px, 4vw, 46px);
+        font-weight: 720;
+        letter-spacing: -0.045em;
+        line-height: 1.08;
+        text-wrap: balance;
+      }
+
+      .lede {
+        max-width: 790px;
+        margin: 0;
+        color: var(--text-muted);
+        font-size: 15px;
+      }
+
+      .header-tools {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .scenario-switch {
+        display: inline-flex;
+        padding: 4px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--surface-muted);
+      }
+
+      .scenario-switch button,
+      .theme-toggle {
+        min-height: 36px;
+        border: 0;
+        border-radius: 7px;
+        cursor: pointer;
+      }
+
+      .scenario-switch button {
+        padding: 0 11px;
+        background: transparent;
+        color: var(--text-subtle);
+        font-size: 12px;
+        font-weight: 650;
+      }
+
+      .scenario-switch button[aria-pressed="true"] {
+        background: var(--surface-raised);
+        color: var(--text);
+        box-shadow: var(--shadow-sm);
+      }
+
+      .theme-toggle {
+        display: inline-grid;
+        width: 44px;
+        place-items: center;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--text-muted);
+      }
+
+      .theme-toggle:hover { border-color: var(--border-strong); color: var(--text); }
+      .theme-toggle svg { width: 17px; height: 17px; }
+
+      .semantic-map {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 1px;
+        margin-bottom: 26px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        background: var(--border);
+      }
+
+      .semantic-map > div {
+        padding: 13px 15px;
+        background: color-mix(in srgb, var(--surface) 92%, transparent);
+      }
+
+      .semantic-map strong {
+        display: block;
+        margin-bottom: 2px;
+        font-size: 12px;
+      }
+
+      .semantic-map span {
+        color: var(--text-subtle);
+        font-size: 11px;
+      }
+
+      .proposal-list { display: grid; gap: 28px; }
+
+      .proposal {
+        overflow: hidden;
+        border: 1px solid var(--border);
+        border-radius: 17px;
+        background: var(--surface);
+        box-shadow: var(--shadow-lg);
+      }
+
+      .proposal-header {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 20px;
+        align-items: start;
+        padding: 21px 24px 17px;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .proposal-title {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+      }
+
+      .proposal-index {
+        display: grid;
+        width: 28px;
+        height: 28px;
+        place-items: center;
+        border-radius: 8px;
+        background: var(--text);
+        color: var(--surface);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-weight: 760;
+      }
+
+      h2 {
+        margin: 0;
+        font-family: var(--font-display);
+        font-size: 18px;
+        letter-spacing: -0.02em;
+      }
+
+      .proposal-header p {
+        max-width: 820px;
+        margin: 6px 0 0 39px;
+        color: var(--text-muted);
+        font-size: 13px;
+      }
+
+      .concept-tag {
+        display: inline-flex;
+        min-height: 27px;
+        align-items: center;
+        padding: 0 10px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: var(--surface-quiet);
+        color: var(--text-muted);
+        font-size: 11px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+
+      .concept-tag.recommended {
+        border-color: color-mix(in srgb, var(--success) 25%, var(--border));
+        background: var(--success-soft);
+        color: var(--success);
+      }
+
+      .demo-stage {
+        padding: 30px 24px 32px;
+        background:
+          linear-gradient(var(--border) 1px, transparent 1px),
+          linear-gradient(90deg, var(--border) 1px, transparent 1px),
+          color-mix(in srgb, var(--bg) 78%, var(--surface));
+        background-size: 24px 24px;
+      }
+
+      .table-shell {
+        border: 1px solid var(--border-strong);
+        border-radius: 12px;
+        background: var(--surface-raised);
+        box-shadow: var(--shadow-sm);
+      }
+
+      .table-head,
+      .provider-row {
+        display: grid;
+        grid-template-columns: minmax(190px, 0.8fr) minmax(520px, 2.4fr) minmax(135px, 0.55fr);
+      }
+
+      .table-head {
+        min-height: 37px;
+        align-items: center;
+        border-bottom: 1px solid var(--border);
+        color: var(--text-subtle);
+        font-family: var(--font-mono);
+        font-size: 9px;
+        font-weight: 720;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .table-head > div,
+      .provider-row > div { min-width: 0; padding-inline: 18px; }
+      .table-head > div + div,
+      .provider-row > div + div { border-left: 1px solid var(--border); }
+
+      .provider-row { min-height: 106px; align-items: center; }
+
+      .provider-cell {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+      }
+
+      .provider-mark {
+        display: grid;
+        width: 37px;
+        height: 37px;
+        flex: 0 0 auto;
+        place-items: center;
+        border-radius: 10px;
+        background: var(--primary-soft);
+        color: var(--primary);
+      }
+
+      .provider-mark svg { width: 21px; height: 21px; }
+
+      .provider-title-line { display: flex; align-items: center; gap: 7px; }
+      .provider-name { font-size: 15px; font-weight: 720; }
+
+      .plan-mark {
+        display: inline-flex;
+        min-height: 19px;
+        align-items: center;
+        padding: 0 6px;
+        border-radius: 5px;
+        background: var(--primary-soft);
+        color: var(--primary-strong);
+        font-size: 9px;
+        font-weight: 780;
+      }
+
+      .provider-id {
+        color: var(--text-subtle);
+        font-family: var(--font-mono);
+        font-size: 9px;
+      }
+
+      .auth-cell { display: grid; justify-items: start; gap: 6px; }
+      .auth-label { font-weight: 650; }
+
+      .status-badge {
+        display: inline-flex;
+        min-height: 24px;
+        align-items: center;
+        gap: 5px;
+        padding: 0 8px;
+        border-radius: 6px;
+        background: var(--success-soft);
+        color: var(--success);
+        font-size: 10px;
+        font-weight: 720;
+      }
+
+      .status-badge::before {
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: currentColor;
+        content: "";
+      }
+
+      .healthy-only { display: initial; }
+      .pressure-only { display: none !important; }
+      body[data-scenario="pressure"] .healthy-only { display: none !important; }
+      body[data-scenario="pressure"] .pressure-only { display: initial !important; }
+
+      .icon-button,
+      .text-button,
+      .recovery-button {
+        border: 0;
+        cursor: pointer;
+        transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+      }
+
+      .icon-button {
+        display: inline-grid;
+        width: 30px;
+        height: 30px;
+        place-items: center;
+        border-radius: 8px;
+        background: transparent;
+        color: var(--text-subtle);
+      }
+
+      .icon-button:hover { background: var(--surface-muted); color: var(--text); }
+      .icon-button svg { width: 15px; height: 15px; }
+
+      .text-button {
+        display: inline-flex;
+        min-height: 32px;
+        align-items: center;
+        gap: 6px;
+        padding: 0 10px;
+        border-radius: 8px;
+        background: transparent;
+        color: var(--primary);
+        font-size: 11px;
+        font-weight: 720;
+      }
+
+      .text-button:hover { background: var(--primary-soft); }
+      .text-button svg { width: 14px; height: 14px; }
+
+      /* A · Decision-first progressive disclosure */
+      .usage-a { padding-block: 13px; }
+
+      .health-disclosure { position: relative; }
+      .health-disclosure > summary { list-style: none; }
+      .health-disclosure > summary::-webkit-details-marker { display: none; }
+
+      .health-summary {
+        display: grid;
+        grid-template-columns: auto minmax(130px, 0.9fr) minmax(120px, 0.8fr) minmax(125px, 0.8fr) auto;
+        align-items: center;
+        gap: 13px;
+        min-height: 58px;
+        padding: 7px 9px 7px 11px;
+        border: 1px solid color-mix(in srgb, var(--success) 22%, var(--border));
+        border-radius: 11px;
+        background: color-mix(in srgb, var(--success-soft) 58%, var(--surface));
+        cursor: pointer;
+      }
+
+      body[data-scenario="pressure"] .health-summary {
+        border-color: color-mix(in srgb, var(--warning) 30%, var(--border));
+        background: color-mix(in srgb, var(--warning-soft) 68%, var(--surface));
+      }
+
+      .health-signal {
+        display: grid;
+        width: 35px;
+        height: 35px;
+        place-items: center;
+        border-radius: 50%;
+        background: var(--success);
+        color: white;
+      }
+
+      body[data-scenario="pressure"] .health-signal { background: var(--warning); }
+      .health-signal svg { width: 17px; height: 17px; }
+
+      .health-copy strong { display: block; font-size: 14px; }
+      .health-copy span { display: block; color: var(--text-muted); font-size: 10px; }
+
+      .health-fact {
+        min-width: 0;
+        padding-left: 13px;
+        border-left: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+      }
+
+      .health-fact span { display: block; color: var(--text-subtle); font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }
+      .health-fact strong { display: block; margin-top: 2px; font-family: var(--font-mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+      .disclosure-chevron { color: var(--text-subtle); transition: transform 180ms ease; }
+      .health-disclosure[open] .disclosure-chevron { transform: rotate(180deg); }
+
+      .health-details {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+        gap: 12px;
+        align-items: center;
+        margin-top: 9px;
+        padding: 10px 11px;
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        background: var(--surface-quiet);
+      }
+
+      .detail-window { min-width: 0; }
+      .detail-window-top { display: flex; align-items: baseline; gap: 6px; margin-bottom: 5px; }
+      .detail-window-name { font-family: var(--font-mono); font-size: 11px; font-weight: 760; }
+      .detail-window-value { font-family: var(--font-mono); font-size: 11px; font-weight: 760; }
+      .detail-window-time { min-width: 0; flex: 1; overflow: hidden; color: var(--text-subtle); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+
+      .mini-track { height: 4px; overflow: hidden; border-radius: 99px; background: var(--surface-muted); }
+      .mini-track span { display: block; height: 100%; border-radius: inherit; background: var(--success); }
+      body[data-scenario="pressure"] .mini-track span { background: var(--warning); }
+      .short-width { width: calc(var(--short-used) * 1%); }
+      .week-width { width: calc(var(--week-used) * 1%); }
+
+      .reserve-action {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding-left: 12px;
+        border-left: 1px solid var(--border);
+      }
+
+      .reserve-action-copy { white-space: nowrap; }
+      .reserve-action-copy span { display: block; color: var(--text-subtle); font-size: 9px; }
+      .reserve-action-copy strong { display: block; font-size: 11px; }
+
+      /* B · Constraint orbit */
+      .usage-b {
+        display: grid;
+        grid-template-columns: 78px minmax(0, 1fr);
+        align-items: center;
+        gap: 12px;
+        padding-block: 4px;
+      }
+
+      .provider-row-b { min-height: 80px; }
+      .provider-row-b .provider-cell { gap: 8px; }
+      .provider-row-b .provider-mark { width: 28px; height: 28px; border-radius: 6px; }
+      .provider-row-b .provider-mark svg { width: 16px; height: 16px; }
+      .provider-row-b .provider-name { font-size: 14px; font-weight: 500; }
+      .provider-row-b .provider-id { font-size: 12px; }
+      .provider-row-b .auth-cell { font-size: 12px; }
+      .provider-row-b .status-badge { font-size: 12px; font-weight: 500; }
+
+      .orbit {
+        position: relative;
+        display: grid;
+        width: 72px;
+        height: 72px;
+        place-items: center;
+      }
+
+      .orbit svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); }
+      .orbit circle { fill: none; stroke-linecap: round; }
+      .orbit-bg { stroke: var(--surface-muted); }
+      .orbit-short { stroke: var(--primary); stroke-dasharray: var(--short-used) 100; transition: stroke-dasharray 240ms ease; }
+      .orbit-week { stroke: var(--info); stroke-dasharray: var(--week-used) 100; transition: stroke-dasharray 240ms ease; }
+      body[data-scenario="pressure"] .orbit-short { stroke: var(--warning); }
+
+      .orbit-center {
+        position: relative;
+        display: grid;
+        width: 44px;
+        height: 44px;
+        place-items: center;
+        align-content: center;
+        padding: 0;
+        border: 0;
+        border-radius: 50%;
+        background: transparent;
+        color: var(--text);
+        cursor: pointer;
+        text-align: center;
+      }
+
+      .orbit-center svg { position: static; inset: auto; width: 13px; height: 13px; transform: none; }
+
+      .orbit-plan {
+        position: absolute;
+        right: 0;
+        bottom: 5px;
+        display: grid;
+        min-width: 34px;
+        height: 23px;
+        place-items: center;
+        border: 2px solid var(--surface-raised);
+        border-radius: 6px;
+        background: var(--primary-soft);
+        color: var(--primary-strong);
+        font-size: 10px;
+        font-weight: 500;
+        box-shadow: var(--shadow-sm);
+      }
+
+      body[data-scenario="pressure"] .orbit-plan { background: var(--warning); color: #fff; }
+
+      .constraint-list { display: grid; gap: 8px; }
+      .constraint-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 9px; }
+      .constraint-swatch { width: 9px; height: 9px; border-radius: 50%; background: var(--primary); }
+      .constraint-row.week .constraint-swatch { background: var(--info); }
+      .constraint-copy strong { display: block; font-size: 10px; font-weight: 500; line-height: 1.35; }
+      .constraint-copy > span { display: block; color: var(--text-subtle); font-size: 9px; line-height: 1.35; }
+      .remaining-value { color: var(--text); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+      /* C · Recovery timeline */
+      .usage-c { padding-block: 15px; }
+      .timeline-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
+      .timeline-head strong { font-size: 12px; }
+      .timeline-head span { color: var(--text-subtle); font-size: 10px; }
+
+      .timeline {
+        position: relative;
+        min-height: 72px;
+        margin-inline: 6px 10px;
+      }
+
+      .timeline-line {
+        position: absolute;
+        top: 18px;
+        left: 0;
+        right: 0;
+        height: 2px;
+        background: linear-gradient(90deg, var(--primary), var(--border-strong) 47%, var(--info));
+      }
+
+      .timeline-point { position: absolute; top: 10px; transform: translateX(-50%); }
+      .timeline-point.now { left: 0; transform: none; }
+      .timeline-point.short { left: 44%; }
+      .timeline-point.week { left: 100%; }
+
+      .point-dot {
+        display: grid;
+        width: 18px;
+        height: 18px;
+        place-items: center;
+        border: 4px solid var(--surface-raised);
+        border-radius: 50%;
+        background: var(--border-strong);
+        box-shadow: 0 0 0 1px var(--border-strong);
+      }
+
+      .timeline-point.now .point-dot { background: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+      .timeline-point.week .point-dot { background: var(--info); box-shadow: 0 0 0 1px var(--info); }
+
+      .point-copy { position: absolute; top: 27px; min-width: 115px; color: var(--text-subtle); font-size: 9px; }
+      .point-copy strong { display: block; color: var(--text); font-family: var(--font-mono); font-size: 11px; }
+      .timeline-point.short .point-copy { left: 50%; transform: translateX(-50%); text-align: center; }
+      .timeline-point.week .point-copy { right: 0; text-align: right; }
+
+      .timeline-branch {
+        position: absolute;
+        top: 18px;
+        left: 7px;
+        height: 42px;
+        border-left: 1px dashed var(--primary);
+      }
+
+      .timeline-branch::after {
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        width: 23px;
+        border-bottom: 1px dashed var(--primary);
+        content: "";
+      }
+
+      .timeline-recovery {
+        position: absolute;
+        top: 43px;
+        left: 29px;
+        display: inline-flex;
+        min-height: 31px;
+        align-items: center;
+        gap: 6px;
+        padding: 0 9px;
+        border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
+        border-radius: 7px;
+        background: var(--primary-soft);
+        color: var(--primary-strong);
+        cursor: pointer;
+        font-size: 10px;
+        font-weight: 750;
+      }
+
+      body[data-scenario="pressure"] .timeline-recovery { border-color: var(--warning); background: var(--warning); color: white; }
+      .timeline-recovery svg { width: 13px; height: 13px; }
+
+      .recovery-popover-wrap { position: relative; }
+      .popover {
+        position: absolute;
+        z-index: 30;
+        top: calc(100% + 8px);
+        right: 0;
+        width: 250px;
+        padding: 12px;
+        border: 1px solid var(--border-strong);
+        border-radius: 10px;
+        background: var(--surface-raised);
+        box-shadow: 0 16px 42px rgb(35 24 12 / 0.2);
+      }
+
+      .popover[hidden] { display: none; }
+      .popover-title { margin-bottom: 8px; font-size: 12px; font-weight: 750; }
+      .popover-row { display: flex; justify-content: space-between; gap: 12px; padding: 8px; border-radius: 7px; background: var(--surface-muted); color: var(--text-muted); font-size: 10px; }
+      .popover-row strong { color: var(--text); font-family: var(--font-mono); }
+      .popover-note { margin: 8px 0; color: var(--text-subtle); font-size: 10px; }
+
+      .recovery-button {
+        display: inline-flex;
+        width: 100%;
+        min-height: 34px;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        border-radius: 8px;
+        background: var(--primary);
+        color: #fff;
+        font-size: 11px;
+        font-weight: 730;
+      }
+
+      .recovery-button:hover { background: var(--primary-strong); }
+
+      .proposal-footer {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 1px;
+        border-top: 1px solid var(--border);
+        background: var(--border);
+      }
+
+      .proposal-footer > div { padding: 13px 17px; background: var(--surface); }
+      .proposal-footer dt { margin-bottom: 3px; color: var(--text-subtle); font-family: var(--font-mono); font-size: 9px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+      .proposal-footer dd { margin: 0; color: var(--text-muted); font-size: 11px; }
+
+      dialog {
+        width: min(420px, calc(100% - 32px));
+        padding: 0;
+        border: 1px solid var(--border-strong);
+        border-radius: 14px;
+        background: var(--surface-raised);
+        color: var(--text);
+        box-shadow: 0 28px 90px rgb(0 0 0 / .32);
+      }
+
+      dialog::backdrop { background: rgb(36 25 14 / .58); backdrop-filter: blur(2px); }
+      .dialog-body { padding: 22px; }
+      .dialog-icon { display: grid; width: 40px; height: 40px; margin-bottom: 14px; place-items: center; border-radius: 50%; background: var(--warning-soft); color: var(--warning); }
+      .dialog-body h3 { margin: 0 0 7px; font-size: 17px; }
+      .dialog-body p { margin: 0; color: var(--text-muted); font-size: 13px; }
+      .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid var(--border); background: var(--surface-muted); }
+      .dialog-actions button { min-height: 36px; padding: 0 13px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; font-weight: 700; }
+      .dialog-actions .confirm { border-color: var(--primary); background: var(--primary); color: white; }
+
+      @media (max-width: 1050px) {
+        .table-head,
+        .provider-row { grid-template-columns: 180px minmax(0, 1fr); }
+        .table-head > :last-child,
+        .provider-row > .auth-cell { display: none; }
+        .usage-b { grid-template-columns: 78px minmax(0, 1fr); }
+      }
+
+      @media (max-width: 760px) {
+        .page { width: min(100% - 24px, 560px); padding-top: 24px; }
+        .page-header { grid-template-columns: 1fr; gap: 18px; }
+        .header-tools { align-items: stretch; justify-content: space-between; }
+        .scenario-switch { flex: 1; }
+        .scenario-switch button { flex: 1; min-height: 40px; }
+        .theme-toggle { width: 44px; min-height: 44px; }
+        .semantic-map { grid-template-columns: 1fr; }
+        .proposal-header { grid-template-columns: 1fr; padding: 18px; }
+        .proposal-header p { margin-left: 0; }
+        .concept-tag { justify-self: start; }
+        .demo-stage { padding: 18px 12px 20px; }
+        .table-head { display: none; }
+        .provider-row { display: block; }
+        .provider-row > div { padding: 15px; }
+        .provider-row > div + div { border-top: 1px solid var(--border); border-left: 0; }
+
+        .health-summary { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+        .health-summary .health-fact:nth-of-type(2) { display: none; }
+        .health-details { grid-template-columns: 1fr; }
+        .reserve-action { padding-top: 9px; padding-left: 0; border-top: 1px solid var(--border); border-left: 0; }
+
+        .usage-b { grid-template-columns: 78px minmax(0, 1fr); gap: 10px; }
+
+        .timeline { min-height: 210px; margin: 0; }
+        .timeline-line { top: 8px; bottom: 8px; left: 18px; right: auto; width: 2px; height: auto; background: linear-gradient(var(--primary), var(--border-strong) 48%, var(--info)); }
+        .timeline-point { top: auto; left: 10px !important; transform: none !important; }
+        .timeline-point.now { top: 0; }
+        .timeline-point.short { top: 82px; }
+        .timeline-point.week { top: 172px; }
+        .point-copy,
+        .timeline-point.short .point-copy,
+        .timeline-point.week .point-copy { top: -2px; left: 31px; right: auto; min-width: 180px; transform: none; text-align: left; }
+        .timeline-branch { top: 18px; left: 18px; width: 30px; height: 40px; border-bottom: 1px dashed var(--primary); }
+        .timeline-branch::after { display: none; }
+        .timeline-recovery { top: 43px; left: 50px; min-height: 38px; }
+
+        .proposal-footer { grid-template-columns: 1fr; }
+        .popover { position: fixed; right: 16px; bottom: 16px; top: auto; width: calc(100vw - 32px); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { transition-duration: .01ms !important; scroll-behavior: auto !important; }
+      }
+    </style>
+  </head>
+  <body data-scenario="normal">
+    <main class="page">
+      <header class="page-header">
+        <div>
+          <div class="eyebrow">TiyGate · Semantic UX exploration / round 02</div>
+          <h1>OpenAI OAuth Usage，不再展示一堆数据</h1>
+          <p class="lede">
+            从“字段如何排列”转向“用户要做什么判断”：先回答能否继续使用、哪个窗口构成约束、何时恢复；身份与恢复能力退到各自正确的层级。
+          </p>
+        </div>
+        <div class="header-tools">
+          <div class="scenario-switch" aria-label="切换演示状态">
+            <button type="button" data-scenario-button="normal" aria-pressed="true">余量充足</button>
+            <button type="button" data-scenario-button="pressure" aria-pressed="false">临近限额</button>
+          </div>
+          <button class="theme-toggle" id="theme-toggle" type="button" aria-label="切换深色模式" aria-pressed="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3a6.8 6.8 0 1 0 9 9 8.8 8.8 0 0 1-9-9Z"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <aside class="semantic-map" aria-label="信息语义分层">
+        <div><strong>身份</strong><span>OpenAI · Plus · OAuth 账户，放回 Provider 身份区</span></div>
+        <div><strong>约束</strong><span>5h 与 7d 是并行生效的使用约束，核心是剩余能力</span></div>
+        <div><strong>恢复能力</strong><span>Reset credit 是备用恢复动作，只在需要时提升权重</span></div>
+      </aside>
+
+      <div class="proposal-list">
+        <section class="proposal" aria-labelledby="proposal-a-title">
+          <header class="proposal-header">
+            <div>
+              <div class="proposal-title"><span class="proposal-index">A</span><h2 id="proposal-a-title">Decision Gate · 先给结论</h2></div>
+              <p>默认只呈现“是否可继续使用、最紧约束、最近恢复时间”三个决策信号；原始窗口数据和 Reset credit 通过一次展开获得。</p>
+            </div>
+            <span class="concept-tag recommended">推荐 · 渐进披露</span>
+          </header>
+          <div class="demo-stage">
+            <div class="table-shell">
+              <div class="table-head" aria-hidden="true"><div>Provider</div><div>Capacity decision</div><div>Auth</div></div>
+              <div class="provider-row">
+                <div class="provider-cell">
+                  <span class="provider-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3.2a4.1 4.1 0 0 1 4 3.2 4.1 4.1 0 0 1 2.8 6.6 4.1 4.1 0 0 1-4 6.4 4.1 4.1 0 0 1-6.9.1 4.1 4.1 0 0 1-2.9-6.4 4.1 4.1 0 0 1 3-6.7A4.1 4.1 0 0 1 12 3.2Z"/><path d="m8 6.4 8.2 4.7v6.3M16 6.4 7.8 11v6.4M5 13h14M8 17.4l8.2-4.7"/></svg>
+                  </span>
+                    <div><div class="provider-title-line"><span class="provider-name">OpenAI</span><span class="plan-mark">PLUS</span></div><div class="provider-id">openai-oauth</div></div>
+                </div>
+                <div class="usage-a">
+                  <details class="health-disclosure">
+                    <summary class="health-summary">
+                      <span class="health-signal" aria-hidden="true">
+                        <svg class="healthy-only" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>
+                        <svg class="pressure-only" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v5M12 17h.01"/><path d="M10.3 3.9 2.5 17.5A2 2 0 0 0 4.2 20h15.6a2 2 0 0 0 1.7-2.5L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+                      </span>
+                      <span class="health-copy">
+                        <strong><span class="healthy-only">余量充足</span><span class="pressure-only">短窗口即将耗尽</span></strong>
+                        <span><span class="healthy-only">可以继续正常使用</span><span class="pressure-only">建议降低请求速率或恢复额度</span></span>
+                      </span>
+                      <span class="health-fact"><span>最小余量</span><strong><span class="healthy-only">85%</span><span class="pressure-only">8%</span> · 5h</strong></span>
+                      <span class="health-fact"><span>最近恢复</span><strong>4h 46m</strong></span>
+                      <svg class="disclosure-chevron" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                    </summary>
+                    <div class="health-details">
+                      <div class="detail-window">
+                        <div class="detail-window-top"><span class="detail-window-name">5h</span><span class="detail-window-time">4 小时 46 分后恢复</span><span class="detail-window-value"><span class="healthy-only">已用 15%</span><span class="pressure-only">已用 92%</span></span></div>
+                        <div class="mini-track"><span class="short-width"></span></div>
+                      </div>
+                      <div class="detail-window">
+                        <div class="detail-window-top"><span class="detail-window-name">7d</span><span class="detail-window-time">6 天 3 小时后恢复</span><span class="detail-window-value"><span class="healthy-only">已用 9%</span><span class="pressure-only">已用 78%</span></span></div>
+                        <div class="mini-track"><span class="week-width"></span></div>
+                      </div>
+                      <div class="reserve-action">
+                        <div class="reserve-action-copy"><span>备用恢复能力</span><strong>1 次可用</strong></div>
+                        <button class="text-button recovery-info-trigger" type="button" aria-expanded="false">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                          <span class="healthy-only">查看</span><span class="pressure-only">立即恢复</span>
+                        </button>
+                      </div>
+                    </div>
+                  </details>
+                </div>
+                <div class="auth-cell"><span class="auth-label">OAuth</span><span class="status-badge">认证有效</span></div>
+              </div>
+            </div>
+          </div>
+          <dl class="proposal-footer">
+            <div><dt>回答的问题</dt><dd>“我现在需要处理吗？”</dd></div>
+            <div><dt>关键变化</dt><dd>从字段展示改为计算后的决策摘要</dd></div>
+            <div><dt>适合</dt><dd>Provider 列表默认态，噪音最低</dd></div>
+          </dl>
+        </section>
+
+        <section class="proposal" aria-labelledby="proposal-b-title">
+          <header class="proposal-header">
+            <div>
+              <div class="proposal-title"><span class="proposal-index">B</span><h2 id="proposal-b-title">Constraint Orbit · 看见瓶颈</h2></div>
+              <p>两个窗口不是两张卡，而是同时作用于同一账户的两道约束。双轨圆环用内外轨表达已用比例，中心专注于可立即使用的恢复能力，Plus 徽章贴在外环边缘。</p>
+            </div>
+            <span class="concept-tag">视觉比较</span>
+          </header>
+          <div class="demo-stage">
+            <div class="table-shell">
+              <div class="table-head" aria-hidden="true"><div>Provider</div><div>Active constraints</div><div>Auth</div></div>
+              <div class="provider-row provider-row-b">
+                <div class="provider-cell">
+                  <span class="provider-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3.2a4.1 4.1 0 0 1 4 3.2 4.1 4.1 0 0 1 2.8 6.6 4.1 4.1 0 0 1-4 6.4 4.1 4.1 0 0 1-6.9.1 4.1 4.1 0 0 1-2.9-6.4 4.1 4.1 0 0 1 3-6.7A4.1 4.1 0 0 1 12 3.2Z"/><path d="m8 6.4 8.2 4.7v6.3M16 6.4 7.8 11v6.4M5 13h14M8 17.4l8.2-4.7"/></svg>
+                  </span>
+                  <div><div class="provider-title-line"><span class="provider-name">OpenAI</span></div><div class="provider-id">openai-oauth</div></div>
+                </div>
+                <div class="usage-b">
+                  <div class="orbit" id="constraint-orbit" role="group" aria-label="5h 与 7d 使用约束；有 1 次备用恢复能力">
+                    <svg viewBox="0 0 120 120" aria-hidden="true">
+                      <circle class="orbit-bg" cx="60" cy="60" r="31" stroke-width="5" pathLength="100"/>
+                      <circle class="orbit-week" cx="60" cy="60" r="31" stroke-width="5" pathLength="100"/>
+                      <circle class="orbit-bg" cx="60" cy="60" r="22" stroke-width="6" pathLength="100"/>
+                      <circle class="orbit-short" cx="60" cy="60" r="22" stroke-width="6" pathLength="100"/>
+                    </svg>
+                    <button class="orbit-center recovery-info-trigger" type="button" aria-label="1 次备用恢复能力，查看详情" aria-expanded="false">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                    </button>
+                    <span class="orbit-plan">Plus</span>
+                  </div>
+                  <div class="constraint-list">
+                    <div class="constraint-row">
+                      <span class="constraint-swatch" aria-hidden="true"></span>
+                      <div class="constraint-copy"><strong>5h · 用量剩余 <span class="remaining-value"><span class="healthy-only">85%</span><span class="pressure-only">8%</span></span></strong><span>4 小时 46 分后恢复</span></div>
+                    </div>
+                    <div class="constraint-row week">
+                      <span class="constraint-swatch" aria-hidden="true"></span>
+                      <div class="constraint-copy"><strong>7d · 用量剩余 <span class="remaining-value"><span class="healthy-only">91%</span><span class="pressure-only">22%</span></span></strong><span>6 天 3 小时后恢复</span></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="auth-cell"><span class="auth-label">OAuth</span><span class="status-badge">认证有效</span></div>
+              </div>
+            </div>
+          </div>
+          <dl class="proposal-footer">
+            <div><dt>回答的问题</dt><dd>“哪个限制会先卡住我？”</dd></div>
+            <div><dt>关键变化</dt><dd>将窗口建模为同一能力的并行约束</dd></div>
+            <div><dt>适合</dt><dd>需要快速比较多窗口压力的用户</dd></div>
+          </dl>
+        </section>
+
+        <section class="proposal" aria-labelledby="proposal-c-title">
+          <header class="proposal-header">
+            <div>
+              <div class="proposal-title"><span class="proposal-index">C</span><h2 id="proposal-c-title">Recovery Timeline · 围绕恢复组织</h2></div>
+              <p>当用户关心的是“多久后能恢复”，百分比就不是主轴。时间轴把自然恢复作为主路径，把 Reset credit 表达成一条可立即抵达的备用路径。</p>
+            </div>
+            <span class="concept-tag">时间优先</span>
+          </header>
+          <div class="demo-stage">
+            <div class="table-shell">
+              <div class="table-head" aria-hidden="true"><div>Provider</div><div>Recovery path</div><div>Auth</div></div>
+              <div class="provider-row">
+                <div class="provider-cell">
+                  <span class="provider-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3.2a4.1 4.1 0 0 1 4 3.2 4.1 4.1 0 0 1 2.8 6.6 4.1 4.1 0 0 1-4 6.4 4.1 4.1 0 0 1-6.9.1 4.1 4.1 0 0 1-2.9-6.4 4.1 4.1 0 0 1 3-6.7A4.1 4.1 0 0 1 12 3.2Z"/><path d="m8 6.4 8.2 4.7v6.3M16 6.4 7.8 11v6.4M5 13h14M8 17.4l8.2-4.7"/></svg>
+                  </span>
+                  <div><div class="provider-title-line"><span class="provider-name">OpenAI</span><span class="plan-mark">PLUS</span></div><div class="provider-id">openai-oauth</div></div>
+                </div>
+                <div class="usage-c">
+                  <div class="timeline-head"><strong><span class="healthy-only">下一次自然恢复在 4 小时 46 分后</span><span class="pressure-only">短窗口承压，可等待或立即恢复</span></strong><span>两个窗口独立恢复</span></div>
+                  <div class="timeline" aria-label="现在，5 小时窗口将在 4 小时 46 分后恢复，7 天窗口将在 6 天 3 小时后恢复；另有 1 次立即恢复机会">
+                    <div class="timeline-line" aria-hidden="true"></div>
+                    <div class="timeline-point now"><span class="point-dot"></span><span class="point-copy"><strong>现在</strong><span class="healthy-only">余量充足</span><span class="pressure-only">5h 已用 92%</span></span></div>
+                    <div class="timeline-point short"><span class="point-dot"></span><span class="point-copy"><strong>+ 4h 46m</strong>5h 窗口恢复</span></div>
+                    <div class="timeline-point week"><span class="point-dot"></span><span class="point-copy"><strong>+ 6d 3h</strong>7d 窗口恢复</span></div>
+                    <span class="timeline-branch" aria-hidden="true"></span>
+                    <button class="timeline-recovery recovery-info-trigger" type="button" aria-expanded="false">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                      现在恢复 · 1 次可用
+                    </button>
+                  </div>
+                </div>
+                <div class="auth-cell"><span class="auth-label">OAuth</span><span class="status-badge">认证有效</span></div>
+              </div>
+            </div>
+          </div>
+          <dl class="proposal-footer">
+            <div><dt>回答的问题</dt><dd>“额度什么时候回来？”</dd></div>
+            <div><dt>关键变化</dt><dd>把 Reset credit 变成自然恢复的备用路径</dd></div>
+            <div><dt>适合</dt><dd>限额已触发、等待时间最受关注的场景</dd></div>
+          </dl>
+        </section>
+      </div>
+    </main>
+
+    <div class="popover recovery-popover" id="recovery-popover" role="dialog" aria-label="备用恢复能力详情" hidden>
+      <div class="popover-title">备用恢复能力 · 1 次</div>
+      <div class="popover-row"><span>到期时间</span><strong>08/30 08:00</strong></div>
+      <p class="popover-note">使用后将尝试重置当前 Codex 使用窗口。操作前仍会再次确认。</p>
+      <button class="recovery-button consume-trigger" type="button">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+        使用 1 次恢复
+      </button>
+    </div>
+
+    <dialog id="consume-dialog" aria-labelledby="dialog-title">
+      <div class="dialog-body">
+        <div class="dialog-icon" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg></div>
+        <h3 id="dialog-title">确认使用备用恢复能力？</h3>
+        <p>将消费 1 个 Reset credit 并尝试重置当前使用窗口。此操作无法撤销。</p>
+      </div>
+      <div class="dialog-actions"><button type="button" id="dialog-cancel">取消</button><button type="button" class="confirm" id="dialog-confirm">确认恢复</button></div>
+    </dialog>
+
+    <script>
+      const root = document.documentElement;
+      const body = document.body;
+      const themeToggle = document.querySelector("#theme-toggle");
+      const popover = document.querySelector("#recovery-popover");
+      const consumeDialog = document.querySelector("#consume-dialog");
+      let activeRecoveryTrigger = null;
+
+      themeToggle.addEventListener("click", () => {
+        const dark = root.dataset.theme === "dark";
+        root.dataset.theme = dark ? "light-warm" : "dark";
+        themeToggle.setAttribute("aria-pressed", String(!dark));
+        themeToggle.setAttribute("aria-label", dark ? "切换深色模式" : "切换浅色模式");
+      });
+
+      document.querySelectorAll("[data-scenario-button]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const scenario = button.dataset.scenarioButton;
+          body.dataset.scenario = scenario;
+          document.querySelector("#constraint-orbit").setAttribute(
+            "aria-label",
+            scenario === "pressure"
+              ? "5h 用量已用 92%，7d 用量已用 78%；中心有 1 次备用恢复能力"
+              : "5h 用量已用 15%，7d 用量已用 9%；中心有 1 次备用恢复能力",
+          );
+          document.querySelectorAll("[data-scenario-button]").forEach((item) => {
+            item.setAttribute("aria-pressed", String(item === button));
+          });
+        });
+      });
+
+      const closeRecoveryPopover = () => {
+        popover.hidden = true;
+        if (activeRecoveryTrigger) activeRecoveryTrigger.setAttribute("aria-expanded", "false");
+        activeRecoveryTrigger = null;
+      };
+
+      document.querySelectorAll(".recovery-info-trigger").forEach((trigger) => {
+        trigger.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const reopen = activeRecoveryTrigger !== trigger || popover.hidden;
+          closeRecoveryPopover();
+          if (!reopen) return;
+          activeRecoveryTrigger = trigger;
+          trigger.setAttribute("aria-expanded", "true");
+          const rect = trigger.getBoundingClientRect();
+          const mobile = window.innerWidth <= 760;
+          if (!mobile) {
+            popover.style.position = "fixed";
+            popover.style.left = `${Math.min(window.innerWidth - 266, Math.max(16, rect.right - 250))}px`;
+            popover.style.top = `${Math.min(window.innerHeight - 190, rect.bottom + 8)}px`;
+            popover.style.right = "auto";
+            popover.style.bottom = "auto";
+          } else {
+            popover.removeAttribute("style");
+          }
+          popover.hidden = false;
+        });
+      });
+
+      popover.addEventListener("click", (event) => event.stopPropagation());
+      document.addEventListener("click", closeRecoveryPopover);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !popover.hidden) closeRecoveryPopover();
+      });
+
+      document.querySelector(".consume-trigger").addEventListener("click", () => {
+        closeRecoveryPopover();
+        consumeDialog.showModal();
+      });
+      document.querySelector("#dialog-cancel").addEventListener("click", () => consumeDialog.close());
+      document.querySelector("#dialog-confirm").addEventListener("click", () => consumeDialog.close());
+      consumeDialog.addEventListener("click", (event) => {
+        if (event.target === consumeDialog) consumeDialog.close();
+      });
+    </script>
+  </body>
+</html>
