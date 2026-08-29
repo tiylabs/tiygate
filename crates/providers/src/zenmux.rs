@@ -109,7 +109,7 @@ fn suite_for_model(model_id: &str) -> ProtocolSuite {
     } else if body.contains("gemini") {
         ProtocolSuite::GoogleGemini
     } else {
-        ProtocolSuite::OpenAiCompatible
+        ProtocolSuite::OpenAiResponses
     }
 }
 
@@ -199,11 +199,11 @@ mod tests {
             provider
                 .egress_protocol_for_model("text-embedding-3-large")
                 .suite,
-            ProtocolSuite::OpenAiCompatible
+            ProtocolSuite::OpenAiResponses
         );
         assert_eq!(
             provider.egress_protocol_for_model("unknown-model").suite,
-            ProtocolSuite::OpenAiCompatible
+            ProtocolSuite::OpenAiResponses
         );
     }
 
