@@ -415,6 +415,90 @@ async fn acceptance_1_provider_secret_is_encrypted_at_rest() {
 }
 
 #[tokio::test]
+async fn zenmux_usage_uses_management_key_and_maps_subscription_data() {
+    let (router, _store, pool) = boot_no_auth().await;
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/api/v1/management/subscription/detail",
+        ))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer manage-key-secret",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "data": {
+                "plan": {"tier": "pro"},
+                "quota_5_hour": {
+                    "usage_percentage": 0.25,
+                    "resets_at": "2026-08-30T00:00:00Z"
+                },
+                "quota_7_day": {
+                    "usage_percentage": 0.1,
+                    "resets_at": "2026-09-01T00:00:00Z"
+                }
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let create = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/providers",
+            json!({
+                "id": "zenmux-usage",
+                "name": "ZenMux",
+                "vendor": "zenmux",
+                "api_base": upstream.uri(),
+                "api_key": "upstream-key",
+                "usage_management_key": "manage-key-secret",
+            }),
+        ))
+        .await
+        .expect("create response");
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let create_body = axum::body::to_bytes(create.into_body(), 8192)
+        .await
+        .expect("create body");
+    let create_json: serde_json::Value = serde_json::from_slice(&create_body).expect("create JSON");
+    assert!(create_json["encrypted_usage_management_key"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("[encrypted:")));
+    assert!(!create_json.to_string().contains("manage-key-secret"));
+
+    let usage = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/v1/providers/zenmux-usage/usage")
+                .body(Body::empty())
+                .expect("usage request"),
+        )
+        .await
+        .expect("usage response");
+    assert_eq!(usage.status(), StatusCode::OK);
+    let usage_body = axum::body::to_bytes(usage.into_body(), 8192)
+        .await
+        .expect("usage body");
+    let usage_json: serde_json::Value = serde_json::from_slice(&usage_body).expect("usage JSON");
+    assert_eq!(usage_json["state"], json!("available"));
+    assert_eq!(usage_json["plan_type"], json!("pro"));
+    assert_eq!(usage_json["five_hour"]["used_percent"], json!(25.0));
+    assert_eq!(usage_json["seven_day"]["used_percent"], json!(10.0));
+
+    let encrypted: String = sqlx::query_scalar(
+        "SELECT encrypted_usage_management_key FROM providers WHERE id = 'zenmux-usage'",
+    )
+    .fetch_one(pool.any())
+    .await
+    .expect("stored management key");
+    assert!(!encrypted.contains("manage-key-secret"));
+}
+
+#[tokio::test]
 async fn acceptance_1_with_master_key_decrypts_into_routing_table() {
     // Boot a DbConfigStore with a real AES-256-GCM master key.
     let pool = Arc::new(db::open_pool("sqlite::memory:").await.expect("pool"));
