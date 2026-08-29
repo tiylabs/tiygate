@@ -116,6 +116,15 @@ so equal-duration weekly limits remain distinguishable. Null or non-applicable
 windows are omitted, and the WebUI keeps successful usage results fresh for 60
 seconds to avoid repeatedly probing the upstream endpoint during navigation.
 
+ZenMux providers can optionally store a separate encrypted usage management
+key. When present, the Admin provider list requests the subscription detail
+endpoint at /api/v1/management/subscription/detail from the configured ZenMux
+API base with that key as a Bearer credential. The response's plan tier and
+5-hour and 7-day quota fields are normalized into the same plan badge and
+usage-window meters used by OpenAI OAuth. ZenMux's usage percentage ratio
+(0..1) is converted to the Admin usage percentage (0..100); the management key
+is never used for inference requests or returned in cleartext.
+
 ## Background keepalive
 
 Every instance scans due OAuth providers. A scan does not elect a permanent

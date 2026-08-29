@@ -255,6 +255,9 @@ const en = {
     },
     apiKey: "API key",
     apiKeyHint: "Leave blank to keep the existing secret.",
+    usageManagementKey: "Usage management key",
+    usageManagementKeyHint:
+      "Leave blank to keep the existing usage management key.",
     redacted: "Secret is stored encrypted and never returned.",
     deleteConfirm: "Delete provider {{name}}? This cannot be undone.",
     deleteImpactLoading: "Checking linked routes…",
