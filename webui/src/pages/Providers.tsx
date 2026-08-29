@@ -584,7 +584,7 @@ function SubscriptionUsageLayout({
   const firstUsed = usageWindowPercent(ringWindows[0]);
   const secondUsed = usageWindowPercent(ringWindows[1]);
   return (
-    <div className="flex min-w-0 items-center gap-4">
+    <div className="flex w-fit min-w-0 shrink-0 items-center gap-4">
       <div className="relative grid h-11 w-11 shrink-0 place-items-center">
         <svg
           viewBox="0 0 80 80"
@@ -681,11 +681,13 @@ function SubscriptionUsageLayout({
           </Badge>
         ) : null}
       </div>
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 shrink-0">
         <div
           className={cn(
-            "grid min-w-0 gap-y-2",
-            hasMultipleWindows ? "grid-cols-2 gap-x-4" : "grid-cols-1",
+            "grid w-fit min-w-0 gap-y-2",
+            hasMultipleWindows
+              ? "grid-flow-col auto-cols-max gap-x-4"
+              : "grid-cols-1",
           )}
         >
           {windows.map((window, index) => (
@@ -1114,7 +1116,7 @@ export default function Providers() {
               <colgroup>
                 <col style={{ width: "20rem" }} />
                 <col style={{ width: "16%" }} />
-                <col />
+                <col style={{ width: "24rem" }} />
                 <col style={{ width: "6rem" }} />
                 <col style={{ width: "6rem" }} />
                 <col style={{ width: "9rem" }} />
@@ -1132,7 +1134,7 @@ export default function Providers() {
                     {t("common.name")}
                   </Th>
                   <Th>{t("providers.vendor")}</Th>
-                  <Th>{t("providers.apiBase")}</Th>
+                  <Th className="min-w-[24rem]">{t("providers.apiBase")}</Th>
                   <Th>{t("providers.authMode")}</Th>
                   <Th className="text-center">{t("common.status")}</Th>
                   <Th>{t("common.updatedAt")}</Th>
@@ -1180,7 +1182,7 @@ export default function Providers() {
                         </span>
                       </div>
                     </Td>
-                    <Td className="align-middle">
+                    <Td className="min-w-[24rem] align-middle">
                       {!isOAuthProvider(p) && !supportsProviderUsage(p) ? (
                         <div
                           className="truncate font-mono text-xs"
