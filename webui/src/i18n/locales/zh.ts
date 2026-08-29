@@ -191,6 +191,7 @@ const zh: Translation = {
         minutes: "{{minutes}}分钟后重置",
       },
       windowFallback: "限额 {{index}}",
+      remaining: "用量剩余 {{percent}}%",
       notConnected: "未授权",
       unavailable: "暂不可用",
       resetCredits: {

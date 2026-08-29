@@ -279,6 +279,13 @@ function usageWindowPercent(window: ProviderUsageWindow | null | undefined) {
     : null;
 }
 
+function usageWindowRemainingPercent(
+  window: ProviderUsageWindow | null | undefined,
+) {
+  const used = usageWindowPercent(window);
+  return used == null ? null : Math.max(0, 100 - used);
+}
+
 function UsageWindow({
   label,
   window,
@@ -403,17 +410,7 @@ function ResetCreditsControl({
   });
 
   const resetCredits: ProviderResetCredits | undefined = usage?.reset_credits ?? undefined;
-  if (loading && !usage) {
-    return (
-      <span
-        className="text-text-subtle"
-        aria-label={t("providers.usage.resetCredits.loading")}
-        title={t("providers.usage.resetCredits.loading")}
-      >
-        …
-      </span>
-    );
-  }
+  if (loading && !usage) return null;
   if (usage?.state !== "available" || !resetCredits) return null;
 
   const availableCount = Math.max(0, resetCredits.available_count);
@@ -423,7 +420,7 @@ function ResetCreditsControl({
   const expiryInfo = (
     <div className="space-y-1">
       <div className="font-medium text-text">
-        {t("providers.usage.resetCredits.expirationTitle")}
+        {t("providers.usage.resetCredits.label")} {availableCount}
       </div>
       {expirations.length > 0 ? (
         expirations.map((expiresAt, index) => (
@@ -439,36 +436,21 @@ function ResetCreditsControl({
 
   return (
     <>
-      <div className="inline-flex shrink-0 items-center gap-1 text-[10px] leading-4">
-        <span className="whitespace-nowrap text-text-muted">
-          {t("providers.usage.resetCredits.label")}
-        </span>
-        <span className="font-mono font-medium text-text">{availableCount}</span>
-        <Tooltip content={expiryInfo} side="top">
-          <button
-            type="button"
-            className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            aria-label={t("providers.usage.resetCredits.expirationInfo")}
-          >
-            <Info size={11} />
-          </button>
-        </Tooltip>
-        <Button
+      <Tooltip content={expiryInfo} side="top">
+        <button
           type="button"
-          size="sm"
-          variant="ghost"
-          className="!min-h-5 !px-1.5 !py-0 whitespace-nowrap text-[10px]"
-          icon={<RotateCcw size={11} />}
-          loading={consumeMutation.isPending}
-          disabled={availableCount <= 0}
+          className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+          aria-label={`${t("providers.usage.resetCredits.consume")} (${availableCount})`}
+          title={t("providers.usage.resetCredits.expirationInfo")}
+          disabled={availableCount <= 0 || consumeMutation.isPending}
           onClick={() => {
             pendingRequestIdRef.current = newResetCreditRequestId();
             setConfirmOpen(true);
           }}
         >
-          {t("providers.usage.resetCredits.consume")}
-        </Button>
-      </div>
+          <RotateCcw size={13} aria-hidden="true" />
+        </button>
+      </Tooltip>
       <ConfirmDialog
         open={confirmOpen}
         onOpenChange={(open) => {
@@ -491,6 +473,222 @@ function ResetCreditsControl({
         }}
       />
     </>
+  );
+}
+
+function UsageWindowSummary({
+  label,
+  window,
+  loading,
+  state,
+  index,
+  t,
+}: {
+  label: string;
+  window?: ProviderUsageWindow | null;
+  loading: boolean;
+  state?: ProviderUsage["state"];
+  index: number;
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const remaining = usageWindowRemainingPercent(window);
+  const isAvailable = state === "available" && remaining != null;
+  const resetAt = formatUsageResetTime(window?.reset_at, t);
+  const fallback = loading
+    ? t("providers.usage.loading")
+    : state === "not_connected"
+      ? t("providers.usage.notConnected")
+      : t("providers.usage.unavailable");
+  const remainingLabel = isAvailable
+    ? t("providers.usage.remaining", { percent: remaining.toFixed(0) })
+    : "—";
+
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <span
+        className={cn(
+          "h-2 w-2 shrink-0 self-center rounded-full",
+          index === 0 ? "bg-primary" : "bg-info",
+        )}
+        aria-hidden="true"
+      />
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center text-[10px] leading-4">
+          <span className="min-w-0 truncate font-medium text-text">
+            {label} · {remainingLabel}
+          </span>
+        </div>
+        <div
+          className="truncate text-[9px] leading-3 text-text-subtle"
+          title={isAvailable ? resetAt : undefined}
+        >
+          {isAvailable ? resetAt : fallback}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OpenAiUsageLayout({
+  providerId,
+  usage,
+  loading,
+  planType,
+  t,
+}: {
+  providerId: string;
+  usage?: ProviderUsage;
+  loading: boolean;
+  planType: string | null;
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const windows = providerUsageWindows(usage);
+  const isAvailable = usage?.state === "available";
+
+  if (loading && !usage) {
+    return (
+      <div className="flex min-h-11 items-center gap-2 text-[10px] text-text-subtle">
+        <span className="h-11 w-11 shrink-0 animate-pulse rounded-full bg-surface-muted" />
+        <span>{t("providers.usage.loading")}</span>
+      </div>
+    );
+  }
+
+  if (!isAvailable || windows.length === 0) {
+    return (
+      <div className="flex min-h-9 items-center text-[10px] text-text-subtle">
+        {loading
+          ? t("providers.usage.loading")
+          : usage?.state === "not_connected"
+            ? t("providers.usage.notConnected")
+            : t("providers.usage.unavailable")}
+      </div>
+    );
+  }
+
+  const ringWindows = windows.slice(0, 2);
+  const hasMultipleWindows = ringWindows.length > 1;
+  const firstUsed = usageWindowPercent(ringWindows[0]);
+  const secondUsed = usageWindowPercent(ringWindows[1]);
+  return (
+    <div className="flex min-w-0 items-center gap-4">
+      <div className="relative grid h-11 w-11 shrink-0 place-items-center">
+        <svg
+          viewBox="0 0 80 80"
+          className="pointer-events-none absolute inset-0 h-full w-full -rotate-90"
+          aria-hidden="true"
+        >
+          {hasMultipleWindows ? (
+            <>
+              <circle
+                cx="40"
+                cy="40"
+                r="31"
+                fill="none"
+                stroke="var(--surface-muted)"
+                strokeWidth="5"
+                pathLength="100"
+              />
+              <circle
+                cx="40"
+                cy="40"
+                r="31"
+                fill="none"
+                stroke="var(--primary)"
+                strokeWidth="5"
+                strokeLinecap="round"
+                pathLength="100"
+                strokeDasharray={
+                  firstUsed == null ? undefined : `${firstUsed} 100`
+                }
+              />
+              <circle
+                cx="40"
+                cy="40"
+                r="22"
+                fill="none"
+                stroke="var(--surface-muted)"
+                strokeWidth="6"
+                pathLength="100"
+              />
+              <circle
+                cx="40"
+                cy="40"
+                r="22"
+                fill="none"
+                stroke="var(--info)"
+                strokeWidth="6"
+                strokeLinecap="round"
+                pathLength="100"
+                strokeDasharray={
+                  secondUsed == null ? undefined : `${secondUsed} 100`
+                }
+              />
+            </>
+          ) : (
+            <>
+              <circle
+                cx="40"
+                cy="40"
+                r="29"
+                fill="none"
+                stroke="var(--surface-muted)"
+                strokeWidth="5"
+                pathLength="100"
+              />
+              <circle
+                cx="40"
+                cy="40"
+                r="29"
+                fill="none"
+                stroke="var(--primary)"
+                strokeWidth="5"
+                strokeLinecap="round"
+                pathLength="100"
+                strokeDasharray={
+                  firstUsed == null ? undefined : `${firstUsed} 100`
+                }
+              />
+            </>
+          )}
+        </svg>
+        <ResetCreditsControl
+          providerId={providerId}
+          usage={usage}
+          loading={loading}
+          t={t}
+        />
+        {planType ? (
+          <Badge
+            tone="primary"
+            className="absolute bottom-0 -right-1 !rounded-xs !px-1.5 !py-0 !text-[10px]"
+            title={usage?.plan_type ?? undefined}
+          >
+            {planType}
+          </Badge>
+        ) : null}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div
+          className={cn(
+            "grid min-w-0 gap-y-2",
+            hasMultipleWindows ? "grid-cols-2 gap-x-4" : "grid-cols-1",
+          )}
+        >
+          {windows.map((window, index) => (
+            <UsageWindowSummary
+              key={`${window?.label ?? "main"}-${window?.limit_window_seconds ?? "unknown"}-${index}`}
+              label={formatUsageWindowLabel(window, index, t)}
+              window={window}
+              loading={loading}
+              state={usage?.state}
+              index={index}
+              t={t}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -973,26 +1171,32 @@ export default function Providers() {
                         </div>
                       ) : null}
                       {supportsOAuthUsage(p) ? (
-                        <div className="mt-1.5 grid min-w-[16rem] grid-cols-2 gap-x-3 gap-y-1">
+                        <div
+                          className={cn(
+                            "mt-1.5 min-w-[16rem]",
+                            p.vendor === "openai" && "min-w-[18rem]",
+                            p.vendor !== "openai" &&
+                              "grid grid-cols-2 gap-x-3 gap-y-1",
+                          )}
+                        >
                           {(() => {
                             const usageQuery = usageByProvider.get(p.id);
                             const usage = usageQuery?.data;
-                            const accountEmail = usage?.account_email?.trim() || undefined;
                             const planType = formatPlanType(usage?.plan_type);
                             const windows = providerUsageWindows(usage);
                             const visibleWindows =
                               windows.length > 0 ? windows : [undefined];
-                            const accountInfo = accountEmail ? (
-                              <span className="break-all font-mono text-[10px]">
-                                {accountEmail}
-                              </span>
-                            ) : (
-                              <span>
-                                {usageQuery?.isFetching
-                                  ? t("providers.usage.loading")
-                                  : t("providers.usage.unavailable")}
-                              </span>
-                            );
+                            if (p.vendor === "openai") {
+                              return (
+                                <OpenAiUsageLayout
+                                  providerId={p.id}
+                                  usage={usage}
+                                  loading={usageQuery?.isFetching ?? true}
+                                  planType={planType}
+                                  t={t}
+                                />
+                              );
+                            }
                             return (
                               <>
                                 <div className="col-span-2 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[10px] leading-4">
@@ -1004,23 +1208,6 @@ export default function Providers() {
                                     >
                                       {planType}
                                     </Badge>
-                                  ) : null}
-                                  <Tooltip content={accountInfo} side="top">
-                                    <button
-                                      type="button"
-                                      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                      aria-label={t("providers.usage.accountInfo")}
-                                    >
-                                      <Info size={12} />
-                                    </button>
-                                  </Tooltip>
-                                  {p.vendor === "openai" ? (
-                                    <ResetCreditsControl
-                                      providerId={p.id}
-                                      usage={usage}
-                                      loading={usageQuery?.isFetching ?? true}
-                                      t={t}
-                                    />
                                   ) : null}
                                 </div>
                                 {visibleWindows.map((window, index) => (
@@ -1042,7 +1229,36 @@ export default function Providers() {
                     </Td>
                     <Td className="whitespace-nowrap text-xs">
                       <div className="flex flex-col items-start gap-1.5">
-                        <span>{t(authModeLabelKey(p.auth_mode))}</span>
+                        <div className="flex items-center gap-1">
+                          <span>{t(authModeLabelKey(p.auth_mode))}</span>
+                          {p.auth_mode === "oauth" && supportsOAuthUsage(p)
+                            ? (() => {
+                                const accountEmail =
+                                  usageByProvider
+                                    .get(p.id)
+                                    ?.data?.account_email?.trim() || undefined;
+                                if (!accountEmail) return null;
+                                return (
+                                  <Tooltip
+                                    content={
+                                      <span className="break-all font-mono text-[10px]">
+                                        {accountEmail}
+                                      </span>
+                                    }
+                                    side="top"
+                                  >
+                                    <button
+                                      type="button"
+                                      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                      aria-label={t("providers.usage.accountInfo")}
+                                    >
+                                      <Info size={12} />
+                                    </button>
+                                  </Tooltip>
+                                );
+                              })()
+                            : null}
+                        </div>
                         {p.auth_mode === "oauth" ? (
                           <Badge
                             tone={oauthStatusTone(p)}

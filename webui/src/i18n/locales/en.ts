@@ -195,6 +195,7 @@ const en = {
         minutes: "Reset in {{minutes}}m",
       },
       windowFallback: "Limit {{index}}",
+      remaining: "{{percent}}% remaining",
       notConnected: "Not authorized",
       unavailable: "Unavailable",
       resetCredits: {
