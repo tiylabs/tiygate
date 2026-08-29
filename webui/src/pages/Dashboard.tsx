@@ -305,9 +305,27 @@ export default function Dashboard() {
   const targets = breakers.data?.targets ?? [];
   const unhealthy = targets.filter((b) => !b.healthy).length;
 
+  async function refreshPage() {
+    await Promise.all([
+      byModel.refetch(),
+      byProvider.refetch(),
+      byApiKey.refetch(),
+      byTarget.refetch(),
+      breakers.refetch(),
+      tokenActivity.refetch(),
+      tokenSummary.refetch(),
+      providers.refetch(),
+      apiKeys.refetch(),
+    ]);
+  }
+
   return (
     <div className="space-y-6">
-      <PageHeader title={t("dashboard.title")} action={<InstanceIndicator />} />
+      <PageHeader
+        title={t("dashboard.title")}
+        onRefresh={refreshPage}
+        action={<InstanceIndicator />}
+      />
 
       {/* 1. Token Activity Heatmap + Summary cards — side by side */}
       <div className="flex flex-col xl:flex-row gap-4 xl:items-stretch">

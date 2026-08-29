@@ -721,6 +721,7 @@ export default function Providers() {
     data: catalog,
     isLoading: catalogLoading,
     isError: catalogError,
+    refetch: refetchCatalog,
   } = useQuery({
     queryKey: ["provider-catalog"],
     queryFn: providerCatalogApi.list,
@@ -752,6 +753,17 @@ export default function Providers() {
     }
     return result;
   }, [data, usageQueries]);
+
+  async function refreshPage() {
+    const usageRefetches = usageQueries.flatMap((query, index) => {
+      const provider = data?.[index];
+      return provider && supportsProviderUsage(provider)
+        ? [query.refetch()]
+        : [];
+    });
+    await Promise.all([refetch(), refetchCatalog(), ...usageRefetches]);
+  }
+
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm());
   const [editing, setEditing] = useState<Provider | null>(null);
@@ -1070,6 +1082,7 @@ export default function Providers() {
     <div>
       <PageHeader
         title={t("providers.title")}
+        onRefresh={refreshPage}
         action={
           <Button
             variant="primary"
