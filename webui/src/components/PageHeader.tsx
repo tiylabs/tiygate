@@ -41,10 +41,10 @@ export function PageHeader({
               title={refreshLabel}
               disabled={isRefreshing}
               onClick={() => void handleRefresh()}
-              className="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-md border border-border bg-surface text-text-muted transition-[background-color,border-color,color,transform] duration-[var(--duration-fast)] hover:border-border-strong hover:bg-surface-muted hover:text-text active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-text-subtle transition-[color,transform,opacity] duration-[var(--duration-fast)] hover:text-text-muted active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg disabled:cursor-not-allowed disabled:opacity-50"
             >
               <RefreshCw
-                size={17}
+                size={14}
                 aria-hidden
                 className={isRefreshing ? "animate-spin" : undefined}
               />
