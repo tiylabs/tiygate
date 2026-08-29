@@ -185,6 +185,11 @@ export default function ApiKeys() {
     queryFn: listAllVirtualModels,
   });
   const availableModels = routesQuery.data ?? [];
+
+  async function refreshPage() {
+    await Promise.all([refetch(), routesQuery.refetch()]);
+  }
+
   const { scrollRef, scrollState } = useStickyTableScroll([
     isLoading,
     data?.length ?? 0,
@@ -349,6 +354,7 @@ export default function ApiKeys() {
     <div>
       <PageHeader
         title={t("apiKeys.title")}
+        onRefresh={refreshPage}
         action={
           <Button
             variant="primary"

@@ -184,7 +184,7 @@ export default function Audit() {
 
   return (
     <div className="space-y-4">
-      <PageHeader title={t("audit.title")} />
+      <PageHeader title={t("audit.title")} onRefresh={() => refetch()} />
       {error ? (
         <ErrorBox
           message={(error as Error).message}

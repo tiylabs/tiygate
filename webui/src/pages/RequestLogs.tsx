@@ -285,7 +285,10 @@ export default function RequestLogs() {
     () => ({ since: filter.since, until: filter.until }),
     [filter.since, filter.until],
   );
-  const { data: filterOptionsData } = useQuery({
+  const {
+    data: filterOptionsData,
+    refetch: refetchFilterOptions,
+  } = useQuery({
     queryKey: ["request-filter-options", filterOptionsRange],
     queryFn: () => requestsApi.filterOptions(filterOptionsRange),
     staleTime: 5 * 60_000,
@@ -302,7 +305,7 @@ export default function RequestLogs() {
   // Provider directory: lets us render the upstream column with provider
   // name (e.g. "OpenAI Production") instead of a raw id. Long stale time
   // since names rarely change.
-  const { data: providers } = useQuery<Provider[]>({
+  const { data: providers, refetch: refetchProviders } = useQuery<Provider[]>({
     queryKey: ["providers"],
     queryFn: providersApi.list,
     staleTime: 5 * 60_000,
@@ -356,7 +359,7 @@ export default function RequestLogs() {
     [providerNameById],
   );
 
-  const { data: apiKeys } = useQuery<ApiKey[]>({
+  const { data: apiKeys, refetch: refetchApiKeys } = useQuery<ApiKey[]>({
     queryKey: ["api-keys"],
     queryFn: apiKeysApi.list,
     staleTime: 5 * 60_000,
@@ -376,6 +379,17 @@ export default function RequestLogs() {
     queryFn: () => requestsApi.replay(detail!.request_id),
     enabled: detail !== null,
   });
+
+  async function refreshPage() {
+    const refetches: Array<Promise<unknown>> = [
+      refetch(),
+      refetchFilterOptions(),
+      refetchProviders(),
+      refetchApiKeys(),
+    ];
+    if (detail !== null) refetches.push(replayQuery.refetch());
+    await Promise.all(refetches);
+  }
 
   const total = data?.total ?? 0;
   const offset = filter.offset ?? 0;
@@ -432,7 +446,7 @@ export default function RequestLogs() {
 
   return (
     <div className="space-y-4">
-      <PageHeader title={t("requests.title")} />
+      <PageHeader title={t("requests.title")} onRefresh={refreshPage} />
 
       <Card>
         <CardBody>
