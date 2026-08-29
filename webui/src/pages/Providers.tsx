@@ -504,10 +504,10 @@ function UsageWindowSummary({
     : "—";
 
   return (
-    <div className="flex min-w-0 items-start gap-2">
+    <div className="flex min-w-0 items-center gap-2">
       <span
         className={cn(
-          "mt-1 h-2 w-2 shrink-0 rounded-full",
+          "h-2 w-2 shrink-0 self-center rounded-full",
           index === 0 ? "bg-primary" : "bg-info",
         )}
         aria-hidden="true"
@@ -534,14 +534,12 @@ function OpenAiUsageLayout({
   usage,
   loading,
   planType,
-  accountEmail,
   t,
 }: {
   providerId: string;
   usage?: ProviderUsage;
   loading: boolean;
   planType: string | null;
-  accountEmail?: string;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
   const windows = providerUsageWindows(usage);
@@ -572,15 +570,9 @@ function OpenAiUsageLayout({
   const hasMultipleWindows = ringWindows.length > 1;
   const firstUsed = usageWindowPercent(ringWindows[0]);
   const secondUsed = usageWindowPercent(ringWindows[1]);
-  const accountInfo = accountEmail ? (
-    <span className="break-all font-mono text-[10px]">{accountEmail}</span>
-  ) : (
-    <span>{t("providers.usage.unavailable")}</span>
-  );
-
   return (
-    <div className="flex min-w-0 items-center gap-2.5">
-      <div className="relative grid h-16 w-16 shrink-0 place-items-center">
+    <div className="flex min-w-0 items-center gap-4">
+      <div className="relative grid h-11 w-11 shrink-0 place-items-center">
         <svg
           viewBox="0 0 80 80"
           className="pointer-events-none absolute inset-0 h-full w-full -rotate-90"
@@ -669,26 +661,20 @@ function OpenAiUsageLayout({
         {planType ? (
           <Badge
             tone="primary"
-            className="absolute bottom-1 right-0 !rounded-xs !px-1.5 !py-0 !text-[10px]"
+            className="absolute bottom-0 -right-1 !rounded-xs !px-1.5 !py-0 !text-[10px]"
             title={usage?.plan_type ?? undefined}
           >
             {planType}
           </Badge>
         ) : null}
       </div>
-      <div className="relative min-w-0 flex-1 pr-6">
-        {accountEmail ? (
-          <Tooltip content={accountInfo} side="top">
-            <button
-              type="button"
-              className="absolute right-0 top-0 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              aria-label={t("providers.usage.accountInfo")}
-            >
-              <Info size={12} />
-            </button>
-          </Tooltip>
-        ) : null}
-        <div className="grid min-w-0 gap-2">
+      <div className="min-w-0 flex-1">
+        <div
+          className={cn(
+            "grid min-w-0 gap-y-2",
+            hasMultipleWindows ? "grid-cols-2 gap-x-4" : "grid-cols-1",
+          )}
+        >
           {windows.map((window, index) => (
             <UsageWindowSummary
               key={`${window?.label ?? "main"}-${window?.limit_window_seconds ?? "unknown"}-${index}`}
@@ -1196,22 +1182,10 @@ export default function Providers() {
                           {(() => {
                             const usageQuery = usageByProvider.get(p.id);
                             const usage = usageQuery?.data;
-                            const accountEmail = usage?.account_email?.trim() || undefined;
                             const planType = formatPlanType(usage?.plan_type);
                             const windows = providerUsageWindows(usage);
                             const visibleWindows =
                               windows.length > 0 ? windows : [undefined];
-                            const accountInfo = accountEmail ? (
-                              <span className="break-all font-mono text-[10px]">
-                                {accountEmail}
-                              </span>
-                            ) : (
-                              <span>
-                                {usageQuery?.isFetching
-                                  ? t("providers.usage.loading")
-                                  : t("providers.usage.unavailable")}
-                              </span>
-                            );
                             if (p.vendor === "openai") {
                               return (
                                 <OpenAiUsageLayout
@@ -1219,7 +1193,6 @@ export default function Providers() {
                                   usage={usage}
                                   loading={usageQuery?.isFetching ?? true}
                                   planType={planType}
-                                  accountEmail={accountEmail}
                                   t={t}
                                 />
                               );
@@ -1236,15 +1209,6 @@ export default function Providers() {
                                       {planType}
                                     </Badge>
                                   ) : null}
-                                  <Tooltip content={accountInfo} side="top">
-                                    <button
-                                      type="button"
-                                      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                      aria-label={t("providers.usage.accountInfo")}
-                                    >
-                                      <Info size={12} />
-                                    </button>
-                                  </Tooltip>
                                 </div>
                                 {visibleWindows.map((window, index) => (
                                   <UsageWindow
@@ -1265,7 +1229,36 @@ export default function Providers() {
                     </Td>
                     <Td className="whitespace-nowrap text-xs">
                       <div className="flex flex-col items-start gap-1.5">
-                        <span>{t(authModeLabelKey(p.auth_mode))}</span>
+                        <div className="flex items-center gap-1">
+                          <span>{t(authModeLabelKey(p.auth_mode))}</span>
+                          {p.auth_mode === "oauth" && supportsOAuthUsage(p)
+                            ? (() => {
+                                const accountEmail =
+                                  usageByProvider
+                                    .get(p.id)
+                                    ?.data?.account_email?.trim() || undefined;
+                                if (!accountEmail) return null;
+                                return (
+                                  <Tooltip
+                                    content={
+                                      <span className="break-all font-mono text-[10px]">
+                                        {accountEmail}
+                                      </span>
+                                    }
+                                    side="top"
+                                  >
+                                    <button
+                                      type="button"
+                                      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                      aria-label={t("providers.usage.accountInfo")}
+                                    >
+                                      <Info size={12} />
+                                    </button>
+                                  </Tooltip>
+                                );
+                              })()
+                            : null}
+                        </div>
                         {p.auth_mode === "oauth" ? (
                           <Badge
                             tone={oauthStatusTone(p)}
