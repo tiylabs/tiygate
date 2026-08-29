@@ -1181,7 +1181,7 @@ export default function Providers() {
                       </div>
                     </Td>
                     <Td className="align-middle">
-                      {!isOAuthProvider(p) ? (
+                      {!isOAuthProvider(p) && !supportsProviderUsage(p) ? (
                         <div
                           className="truncate font-mono text-xs"
                           title={p.api_base}
