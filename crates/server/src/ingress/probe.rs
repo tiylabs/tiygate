@@ -39,6 +39,7 @@ const PROBE_POLL_SECS: u64 = 2;
 const FRESH_SECS: i64 = 24 * 60 * 60;
 const STALE_SECS: i64 = 7 * 24 * 60 * 60;
 const MAX_ERROR_BYTES: usize = 512;
+const MAX_PROBE_RESPONSE_BYTES: usize = 64 * 1024;
 const NONCE_PREFIX: &str = "tiygate-probe";
 const GLOBAL_PROBE_CONCURRENCY: usize = 4;
 const PROVIDER_PROBE_CONCURRENCY: usize = 2;
@@ -1330,6 +1331,43 @@ fn probe_body(
     (body, CapabilityId::from(capability_id), false)
 }
 
+fn prepare_probe_egress_profile(
+    target: &tiygate_core::RoutingTarget,
+    body: &mut Value,
+    headers: &mut http::HeaderMap,
+    stream: bool,
+    request_id: &str,
+) -> Result<bool, ProbeRequestError> {
+    let suite = target.api_protocol.suite;
+    let codex_profile = crate::openai_codex_oauth::is_enabled(target, suite);
+    if codex_profile {
+        crate::openai_codex_oauth::prepare_body(body, false);
+        crate::openai_codex_oauth::validate_codex_tool_names(body).map_err(|error| {
+            ProbeRequestError::Transient(format!(
+                "Codex probe body validation failed with HTTP {}",
+                error.http_status()
+            ))
+        })?;
+        crate::openai_codex_oauth::apply_request_headers(
+            headers,
+            stream,
+            false,
+            request_id,
+            None,
+            target
+                .oauth
+                .as_ref()
+                .and_then(|oauth| oauth.account_id.as_deref()),
+        );
+    }
+    if crate::anthropic_oauth::is_enabled(target, suite) {
+        crate::anthropic_oauth::prepare_body(body);
+        crate::anthropic_oauth::apply_headers(target, headers, stream, request_id)
+            .map_err(ProbeRequestError::Transient)?;
+    }
+    Ok(codex_profile)
+}
+
 async fn send_probe(
     state: &AppState,
     target: &tiygate_core::RoutingTarget,
@@ -1337,6 +1375,7 @@ async fn send_probe(
     stream: bool,
     timeout: Duration,
 ) -> Result<(u16, Option<String>, String), ProbeRequestError> {
+    let mut body = body;
     let suite = target.api_protocol.suite;
     let url = match suite {
         tiygate_core::ProtocolSuite::GoogleGemini => format!(
@@ -1372,9 +1411,11 @@ async fn send_probe(
                 ProbeRequestError::Transient(detail)
             }
         })?;
-    let client = if target.api_protocol.suite == tiygate_core::ProtocolSuite::AnthropicMessages
-        && target.oauth.is_some()
-    {
+    let request_id = format!("capability-probe-{}", uuid::Uuid::now_v7());
+    let codex_profile =
+        prepare_probe_egress_profile(target, &mut body, &mut headers, stream, &request_id)?;
+    let anthropic_oauth_profile = crate::anthropic_oauth::is_enabled(target, suite);
+    let client = if anthropic_oauth_profile {
         state.tunables().anthropic_oauth_http_client.clone()
     } else {
         state.tunables().http_client.clone()
@@ -1398,12 +1439,23 @@ async fn send_probe(
         .await
         .map_err(|_| ProbeRequestError::Transient("probe response body timed out".to_string()))?
         .map_err(ProbeRequestError::Transient)?;
+    let text = if codex_profile && !stream && (200..300).contains(&status) {
+        crate::openai_codex_oauth::parse_http_response(&text)
+            .map(|value| value.to_string())
+            .map_err(|error| ProbeRequestError::Transient(error.message))?
+    } else {
+        text
+    };
     let redacted = redact_upstream_text(state, &text);
     // JSON redaction handles structured credential fields; the target-aware
     // pass also removes API keys, API-base strings and URL-like tokens from
     // plain-text upstream errors before they reach profile diagnostics.
     let redacted = redact_target_error(target, &redacted);
-    Ok((status, content_type, truncate(&redacted, MAX_ERROR_BYTES)))
+    Ok((
+        status,
+        content_type,
+        truncate(&redacted, MAX_PROBE_RESPONSE_BYTES),
+    ))
 }
 
 fn probe_timeout(probe_id: &str) -> Duration {
@@ -1415,18 +1467,18 @@ fn probe_timeout(probe_id: &str) -> Duration {
 }
 
 async fn read_limited_body(response: reqwest::Response) -> Result<String, String> {
-    let mut bytes = Vec::with_capacity(MAX_ERROR_BYTES + 1);
+    let mut bytes = Vec::with_capacity(MAX_PROBE_RESPONSE_BYTES + 1);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
-        let remaining = MAX_ERROR_BYTES
+        let remaining = MAX_PROBE_RESPONSE_BYTES
             .saturating_add(1)
             .saturating_sub(bytes.len());
         if remaining == 0 {
             break;
         }
         bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-        if bytes.len() > MAX_ERROR_BYTES {
+        if bytes.len() > MAX_PROBE_RESPONSE_BYTES {
             break;
         }
     }
@@ -1729,9 +1781,37 @@ async fn apply_outcomes(
     probe_judge_version: u32,
 ) -> Result<ProbeApplyResult, tiygate_store::config_store::StoreError> {
     let identity = store.target_identity(target)?;
-    let existing = store.get_capability_profile(target_key).await?;
+    let wire_profile = wire_profile_for_target(target);
+    let baseline = tiygate_protocols::capabilities::baseline_for(&wire_profile);
+    let matchers = tiygate_protocols::capabilities::matcher_map();
+    store
+        .update_capability_profile_atomically(target_key, move |existing| {
+            let (profile, result) = merge_probe_outcomes(
+                existing,
+                &identity,
+                target_key,
+                outcomes,
+                probe_judge_version,
+                &baseline,
+                &matchers,
+            );
+            Ok((profile, result))
+        })
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_probe_outcomes(
+    existing: Option<TargetCapabilityProfile>,
+    identity: &tiygate_core::CanonicalTargetIdentity,
+    target_key: &tiygate_core::TargetKey,
+    outcomes: Vec<ProbeOutcome>,
+    probe_judge_version: u32,
+    baseline: &std::collections::BTreeMap<CapabilityId, tiygate_core::BaselineSupport>,
+    matchers: &std::collections::BTreeMap<CapabilityId, tiygate_core::CapabilityMatcher>,
+) -> (TargetCapabilityProfile, ProbeApplyResult) {
     let mut profile =
-        existing.unwrap_or_else(|| TargetCapabilityProfile::pending(&identity, target_key.clone()));
+        existing.unwrap_or_else(|| TargetCapabilityProfile::pending(identity, target_key.clone()));
     let now = Utc::now();
     let mut updated_observation = false;
     let mut partial = false;
@@ -1812,11 +1892,9 @@ async fn apply_outcomes(
             }
         }
     }
-    let wire_profile = wire_profile_for_target(target);
-    let baseline = tiygate_protocols::capabilities::baseline_for(&wire_profile);
     profile.resolved_capabilities = tiygate_core::resolve_capabilities_with_matchers(
-        &baseline,
-        &tiygate_protocols::capabilities::matcher_map(),
+        baseline,
+        matchers,
         profile.observations.clone(),
         now,
     );
@@ -1868,12 +1946,14 @@ async fn apply_outcomes(
         profile.stale_until = Some(stale_until);
     }
     profile.updated_at = now;
-    store.upsert_capability_profile(&profile).await?;
-    Ok(ProbeApplyResult {
-        partial,
-        retryable_error,
-        terminal_error,
-    })
+    (
+        profile,
+        ProbeApplyResult {
+            partial,
+            retryable_error,
+            terminal_error,
+        },
+    )
 }
 
 fn redact_error(error: &str) -> String {
@@ -2065,6 +2145,133 @@ mod tests {
             weight: 1.0,
             oauth: None,
         }
+    }
+
+    fn oauth_config(
+        profile: tiygate_core::provider::oauth::OAuthEgressProfile,
+    ) -> tiygate_core::provider::oauth::OAuthTargetConfig {
+        tiygate_core::provider::oauth::OAuthTargetConfig {
+            upstream_transport: tiygate_core::provider::oauth::UpstreamTransport::Http,
+            egress_profile: profile,
+            token_url: "https://example.com/token".to_string(),
+            client_id: "client".to_string(),
+            client_secret: None,
+            refresh_token: "refresh".to_string(),
+            scopes: Vec::new(),
+            token_request_style: tiygate_core::provider::oauth::TokenRequestStyle::Form,
+            authorization_header: None,
+            authorization_prefix: None,
+            extra_headers: Vec::new(),
+            account_id: Some("account-1".to_string()),
+        }
+    }
+
+    #[test]
+    fn probe_egress_profile_matches_codex_and_anthropic_contracts() {
+        let mut codex = test_responses_target();
+        codex.oauth = Some(oauth_config(
+            tiygate_core::provider::oauth::OAuthEgressProfile::OpenAiCodex,
+        ));
+        let mut codex_body = json!({
+            "model": "model",
+            "input": "probe",
+            "max_output_tokens": 32
+        });
+        let mut codex_headers = http::HeaderMap::new();
+        assert!(prepare_probe_egress_profile(
+            &codex,
+            &mut codex_body,
+            &mut codex_headers,
+            false,
+            "probe-request"
+        )
+        .expect("Codex profile"));
+        assert_eq!(codex_body["store"], false);
+        assert_eq!(codex_body["stream"], true);
+        assert!(codex_body["input"].is_array());
+        assert!(codex_body.get("max_output_tokens").is_none());
+        assert_eq!(
+            codex_headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("account-1")
+        );
+
+        let mut anthropic = test_responses_target();
+        anthropic.api_protocol = tiygate_core::ProtocolEndpoint::new(
+            tiygate_core::ProtocolSuite::AnthropicMessages,
+            "messages",
+            "2023-06-01",
+        );
+        anthropic.oauth = Some(oauth_config(
+            tiygate_core::provider::oauth::OAuthEgressProfile::AnthropicOAuth,
+        ));
+        let mut anthropic_body = json!({"thinking": {"type": "enabled"}});
+        let mut anthropic_headers = http::HeaderMap::new();
+        assert!(!prepare_probe_egress_profile(
+            &anthropic,
+            &mut anthropic_body,
+            &mut anthropic_headers,
+            true,
+            "probe-request"
+        )
+        .expect("Anthropic profile"));
+        assert_eq!(anthropic_body["thinking"]["display"], "summarized");
+        assert_eq!(
+            anthropic_headers
+                .get("x-app")
+                .and_then(|value| value.to_str().ok()),
+            Some("cli")
+        );
+    }
+
+    #[test]
+    fn probe_merge_preserves_latest_business_evidence() {
+        let target = test_responses_target();
+        let identity = tiygate_core::CanonicalTargetIdentity {
+            identity_version: 1,
+            provider_id: "test".to_string(),
+            credential_scope_fingerprint: "scope".to_string(),
+            canonical_api_base: "https://example.com/v1".to_string(),
+            egress_protocol_suite: "openairesponses".to_string(),
+            egress_endpoint_name: "responses".to_string(),
+            egress_endpoint_version: "v1".to_string(),
+            egress_dialect_id: "openai-responses-standard".to_string(),
+            exact_model_id: "model".to_string(),
+        };
+        let key = tiygate_core::target_key(&identity);
+        let mut profile = TargetCapabilityProfile::pending(&identity, key.clone());
+        let mut business = CapabilityObservation::now(
+            "tools.custom",
+            CapabilityState::Supported,
+            EvidenceSource::SuccessfulTraffic,
+            1,
+        );
+        business.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        profile.observations.push(business);
+        let baseline =
+            tiygate_protocols::capabilities::baseline_for(&wire_profile_for_target(&target));
+        let (merged, _) = merge_probe_outcomes(
+            Some(profile),
+            &identity,
+            &key,
+            vec![ProbeOutcome::Positive(probe_observation(
+                &CapabilityId::from("tools.function"),
+                CapabilityState::Supported,
+                None,
+            ))],
+            PROBE_JUDGE_VERSION,
+            &baseline,
+            &tiygate_protocols::capabilities::matcher_map(),
+        );
+        assert!(merged.observations.iter().any(|observation| {
+            observation.capability_id == CapabilityId::from("tools.custom")
+                && observation.source == EvidenceSource::SuccessfulTraffic
+        }));
+        assert!(merged.observations.iter().any(|observation| {
+            observation.capability_id == CapabilityId::from("tools.function")
+                && observation.source == EvidenceSource::SemanticProbe
+        }));
     }
 
     #[test]

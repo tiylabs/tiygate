@@ -242,6 +242,21 @@ async fn target_capability_routes_create_profile_and_probe_job() {
         .expect("probe response");
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 
+    let unknown_override = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            &format!("/admin/v1/target-capabilities/{target_key}/overrides"),
+            json!({
+                "capability_id": "tools.function",
+                "state": "unknown",
+                "reason": "must not silently retain lower-priority evidence"
+            }),
+        ))
+        .await
+        .expect("unknown override response");
+    assert_eq!(unknown_override.status(), StatusCode::BAD_REQUEST);
+
     let override_body = json!({
         "capability_id": "tools.function",
         "state": "supported",

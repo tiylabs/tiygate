@@ -796,7 +796,12 @@ async fn upsert_target_capability_override(
         "supported" => tiygate_core::CapabilityState::Supported,
         "unsupported" => tiygate_core::CapabilityState::Unsupported,
         "constrained" => tiygate_core::CapabilityState::Constrained,
-        "unknown" => tiygate_core::CapabilityState::Unknown,
+        "unknown" => {
+            return Err(AdminError::InvalidCapability(
+                "unknown is not a valid override state; delete the override to return to discovered evidence"
+                    .to_string(),
+            ))
+        }
         _ => {
             return Err(AdminError::InvalidCapability(
                 "invalid capability state".to_string(),
@@ -1807,9 +1812,7 @@ async fn build_shape_admission_report(
     let planner_internal_error_rate = metric.map_or(0.0, |value| value.planner_internal_error_rate);
     let telemetry_gap = metric.is_some_and(|value| value.telemetry_gap);
     let observation_window_seconds = metric.map_or(0, |value| value.observation_window_seconds);
-    let observation_window_complete = metric.is_some_and(|value| {
-        value.observation_window_complete && observation_window_seconds >= 24 * 60 * 60
-    });
+    let observation_window_complete = metric.is_some_and(|value| value.observation_window_complete);
     let planning_latency_p95_micros = metric.map_or(0, |value| value.planning_latency_p95_micros);
     let metric_truncated = metric.is_some_and(|value| value.truncated);
     let low_traffic_eligible = required

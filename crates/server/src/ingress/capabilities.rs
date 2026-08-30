@@ -632,7 +632,6 @@ pub fn spawn_admission_guard(store: Arc<DbConfigStore>) -> CapabilityAdmissionGu
                         .unwrap_or(0),
                 );
                 let sample_gate = (metric.observation_window_complete
-                    && metric.observation_window_seconds >= 24 * 60 * 60
                     && metric.relevant_requests >= 100)
                     || (low_traffic_exception && low_traffic_eligible);
                 let healthy = metric.profile_resolution_coverage >= 1.0

@@ -21,22 +21,26 @@ export function Field({
   hint,
   error,
   required,
+  controlId,
+  errorId,
   children,
 }: PropsWithChildren<{
   label: ReactNode;
   hint?: ReactNode;
   error?: ReactNode;
   required?: boolean;
+  controlId?: string;
+  errorId?: string;
 }>) {
   return (
     <div className="space-y-1.5">
-      <Label>
+      <Label htmlFor={controlId}>
         {label}
         {required ? <span className="ml-0.5 text-danger">*</span> : null}
       </Label>
       {children}
       {error ? (
-        <p className="text-xs text-danger" role="alert">
+        <p id={errorId} className="text-xs text-danger" role="alert">
           {error}
         </p>
       ) : hint ? (

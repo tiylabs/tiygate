@@ -258,6 +258,51 @@ impl From<&TargetCapabilityProfile> for CapabilityProfileSummary {
 }
 
 impl DbConfigStore {
+    /// Atomically merge a capability profile using the latest durable row.
+    /// PostgreSQL locks the target row across the callback and write; SQLite is
+    /// serialized by the store-owned mutex because it has no `FOR UPDATE`.
+    pub async fn update_capability_profile_atomically<T>(
+        &self,
+        target_key: &TargetKey,
+        update: impl FnOnce(
+            Option<TargetCapabilityProfile>,
+        ) -> Result<(TargetCapabilityProfile, T), StoreError>,
+    ) -> Result<T, StoreError> {
+        let _write_guard = self.capability_profile_write_lock.lock().await;
+        let mut tx = self.pool.any().begin().await?;
+        let profile_query = if self.pool.kind() == crate::db::DbKind::Postgres {
+            "SELECT target_key, identity_version, provider_id, credential_scope_fingerprint, canonical_api_base,
+             protocol_suite, endpoint_name, endpoint_version, dialect_id, model_id, schema_version,
+             registry_version, baseline_version, profile_status, resolved_capabilities_json, observations_json,
+             last_probe_suite_version, last_probe_judge_version,
+             last_successful_probe_at, last_probe_error_class, last_probe_error_redacted, fresh_until, stale_until,
+             created_at, updated_at FROM target_capability_profiles WHERE target_key = $1 FOR UPDATE"
+        } else {
+            "SELECT target_key, identity_version, provider_id, credential_scope_fingerprint, canonical_api_base,
+             protocol_suite, endpoint_name, endpoint_version, dialect_id, model_id, schema_version,
+             registry_version, baseline_version, profile_status, resolved_capabilities_json, observations_json,
+             last_probe_suite_version, last_probe_judge_version,
+             last_successful_probe_at, last_probe_error_class, last_probe_error_redacted, fresh_until, stale_until,
+             created_at, updated_at FROM target_capability_profiles WHERE target_key = $1"
+        };
+        let existing = sqlx::query(profile_query)
+            .bind(target_key.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(parse_profile)
+            .transpose()?;
+        let (profile, output) = update(existing)?;
+        if profile.target_key != *target_key {
+            return Err(StoreError::Invalid(
+                "capability profile update changed its target key".to_string(),
+            ));
+        }
+        self.upsert_capability_profile_tx(&mut tx, &profile).await?;
+        self.bump_capability_epoch_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(output)
+    }
+
     /// Check whether a runtime target identity is still referenced by the
     /// current configuration snapshot. Background stale/reprobe feedback
     /// must not recreate a profile after the originating route was deleted.
@@ -843,6 +888,11 @@ impl DbConfigStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         override_record: &TargetCapabilityOverride,
     ) -> Result<(), StoreError> {
+        if override_record.state == CapabilityState::Unknown {
+            return Err(StoreError::Invalid(
+                "unknown is diagnostic state, not a capability override".to_string(),
+            ));
+        }
         let value = override_record
             .value
             .as_ref()
@@ -1786,6 +1836,7 @@ impl DbConfigStore {
         target_key: &TargetKey,
         capability_id: &CapabilityId,
     ) -> Result<bool, StoreError> {
+        let _write_guard = self.capability_profile_write_lock.lock().await;
         let mut tx = self.pool.any().begin().await?;
         let profile_query = if self.pool.kind() == crate::db::DbKind::Postgres {
             "SELECT target_key, identity_version, provider_id, credential_scope_fingerprint, canonical_api_base,
@@ -3136,6 +3187,30 @@ mod tests {
                 && observation.source == tiygate_core::EvidenceSource::SuccessfulTraffic
                 && observation.state == CapabilityState::Supported
         }));
+    }
+
+    #[tokio::test]
+    async fn unknown_capability_override_is_rejected_at_store_boundary() {
+        let pool = crate::db::open_pool("sqlite::memory:").await.expect("pool");
+        crate::db::run_migrations(&pool).await.expect("migrations");
+        let store = DbConfigStore::new(pool, None);
+        let now = Utc::now();
+        let record = TargetCapabilityOverride {
+            target_key: TargetKey("unknown-override".to_string()),
+            capability_id: CapabilityId::from("tools.function"),
+            state: CapabilityState::Unknown,
+            value: None,
+            reason: "invalid tombstone".to_string(),
+            actor: "test".to_string(),
+            expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let error = store
+            .upsert_capability_override(&record)
+            .await
+            .expect_err("Unknown override must be rejected");
+        assert!(error.to_string().contains("diagnostic state"));
     }
 
     #[tokio::test]

@@ -3590,6 +3590,8 @@ struct ShadowMetricAccumulator {
     probe_auth_errors: u64,
     targets: HashSet<String>,
     telemetry_gap: bool,
+    first_observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_observed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Aggregate persisted capability plans for the requested observation window.
@@ -3602,6 +3604,11 @@ pub async fn list_capability_shadow_metrics(
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<Vec<CapabilityShadowMetric>, sqlx::Error> {
+    const REQUIRED_OBSERVATION_WINDOW_SECS: u64 = 24 * 60 * 60;
+    // Events are discrete. Allow the first and last observations to land up to
+    // five minutes inside the requested window while still requiring their
+    // actual timestamps to span essentially the whole 24-hour gate period.
+    const OBSERVATION_EDGE_TOLERANCE_SECS: u64 = 5 * 60;
     let now = chrono::Utc::now();
     let since = since
         .map(str::to_string)
@@ -3610,7 +3617,7 @@ pub async fn list_capability_shadow_metrics(
         .map(str::to_string)
         .unwrap_or_else(|| now.to_rfc3339());
     let mut sql = String::from(
-        "SELECT route_id, shape_hash, request_id, target, status, planning_micros,
+        "SELECT route_id, shape_hash, request_id, target, status, planning_micros, ts,
                 requirements_json, missing_json, unknown_json
          FROM request_capability_plans WHERE ts >= $1 AND ts < $2",
     );
@@ -3650,6 +3657,19 @@ pub async fn list_capability_shadow_metrics(
                 .unwrap_or(0)
                 .min(required_count);
         let aggregate = aggregates.entry(key).or_default();
+        if let Ok(observed_at) = chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("ts")) {
+            let observed_at = observed_at.with_timezone(&chrono::Utc);
+            aggregate.first_observed_at = Some(
+                aggregate
+                    .first_observed_at
+                    .map_or(observed_at, |current| current.min(observed_at)),
+            );
+            aggregate.last_observed_at = Some(
+                aggregate
+                    .last_observed_at
+                    .map_or(observed_at, |current| current.max(observed_at)),
+            );
+        }
         aggregate.relevant_requests.insert(request_id.clone());
         aggregate.targets.insert(row.get("target"));
         aggregate.target_pairs = aggregate.target_pairs.saturating_add(required_count);
@@ -3819,27 +3839,21 @@ pub async fn list_capability_shadow_metrics(
                 })
                 .copied()
                 .unwrap_or(0);
+            let observation_window_seconds = aggregate
+                .first_observed_at
+                .zip(aggregate.last_observed_at)
+                .map(|(start, end)| (end - start).num_seconds().max(0) as u64)
+                .unwrap_or(0);
             CapabilityShadowMetric {
                 route_id,
                 shape_hash,
                 window_start: since.clone(),
                 window_end: until.clone(),
-                observation_window_seconds: chrono::DateTime::parse_from_rfc3339(&until)
-                    .ok()
-                    .and_then(|end| {
-                        chrono::DateTime::parse_from_rfc3339(&since)
-                            .ok()
-                            .map(|start| (end - start).num_seconds().max(0) as u64)
-                    })
-                    .unwrap_or(0),
-                observation_window_complete: chrono::DateTime::parse_from_rfc3339(&until)
-                    .ok()
-                    .and_then(|end| {
-                        chrono::DateTime::parse_from_rfc3339(&since)
-                            .ok()
-                            .map(|start| (end - start).num_hours() >= 24)
-                    })
-                    .unwrap_or(false),
+                observation_window_seconds,
+                observation_window_complete: observation_window_seconds
+                    .saturating_add(OBSERVATION_EDGE_TOLERANCE_SECS)
+                    >= REQUIRED_OBSERVATION_WINDOW_SECS
+                    && !aggregate.telemetry_gap,
                 relevant_requests: relevant,
                 target_pairs: aggregate.target_pairs,
                 resolved_pairs: aggregate.resolved_pairs,
@@ -4353,6 +4367,8 @@ mod tests {
         assert_eq!(metrics[0].planner_unknown_rate, 0.5);
         assert_eq!(metrics[0].verified_success_requests, 1);
         assert_eq!(metrics[0].verified_success_disagreements, 1);
+        assert!(!metrics[0].observation_window_complete);
+        assert!(metrics[0].observation_window_seconds < 60);
 
         sink.write_event(&PipelineEvent {
             request_id: "req-capability-planner-error".to_string(),
@@ -4433,6 +4449,56 @@ mod tests {
         .expect("list capability metrics with gap");
         assert_eq!(metrics_with_gap.len(), 1);
         assert!(metrics_with_gap[0].telemetry_gap);
+    }
+
+    #[tokio::test]
+    async fn shadow_window_uses_observed_event_span() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+        let now = Utc::now();
+        for (request_id, timestamp) in [
+            (
+                "window-start",
+                now - chrono::Duration::hours(24) + chrono::Duration::minutes(1),
+            ),
+            ("window-end", now),
+        ] {
+            sink.write_event(&PipelineEvent {
+                request_id: request_id.to_string(),
+                timestamp,
+                stage: "capability_planner".to_string(),
+                payload: EventPayload::CapabilityPlan {
+                    mode: "shadow".to_string(),
+                    route_id: "window-route".to_string(),
+                    shape_hash: "shape/v1:window".to_string(),
+                    planning_micros: 1,
+                    requirements: vec!["tools.function".to_string()],
+                    target: "target:key".to_string(),
+                    status: "compatible".to_string(),
+                    missing: Vec::new(),
+                    unknown: Vec::new(),
+                    transform: None,
+                    evidence: Vec::new(),
+                },
+            })
+            .await
+            .expect("write plan");
+        }
+        let since = (now - chrono::Duration::hours(24)).to_rfc3339();
+        let until = (now + chrono::Duration::seconds(1)).to_rfc3339();
+        let metrics = list_capability_shadow_metrics(
+            &pool,
+            Some("window-route"),
+            Some("shape/v1:window"),
+            Some(&since),
+            Some(&until),
+        )
+        .await
+        .expect("metrics");
+        assert_eq!(metrics.len(), 1);
+        assert!(metrics[0].observation_window_complete);
+        assert!(metrics[0].observation_window_seconds >= 23 * 60 * 60);
     }
 
     #[test]

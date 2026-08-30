@@ -30,8 +30,51 @@ const stateOptions = [
   { value: "supported", label: "Supported" },
   { value: "unsupported", label: "Unsupported" },
   { value: "constrained", label: "Constrained" },
-  { value: "unknown", label: "Unknown" },
 ];
+
+function constrainedOverrideValue(
+  valueKind: string | undefined,
+  setValue: string,
+  rangeMin: string,
+  rangeMax: string,
+  booleanValue: string,
+  opaqueValue: string,
+): unknown {
+  if (!valueKind) throw new Error("Select a registered capability before adding a constraint.");
+  if (["enum_set", "string_set", "schema_keyword_set"].includes(valueKind)) {
+    const values = setValue.split(",").map((value) => value.trim()).filter(Boolean);
+    if (values.length === 0) throw new Error("Enter at least one allowed value.");
+    return { kind: valueKind, value: [...new Set(values)] };
+  }
+  if (valueKind === "integer_range" || valueKind === "decimal_range") {
+    if (!rangeMin.trim() && !rangeMax.trim()) throw new Error("Enter a minimum or maximum value.");
+    const parse = (raw: string): number | null => {
+      if (!raw.trim()) return null;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed)) throw new Error("Range bounds must be valid numbers.");
+      if (valueKind === "integer_range" && !Number.isSafeInteger(parsed)) {
+        throw new Error("Integer range bounds must be safe integers.");
+      }
+      return parsed;
+    };
+    const min = parse(rangeMin);
+    const max = parse(rangeMax);
+    if (min !== null && max !== null && min > max) {
+      throw new Error("Minimum cannot be greater than maximum.");
+    }
+    return { kind: valueKind, value: { min, max } };
+  }
+  if (valueKind === "bool") {
+    return { kind: "bool", value: booleanValue === "true" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(opaqueValue);
+  } catch (error) {
+    throw new Error(`Enter valid JSON: ${(error as Error).message}`);
+  }
+  return { kind: "opaque", value: parsed };
+}
 
 function statusTone(status: string): "success" | "warning" | "danger" | "neutral" {
   if (status === "ready") return "success";
@@ -58,6 +101,12 @@ export default function CapabilitiesPage() {
   const [overrideState, setOverrideState] = useState<CapabilityState>("supported");
   const [overrideReason, setOverrideReason] = useState("");
   const [overrideExpiresAt, setOverrideExpiresAt] = useState("");
+  const [overrideSetValue, setOverrideSetValue] = useState("");
+  const [overrideRangeMin, setOverrideRangeMin] = useState("");
+  const [overrideRangeMax, setOverrideRangeMax] = useState("");
+  const [overrideBooleanValue, setOverrideBooleanValue] = useState("true");
+  const [overrideOpaqueValue, setOverrideOpaqueValue] = useState("");
+  const [overrideValueError, setOverrideValueError] = useState<string | null>(null);
   const [selectedRouteId, setSelectedRouteId] = useState("");
   const [admissionShape, setAdmissionShape] = useState("");
   const [admissionCapabilities, setAdmissionCapabilities] = useState("");
@@ -120,9 +169,31 @@ export default function CapabilitiesPage() {
   const overrideMutation = useMutation({
     mutationFn: () => {
       if (!selectedKey) throw new Error(t("capabilities.selectTarget"));
+      const descriptor = (registryQuery.data?.entries ?? registryQuery.data?.items ?? []).find(
+        (entry) => entry.id === overrideCapability.trim(),
+      );
+      let value: unknown;
+      if (overrideState === "constrained") {
+        try {
+          value = constrainedOverrideValue(
+            descriptor?.value_kind,
+            overrideSetValue,
+            overrideRangeMin,
+            overrideRangeMax,
+            overrideBooleanValue,
+            overrideOpaqueValue,
+          );
+          setOverrideValueError(null);
+        } catch (error) {
+          const message = (error as Error).message;
+          setOverrideValueError(message);
+          throw new Error(message);
+        }
+      }
       return capabilitiesApi.override(selectedKey, {
         capability_id: overrideCapability.trim(),
         state: overrideState,
+        value,
         reason: overrideReason.trim(),
         expires_at: overrideExpiresAt
           ? new Date(overrideExpiresAt).toISOString()
@@ -133,6 +204,11 @@ export default function CapabilitiesPage() {
       setOverrideCapability("");
       setOverrideReason("");
       setOverrideExpiresAt("");
+      setOverrideSetValue("");
+      setOverrideRangeMin("");
+      setOverrideRangeMax("");
+      setOverrideOpaqueValue("");
+      setOverrideValueError(null);
       toast.success(t("capabilities.overrideSaved"));
       void qc.invalidateQueries({ queryKey: ["target-capabilities"] });
       void qc.invalidateQueries({ queryKey: ["target-capability", selectedKey] });
@@ -224,6 +300,9 @@ export default function CapabilitiesPage() {
   const profiles = profilesQuery.data?.entries ?? [];
   const routes = routesQuery.data?.entries ?? [];
   const registryEntries = registryQuery.data?.entries ?? registryQuery.data?.items ?? [];
+  const overrideDescriptor = registryEntries.find(
+    (descriptor) => descriptor.id === overrideCapability.trim(),
+  );
   const admissions = currentAdmissions;
   const metrics = metricsQuery.data?.entries ?? [];
   const probeWorkerEnabled =
@@ -435,12 +514,116 @@ export default function CapabilitiesPage() {
                 </div>
                 <div className="space-y-2 border-t border-border pt-3">
                   <div className="flex items-center gap-2 text-xs font-medium"><ShieldCheck size={14} />{t("capabilities.overrideTitle")}</div>
-                  <Field label={t("capabilities.capabilityId")}>
-                    <Input value={overrideCapability} onChange={(event) => setOverrideCapability(event.target.value)} placeholder="tools.function" />
+                  <Field label={t("capabilities.capabilityId")} controlId="override-capability-id">
+                    <Input
+                      id="override-capability-id"
+                      list="capability-registry-options"
+                      value={overrideCapability}
+                      onChange={(event) => {
+                        setOverrideCapability(event.target.value);
+                        setOverrideValueError(null);
+                      }}
+                      placeholder="tools.function"
+                    />
+                    <datalist id="capability-registry-options">
+                      {registryEntries.map((descriptor) => (
+                        <option key={descriptor.id} value={descriptor.id} />
+                      ))}
+                    </datalist>
                   </Field>
                   <Field label={t("capabilities.state")}>
-                    <Select value={overrideState} onValueChange={(value) => setOverrideState(value as CapabilityState)} options={stateOptions} ariaLabel={t("capabilities.state")} />
+                    <Select
+                      value={overrideState}
+                      onValueChange={(value) => {
+                        setOverrideState(value as CapabilityState);
+                        setOverrideValueError(null);
+                      }}
+                      options={stateOptions}
+                      ariaLabel={t("capabilities.state")}
+                    />
                   </Field>
+                  {overrideState === "constrained" ? (
+                    <Field
+                      label={t("capabilities.overrideValue")}
+                      hint={overrideDescriptor
+                        ? t("capabilities.overrideValueKind", { kind: overrideDescriptor.value_kind })
+                        : t("capabilities.overrideValueSelectCapability")}
+                      error={overrideValueError}
+                      controlId={overrideDescriptor?.value_kind === "bool" ? undefined : "override-capability-value"}
+                      errorId="override-capability-value-error"
+                      required
+                    >
+                      {["enum_set", "string_set", "schema_keyword_set"].includes(
+                        overrideDescriptor?.value_kind ?? "",
+                      ) ? (
+                        <Input
+                          id="override-capability-value"
+                          value={overrideSetValue}
+                          onChange={(event) => {
+                            setOverrideSetValue(event.target.value);
+                            setOverrideValueError(null);
+                          }}
+                          placeholder={t("capabilities.overrideSetPlaceholder")}
+                          aria-invalid={Boolean(overrideValueError)}
+                          aria-describedby={overrideValueError ? "override-capability-value-error" : undefined}
+                        />
+                      ) : ["integer_range", "decimal_range"].includes(
+                          overrideDescriptor?.value_kind ?? "",
+                        ) ? (
+                        <div className="grid grid-cols-2 gap-2">
+                          <Input
+                            id="override-capability-value"
+                            type="number"
+                            value={overrideRangeMin}
+                            onChange={(event) => {
+                              setOverrideRangeMin(event.target.value);
+                              setOverrideValueError(null);
+                            }}
+                            placeholder={t("capabilities.overrideRangeMin")}
+                            aria-label={t("capabilities.overrideRangeMin")}
+                            aria-invalid={Boolean(overrideValueError)}
+                          />
+                          <Input
+                            type="number"
+                            value={overrideRangeMax}
+                            onChange={(event) => {
+                              setOverrideRangeMax(event.target.value);
+                              setOverrideValueError(null);
+                            }}
+                            placeholder={t("capabilities.overrideRangeMax")}
+                            aria-label={t("capabilities.overrideRangeMax")}
+                            aria-invalid={Boolean(overrideValueError)}
+                          />
+                        </div>
+                      ) : overrideDescriptor?.value_kind === "bool" ? (
+                        <Select
+                          value={overrideBooleanValue}
+                          onValueChange={(value) => {
+                            setOverrideBooleanValue(value);
+                            setOverrideValueError(null);
+                          }}
+                          options={[
+                            { value: "true", label: "true" },
+                            { value: "false", label: "false" },
+                          ]}
+                          ariaLabel={t("capabilities.overrideValue")}
+                        />
+                      ) : (
+                        <Textarea
+                          id="override-capability-value"
+                          rows={3}
+                          value={overrideOpaqueValue}
+                          onChange={(event) => {
+                            setOverrideOpaqueValue(event.target.value);
+                            setOverrideValueError(null);
+                          }}
+                          placeholder={t("capabilities.overrideJsonPlaceholder")}
+                          aria-invalid={Boolean(overrideValueError)}
+                          aria-describedby={overrideValueError ? "override-capability-value-error" : undefined}
+                        />
+                      )}
+                    </Field>
+                  ) : null}
                   <Field label={t("capabilities.reason")}>
                     <Input value={overrideReason} onChange={(event) => setOverrideReason(event.target.value)} placeholder={t("capabilities.reasonPlaceholder")} />
                   </Field>

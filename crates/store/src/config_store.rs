@@ -697,6 +697,10 @@ pub struct DbConfigStore {
     /// row during async startup; the random in-memory value is only a safe
     /// fallback for legacy/test stores that have not been initialized yet.
     pub(crate) fingerprint_secret: arc_swap::ArcSwap<zeroize::Zeroizing<[u8; 32]>>,
+    /// Serializes profile read-modify-write cycles for SQLite and for callers
+    /// sharing this store instance. PostgreSQL additionally takes a row lock so
+    /// independent gateway replicas cannot overwrite each other's evidence.
+    pub(crate) capability_profile_write_lock: tokio::sync::Mutex<()>,
     /// In-memory copy of the latest snapshot, used by readers that
     /// want a `ConfigStore` view. Held in an `ArcSwap` so the data
     /// plane can read the latest snapshot lock-free (a single
@@ -714,6 +718,7 @@ impl DbConfigStore {
             pool,
             encryption,
             fingerprint_secret: arc_swap::ArcSwap::from_pointee(zeroize::Zeroizing::new(secret)),
+            capability_profile_write_lock: tokio::sync::Mutex::new(()),
             inner,
         }
     }
@@ -2405,7 +2410,10 @@ impl DbConfigStore {
                 "supported" => tiygate_core::CapabilityState::Supported,
                 "unsupported" => tiygate_core::CapabilityState::Unsupported,
                 "constrained" => tiygate_core::CapabilityState::Constrained,
-                "unknown" => tiygate_core::CapabilityState::Unknown,
+                "unknown" => {
+                    report.capability_overrides_skipped += 1;
+                    continue;
+                }
                 _ => {
                     report.capability_overrides_skipped += 1;
                     continue;

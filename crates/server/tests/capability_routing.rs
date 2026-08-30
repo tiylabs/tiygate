@@ -461,11 +461,39 @@ async fn mixed_native_and_promotion_targets_use_independent_bodies() {
     let promoted = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/responses"))
+        .and(body_string_contains("\"stream\":true"))
+        .and(body_string_contains("additional_tools"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"error\":{\"type\":\"invalid_request_error\",\"param\":\"additional_tools\",\"message\":\"additional_tools are not supported\"}}\n\n",
+                ),
+        )
+        .with_priority(1)
+        .mount(&native)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
         .and(body_string_contains("additional_tools"))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
             "error": {"type": "invalid_request_error", "param": "tools", "message": "tools are not supported"}
         })))
+        .with_priority(10)
         .mount(&native)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .and(body_string_contains("\"stream\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stream\",\"status\":\"in_progress\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-stream\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                ),
+        )
+        .with_priority(1)
+        .mount(&promoted)
         .await;
     Mock::given(method("POST"))
         .and(path("/responses"))
@@ -481,6 +509,7 @@ async fn mixed_native_and_promotion_targets_use_independent_bodies() {
                 "arguments": "{}"
             }]
         })))
+        .with_priority(10)
         .mount(&promoted)
         .await;
 
@@ -557,6 +586,7 @@ async fn mixed_native_and_promotion_targets_use_independent_bodies() {
             .expect("profile row");
         let mut observations = vec![
             supported("transport.http"),
+            supported("transport.sse"),
             supported("tools.function"),
             supported("tools.function.continuation"),
             supported_namespace("functions"),
@@ -596,7 +626,7 @@ async fn mixed_native_and_promotion_targets_use_independent_bodies() {
     store
         .upsert_capability_route_admission(
             &CapabilityRouteAdmission {
-                route_id: route.id,
+                route_id: route.id.clone(),
                 capability_shape_hash: capability_shape_hash_from_requirements(
                     &required_requirements,
                 ),
@@ -621,6 +651,42 @@ async fn mixed_native_and_promotion_targets_use_independent_bodies() {
         )
         .await
         .expect("admission");
+    let mut streaming_requirements = crl_requirements();
+    streaming_requirements.push(CapabilityRequirement::required("transport.sse"));
+    store
+        .upsert_capability_route_admission(
+            &CapabilityRouteAdmission {
+                route_id: route.id,
+                capability_shape_hash: capability_shape_hash_from_requirements(
+                    &streaming_requirements,
+                ),
+                required_capabilities: vec![
+                    CapabilityId::from("transport.http"),
+                    CapabilityId::from("transport.sse"),
+                    CapabilityId::from("tools.crl.additional_tools"),
+                    CapabilityId::from("tools.namespace"),
+                    CapabilityId::from("tools.function"),
+                ],
+                required_requirements: streaming_requirements,
+                mode: tiygate_core::CapabilityRoutingMode::Enforce,
+                gate_policy_version: 1,
+                report: json!({
+                    "gate_passed": true,
+                    "registry_version": tiygate_store::capabilities::CAPABILITY_REGISTRY_VERSION,
+                    "baseline_version": tiygate_store::capabilities::CAPABILITY_BASELINE_VERSION,
+                    "shape_hash_version": "shape/v1"
+                }),
+                approved_by: Some("test".to_string()),
+                approved_at: Some(now),
+                expires_at: Some(now + chrono::Duration::hours(1)),
+                revision: 0,
+                created_at: now,
+                updated_at: now,
+            },
+            None,
+        )
+        .await
+        .expect("streaming admission");
     store
         .set_setting(
             tiygate_store::settings_keys::CAPABILITY_PROBE_ENABLED,
@@ -662,6 +728,32 @@ async fn mixed_native_and_promotion_targets_use_independent_bodies() {
         None,
     );
     tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    let streaming_response = router
+        .clone()
+        .oneshot(request(json!({
+            "model": "mixed-model",
+            "stream": true,
+            "input": [
+                {"role": "user", "content": "run"},
+                {"type": "additional_tools", "role": "developer", "tools": [{
+                    "type": "namespace", "name": "functions", "tools": [
+                        {"type": "function", "name": "wait", "parameters": {"type": "object"}}
+                    ]
+                }]}
+            ],
+            "tool_choice": "auto"
+        })))
+        .await
+        .expect("streaming response");
+    assert_eq!(streaming_response.status(), StatusCode::OK);
+    let streaming_body = axum::body::to_bytes(streaming_response.into_body(), usize::MAX)
+        .await
+        .expect("streaming body");
+    assert!(String::from_utf8_lossy(&streaming_body).contains("resp-stream"));
+    assert!(
+        !String::from_utf8_lossy(&streaming_body).contains("additional_tools are not supported")
+    );
+
     let response = router
         .oneshot(request(json!({
             "model": "mixed-model",
@@ -679,15 +771,18 @@ async fn mixed_native_and_promotion_targets_use_independent_bodies() {
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
     let native_requests = native.received_requests().await.expect("native requests");
-    assert_eq!(native_requests.len(), 1);
+    assert_eq!(native_requests.len(), 2);
     assert!(String::from_utf8_lossy(&native_requests[0].body).contains("additional_tools"));
     let promoted_requests = promoted
         .received_requests()
         .await
         .expect("promoted requests");
-    assert_eq!(promoted_requests.len(), 1);
-    let promoted_body: serde_json::Value =
-        serde_json::from_slice(&promoted_requests[0].body).expect("promoted json");
+    assert_eq!(promoted_requests.len(), 2);
+    let promoted_body: serde_json::Value = promoted_requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice(&request.body).ok())
+        .find(|body: &serde_json::Value| body["stream"] != true)
+        .expect("promoted non-stream json");
     assert!(promoted_body["input"]
         .as_array()
         .expect("promoted input")

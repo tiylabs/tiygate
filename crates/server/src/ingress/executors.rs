@@ -47,17 +47,20 @@ const IMAGES_NONSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const CODEX_WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_WEBSOCKET_EVENT_BUFFER: usize = 16;
 
-fn is_target_capability_rejection(status: u16, body: &str) -> bool {
-    if status != 400 && status != 422 {
-        return false;
-    }
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return false;
-    };
-    let error = value.get("error").unwrap_or(&value);
-    let Some(error_object) = error.as_object() else {
-        return false;
-    };
+const STREAM_PREFLIGHT_MAX_BYTES: usize = 64 * 1024;
+
+fn capability_rejection_details(value: &Value) -> Option<(String, Option<String>)> {
+    let error = value
+        .get("error")
+        .filter(|error| error.is_object())
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .filter(|error| error.is_object())
+        })
+        .unwrap_or(value);
+    let error_object = error.as_object()?;
     let code = error_object
         .get("code")
         .or_else(|| error_object.get("type"))
@@ -96,8 +99,112 @@ fn is_target_capability_rejection(status: u16, body: &str) -> bool {
     // A structured error type/code plus an explicit tool-related field or
     // message is required. Generic 400/422 text, including plain upstream
     // strings, never triggers target-specific fallback.
-    (capability_code || (code == "invalid_request_error" && unsupported_message))
+    if (capability_code || (code == "invalid_request_error" && unsupported_message))
         && capability_field
+    {
+        Some((
+            if message.is_empty() {
+                "upstream rejected a required capability".to_string()
+            } else {
+                message
+            },
+            (!code.is_empty()).then_some(code),
+        ))
+    } else {
+        None
+    }
+}
+
+fn is_target_capability_rejection(status: u16, body: &str) -> bool {
+    if status != 400 && status != 422 {
+        return false;
+    }
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| capability_rejection_details(&value))
+        .is_some()
+}
+
+fn first_sse_capability_rejection(bytes: &[u8]) -> Option<(String, Option<String>)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    for line in text.lines() {
+        let Some(payload) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        if let Some(details) = capability_rejection_details(&value) {
+            return Some(details);
+        }
+    }
+    None
+}
+
+fn has_complete_sse_event(bytes: &[u8]) -> bool {
+    bytes.windows(2).any(|window| window == b"\n\n")
+        || bytes.windows(4).any(|window| window == b"\r\n\r\n")
+}
+
+/// Read one complete upstream event before returning the downstream response.
+/// A structured capability rejection in that event is still pre-commit and can
+/// safely consume the normal target-fallback budget. Every other event is
+/// replayed byte-for-byte ahead of the remaining upstream stream.
+async fn preflight_capability_stream(
+    mut upstream: UpstreamByteStream,
+    timeout: Duration,
+) -> Result<UpstreamByteStream, AppError> {
+    let deadline = tokio::time::Instant::now() + timeout.max(Duration::from_secs(1));
+    let mut prefix = Vec::<Bytes>::new();
+    let mut scanned = Vec::<u8>::new();
+    loop {
+        let next = tokio::time::timeout_at(deadline, upstream.next())
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream did not produce an initial stream event".to_string(),
+                )
+                .with_class(tiygate_core::ErrorClass::DeadlineExceeded)
+                .with_client_bytes_emitted(0)
+            })?;
+        match next {
+            Some(Ok(bytes)) => {
+                scanned.extend_from_slice(&bytes);
+                prefix.push(bytes);
+                if has_complete_sse_event(&scanned) || scanned.len() >= STREAM_PREFLIGHT_MAX_BYTES {
+                    break;
+                }
+            }
+            Some(Err(error)) => {
+                return Err(AppError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("upstream stream failed before its first event: {error}"),
+                )
+                .with_class(tiygate_core::ErrorClass::Transient)
+                .with_client_bytes_emitted(0));
+            }
+            None => break,
+        }
+    }
+    if let Some((message, code)) = first_sse_capability_rejection(&scanned) {
+        let mut error = AppError::new(StatusCode::BAD_GATEWAY, message)
+            .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+            .with_target_capability_error()
+            .with_client_bytes_emitted(0);
+        error.upstream_status = Some(StatusCode::OK.as_u16());
+        if let Some(code) = code {
+            error = error.with_upstream_code(code);
+        }
+        return Err(error);
+    }
+    Ok(Box::pin(
+        futures::stream::iter(prefix.into_iter().map(Ok)).chain(upstream),
+    ))
 }
 
 fn upstream_error_code_from_body(body: &str) -> Option<String> {
@@ -1086,6 +1193,17 @@ pub(super) async fn execute_upstream(
             return Err(app_err);
         }
 
+        let upstream: UpstreamByteStream = Box::pin(
+            response
+                .bytes_stream()
+                .map(|result| result.map_err(|error| error.to_string())),
+        );
+        let upstream = preflight_capability_stream(
+            upstream,
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+        )
+        .await?;
+
         // Usage accumulator tracks chunks received from upstream, used
         // by `drive_upstream_stream` for disconnect-billing and the
         // bytes_emitted idempotency gate.
@@ -1114,11 +1232,7 @@ pub(super) async fn execute_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|result| result.map_err(|error| error.to_string())),
-            ),
+            upstream,
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -1650,6 +1764,16 @@ pub(super) async fn execute_messages_upstream(
             return Err(app_err);
         }
 
+        let upstream: UpstreamByteStream = Box::pin(
+            response
+                .bytes_stream()
+                .map(|result| result.map_err(|error| error.to_string())),
+        );
+        let upstream = preflight_capability_stream(
+            upstream,
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+        )
+        .await?;
         let accum =
             std::sync::Arc::new(std::sync::Mutex::new(tiygate_core::UsageAccumulator::new()));
 
@@ -1675,11 +1799,7 @@ pub(super) async fn execute_messages_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|result| result.map_err(|error| error.to_string())),
-            ),
+            upstream,
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -2489,6 +2609,16 @@ pub(super) async fn execute_responses_upstream(
             return Err(app_err);
         }
 
+        let upstream: UpstreamByteStream = Box::pin(
+            response
+                .bytes_stream()
+                .map(|result| result.map_err(|error| error.to_string())),
+        );
+        let upstream = preflight_capability_stream(
+            upstream,
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+        )
+        .await?;
         let accum = std::sync::Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
         let mut end_enc = codec.stream_encoder();
         let mut err_enc = codec.stream_encoder();
@@ -2502,11 +2632,7 @@ pub(super) async fn execute_responses_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|result| result.map_err(|error| error.to_string())),
-            ),
+            upstream,
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -2925,6 +3051,11 @@ async fn execute_codex_responses_websocket(
     }
 
     if is_stream {
+        let upstream = preflight_capability_stream(
+            websocket_event_stream(socket),
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+        )
+        .await?;
         let accum = std::sync::Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
         let mut end_enc = ingress_codec.stream_encoder();
         let mut err_enc = ingress_codec.stream_encoder();
@@ -2937,7 +3068,7 @@ async fn execute_codex_responses_websocket(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            websocket_event_stream(socket),
+            upstream,
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -3321,6 +3452,16 @@ pub(super) async fn execute_gemini_upstream(
             return Err(app_err);
         }
 
+        let upstream: UpstreamByteStream = Box::pin(
+            response
+                .bytes_stream()
+                .map(|result| result.map_err(|error| error.to_string())),
+        );
+        let upstream = preflight_capability_stream(
+            upstream,
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+        )
+        .await?;
         let accum = std::sync::Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
         let mut end_enc = codec.stream_encoder();
         let mut err_enc = codec.stream_encoder();
@@ -3334,11 +3475,7 @@ pub(super) async fn execute_gemini_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|result| result.map_err(|error| error.to_string())),
-            ),
+            upstream,
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -4341,6 +4478,10 @@ mod tests {
             400,
             r#"{"error":{"type":"invalid_request_error","param":"tools","message":"tools are not supported"}}"#
         ));
+        assert!(first_sse_capability_rejection(
+            b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"unsupported_parameter\",\"param\":\"tools\",\"message\":\"tools are not supported\"}}}\n\n"
+        )
+        .is_some());
         assert!(!is_target_capability_rejection(400, "unsupported tools"));
         assert!(!is_target_capability_rejection(
             400,
@@ -4356,6 +4497,36 @@ mod tests {
             ),
             Some("unsupported_parameter".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn stream_preflight_rejects_capability_error_before_commit() {
+        let stream: UpstreamByteStream = Box::pin(futures::stream::iter([Ok(Bytes::from_static(
+            b"data: {\"error\":{\"type\":\"invalid_request_error\",\"param\":\"additional_tools\",\"message\":\"additional_tools are not supported\"}}\n\n",
+        ))]));
+        let error = match preflight_capability_stream(stream, Duration::from_secs(1)).await {
+            Ok(_) => panic!("expected capability error"),
+            Err(error) => error,
+        };
+        assert!(error.is_target_capability_error());
+        assert_eq!(error.client_bytes_emitted(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_preflight_replays_non_capability_first_event() {
+        let first = Bytes::from_static(b"data: {\"type\":\"response.created\"}\n\n");
+        let second = Bytes::from_static(b"data: [DONE]\n\n");
+        let stream: UpstreamByteStream = Box::pin(futures::stream::iter([
+            Ok(first.clone()),
+            Ok(second.clone()),
+        ]));
+        let replayed = preflight_capability_stream(stream, Duration::from_secs(1))
+            .await
+            .expect("preflight");
+        let chunks = replayed.collect::<Vec<_>>().await;
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].as_ref().expect("first"), &first);
+        assert_eq!(chunks[1].as_ref().expect("second"), &second);
     }
 
     #[test]
