@@ -22,6 +22,11 @@ eventsource-stream.workspace = true
 proptest.workspace = true
 insta.workspace = true
 chrono.workspace = true
+toml.workspace = true
+
+[build-dependencies]
+serde.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

@@ -16,6 +16,7 @@
 //! latency. Phase 4 keeps the simple single-row path; Phase 5 may
 //! introduce a batching layer.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -132,6 +133,18 @@ impl EventSink for OltpSink {
             } => {
                 self.update_attempt_decision(event, target, *hop, decision)
                     .await
+            }
+            payload @ EventPayload::CapabilityPlan { .. } => {
+                self.upsert_capability_plan(event, payload).await
+            }
+            payload @ EventPayload::CapabilityFeedback { .. } => {
+                self.insert_capability_feedback(event, payload).await
+            }
+            payload @ EventPayload::CapabilityTelemetryGap { .. } => {
+                self.insert_capability_telemetry_gap(event, payload).await
+            }
+            payload @ EventPayload::CapabilityProbe { .. } => {
+                self.insert_capability_probe_run(event, payload).await
             }
             EventPayload::RequestStarted { .. }
             | EventPayload::RouteResolved { .. }
@@ -595,6 +608,7 @@ impl OltpSink {
         error_class: &str,
         latency_ms: u64,
     ) -> Result<(), sqlx::Error> {
+        let redacted_error = redact_error_for_storage(&self.redactor, error);
         sqlx::query(
             "INSERT INTO request_attempts (\
                 request_id, hop, ts, stage, target, status, error_class, error, \
@@ -615,7 +629,7 @@ impl OltpSink {
         .bind(&event.stage)
         .bind(target)
         .bind(error_class)
-        .bind(error)
+        .bind(redacted_error)
         .bind(latency_ms as i64)
         .execute(self.pool.any())
         .await?;
@@ -643,6 +657,202 @@ impl OltpSink {
         .bind(&event.stage)
         .bind(target)
         .bind(decision)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_capability_plan(
+        &self,
+        event: &PipelineEvent,
+        payload: &EventPayload,
+    ) -> Result<(), sqlx::Error> {
+        let EventPayload::CapabilityPlan {
+            mode,
+            route_id,
+            shape_hash,
+            planning_micros,
+            requirements,
+            target,
+            status,
+            missing,
+            unknown,
+            transform,
+            evidence,
+        } = payload
+        else {
+            return Ok(());
+        };
+        let requirements_json = serde_json::to_string(requirements)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let missing_json = serde_json::to_string(missing)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let unknown_json = serde_json::to_string(unknown)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let evidence_json = serde_json::to_string(evidence)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        sqlx::query(
+            "INSERT INTO request_capability_plans
+             (request_id, route_id, target, ts, mode, shape_hash, planning_micros, status, requirements_json, missing_json, unknown_json, transform, evidence_json)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             ON CONFLICT(request_id, target) DO UPDATE SET
+               route_id=excluded.route_id, ts=excluded.ts, mode=excluded.mode,
+               shape_hash=excluded.shape_hash, planning_micros=excluded.planning_micros,
+               status=excluded.status,
+               requirements_json=excluded.requirements_json, missing_json=excluded.missing_json,
+               unknown_json=excluded.unknown_json, transform=excluded.transform,
+               evidence_json=excluded.evidence_json",
+        )
+        .bind(&event.request_id)
+        .bind(route_id)
+        .bind(target)
+        .bind(event.timestamp.to_rfc3339())
+        .bind(mode)
+        .bind(shape_hash)
+        .bind(i64::try_from(*planning_micros).unwrap_or(i64::MAX))
+        .bind(status)
+        .bind(requirements_json)
+        .bind(missing_json)
+        .bind(unknown_json)
+        .bind(transform)
+        .bind(evidence_json)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_capability_feedback(
+        &self,
+        event: &PipelineEvent,
+        payload: &EventPayload,
+    ) -> Result<(), sqlx::Error> {
+        let EventPayload::CapabilityFeedback {
+            route_id,
+            shape_hash,
+            target,
+            capability,
+            outcome,
+        } = payload
+        else {
+            return Ok(());
+        };
+        sqlx::query(
+            "INSERT INTO request_capability_feedback
+             (request_id, route_id, shape_hash, target, capability, outcome, ts)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT(request_id, target, capability) DO UPDATE SET
+               route_id=excluded.route_id, shape_hash=excluded.shape_hash,
+               outcome=excluded.outcome, ts=excluded.ts",
+        )
+        .bind(&event.request_id)
+        .bind(route_id)
+        .bind(shape_hash)
+        .bind(target)
+        .bind(capability)
+        .bind(outcome)
+        .bind(event.timestamp.to_rfc3339())
+        .execute(self.pool.any())
+        .await?;
+        if outcome == "success" {
+            if let Some(store) = self.config_store.as_ref() {
+                let key = tiygate_core::TargetKey(target.clone());
+                let capability_id = tiygate_core::CapabilityId::from(capability.clone());
+                if let Err(error) = store
+                    .record_successful_capability(&key, &capability_id)
+                    .await
+                {
+                    warn!(
+                        error = %error,
+                        target = %target,
+                        capability = %capability,
+                        "failed to persist successful capability evidence"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn insert_capability_telemetry_gap(
+        &self,
+        event: &PipelineEvent,
+        payload: &EventPayload,
+    ) -> Result<(), sqlx::Error> {
+        let EventPayload::CapabilityTelemetryGap {
+            route_id,
+            shape_hash,
+            target,
+            reason,
+            dropped_count,
+        } = payload
+        else {
+            return Ok(());
+        };
+        // Keep the marker bounded even when a faulty producer supplies an
+        // unexpectedly large string.  The gap itself is diagnostic only and
+        // must never contain request bodies or credentials.
+        let route_id = bounded_text(route_id, 256);
+        let shape_hash = bounded_text(shape_hash, 256);
+        let target = bounded_text(target, 256);
+        let reason = bounded_text(reason, 256);
+        let dropped_count = (*dropped_count).clamp(1, i64::MAX as u64) as i64;
+        let timestamp = event.timestamp.to_rfc3339();
+        sqlx::query(
+            "INSERT INTO request_capability_telemetry_gaps
+             (request_id, route_id, shape_hash, target, reason, dropped_count, first_ts, last_ts)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
+             ON CONFLICT(request_id, route_id, shape_hash, target, reason) DO UPDATE SET
+               dropped_count=request_capability_telemetry_gaps.dropped_count + excluded.dropped_count,
+               last_ts=excluded.last_ts",
+        )
+        .bind(&event.request_id)
+        .bind(route_id)
+        .bind(shape_hash)
+        .bind(target)
+        .bind(reason)
+        .bind(dropped_count)
+        .bind(timestamp)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_capability_probe_run(
+        &self,
+        event: &PipelineEvent,
+        payload: &EventPayload,
+    ) -> Result<(), sqlx::Error> {
+        let EventPayload::CapabilityProbe {
+            run_id,
+            target,
+            probe_id,
+            outcome,
+            duration_micros,
+            budget_weight,
+            error_class,
+        } = payload
+        else {
+            return Ok(());
+        };
+        let run_id = bounded_text(run_id, 128);
+        let target = bounded_text(target, 256);
+        let probe_id = bounded_text(probe_id, 256);
+        let outcome = bounded_text(outcome, 64);
+        let error_class = error_class.as_deref().map(|value| bounded_text(value, 64));
+        sqlx::query(
+            "INSERT INTO capability_probe_runs
+             (run_id, target, probe_id, outcome, duration_micros, budget_weight, error_class, ts)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             ON CONFLICT(run_id) DO NOTHING",
+        )
+        .bind(run_id)
+        .bind(target)
+        .bind(probe_id)
+        .bind(outcome)
+        .bind(i64::try_from(*duration_micros).unwrap_or(i64::MAX))
+        .bind(i64::from((*budget_weight).max(1)))
+        .bind(error_class)
+        .bind(event.timestamp.to_rfc3339())
         .execute(self.pool.any())
         .await?;
         Ok(())
@@ -1071,6 +1281,54 @@ impl OltpSink {
         };
         Some(redacted)
     }
+}
+
+fn redact_error_for_storage(redactor: &Redactor, error: &str) -> String {
+    const MAX_ERROR_BYTES: usize = 4096;
+    let mut value = if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(error) {
+        redactor.redact_value(&mut json);
+        json.to_string()
+    } else {
+        error
+            .split_whitespace()
+            .map(|token| {
+                let lower = token.to_ascii_lowercase();
+                if lower.starts_with("http://")
+                    || lower.starts_with("https://")
+                    || lower.starts_with("bearer ")
+                    || lower.starts_with("sk-")
+                    || lower.starts_with("key-")
+                {
+                    "[REDACTED]"
+                } else {
+                    token
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if value.len() > MAX_ERROR_BYTES {
+        let mut end = MAX_ERROR_BYTES;
+        while !value.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        value.truncate(end);
+        value.push('…');
+    }
+    value
+}
+
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut bounded = value[..end].to_string();
+    bounded.push('…');
+    bounded
 }
 
 /// Redact a header list and serialize it to a JSON object string.
@@ -3170,6 +3428,458 @@ pub struct RequestAttemptEntry {
     pub fallback_decision: Option<String>,
 }
 
+/// Target-specific capability planning decision for request drill-down.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RequestCapabilityPlanEntry {
+    pub request_id: String,
+    pub route_id: String,
+    pub target: String,
+    pub ts: String,
+    pub mode: String,
+    pub shape_hash: String,
+    pub planning_micros: u64,
+    pub status: String,
+    pub requirements: Vec<String>,
+    pub missing: Vec<String>,
+    pub unknown: Vec<String>,
+    pub transform: Option<String>,
+    pub evidence: Vec<String>,
+}
+
+/// Independent audit record for one active capability probe.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct CapabilityProbeRunEntry {
+    pub run_id: String,
+    pub target: String,
+    pub probe_id: String,
+    pub outcome: String,
+    pub duration_micros: u64,
+    pub budget_weight: u32,
+    pub error_class: Option<String>,
+    pub ts: String,
+}
+
+/// List bounded probe-run audit records for one TargetKey.
+pub async fn list_capability_probe_runs(
+    pool: &DbPool,
+    target: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<CapabilityProbeRunEntry>, u64), sqlx::Error> {
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM capability_probe_runs WHERE target = $1")
+            .bind(target)
+            .fetch_one(pool.any())
+            .await?;
+    let rows = sqlx::query(
+        "SELECT run_id, target, probe_id, outcome, duration_micros, budget_weight, error_class, ts
+         FROM capability_probe_runs WHERE target = $1 ORDER BY ts DESC LIMIT $2 OFFSET $3",
+    )
+    .bind(target)
+    .bind(i64::from(limit.clamp(1, 500)))
+    .bind(i64::from(offset))
+    .fetch_all(pool.any())
+    .await?;
+    let entries = rows
+        .into_iter()
+        .map(|row| CapabilityProbeRunEntry {
+            run_id: row.get("run_id"),
+            target: row.get("target"),
+            probe_id: row.get("probe_id"),
+            outcome: row.get("outcome"),
+            duration_micros: row.get::<i64, _>("duration_micros").max(0) as u64,
+            budget_weight: row.get::<i64, _>("budget_weight").max(0) as u32,
+            error_class: row.get("error_class"),
+            ts: row.get("ts"),
+        })
+        .collect();
+    Ok((entries, total.max(0) as u64))
+}
+
+fn row_to_capability_plan(
+    row: &sqlx::any::AnyRow,
+) -> Result<RequestCapabilityPlanEntry, sqlx::Error> {
+    let requirements_json: String = row.get("requirements_json");
+    let missing_json: String = row.get("missing_json");
+    let unknown_json: String = row.get("unknown_json");
+    Ok(RequestCapabilityPlanEntry {
+        request_id: row.get("request_id"),
+        route_id: row.get("route_id"),
+        target: row.get("target"),
+        ts: row.get("ts"),
+        mode: row.get("mode"),
+        shape_hash: row.get("shape_hash"),
+        planning_micros: row.get::<i64, _>("planning_micros").max(0) as u64,
+        status: row.get("status"),
+        requirements: serde_json::from_str(&requirements_json)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+        missing: serde_json::from_str(&missing_json)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+        unknown: serde_json::from_str(&unknown_json)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+        transform: row.get("transform"),
+        evidence: serde_json::from_str::<Vec<String>>(&row.get::<String, _>("evidence_json"))
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+    })
+}
+
+/// List target-specific capability plans for a request.
+pub async fn list_request_capability_plans(
+    pool: &DbPool,
+    request_id: &str,
+) -> Result<Vec<RequestCapabilityPlanEntry>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT request_id, route_id, target, ts, mode, shape_hash, planning_micros, status, requirements_json, missing_json, unknown_json, transform, evidence_json
+         FROM request_capability_plans WHERE request_id = $1 ORDER BY target ASC",
+    )
+    .bind(request_id)
+    .fetch_all(pool.any())
+    .await?;
+    rows.iter().map(row_to_capability_plan).collect()
+}
+
+/// Aggregated Shadow metrics derived from the durable capability-plan event
+/// stream. The aggregation is intentionally independent from the process-local
+/// counters used for cheap diagnostics, so it survives restarts and multiple
+/// gateway replicas.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct CapabilityShadowMetric {
+    pub route_id: String,
+    pub shape_hash: String,
+    pub window_start: String,
+    pub window_end: String,
+    pub observation_window_seconds: u64,
+    pub observation_window_complete: bool,
+    pub relevant_requests: u64,
+    pub target_pairs: u64,
+    pub resolved_pairs: u64,
+    pub compatible_requests: u64,
+    pub unknown_requests: u64,
+    pub verified_success_requests: u64,
+    pub verified_success_disagreements: u64,
+    pub verified_success_disagreement_rate: f64,
+    pub profile_resolution_coverage: f64,
+    pub compatible_shape_coverage: f64,
+    pub planner_unknown_rate: f64,
+    pub planner_internal_errors: u64,
+    pub planner_internal_error_rate: f64,
+    pub probe_terminal_errors: u64,
+    pub probe_auth_errors: u64,
+    pub probe_terminal_error_rate: f64,
+    pub planning_latency_p95_micros: u64,
+    pub has_samples: bool,
+    pub minimum_sample_met: bool,
+    pub telemetry_gap: bool,
+    pub truncated: bool,
+}
+
+#[derive(Default)]
+struct ShadowMetricAccumulator {
+    relevant_requests: HashSet<String>,
+    compatible_requests: HashSet<String>,
+    unknown_requests: HashSet<String>,
+    incompatible_targets: HashSet<(String, String)>,
+    verified_successes: HashSet<(String, String, String)>,
+    verified_success_disagreements: HashSet<(String, String, String)>,
+    target_pairs: u64,
+    resolved_pairs: u64,
+    planning_samples: HashMap<String, u64>,
+    planner_internal_errors: HashSet<String>,
+    probe_terminal_jobs: u64,
+    probe_terminal_errors: u64,
+    probe_auth_errors: u64,
+    targets: HashSet<String>,
+    telemetry_gap: bool,
+}
+
+/// Aggregate persisted capability plans for the requested observation window.
+/// At most 100,000 rows are read per call; `truncated=true` tells Admin/UI that
+/// the caller should narrow the time window before using the result as a gate.
+pub async fn list_capability_shadow_metrics(
+    pool: &DbPool,
+    route_id: Option<&str>,
+    shape_hash: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<Vec<CapabilityShadowMetric>, sqlx::Error> {
+    let now = chrono::Utc::now();
+    let since = since
+        .map(str::to_string)
+        .unwrap_or_else(|| (now - chrono::Duration::hours(24)).to_rfc3339());
+    let until = until
+        .map(str::to_string)
+        .unwrap_or_else(|| now.to_rfc3339());
+    let mut sql = String::from(
+        "SELECT route_id, shape_hash, request_id, target, status, planning_micros,
+                requirements_json, missing_json, unknown_json
+         FROM request_capability_plans WHERE ts >= $1 AND ts < $2",
+    );
+    if route_id.is_some() {
+        sql.push_str(" AND route_id = $3");
+    }
+    if shape_hash.is_some() {
+        sql.push_str(if route_id.is_some() {
+            " AND shape_hash = $4"
+        } else {
+            " AND shape_hash = $3"
+        });
+    }
+    sql.push_str(" ORDER BY route_id, shape_hash, ts LIMIT 100001");
+    let mut query = sqlx::query(&sql).bind(&since).bind(&until);
+    if let Some(route_id) = route_id {
+        query = query.bind(route_id);
+    }
+    if let Some(shape_hash) = shape_hash {
+        query = query.bind(shape_hash);
+    }
+    let rows = query.fetch_all(pool.any()).await?;
+    let mut truncated = rows.len() > 100_000;
+    let mut aggregates: BTreeMap<(String, String), ShadowMetricAccumulator> = BTreeMap::new();
+    for row in rows.into_iter().take(100_000) {
+        let key = (row.get("route_id"), row.get("shape_hash"));
+        let request_id: String = row.get("request_id");
+        let status: String = row.get("status");
+        let planning_micros = row.get::<i64, _>("planning_micros").max(0) as u64;
+        let required_count =
+            serde_json::from_str::<Vec<String>>(&row.get::<String, _>("requirements_json"))
+                .map(|items| items.len() as u64)
+                .unwrap_or(0);
+        let unknown_count =
+            serde_json::from_str::<Vec<String>>(&row.get::<String, _>("unknown_json"))
+                .map(|items| items.len() as u64)
+                .unwrap_or(0)
+                .min(required_count);
+        let aggregate = aggregates.entry(key).or_default();
+        aggregate.relevant_requests.insert(request_id.clone());
+        aggregate.targets.insert(row.get("target"));
+        aggregate.target_pairs = aggregate.target_pairs.saturating_add(required_count);
+        if status != "planner_error" {
+            aggregate.resolved_pairs = aggregate
+                .resolved_pairs
+                .saturating_add(required_count.saturating_sub(unknown_count));
+        }
+        if status == "unknown" {
+            aggregate.unknown_requests.insert(request_id.clone());
+        }
+        if status == "planner_error" {
+            aggregate.planner_internal_errors.insert(request_id.clone());
+        }
+        if status == "compatible" {
+            aggregate.compatible_requests.insert(request_id.clone());
+        } else if status == "incompatible" {
+            aggregate
+                .incompatible_targets
+                .insert((request_id.clone(), row.get("target")));
+        }
+        aggregate
+            .planning_samples
+            .entry(request_id)
+            .or_insert(planning_micros);
+    }
+    // A gap marker is itself part of the durable observation window.  It may
+    // arrive without a corresponding plan (for example when the queue was
+    // full before the first target diagnostic), so create the aggregate key
+    // here instead of silently discarding the marker.
+    let mut gap_sql = String::from(
+        "SELECT route_id, shape_hash FROM request_capability_telemetry_gaps
+         WHERE last_ts >= $1 AND first_ts < $2",
+    );
+    if route_id.is_some() {
+        gap_sql.push_str(" AND route_id = $3");
+    }
+    if shape_hash.is_some() {
+        gap_sql.push_str(if route_id.is_some() {
+            " AND shape_hash = $4"
+        } else {
+            " AND shape_hash = $3"
+        });
+    }
+    gap_sql.push_str(" ORDER BY last_ts LIMIT 100001");
+    let mut gap_query = sqlx::query(&gap_sql).bind(&since).bind(&until);
+    if let Some(route_id) = route_id {
+        gap_query = gap_query.bind(route_id);
+    }
+    if let Some(shape_hash) = shape_hash {
+        gap_query = gap_query.bind(shape_hash);
+    }
+    let gap_rows = gap_query.fetch_all(pool.any()).await?;
+    if gap_rows.len() > 100_000 {
+        truncated = true;
+    }
+    for row in gap_rows.into_iter().take(100_000) {
+        let key = (
+            row.get::<String, _>("route_id"),
+            row.get::<String, _>("shape_hash"),
+        );
+        aggregates.entry(key).or_default().telemetry_gap = true;
+    }
+    // Probe failures are target-scoped. Use the per-probe audit stream as the
+    // denominator (a job can contain several probes and may retry); join each
+    // run to every Route × shape that observed the target in this window.
+    let probe_rows = sqlx::query(
+        "SELECT target, outcome, error_class
+         FROM capability_probe_runs WHERE ts >= $1 AND ts < $2",
+    )
+    .bind(&since)
+    .bind(&until)
+    .fetch_all(pool.any())
+    .await?;
+    for row in probe_rows {
+        let target_key: String = row.get("target");
+        let outcome: String = row.get("outcome");
+        let error_class: Option<String> = row.get("error_class");
+        for aggregate in aggregates.values_mut() {
+            if !aggregate.targets.contains(&target_key) {
+                continue;
+            }
+            aggregate.probe_terminal_jobs = aggregate.probe_terminal_jobs.saturating_add(1);
+            if outcome == "error" {
+                aggregate.probe_terminal_errors = aggregate.probe_terminal_errors.saturating_add(1);
+                if error_class
+                    .as_deref()
+                    .is_some_and(|class| class.eq_ignore_ascii_case("auth"))
+                {
+                    aggregate.probe_auth_errors = aggregate.probe_auth_errors.saturating_add(1);
+                }
+            }
+        }
+    }
+    let mut feedback_sql = String::from(
+        "SELECT route_id, shape_hash, request_id, target, capability, outcome
+         FROM request_capability_feedback WHERE ts >= $1 AND ts < $2",
+    );
+    if route_id.is_some() {
+        feedback_sql.push_str(" AND route_id = $3");
+    }
+    if shape_hash.is_some() {
+        feedback_sql.push_str(if route_id.is_some() {
+            " AND shape_hash = $4"
+        } else {
+            " AND shape_hash = $3"
+        });
+    }
+    let mut feedback_query = sqlx::query(&feedback_sql).bind(&since).bind(&until);
+    if let Some(route_id) = route_id {
+        feedback_query = feedback_query.bind(route_id);
+    }
+    if let Some(shape_hash) = shape_hash {
+        feedback_query = feedback_query.bind(shape_hash);
+    }
+    for row in feedback_query.fetch_all(pool.any()).await? {
+        if row.get::<String, _>("outcome") != "success" {
+            continue;
+        }
+        let key = (
+            row.get::<String, _>("route_id"),
+            row.get::<String, _>("shape_hash"),
+        );
+        let request_id: String = row.get("request_id");
+        let target: String = row.get("target");
+        let capability: String = row.get("capability");
+        if let Some(aggregate) = aggregates.get_mut(&key) {
+            let feedback_key = (request_id.clone(), target.clone(), capability);
+            if aggregate.verified_successes.insert(feedback_key.clone())
+                && aggregate
+                    .incompatible_targets
+                    .contains(&(request_id, target))
+            {
+                aggregate
+                    .verified_success_disagreements
+                    .insert(feedback_key);
+            }
+        }
+    }
+    Ok(aggregates
+        .into_iter()
+        .map(|((route_id, shape_hash), aggregate)| {
+            let relevant = aggregate.relevant_requests.len() as u64;
+            let planner_internal_errors = aggregate.planner_internal_errors.len() as u64;
+            let profile_resolution_coverage = if aggregate.target_pairs == 0 {
+                0.0
+            } else {
+                aggregate.resolved_pairs as f64 / aggregate.target_pairs as f64
+            };
+            let compatible_shape_coverage = if relevant == 0 {
+                0.0
+            } else {
+                aggregate.compatible_requests.len() as f64 / relevant as f64
+            };
+            let planner_unknown_rate = if relevant == 0 {
+                0.0
+            } else {
+                aggregate.unknown_requests.len() as f64 / relevant as f64
+            };
+            let mut samples = aggregate.planning_samples.into_values().collect::<Vec<_>>();
+            samples.sort_unstable();
+            let planning_latency_p95_micros = samples
+                .get(if samples.is_empty() {
+                    0
+                } else {
+                    ((samples.len() - 1) * 95).div_ceil(100)
+                })
+                .copied()
+                .unwrap_or(0);
+            CapabilityShadowMetric {
+                route_id,
+                shape_hash,
+                window_start: since.clone(),
+                window_end: until.clone(),
+                observation_window_seconds: chrono::DateTime::parse_from_rfc3339(&until)
+                    .ok()
+                    .and_then(|end| {
+                        chrono::DateTime::parse_from_rfc3339(&since)
+                            .ok()
+                            .map(|start| (end - start).num_seconds().max(0) as u64)
+                    })
+                    .unwrap_or(0),
+                observation_window_complete: chrono::DateTime::parse_from_rfc3339(&until)
+                    .ok()
+                    .and_then(|end| {
+                        chrono::DateTime::parse_from_rfc3339(&since)
+                            .ok()
+                            .map(|start| (end - start).num_hours() >= 24)
+                    })
+                    .unwrap_or(false),
+                relevant_requests: relevant,
+                target_pairs: aggregate.target_pairs,
+                resolved_pairs: aggregate.resolved_pairs,
+                compatible_requests: aggregate.compatible_requests.len() as u64,
+                unknown_requests: aggregate.unknown_requests.len() as u64,
+                verified_success_requests: aggregate.verified_successes.len() as u64,
+                verified_success_disagreements: aggregate.verified_success_disagreements.len()
+                    as u64,
+                verified_success_disagreement_rate: if aggregate.verified_successes.is_empty() {
+                    0.0
+                } else {
+                    aggregate.verified_success_disagreements.len() as f64
+                        / aggregate.verified_successes.len() as f64
+                },
+                profile_resolution_coverage,
+                compatible_shape_coverage,
+                planner_unknown_rate,
+                planner_internal_errors,
+                planner_internal_error_rate: if relevant == 0 {
+                    0.0
+                } else {
+                    planner_internal_errors as f64 / relevant as f64
+                },
+                probe_terminal_errors: aggregate.probe_terminal_errors,
+                probe_auth_errors: aggregate.probe_auth_errors,
+                probe_terminal_error_rate: if aggregate.probe_terminal_jobs == 0 {
+                    0.0
+                } else {
+                    aggregate.probe_terminal_errors as f64 / aggregate.probe_terminal_jobs as f64
+                },
+                planning_latency_p95_micros,
+                has_samples: relevant > 0,
+                minimum_sample_met: relevant >= 100,
+                telemetry_gap: aggregate.telemetry_gap,
+                truncated,
+            }
+        })
+        .collect())
+}
+
 fn row_to_attempt_entry(row: &sqlx::any::AnyRow) -> RequestAttemptEntry {
     RequestAttemptEntry {
         request_id: row.get("request_id"),
@@ -3297,6 +4007,7 @@ pub struct RequestReplay {
     pub payload_archived_at: Option<String>,
     pub payload_archive_manifest_json: Option<String>,
     pub attempts: Vec<RequestAttemptEntry>,
+    pub capability_plans: Vec<RequestCapabilityPlanEntry>,
 }
 
 /// Fetch the raw envelope (redacted) for a given request id.
@@ -3340,6 +4051,7 @@ pub async fn get_request_replay(
     .await?;
     if let Some(r) = row {
         let attempts = list_request_attempts(pool, request_id).await?;
+        let capability_plans = list_request_capability_plans(pool, request_id).await?;
         Ok(Some(RequestReplay {
             request_id: r.get("request_id"),
             raw_envelope_json: r.get("raw_envelope_json"),
@@ -3379,6 +4091,7 @@ pub async fn get_request_replay(
             payload_archived_at: r.get("payload_archived_at"),
             payload_archive_manifest_json: r.get("payload_archive_manifest_json"),
             attempts,
+            capability_plans,
         }))
     } else {
         Ok(None)
@@ -3531,6 +4244,208 @@ mod tests {
         assert_eq!(attempts[1].hop, 2);
         assert_eq!(attempts[1].status, "success");
         assert_eq!(attempts[1].latency_ms, Some(17));
+    }
+
+    #[tokio::test]
+    async fn write_capability_plan_persists_target_diagnostics() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+        sink.write_event(&PipelineEvent {
+            request_id: "req-capability".to_string(),
+            timestamp: Utc::now(),
+            stage: "capability_planner".to_string(),
+            payload: EventPayload::CapabilityPlan {
+                mode: "shadow".to_string(),
+                route_id: "route-capability".to_string(),
+                shape_hash: "shape/v1:test".to_string(),
+                planning_micros: 7,
+                requirements: vec!["tools.namespace".to_string()],
+                target: "target:key".to_string(),
+                status: "incompatible".to_string(),
+                missing: vec!["tools.namespace".to_string()],
+                unknown: Vec::new(),
+                transform: None,
+                evidence: vec!["tools.function:semantic_probe".to_string()],
+            },
+        })
+        .await
+        .expect("write capability plan");
+        sink.write_event(&PipelineEvent {
+            request_id: "req-capability".to_string(),
+            timestamp: Utc::now(),
+            stage: "capability_feedback".to_string(),
+            payload: EventPayload::CapabilityFeedback {
+                route_id: "route-capability".to_string(),
+                shape_hash: "shape/v1:test".to_string(),
+                target: "target:key".to_string(),
+                capability: "tools.function".to_string(),
+                outcome: "success".to_string(),
+            },
+        })
+        .await
+        .expect("write capability feedback");
+        sink.write_event(&PipelineEvent {
+            request_id: "req-capability-unknown".to_string(),
+            timestamp: Utc::now(),
+            stage: "capability_planner".to_string(),
+            payload: EventPayload::CapabilityPlan {
+                mode: "shadow".to_string(),
+                route_id: "route-capability".to_string(),
+                shape_hash: "shape/v1:test".to_string(),
+                planning_micros: 9,
+                requirements: vec!["tools.namespace".to_string(), "tools.custom".to_string()],
+                target: "target:key-2".to_string(),
+                status: "unknown".to_string(),
+                missing: Vec::new(),
+                unknown: vec!["tools.custom".to_string()],
+                transform: None,
+                evidence: Vec::new(),
+            },
+        })
+        .await
+        .expect("write unknown capability plan");
+        sink.write_event(&PipelineEvent {
+            request_id: "probe-job-1".to_string(),
+            timestamp: Utc::now(),
+            stage: "capability_probe".to_string(),
+            payload: EventPayload::CapabilityProbe {
+                run_id: "probe-run-1".to_string(),
+                target: "target:key".to_string(),
+                probe_id: "tools.function".to_string(),
+                outcome: "positive".to_string(),
+                duration_micros: 42,
+                budget_weight: 2,
+                error_class: None,
+            },
+        })
+        .await
+        .expect("write capability probe run");
+        let probe_runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM capability_probe_runs WHERE run_id = 'probe-run-1'",
+        )
+        .fetch_one(pool.any())
+        .await
+        .expect("read capability probe run");
+        assert_eq!(probe_runs, 1);
+        let plans = list_request_capability_plans(&pool, "req-capability")
+            .await
+            .expect("list capability plans");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].mode, "shadow");
+        assert_eq!(plans[0].route_id, "route-capability");
+        assert_eq!(plans[0].shape_hash, "shape/v1:test");
+        assert_eq!(plans[0].planning_micros, 7);
+        assert_eq!(plans[0].missing, vec!["tools.namespace"]);
+        let metrics = list_capability_shadow_metrics(
+            &pool,
+            Some("route-capability"),
+            Some("shape/v1:test"),
+            None,
+            None,
+        )
+        .await
+        .expect("list capability metrics");
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].relevant_requests, 2);
+        assert_eq!(metrics[0].target_pairs, 3);
+        assert_eq!(metrics[0].profile_resolution_coverage, 2.0 / 3.0);
+        assert_eq!(metrics[0].planner_unknown_rate, 0.5);
+        assert_eq!(metrics[0].verified_success_requests, 1);
+        assert_eq!(metrics[0].verified_success_disagreements, 1);
+
+        sink.write_event(&PipelineEvent {
+            request_id: "req-capability-planner-error".to_string(),
+            timestamp: Utc::now(),
+            stage: "capability_planner".to_string(),
+            payload: EventPayload::CapabilityPlan {
+                mode: "shadow".to_string(),
+                route_id: "route-capability".to_string(),
+                shape_hash: "shape/v1:test".to_string(),
+                planning_micros: 11,
+                requirements: vec!["tools.function".to_string()],
+                target: "target:key-3".to_string(),
+                status: "planner_error".to_string(),
+                missing: Vec::new(),
+                unknown: Vec::new(),
+                transform: None,
+                evidence: vec!["planner_error:resolver".to_string()],
+            },
+        })
+        .await
+        .expect("write planner error");
+        let metrics_with_error = list_capability_shadow_metrics(
+            &pool,
+            Some("route-capability"),
+            Some("shape/v1:test"),
+            None,
+            None,
+        )
+        .await
+        .expect("list metrics with planner error");
+        assert_eq!(metrics_with_error[0].planner_internal_errors, 1);
+        assert_eq!(metrics_with_error[0].relevant_requests, 3);
+        assert!(metrics_with_error[0].profile_resolution_coverage < 1.0);
+
+        sink.write_event(&PipelineEvent {
+            request_id: "req-gap".to_string(),
+            timestamp: Utc::now(),
+            stage: "capability_telemetry_gap".to_string(),
+            payload: EventPayload::CapabilityTelemetryGap {
+                route_id: "route-capability".to_string(),
+                shape_hash: "shape/v1:test".to_string(),
+                target: "target:key-2".to_string(),
+                reason: "telemetry_backpressure".to_string(),
+                dropped_count: 2,
+            },
+        })
+        .await
+        .expect("write capability telemetry gap");
+        sink.write_event(&PipelineEvent {
+            request_id: "req-gap".to_string(),
+            timestamp: Utc::now(),
+            stage: "capability_telemetry_gap".to_string(),
+            payload: EventPayload::CapabilityTelemetryGap {
+                route_id: "route-capability".to_string(),
+                shape_hash: "shape/v1:test".to_string(),
+                target: "target:key-2".to_string(),
+                reason: "telemetry_backpressure".to_string(),
+                dropped_count: 3,
+            },
+        })
+        .await
+        .expect("merge capability telemetry gap");
+        let gap_count: i64 = sqlx::query_scalar(
+            "SELECT dropped_count FROM request_capability_telemetry_gaps WHERE request_id = 'req-gap'",
+        )
+        .fetch_one(pool.any())
+        .await
+        .expect("read capability gap count");
+        assert_eq!(gap_count, 5);
+        let metrics_with_gap = list_capability_shadow_metrics(
+            &pool,
+            Some("route-capability"),
+            Some("shape/v1:test"),
+            None,
+            None,
+        )
+        .await
+        .expect("list capability metrics with gap");
+        assert_eq!(metrics_with_gap.len(), 1);
+        assert!(metrics_with_gap[0].telemetry_gap);
+    }
+
+    #[test]
+    fn stored_attempt_error_redacts_json_credentials_and_bounds_text() {
+        let redactor = Redactor::with_defaults();
+        let redacted = redact_error_for_storage(
+            &redactor,
+            r#"{"error":{"message":"bad","api_key":"secret-value"}}"#,
+        );
+        assert!(!redacted.contains("secret-value"));
+        assert!(redacted.contains("[REDACTED]"));
+        let long = redact_error_for_storage(&redactor, &"x".repeat(5000));
+        assert!(long.len() <= 4099);
     }
 
     #[tokio::test]

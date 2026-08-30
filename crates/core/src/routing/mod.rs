@@ -10,9 +10,14 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::protocol::ProtocolEndpoint;
 use crate::telemetry::RequestErrorClass;
+
+fn legacy_health_key(key: &str) -> Option<&str> {
+    key.split_once('#').map(|(prefix, _)| prefix)
+}
 
 /// A single routing target — one hop in the routing chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +41,10 @@ pub struct RoutingTarget {
     /// Override API base (set by route hooks).
     #[serde(default, skip)]
     pub api_base_override: Option<String>,
+    /// Optional target-side wire dialect. `None` means auto/standard
+    /// baseline; private dialects are selected explicitly by the route.
+    #[serde(default, skip)]
+    pub egress_dialect_id: Option<String>,
     /// Weight for weighted routing strategy.
     pub weight: f64,
     /// OAuth configuration. `Some` when the provider's `auth_mode`
@@ -57,9 +66,43 @@ impl RoutingTarget {
         self.api_base_override.as_deref().unwrap_or(&self.api_base)
     }
 
+    /// Return the configured egress dialect, defaulting to `auto`.
+    pub fn effective_egress_dialect_id(&self) -> &str {
+        self.egress_dialect_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("auto")
+    }
+
     /// The health registry key for this target.
     pub fn health_key(&self) -> String {
-        format!("{}:{}", self.provider_id, self.model_id)
+        let canonical_base = crate::capability::canonicalize_api_base(self.effective_api_base())
+            .unwrap_or_else(|_| self.effective_api_base().trim_end_matches('/').to_string());
+        let material = format!(
+            "tiygate/target-health/v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            self.provider_id,
+            self.model_id,
+            canonical_base,
+            self.api_protocol.suite.label(),
+            self.api_protocol.name,
+            self.api_protocol.version,
+            self.effective_api_key(),
+            self.effective_egress_dialect_id()
+        );
+        let digest = Sha256::digest(material.as_bytes());
+        format!(
+            "{}:{}#{}",
+            self.provider_id,
+            self.model_id,
+            hex::encode(digest)
+        )
+    }
+
+    /// Typed health identity used at capability/fallback boundaries.  The
+    /// registry retains its string API for backwards compatibility, while
+    /// new code can no longer accidentally pass a TargetKey as a health key.
+    pub fn health_instance_id(&self) -> crate::TargetInstanceId {
+        crate::TargetInstanceId(self.health_key())
     }
 }
 
@@ -120,18 +163,25 @@ impl RoutingStrategyName {
 /// (the `routing_strategy` configured on `ServerConfig`/`AppState`).
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
+    /// Durable route identifier used to scope capability-shape admission
+    /// records. `None` is retained for legacy in-memory routes.
+    pub route_id: Option<String>,
     /// Ordered list of routing targets (fallback chain).
     pub targets: Vec<RoutingTarget>,
     /// Optional per-route strategy override. `None` → inherit default.
     pub strategy: Option<RoutingStrategyName>,
+    /// Optional capability-aware routing mode inherited by the route.
+    pub capability_routing_mode: Option<crate::CapabilityRoutingMode>,
 }
 
 impl RouteEntry {
     /// Construct an entry with no strategy override (inherits default).
     pub fn new(targets: Vec<RoutingTarget>) -> Self {
         Self {
+            route_id: None,
             targets,
             strategy: None,
+            capability_routing_mode: None,
         }
     }
 }
@@ -161,6 +211,16 @@ impl RoutingTable {
     /// — both cases mean "use the gateway default strategy".
     pub fn resolve_strategy(&self, virtual_model: &str) -> Option<RoutingStrategyName> {
         self.routes.get(virtual_model).and_then(|e| e.strategy)
+    }
+
+    /// Look up an optional per-route capability routing mode.
+    pub fn resolve_capability_mode(
+        &self,
+        virtual_model: &str,
+    ) -> Option<crate::CapabilityRoutingMode> {
+        self.routes
+            .get(virtual_model)
+            .and_then(|entry| entry.capability_routing_mode)
     }
 
     /// Borrow the full route entry (targets + strategy) for a virtual model.
@@ -278,7 +338,10 @@ impl HealthRegistry {
         let states = self.states.read();
         let now = Instant::now();
 
-        match states.get(target_key) {
+        let state = states
+            .get(target_key)
+            .or_else(|| legacy_health_key(target_key).and_then(|key| states.get(key)));
+        match state {
             None => true,
             Some(state) => {
                 // Check cooling first
@@ -297,6 +360,10 @@ impl HealthRegistry {
         }
     }
 
+    pub fn is_healthy_id(&self, target: &crate::TargetInstanceId) -> bool {
+        self.is_healthy(target.as_str())
+    }
+
     /// Record a successful request.
     pub fn record_success(&self, target_key: &str) {
         let mut states = self.states.write();
@@ -305,6 +372,10 @@ impl HealthRegistry {
             state.cooling_until = None;
             state.cooling_reason = None;
         }
+    }
+
+    pub fn record_success_id(&self, target: &crate::TargetInstanceId) {
+        self.record_success(target.as_str());
     }
 
     /// Record a failed request.
@@ -320,6 +391,10 @@ impl HealthRegistry {
             });
         state.consecutive_failures += 1;
         state.last_failure_at = Some(Instant::now());
+    }
+
+    pub fn record_failure_id(&self, target: &crate::TargetInstanceId) {
+        self.record_failure(target.as_str());
     }
 
     /// Apply a cooling period (e.g., from RateLimited with Retry-After).
@@ -342,7 +417,10 @@ impl HealthRegistry {
         let states = self.states.read();
         let now = Instant::now();
 
-        match states.get(target_key) {
+        let state = states
+            .get(target_key)
+            .or_else(|| legacy_health_key(target_key).and_then(|key| states.get(key)));
+        match state {
             None => RoutingTargetHealth::Healthy,
             Some(state) => {
                 if let Some(until) = state.cooling_until {
@@ -368,18 +446,20 @@ impl HealthRegistry {
 
     /// Return the consecutive failure count for a target.
     pub fn consecutive_failures(&self, target_key: &str) -> u32 {
-        self.states
-            .read()
+        let states = self.states.read();
+        states
             .get(target_key)
+            .or_else(|| legacy_health_key(target_key).and_then(|key| states.get(key)))
             .map(|s| s.consecutive_failures)
             .unwrap_or(0)
     }
 
     /// Return the cooling reason, if any.
     pub fn cooling_reason(&self, target_key: &str) -> Option<String> {
-        self.states
-            .read()
+        let states = self.states.read();
+        states
             .get(target_key)
+            .or_else(|| legacy_health_key(target_key).and_then(|key| states.get(key)))
             .and_then(|s| s.cooling_reason.clone())
     }
 
@@ -418,17 +498,30 @@ impl HealthRegistry {
         entry.samples += 1;
     }
 
+    pub fn record_latency_ms_id(&self, target: &crate::TargetInstanceId, latency_ms: u64) {
+        self.record_latency_ms(target.as_str(), latency_ms);
+    }
+
     /// Get the current EWMA latency in milliseconds for a target.
     /// Returns None if no samples have been recorded yet.
     pub fn ewma_latency_ms(&self, target_key: &str) -> Option<u64> {
-        self.latencies.read().get(target_key).map(|l| l.ewma as u64)
+        let latencies = self.latencies.read();
+        latencies
+            .get(target_key)
+            .or_else(|| legacy_health_key(target_key).and_then(|key| latencies.get(key)))
+            .map(|l| l.ewma as u64)
+    }
+
+    pub fn ewma_latency_ms_id(&self, target: &crate::TargetInstanceId) -> Option<u64> {
+        self.ewma_latency_ms(target.as_str())
     }
 
     /// Number of latency samples recorded for the target.
     pub fn latency_samples(&self, target_key: &str) -> u64 {
-        self.latencies
-            .read()
+        let latencies = self.latencies.read();
+        latencies
             .get(target_key)
+            .or_else(|| legacy_health_key(target_key).and_then(|key| latencies.get(key)))
             .map(|l| l.samples)
             .unwrap_or(0)
     }
@@ -665,7 +758,7 @@ impl Strategy for CooldownStrategy {
     fn order<'a>(&self, targets: &'a [RoutingTarget]) -> Vec<&'a RoutingTarget> {
         let mut sorted: Vec<&RoutingTarget> = targets.iter().collect();
         sorted.sort_by_key(|t| {
-            if self.health.is_healthy(&t.health_key()) {
+            if self.health.is_healthy_id(&t.health_instance_id()) {
                 0u8
             } else {
                 1u8
@@ -696,12 +789,12 @@ impl Strategy for LatencyStrategy {
         // then unobserved (None latency) before high-latency.
         let mut sorted: Vec<&RoutingTarget> = targets.iter().collect();
         sorted.sort_by_key(|t| {
-            let healthy = if self.health.is_healthy(&t.health_key()) {
+            let healthy = if self.health.is_healthy_id(&t.health_instance_id()) {
                 0u32
             } else {
                 1u32
             };
-            let latency = self.health.ewma_latency_ms(&t.health_key());
+            let latency = self.health.ewma_latency_ms_id(&t.health_instance_id());
             // u128 prevents overflow when combining healthy + latency_key.
             let latency_key: u128 = match latency {
                 Some(ms) => (ms as u128) & 0x0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128,

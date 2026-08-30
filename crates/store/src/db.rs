@@ -198,8 +198,12 @@ async fn apply_sequence(pool: &sqlx::AnyPool, sequence: &str, dir: &str) -> Resu
             continue;
         }
 
+        // Apply one migration and its bookkeeping row atomically.  Without a
+        // transaction, a multi-statement migration could leave half-created
+        // columns/tables and then fail permanently on the next startup.
+        let mut tx = pool.begin().await?;
         for stmt in split_sql_statements(&sql) {
-            sqlx::query(&stmt).execute(pool).await.map_err(|e| {
+            sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
                 DbError::Migration(format!(
                     "sequence={sequence} version={version} stmt={stmt}: {e}"
                 ))
@@ -210,8 +214,9 @@ async fn apply_sequence(pool: &sqlx::AnyPool, sequence: &str, dir: &str) -> Resu
             .bind(sequence)
             .bind(version)
             .bind(now)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         info!(sequence, version, "migration applied");
     }
     Ok(())

@@ -12,6 +12,7 @@
 //! `core` has zero dependencies on concrete providers, protocols, or databases.
 //! All implementations register against the traits defined here.
 
+pub mod capability;
 pub mod header_forward;
 pub mod ir;
 pub mod pipeline;
@@ -25,6 +26,20 @@ mod tests;
 pub mod tracing_ctx;
 
 // Re-export key types
+pub use capability::{
+    canonicalize_api_base, capability_shape_hash, capability_shape_hash_from_ids,
+    capability_shape_hash_from_requirements, compatibility_report, credential_scope_fingerprint,
+    derive_ir_requirements, is_flat_required_shape, merge_exchange_requirements,
+    resolve_capabilities, resolve_capabilities_with_matchers, target_instance_id, target_key,
+    validate_capability_descriptors, validate_capability_observation, BaselineSupport,
+    CanonicalTargetIdentity, CapabilityDescriptor, CapabilityId, CapabilityMatcher,
+    CapabilityObservation, CapabilityRequirement, CapabilityRoutingMode, CapabilityScope,
+    CapabilityState, CapabilityValue, CapabilityValueKind, CompatibilityReport, DiscoveryMethod,
+    EvidenceSource, ExchangeRequirements, ImplementationStatus, PlannedTarget, PlannedTransform,
+    ProtocolRequirementProvider, ProtocolTransformProvider, RequirementExpr, RequirementStrength,
+    ResolvedCapability, ResolvedTargetCapabilities, RoutingEligibility, TargetIdentityError,
+    TargetInstanceId, TargetKey, TransformId, WireProfileId, CAPABILITY_SHAPE_HASH_VERSION,
+};
 pub use header_forward::HeaderForwardPolicy;
 pub use ir::{
     Annotation, AnnotationKind, Content, FinishReason, GenerationParams, IrRequest, IrResponse,

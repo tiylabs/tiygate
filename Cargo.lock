@@ -5728,6 +5728,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tiygate-auth",
  "tiygate-core",
+ "tiygate-protocols",
  "tiygate-providers",
  "tiygate-store",
  "tokio",
@@ -5788,6 +5789,8 @@ dependencies = [
  "dashmap",
  "futures",
  "hdrhistogram",
+ "hex",
+ "hmac",
  "http 1.4.2",
  "indexmap 2.14.0",
  "inventory",
@@ -5798,6 +5801,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -5846,6 +5850,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tiygate-core",
  "tokio",
+ "toml 0.8.2",
  "tracing",
 ]
 

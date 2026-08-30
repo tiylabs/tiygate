@@ -27,6 +27,146 @@ use super::response_model::ResponseModelOverride;
 use super::{compute_pass_through, enforce_body_limit, AppError, AppState};
 use tiygate_core::telemetry::RequestErrorClass;
 
+#[allow(clippy::too_many_arguments)]
+async fn emit_capability_plan_events(
+    state: &AppState,
+    request_id: &str,
+    mode: tiygate_core::CapabilityRoutingMode,
+    virtual_model: &str,
+    shape_hash: &str,
+    planning_micros: u64,
+    requirements: &[tiygate_core::CapabilityId],
+    diagnostics: &[super::capability_planner::TargetPlanDiagnostic],
+) {
+    const MAX_DIAGNOSTICS_PER_REQUEST: usize = 128;
+    for diagnostic in diagnostics.iter().take(MAX_DIAGNOSTICS_PER_REQUEST) {
+        let status = if diagnostic.status.is_empty() {
+            if !diagnostic.unknown.is_empty() {
+                "unknown"
+            } else if !diagnostic.missing.is_empty() {
+                "incompatible"
+            } else {
+                "compatible"
+            }
+        } else {
+            diagnostic.status.as_str()
+        };
+        let mut evidence = diagnostic.evidence.clone();
+        if let Some(error) = diagnostic.planner_error.as_deref() {
+            evidence.push(format!(
+                "planner_error:{}",
+                bounded_capability_detail(error)
+            ));
+        }
+        evidence.truncate(128);
+        state
+            .telemetry
+            .send(tiygate_core::PipelineEvent {
+                request_id: request_id.to_string(),
+                timestamp: chrono::Utc::now(),
+                stage: "capability_planner".to_string(),
+                payload: tiygate_core::telemetry::EventPayload::CapabilityPlan {
+                    mode: mode.as_str().to_string(),
+                    route_id: super::capability_planner::route_scope(state, virtual_model),
+                    shape_hash: shape_hash.to_string(),
+                    planning_micros,
+                    requirements: requirements.iter().map(ToString::to_string).collect(),
+                    target: diagnostic
+                        .target_key
+                        .clone()
+                        .unwrap_or_else(|| diagnostic.health_key.clone()),
+                    status: status.to_string(),
+                    missing: diagnostic.missing.iter().map(ToString::to_string).collect(),
+                    unknown: diagnostic.unknown.iter().map(ToString::to_string).collect(),
+                    transform: diagnostic.transform.clone(),
+                    evidence,
+                },
+            })
+            .await;
+    }
+    if diagnostics.len() > MAX_DIAGNOSTICS_PER_REQUEST {
+        state
+            .telemetry
+            .send(tiygate_core::PipelineEvent {
+                request_id: request_id.to_string(),
+                timestamp: chrono::Utc::now(),
+                stage: "capability_telemetry_gap".to_string(),
+                payload: tiygate_core::telemetry::EventPayload::CapabilityTelemetryGap {
+                    route_id: super::capability_planner::route_scope(state, virtual_model),
+                    shape_hash: shape_hash.to_string(),
+                    target: String::new(),
+                    reason: "diagnostic_cardinality_limit".to_string(),
+                    dropped_count: (diagnostics.len() - MAX_DIAGNOSTICS_PER_REQUEST) as u64,
+                },
+            })
+            .await;
+    }
+}
+
+fn bounded_capability_detail(value: &str) -> String {
+    const MAX_BYTES: usize = 256;
+    if value.len() <= MAX_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_BYTES;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}…", &value[..end])
+}
+
+fn record_capability_metrics(
+    state: &AppState,
+    virtual_model: &str,
+    shape_hash: &str,
+    requirements: &[tiygate_core::CapabilityId],
+    diagnostics: &[super::capability_planner::TargetPlanDiagnostic],
+    planning_micros: u64,
+) {
+    let route_scope = super::capability_planner::route_scope(state, virtual_model);
+    super::shadow::record(
+        &route_scope,
+        shape_hash,
+        requirements,
+        diagnostics,
+        planning_micros,
+    );
+}
+
+fn no_compatible_target_error(
+    request_id: &str,
+    report: &super::capability_planner::NoCompatibleTarget,
+) -> AppError {
+    let mut required = report
+        .required
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    required.truncate(64);
+    let mut unknown = report
+        .diagnostics
+        .iter()
+        .flat_map(|item| item.unknown.iter().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    unknown.sort();
+    unknown.dedup();
+    unknown.truncate(64);
+    AppError::new(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "no compatible target for required capabilities: {}",
+            required.join(", ")
+        ),
+    )
+    .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+    .with_details(serde_json::json!({
+        "code": "no_compatible_target",
+        "required": required,
+        "unknown": unknown,
+        "request_id": request_id,
+    }))
+}
+
 /// Health check — always returns 200 while process is alive.
 pub(super) async fn handle_healthz() -> StatusCode {
     StatusCode::OK
@@ -415,28 +555,120 @@ pub(super) async fn handle_chat_completions(
     let (_pass_through_candidate, raw_passthrough_body) =
         compute_pass_through(&codec, &ingress_protocol, &targets, &original_body_str);
 
+    let capability_mode = super::capability_planner::effective_mode(
+        &state,
+        state
+            .current_config()
+            .routing_table
+            .resolve_capability_mode(&virtual_model)
+            .unwrap_or(state.tunables().capability_routing_mode),
+    );
+    let planning_started = Instant::now();
+    let generic_plan = match super::capability_planner::plan_generic(
+        &state,
+        capability_mode,
+        &ir_request,
+        &ingress_protocol,
+        &original_body_str,
+        &targets,
+    ) {
+        Ok(plan) => plan,
+        Err(report) => {
+            emit_capability_plan_events(
+                &state,
+                scope.request_id(),
+                capability_mode,
+                &virtual_model,
+                &report.shape_hash,
+                planning_started.elapsed().as_micros() as u64,
+                &report.required,
+                &report.diagnostics,
+            )
+            .await;
+            let app_err = no_compatible_target_error(scope.request_id(), &report);
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error(
+                RequestErrorClass::LossyOrCapability,
+                Some(&app_err.message),
+                Some(http_status),
+            );
+            return Err(app_err.with_protocol_suite(codec.id().suite));
+        }
+    };
+    emit_capability_plan_events(
+        &state,
+        scope.request_id(),
+        capability_mode,
+        &virtual_model,
+        &generic_plan.shape_hash,
+        planning_started.elapsed().as_micros() as u64,
+        &generic_plan.requirements,
+        &generic_plan.diagnostics,
+    )
+    .await;
+    record_capability_metrics(
+        &state,
+        &virtual_model,
+        &generic_plan.shape_hash,
+        &generic_plan.requirements,
+        &generic_plan.diagnostics,
+        planning_started.elapsed().as_micros() as u64,
+    );
+    let execution_targets = if generic_plan.enforce {
+        &generic_plan.targets
+    } else {
+        &targets
+    };
+    let planned_raw_bodies = std::sync::Arc::new(generic_plan.raw_body_by_health_key);
+    let planned_targets = std::sync::Arc::new(generic_plan.planned_targets.clone());
+
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
-        &targets,
+        execution_targets,
         &virtual_model,
         &request_id,
         |target| {
-            Box::pin(execute_upstream(
-                &state,
-                &codec,
-                &ingress_protocol,
-                &ir_request,
-                target,
-                is_stream,
-                raw_passthrough_body.as_deref(),
-                &trace_ctx,
-                &request_id,
-                &headers,
-                &api_key.key_id,
-            ))
+            let target_body = if generic_plan.enforce {
+                planned_targets
+                    .iter()
+                    .any(|planned| planned.target.health_key() == target.health_key())
+                    .then(|| {
+                        planned_raw_bodies
+                            .get(&target.health_key())
+                            .cloned()
+                            .flatten()
+                    })
+                    .flatten()
+            } else {
+                raw_passthrough_body.clone()
+            };
+            let state_for_call = state.clone();
+            let codec_for_call = ChatCompletionsCodec::new();
+            let ingress_for_call = ingress_protocol.clone();
+            let request_for_call = ir_request.clone();
+            let trace_for_call = trace_ctx.clone();
+            let request_id_for_call = request_id.clone();
+            let headers_for_call = headers.clone();
+            let api_key_id_for_call = api_key.key_id.clone();
+            Box::pin(async move {
+                execute_upstream(
+                    &state_for_call,
+                    &codec_for_call,
+                    &ingress_for_call,
+                    &request_for_call,
+                    target,
+                    is_stream,
+                    target_body.as_deref(),
+                    &trace_for_call,
+                    &request_id_for_call,
+                    &headers_for_call,
+                    &api_key_id_for_call,
+                )
+                .await
+            })
         },
     )
     .await;
@@ -557,29 +789,120 @@ pub(super) async fn handle_messages(
     // protocol suite matches the ingress suite.
     let (_pass_through, raw_passthrough_body) =
         compute_pass_through(&codec, &ingress_protocol, &targets, &original_body_str);
+    let capability_mode = super::capability_planner::effective_mode(
+        &state,
+        state
+            .current_config()
+            .routing_table
+            .resolve_capability_mode(&virtual_model)
+            .unwrap_or(state.tunables().capability_routing_mode),
+    );
+    let planning_started = Instant::now();
+    let generic_plan = match super::capability_planner::plan_generic(
+        &state,
+        capability_mode,
+        &ir_request,
+        &ingress_protocol,
+        &original_body_str,
+        &targets,
+    ) {
+        Ok(plan) => plan,
+        Err(report) => {
+            emit_capability_plan_events(
+                &state,
+                scope.request_id(),
+                capability_mode,
+                &virtual_model,
+                &report.shape_hash,
+                planning_started.elapsed().as_micros() as u64,
+                &report.required,
+                &report.diagnostics,
+            )
+            .await;
+            let app_err = no_compatible_target_error(scope.request_id(), &report);
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error(
+                RequestErrorClass::LossyOrCapability,
+                Some(&app_err.message),
+                Some(http_status),
+            );
+            return Err(app_err.with_protocol_suite(codec.id().suite));
+        }
+    };
+    emit_capability_plan_events(
+        &state,
+        scope.request_id(),
+        capability_mode,
+        &virtual_model,
+        &generic_plan.shape_hash,
+        planning_started.elapsed().as_micros() as u64,
+        &generic_plan.requirements,
+        &generic_plan.diagnostics,
+    )
+    .await;
+    record_capability_metrics(
+        &state,
+        &virtual_model,
+        &generic_plan.shape_hash,
+        &generic_plan.requirements,
+        &generic_plan.diagnostics,
+        planning_started.elapsed().as_micros() as u64,
+    );
+    let execution_targets = if generic_plan.enforce {
+        &generic_plan.targets
+    } else {
+        &targets
+    };
+    let planned_raw_bodies = std::sync::Arc::new(generic_plan.raw_body_by_health_key);
+    let planned_targets = std::sync::Arc::new(generic_plan.planned_targets.clone());
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
-        &targets,
+        execution_targets,
         &virtual_model,
         &request_id,
         |target| {
-            Box::pin(execute_messages_upstream(
-                &state,
-                &codec,
-                &ingress_protocol,
-                &ir_request,
-                target,
-                is_stream,
-                raw_passthrough_body.as_deref(),
-                &trace_ctx,
-                &request_id,
-                &headers,
-                &api_key.key_id,
-            ))
+            let target_body = if generic_plan.enforce {
+                planned_targets
+                    .iter()
+                    .any(|planned| planned.target.health_key() == target.health_key())
+                    .then(|| {
+                        planned_raw_bodies
+                            .get(&target.health_key())
+                            .cloned()
+                            .flatten()
+                    })
+                    .flatten()
+            } else {
+                raw_passthrough_body.clone()
+            };
+            let state_for_call = state.clone();
+            let codec_for_call = MessagesCodec::new();
+            let ingress_for_call = ingress_protocol.clone();
+            let request_for_call = ir_request.clone();
+            let trace_for_call = trace_ctx.clone();
+            let request_id_for_call = request_id.clone();
+            let headers_for_call = headers.clone();
+            let api_key_id_for_call = api_key.key_id.clone();
+            Box::pin(async move {
+                execute_messages_upstream(
+                    &state_for_call,
+                    &codec_for_call,
+                    &ingress_for_call,
+                    &request_for_call,
+                    target,
+                    is_stream,
+                    target_body.as_deref(),
+                    &trace_for_call,
+                    &request_id_for_call,
+                    &headers_for_call,
+                    &api_key_id_for_call,
+                )
+                .await
+            })
         },
     )
     .await;
@@ -666,6 +989,7 @@ pub(super) async fn handle_embeddings(
         .and_then(|v| v.as_str())
         .unwrap_or("default")
         .to_string();
+    let original_body_str = serde_json::to_string(&body).unwrap_or_default();
     let input_for_cache = body.get("input").map(|v| v.to_string()).unwrap_or_default();
     scope.set_virtual_model(model_for_cache.clone());
     let mut scope =
@@ -753,13 +1077,78 @@ pub(super) async fn handle_embeddings(
         }
     };
 
+    let capability_mode = super::capability_planner::effective_mode(
+        &state,
+        state
+            .current_config()
+            .routing_table
+            .resolve_capability_mode(&virtual_model)
+            .unwrap_or(state.tunables().capability_routing_mode),
+    );
+    let planning_started = Instant::now();
+    let generic_plan = match super::capability_planner::plan_generic(
+        &state,
+        capability_mode,
+        &ir_request,
+        &ingress_protocol,
+        &original_body_str,
+        &targets,
+    ) {
+        Ok(plan) => plan,
+        Err(report) => {
+            emit_capability_plan_events(
+                &state,
+                scope.request_id(),
+                capability_mode,
+                &virtual_model,
+                &report.shape_hash,
+                planning_started.elapsed().as_micros() as u64,
+                &report.required,
+                &report.diagnostics,
+            )
+            .await;
+            let app_err = no_compatible_target_error(scope.request_id(), &report);
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error(
+                RequestErrorClass::LossyOrCapability,
+                Some(&app_err.message),
+                Some(http_status),
+            );
+            return Err(app_err.with_protocol_suite(codec.id().suite));
+        }
+    };
+    emit_capability_plan_events(
+        &state,
+        scope.request_id(),
+        capability_mode,
+        &virtual_model,
+        &generic_plan.shape_hash,
+        planning_started.elapsed().as_micros() as u64,
+        &generic_plan.requirements,
+        &generic_plan.diagnostics,
+    )
+    .await;
+    record_capability_metrics(
+        &state,
+        &virtual_model,
+        &generic_plan.shape_hash,
+        &generic_plan.requirements,
+        &generic_plan.diagnostics,
+        planning_started.elapsed().as_micros() as u64,
+    );
+    let execution_targets = if generic_plan.enforce {
+        &generic_plan.targets
+    } else {
+        &targets
+    };
+
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     let request_id = scope.request_id().to_string();
     scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
-        &targets,
+        execution_targets,
         &virtual_model,
         &request_id,
         |target| {
@@ -861,6 +1250,7 @@ pub(super) async fn handle_responses(
         return Err(err.with_protocol_suite(codec.id().suite));
     }
     let original_body_str = serde_json::to_string(&body).unwrap_or_default();
+    let planner_body = body.clone();
 
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
@@ -904,29 +1294,130 @@ pub(super) async fn handle_responses(
     let (_pass_through, raw_passthrough_body) =
         compute_pass_through(&codec, &ingress_protocol, &targets, &original_body_str);
 
+    let capability_mode = super::capability_planner::effective_mode(
+        &state,
+        state
+            .current_config()
+            .routing_table
+            .resolve_capability_mode(&virtual_model)
+            .unwrap_or(state.tunables().capability_routing_mode),
+    );
+    let planning_started = Instant::now();
+    let response_plan = match super::capability_planner::plan_responses(
+        &state,
+        capability_mode,
+        &ir_request,
+        &planner_body,
+        &original_body_str,
+        &targets,
+    ) {
+        Ok(plan) => plan,
+        Err(no_compatible) => {
+            emit_capability_plan_events(
+                &state,
+                scope.request_id(),
+                capability_mode,
+                &virtual_model,
+                &no_compatible.shape_hash,
+                planning_started.elapsed().as_micros() as u64,
+                &no_compatible.required,
+                &no_compatible.diagnostics,
+            )
+            .await;
+            let app_err = no_compatible_target_error(scope.request_id(), &no_compatible);
+            scope.emit_error(
+                RequestErrorClass::LossyOrCapability,
+                Some(&app_err.message),
+                Some(app_err.http_status().as_u16()),
+            );
+            return Err(app_err.with_protocol_suite(codec.id().suite));
+        }
+    };
+    if capability_mode == tiygate_core::CapabilityRoutingMode::Shadow
+        && !response_plan.diagnostics.is_empty()
+    {
+        tracing::debug!(
+            request_id = %scope.request_id(),
+            requirements = ?response_plan.requirements,
+            diagnostics = response_plan.diagnostics.len(),
+            "capability shadow plan computed"
+        );
+    }
+    emit_capability_plan_events(
+        &state,
+        scope.request_id(),
+        capability_mode,
+        &virtual_model,
+        &response_plan.shape_hash,
+        planning_started.elapsed().as_micros() as u64,
+        &response_plan.requirements,
+        &response_plan.diagnostics,
+    )
+    .await;
+    record_capability_metrics(
+        &state,
+        &virtual_model,
+        &response_plan.shape_hash,
+        &response_plan.requirements,
+        &response_plan.diagnostics,
+        planning_started.elapsed().as_micros() as u64,
+    );
+    let execution_targets = if response_plan.enforce {
+        &response_plan.targets
+    } else {
+        &targets
+    };
+    let planned_raw_bodies = std::sync::Arc::new(response_plan.raw_body_by_health_key);
+    let planned_targets = std::sync::Arc::new(response_plan.planned_targets.clone());
+
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     let request_id = scope.request_id().to_string();
     scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
-        &targets,
+        execution_targets,
         &virtual_model,
         &request_id,
         |target| {
-            Box::pin(execute_responses_upstream(
-                &state,
-                &codec,
-                &ingress_protocol,
-                &ir_request,
-                target,
-                is_stream,
-                raw_passthrough_body.as_deref(),
-                &trace_ctx,
-                &request_id,
-                &headers,
-                &api_key.key_id,
-            ))
+            let target_body = if response_plan.enforce {
+                planned_targets
+                    .iter()
+                    .any(|planned| planned.target.health_key() == target.health_key())
+                    .then(|| {
+                        planned_raw_bodies
+                            .get(&target.health_key())
+                            .cloned()
+                            .flatten()
+                    })
+                    .flatten()
+            } else {
+                raw_passthrough_body.clone()
+            };
+            let state_for_call = state.clone();
+            let codec_for_call = ResponsesCodec::new();
+            let ingress_for_call = ingress_protocol.clone();
+            let request_for_call = ir_request.clone();
+            let trace_for_call = trace_ctx.clone();
+            let request_id_for_call = request_id.clone();
+            let headers_for_call = headers.clone();
+            let api_key_id_for_call = api_key.key_id.clone();
+            Box::pin(async move {
+                execute_responses_upstream(
+                    &state_for_call,
+                    &codec_for_call,
+                    &ingress_for_call,
+                    &request_for_call,
+                    target,
+                    is_stream,
+                    target_body.as_deref(),
+                    &trace_for_call,
+                    &request_id_for_call,
+                    &headers_for_call,
+                    &api_key_id_for_call,
+                )
+                .await
+            })
         },
     )
     .await;
@@ -1082,29 +1573,121 @@ pub(super) async fn handle_gemini_generate(
     let (_pass_through, raw_passthrough_body) =
         compute_pass_through(&codec, &ingress_protocol, &targets, &original_body_str);
 
+    let capability_mode = super::capability_planner::effective_mode(
+        &state,
+        state
+            .current_config()
+            .routing_table
+            .resolve_capability_mode(&virtual_model)
+            .unwrap_or(state.tunables().capability_routing_mode),
+    );
+    let planning_started = Instant::now();
+    let generic_plan = match super::capability_planner::plan_generic(
+        &state,
+        capability_mode,
+        &ir_request,
+        &ingress_protocol,
+        &original_body_str,
+        &targets,
+    ) {
+        Ok(plan) => plan,
+        Err(report) => {
+            emit_capability_plan_events(
+                &state,
+                scope.request_id(),
+                capability_mode,
+                &virtual_model,
+                &report.shape_hash,
+                planning_started.elapsed().as_micros() as u64,
+                &report.required,
+                &report.diagnostics,
+            )
+            .await;
+            let app_err = no_compatible_target_error(scope.request_id(), &report);
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error(
+                RequestErrorClass::LossyOrCapability,
+                Some(&app_err.message),
+                Some(http_status),
+            );
+            return Err(app_err.with_protocol_suite(codec.id().suite));
+        }
+    };
+    emit_capability_plan_events(
+        &state,
+        scope.request_id(),
+        capability_mode,
+        &virtual_model,
+        &generic_plan.shape_hash,
+        planning_started.elapsed().as_micros() as u64,
+        &generic_plan.requirements,
+        &generic_plan.diagnostics,
+    )
+    .await;
+    record_capability_metrics(
+        &state,
+        &virtual_model,
+        &generic_plan.shape_hash,
+        &generic_plan.requirements,
+        &generic_plan.diagnostics,
+        planning_started.elapsed().as_micros() as u64,
+    );
+    let execution_targets = if generic_plan.enforce {
+        &generic_plan.targets
+    } else {
+        &targets
+    };
+    let planned_raw_bodies = std::sync::Arc::new(generic_plan.raw_body_by_health_key);
+    let planned_targets = std::sync::Arc::new(generic_plan.planned_targets.clone());
+
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     let request_id = scope.request_id().to_string();
     scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
-        &targets,
+        execution_targets,
         &virtual_model,
         &request_id,
         |target| {
-            Box::pin(execute_gemini_upstream(
-                &state,
-                &codec,
-                &ingress_protocol,
-                &ir_request,
-                target,
-                is_stream,
-                raw_passthrough_body.as_deref(),
-                &trace_ctx,
-                &request_id,
-                &headers,
-                &api_key.key_id,
-            ))
+            let target_body = if generic_plan.enforce {
+                planned_targets
+                    .iter()
+                    .any(|planned| planned.target.health_key() == target.health_key())
+                    .then(|| {
+                        planned_raw_bodies
+                            .get(&target.health_key())
+                            .cloned()
+                            .flatten()
+                    })
+                    .flatten()
+            } else {
+                raw_passthrough_body.clone()
+            };
+            let state_for_call = state.clone();
+            let codec_for_call = GeminiCodec::new();
+            let ingress_for_call = ingress_protocol.clone();
+            let request_for_call = ir_request.clone();
+            let trace_for_call = trace_ctx.clone();
+            let request_id_for_call = request_id.clone();
+            let headers_for_call = headers.clone();
+            let api_key_id_for_call = api_key.key_id.clone();
+            Box::pin(async move {
+                execute_gemini_upstream(
+                    &state_for_call,
+                    &codec_for_call,
+                    &ingress_for_call,
+                    &request_for_call,
+                    target,
+                    is_stream,
+                    target_body.as_deref(),
+                    &trace_for_call,
+                    &request_id_for_call,
+                    &headers_for_call,
+                    &api_key_id_for_call,
+                )
+                .await
+            })
         },
     )
     .await;

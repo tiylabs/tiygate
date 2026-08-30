@@ -87,10 +87,35 @@ pub fn encode_error_body_for_suite(
     http_status: u16,
     upstream_code: Option<&str>,
 ) -> Value {
+    encode_error_body_for_suite_with_details(
+        suite,
+        message,
+        class,
+        http_status,
+        upstream_code,
+        None,
+    )
+}
+
+/// Variant used by gateway-originated errors that carry a small, already
+/// redacted diagnostic object (for example `no_compatible_target`).
+pub fn encode_error_body_for_suite_with_details(
+    suite: ProtocolSuite,
+    message: &str,
+    class: ErrorClass,
+    http_status: u16,
+    upstream_code: Option<&str>,
+    details: Option<&Value>,
+) -> Value {
     let error_code = upstream_code.or(match class {
         ErrorClass::ModelAccessDenied => Some("model_access_denied"),
         _ => None,
     });
+    let detail_code = details
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("code"))
+        .and_then(Value::as_str)
+        .filter(|code| !code.trim().is_empty());
     match suite {
         ProtocolSuite::OpenAiCompatible | ProtocolSuite::OpenAiResponses => {
             let mut err = json!({
@@ -98,29 +123,40 @@ pub fn encode_error_body_for_suite(
                 "type": openai_error_type(class),
                 "param": null,
             });
-            if let Some(c) = error_code {
+            if let Some(c) = error_code.or(detail_code) {
                 err["code"] = json!(c);
+            }
+            if let Some(details) = details {
+                err["details"] = details.clone();
             }
             json!({"error": err})
         }
         ProtocolSuite::AnthropicMessages => {
-            json!({
+            let mut body = json!({
                 "type": "error",
                 "error": {
                     "type": anthropic_error_type(class),
                     "message": message,
                 }
-            })
+            });
+            if let Some(details) = details {
+                body["error"]["details"] = details.clone();
+            }
+            body
         }
         ProtocolSuite::GoogleGemini => {
-            json!({
+            let mut body = json!({
                 "error": {
                     "code": http_status,
                     "message": message,
                     "status": gemini_error_status(class),
                     "details": []
                 }
-            })
+            });
+            if let Some(details) = details {
+                body["error"]["details"] = json!([details.clone()]);
+            }
+            body
         }
     }
 }
@@ -141,5 +177,22 @@ mod tests {
         );
         assert_eq!(body["error"]["type"], "permission_error");
         assert_eq!(body["error"]["code"], "model_access_denied");
+    }
+
+    #[test]
+    fn capability_details_promote_safe_error_code() {
+        let body = encode_error_body_for_suite_with_details(
+            ProtocolSuite::OpenAiResponses,
+            "no compatible target",
+            ErrorClass::LossyOrCapability,
+            400,
+            None,
+            Some(&json!({
+                "code": "no_compatible_target",
+                "required": ["tools.namespace"]
+            })),
+        );
+        assert_eq!(body["error"]["code"], "no_compatible_target");
+        assert_eq!(body["error"]["details"]["required"][0], "tools.namespace");
     }
 }

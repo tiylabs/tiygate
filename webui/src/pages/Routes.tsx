@@ -32,6 +32,7 @@ import type {
   Route,
   RouteInput,
   RouteTarget,
+  CapabilityRoutingMode,
   RoutingStrategyName,
 } from "@/api/types";
 import {
@@ -74,6 +75,7 @@ interface FormState {
   virtual_model: string;
   targets: FormTarget[];
   routing_strategy: RoutingStrategyName | "";
+  capability_routing_mode: CapabilityRoutingMode | "";
   model_metadata: ModelMetadata | null;
   enabled: boolean;
 }
@@ -96,6 +98,7 @@ function createFormTarget(target: Partial<RouteTarget> = {}): FormTarget {
     uiKey: `target-${nextTargetUiKey}`,
     provider_id: target.provider_id ?? "",
     model_id: target.model_id ?? "",
+    egress_dialect_id: target.egress_dialect_id ?? null,
     enabled: target.enabled ?? true,
     ...(target.weight !== undefined ? { weight: target.weight } : {}),
   };
@@ -170,6 +173,7 @@ function emptyForm(): FormState {
     virtual_model: "",
     targets: [createFormTarget()],
     routing_strategy: "",
+    capability_routing_mode: "",
     model_metadata: null,
     enabled: true,
   };
@@ -295,11 +299,13 @@ export default function RoutesPage() {
       const body: RouteInput = {
         virtual_model: `${r.virtual_model}-${suffix}`,
         targets: r.targets.map((tg) => ({
-          provider_id: tg.provider_id,
-          model_id: tg.model_id,
-          enabled: tg.enabled ?? true,
+              provider_id: tg.provider_id,
+              model_id: tg.model_id,
+              egress_dialect_id: tg.egress_dialect_id ?? null,
+              enabled: tg.enabled ?? true,
         })),
         routing_strategy: r.routing_strategy ?? undefined,
+        capability_routing_mode: r.capability_routing_mode ?? undefined,
         model_metadata: r.model_metadata ?? null,
         enabled: false,
       };
@@ -338,11 +344,13 @@ export default function RoutesPage() {
             createFormTarget({
               provider_id: tg.provider_id,
               model_id: tg.model_id,
+              egress_dialect_id: tg.egress_dialect_id ?? null,
               enabled: tg.enabled ?? true,
             }),
           )
         : [createFormTarget()],
       routing_strategy: r.routing_strategy ?? "",
+      capability_routing_mode: r.capability_routing_mode ?? "",
       model_metadata: r.model_metadata ?? null,
       enabled: r.enabled,
     });
@@ -532,9 +540,10 @@ export default function RoutesPage() {
       .map((tg, idx) => ({ tg, idx }))
       .filter(({ tg }) => tg.provider_id && tg.model_id);
     const targets = valid.map(({ tg }, i) => ({
-      provider_id: tg.provider_id,
-      model_id: tg.model_id,
-      enabled: tg.enabled ?? true,
+          provider_id: tg.provider_id,
+          model_id: tg.model_id,
+          egress_dialect_id: tg.egress_dialect_id ?? null,
+          enabled: tg.enabled ?? true,
       weight: valid.length - i,
     }));
     if (!form.virtual_model || targets.length === 0) {
@@ -590,6 +599,7 @@ export default function RoutesPage() {
       virtual_model: form.virtual_model,
       targets,
       routing_strategy: form.routing_strategy || undefined,
+      capability_routing_mode: form.capability_routing_mode || undefined,
       model_metadata: modelMetadata,
       enabled: form.enabled,
     };
@@ -1162,6 +1172,33 @@ export default function RoutesPage() {
               options={strategyOptions}
             />
           </Field>
+          <Field
+            label={t("routes.capabilityRoutingMode")}
+            hint={t("routes.capabilityRoutingModeHint")}
+          >
+            <Select
+              value={form.capability_routing_mode}
+              onValueChange={(value) => {
+                if (
+                  value === "enforce" &&
+                  !window.confirm(t("routes.capabilityRoutingModeConfirm"))
+                ) {
+                  return;
+                }
+                setForm((current) => ({
+                  ...current,
+                  capability_routing_mode: value as CapabilityRoutingMode | "",
+                }));
+              }}
+              ariaLabel={t("routes.capabilityRoutingMode")}
+              options={[
+                { value: "", label: t("routes.strategyDefault") },
+                { value: "off", label: "Off" },
+                { value: "shadow", label: "Shadow" },
+                { value: "enforce", label: "Enforce" },
+              ]}
+            />
+          </Field>
 
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
@@ -1195,12 +1232,13 @@ export default function RoutesPage() {
                 {reorderMessage}
               </span>
               <div
-                className="hidden border-b border-border bg-surface-muted/50 px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.04em] text-text-subtle sm:grid sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_36px_28px] sm:gap-2"
+                className="hidden border-b border-border bg-surface-muted/50 px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.04em] text-text-subtle sm:grid sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,0.9fr)_36px_28px] sm:gap-2"
                 aria-hidden="true"
               >
                 <span />
                 <span>{t("routes.provider")}</span>
                 <span>{t("routes.model")}</span>
+                <span>{t("routes.dialect")}</span>
                 <span className="text-center">
                   {t("routes.targetEnabledHeader")}
                 </span>
@@ -1231,7 +1269,7 @@ export default function RoutesPage() {
                         : undefined
                     }
                     className={cn(
-                      "relative grid grid-cols-[18px_minmax(0,1fr)_28px] gap-2 px-3 py-2 sm:items-center sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_36px_28px]",
+                      "relative grid grid-cols-[18px_minmax(0,1fr)_28px] gap-2 px-3 py-2 sm:items-center sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,0.9fr)_36px_28px]",
                       idx > 0 && "border-t border-border",
                       !enabled && !isDragging && "opacity-50",
                       isDragging &&
@@ -1290,6 +1328,16 @@ export default function RoutesPage() {
                         onFocus={() => {
                           if (tg.provider_id) void fetchModels(tg.provider_id);
                         }}
+                      />
+                      <Input
+                        value={tg.egress_dialect_id ?? ""}
+                        placeholder="auto"
+                        aria-label={t("routes.dialect")}
+                        onChange={(event) =>
+                          updateTarget(idx, {
+                            egress_dialect_id: event.target.value.trim() || null,
+                          })
+                        }
                       />
                       <div className="flex items-center justify-center">
                         <Switch

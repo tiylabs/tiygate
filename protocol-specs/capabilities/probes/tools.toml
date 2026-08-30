@@ -1,0 +1,92 @@
+schema_version = 1
+
+[[probe]]
+id = "tools.function"
+kind = "forced_function_call"
+wire_profiles = ["openai-responses-standard", "openai-responses-codex-lite", "openai-chat-standard", "anthropic-messages-standard", "gemini-generate-content-standard"]
+input_schema = "single-noop-function"
+unique_variable = "nonce"
+control = "forced_specific_call"
+timeout_secs = 30
+max_output_tokens = 32
+budget_weight = 2
+probe_suite_version = 1
+judge_version = 1
+
+[[probe]]
+id = "tools.function.continuation"
+kind = "function_continuation"
+wire_profiles = ["openai-responses-standard", "openai-responses-codex-lite"]
+input_schema = "function-call-output-pair"
+unique_variable = "nonce_and_call_id"
+control = "forced_specific_call_then_output"
+timeout_secs = 60
+max_output_tokens = 32
+budget_weight = 3
+probe_suite_version = 1
+judge_version = 1
+
+[[probe]]
+id = "tools.choice.required"
+kind = "required_function_call"
+wire_profiles = ["openai-responses-standard", "openai-responses-codex-lite", "openai-chat-standard", "anthropic-messages-standard", "gemini-generate-content-standard"]
+input_schema = "single-noop-function"
+unique_variable = "nonce"
+control = "required_call"
+timeout_secs = 30
+max_output_tokens = 32
+budget_weight = 2
+probe_suite_version = 1
+judge_version = 1
+
+[[probe]]
+id = "tools.choice.specific"
+kind = "specific_function_call"
+wire_profiles = ["openai-responses-standard", "openai-responses-codex-lite", "openai-chat-standard", "anthropic-messages-standard", "gemini-generate-content-standard"]
+input_schema = "single-noop-function"
+unique_variable = "nonce"
+control = "specific_call"
+timeout_secs = 30
+max_output_tokens = 32
+budget_weight = 2
+probe_suite_version = 1
+judge_version = 1
+
+[[probe]]
+id = "tools.namespace"
+kind = "namespace_function_call"
+wire_profiles = ["openai-responses-standard", "openai-responses-codex-lite"]
+input_schema = "single-namespace-function"
+unique_variable = "nonce"
+control = "forced_namespace_call"
+timeout_secs = 30
+max_output_tokens = 32
+budget_weight = 2
+probe_suite_version = 1
+judge_version = 1
+
+[[probe]]
+id = "tools.custom"
+kind = "custom_tool_call"
+wire_profiles = ["openai-responses-standard", "openai-responses-codex-lite"]
+input_schema = "single-noop-custom"
+unique_variable = "nonce"
+control = "forced_custom_call"
+timeout_secs = 30
+max_output_tokens = 32
+budget_weight = 2
+probe_suite_version = 1
+judge_version = 1
+
+[[probe]]
+id = "tools.crl.additional_tools"
+kind = "crl_controlled_ab"
+wire_profiles = ["openai-responses-standard", "openai-responses-codex-lite"]
+input_schema = "top-level-control-plus-additional-tools"
+unique_variable = "nonce"
+control = "top_level_controlled_ab"
+timeout_secs = 90
+max_output_tokens = 32
+budget_weight = 4
+probe_suite_version = 1
+judge_version = 1

@@ -10,6 +10,7 @@ use sqlx::Row;
 use thiserror::Error;
 
 use crate::db::{AnyRow, DbPool};
+use sqlx::{Any, Transaction};
 
 #[derive(Debug, Error)]
 pub enum AuditError {
@@ -40,6 +41,23 @@ pub async fn record(
     target_id: &str,
     details: &serde_json::Value,
 ) -> Result<i64, AuditError> {
+    let mut tx = pool.any().begin().await?;
+    let id = record_tx(&mut tx, actor, action, target_type, target_id, details).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Record an audit event in a caller-owned transaction.  Capability control
+/// mutations use this variant so state, epoch and audit history commit or
+/// roll back together.
+pub async fn record_tx(
+    tx: &mut Transaction<'_, Any>,
+    actor: &str,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    details: &serde_json::Value,
+) -> Result<i64, AuditError> {
     let now = Utc::now().to_rfc3339();
     let details_str = serde_json::to_string(details)?;
     let id: i64 = sqlx::query_scalar(
@@ -52,7 +70,7 @@ pub async fn record(
     .bind(target_id)
     .bind(&details_str)
     .bind(&now)
-    .fetch_one(pool.any())
+    .fetch_one(&mut **tx)
     .await?;
     Ok(id)
 }

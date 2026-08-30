@@ -81,6 +81,7 @@ async fn data_plane_sees_admin_writes_via_epoch_poll() {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
             }],
             None,
             None,

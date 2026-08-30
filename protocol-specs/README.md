@@ -7,6 +7,7 @@ loaded by the request hot path.
 | --- | --- | --- |
 | API wire schemas | `api-wire/` | Authoritative request/response, header, and event-shape sources. Future consumers include fixture generation, compatibility checks, and offline validation. |
 | Structured-output profiles | `structured-output/` | The JSON Schema dialect accepted inside each provider's output-format field. Future consumers include cross-protocol schema compatibility decisions. |
+| Target capability contract | `capabilities/` | Versioned capability registry, protocol/dialect baselines, audited probe metadata, and the matrix mapping consumed by the `tiygate-protocols` build validator. |
 
 ## Source policy
 
@@ -19,6 +20,10 @@ loaded by the request hot path.
 - Only official vendor URLs are recorded here. Anthropic currently publishes an
   API reference and SDK types, but not an official OpenAPI document; its entry
   is deliberately reference-only.
+- Capability TOML is a build-time contract, not runtime configuration. The
+  `tiygate-protocols` build script rejects unknown IDs, invalid lifecycle or
+  matcher combinations, missing matrix references, incomplete probe metadata,
+  and baseline entries that omit routing-relevant capabilities.
 
 ## Refreshing wire snapshots
 

@@ -4,6 +4,7 @@
 //! Each protocol implements the `EndpointCodec` trait from `tiygate_core`
 //! and registers via `inventory::submit!`.
 
+pub mod capabilities;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod error_body;

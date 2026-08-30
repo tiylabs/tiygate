@@ -1,6 +1,7 @@
 //! Upstream executors and codec/URL builders for each protocol.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -45,6 +46,305 @@ const IMAGES_NONSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
 const CODEX_WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_WEBSOCKET_EVENT_BUFFER: usize = 16;
+
+fn is_target_capability_rejection(status: u16, body: &str) -> bool {
+    if status != 400 && status != 422 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let Some(error_object) = error.as_object() else {
+        return false;
+    };
+    let code = error_object
+        .get("code")
+        .or_else(|| error_object.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let field = error_object
+        .get("param")
+        .or_else(|| error_object.get("field"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let message = error_object
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let unsupported_message = message.contains("unsupported")
+        || message.contains("not supported")
+        || message.contains("unknown field")
+        || message.contains("unrecognized")
+        || message.contains("not allowed")
+        || message.contains("does not support");
+    let capability_code = code.contains("unsupported")
+        || code.contains("unknown")
+        || code.contains("unrecognized")
+        || code.contains("invalid_tool")
+        || code.contains("unsupported_parameter");
+    let capability_field = [field.as_str(), message.as_str()].into_iter().any(|text| {
+        text.contains("tool")
+            || text.contains("function")
+            || text.contains("namespace")
+            || text.contains("additional_tools")
+            || text.contains("tool_choice")
+    });
+    // A structured error type/code plus an explicit tool-related field or
+    // message is required. Generic 400/422 text, including plain upstream
+    // strings, never triggers target-specific fallback.
+    (capability_code || (code == "invalid_request_error" && unsupported_message))
+        && capability_field
+}
+
+fn upstream_error_code_from_body(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn collect_required_capability_ids(
+    expression: &tiygate_core::RequirementExpr,
+    output: &mut Vec<tiygate_core::CapabilityId>,
+) {
+    match expression {
+        tiygate_core::RequirementExpr::AllOf(items)
+        | tiygate_core::RequirementExpr::AnyOf(items) => {
+            for item in items {
+                collect_required_capability_ids(item, output);
+            }
+        }
+        tiygate_core::RequirementExpr::Not(item) => collect_required_capability_ids(item, output),
+        tiygate_core::RequirementExpr::Capability(requirement)
+            if requirement.strength == tiygate_core::RequirementStrength::Required =>
+        {
+            output.push(requirement.id.clone());
+        }
+        tiygate_core::RequirementExpr::Capability(_) => {}
+    }
+}
+
+fn response_has_tool_call(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(response_has_tool_call),
+        Value::Object(object) => {
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("function_call")
+                    | Some("custom_tool_call")
+                    | Some("tool_use")
+                    | Some("program")
+            ) {
+                return true;
+            }
+            if object
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty())
+                || object
+                    .get("functionCall")
+                    .and_then(Value::as_object)
+                    .is_some()
+            {
+                return true;
+            }
+            object.values().any(response_has_tool_call)
+        }
+        _ => false,
+    }
+}
+
+fn response_has_custom_tool_call(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(response_has_custom_tool_call),
+        Value::Object(object) => {
+            object.get("type").and_then(Value::as_str) == Some("custom_tool_call")
+                || object.values().any(response_has_custom_tool_call)
+        }
+        _ => false,
+    }
+}
+
+fn response_has_program(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(response_has_program),
+        Value::Object(object) => {
+            object.get("type").and_then(Value::as_str) == Some("program")
+                || object.values().any(response_has_program)
+        }
+        _ => false,
+    }
+}
+
+fn response_has_namespace_tool_call(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(response_has_namespace_tool_call),
+        Value::Object(object) => {
+            let is_function_call = matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("function_call") | Some("functionCall") | Some("function")
+            ) || object.get("tool_calls").is_some();
+            let has_namespace = object
+                .get("namespace")
+                .or_else(|| object.get("namespace_path"))
+                .or_else(|| object.get("tool_namespace"))
+                .is_some();
+            (is_function_call && has_namespace)
+                || object.values().any(response_has_namespace_tool_call)
+        }
+        _ => false,
+    }
+}
+
+async fn emit_verified_tool_feedback(
+    state: &AppState,
+    ir_request: &IrRequest,
+    target: &tiygate_core::RoutingTarget,
+    request_id: &str,
+    response: &Value,
+) {
+    if !response_has_tool_call(response) {
+        return;
+    }
+    let (exchange, ids) = capability_feedback_exchange(ir_request);
+    // A tool-shaped response is not evidence by itself: providers may return
+    // tool-like metadata or a tool call that was not requested. Only attach
+    // SuccessfulTraffic when the ingress exchange actually required a tool
+    // capability (including a CRL carrier).
+    if !ids.iter().any(|id| {
+        matches!(
+            id.as_str(),
+            "tools.function"
+                | "tools.custom"
+                | "tools.namespace"
+                | "tools.crl.additional_tools"
+                | "tools.programmatic"
+        )
+    }) {
+        return;
+    }
+    let shape_hash = tiygate_core::capability_shape_hash(&exchange);
+    let route_id = state
+        .current_config()
+        .routing_table
+        .resolve_entry(&ir_request.model)
+        .and_then(|entry| entry.route_id.clone())
+        .unwrap_or_else(|| ir_request.model.clone());
+    let target_key = state
+        .db_store
+        .as_ref()
+        .and_then(|store| store.target_key_for(target).ok().map(|(key, _)| key.0))
+        .unwrap_or_else(|| target.health_key());
+    let mut capabilities = if response_has_program(response) {
+        vec!["tools.programmatic"]
+    } else if response_has_custom_tool_call(response) {
+        vec!["tools.custom"]
+    } else {
+        let mut capabilities = vec!["tools.function"];
+        if response_has_namespace_tool_call(response) {
+            capabilities.push("tools.namespace");
+        }
+        capabilities
+    };
+    capabilities.sort_unstable();
+    capabilities.dedup();
+    for capability in capabilities {
+        state
+            .telemetry
+            .send(tiygate_core::PipelineEvent {
+                request_id: request_id.to_string(),
+                timestamp: chrono::Utc::now(),
+                stage: "capability_feedback".to_string(),
+                payload: tiygate_core::telemetry::EventPayload::CapabilityFeedback {
+                    route_id: route_id.clone(),
+                    shape_hash: shape_hash.clone(),
+                    target: target_key.clone(),
+                    capability: capability.to_string(),
+                    outcome: "success".to_string(),
+                },
+            })
+            .await;
+    }
+}
+
+/// Rebuild the same exchange shape used by the request planner for passive
+/// feedback.  Typed Responses wire expressions take precedence over the
+/// legacy ID list; combining both would add an untyped duplicate and make the
+/// feedback hash differ from the plan hash.
+fn capability_feedback_exchange(
+    ir_request: &IrRequest,
+) -> (
+    tiygate_core::ExchangeRequirements,
+    Vec<tiygate_core::CapabilityId>,
+) {
+    let mut exchange = tiygate_core::derive_ir_requirements(ir_request);
+    let mut ids = Vec::new();
+    for expression in [
+        &exchange.request,
+        &exchange.response_contract,
+        &exchange.continuation,
+    ] {
+        collect_required_capability_ids(expression, &mut ids);
+    }
+    let typed_wire_requirements = ir_request
+        .extensions
+        .get("responses_wire_requirement_exprs")
+        .and_then(Value::as_array)
+        .map(|expressions| {
+            expressions
+                .iter()
+                .filter_map(|value| {
+                    serde_json::from_value::<tiygate_core::RequirementExpr>(value.clone()).ok()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for requirement in &typed_wire_requirements {
+        collect_required_capability_ids(requirement, &mut ids);
+    }
+    if !typed_wire_requirements.is_empty() {
+        exchange.request = tiygate_core::RequirementExpr::all([
+            exchange.request,
+            tiygate_core::RequirementExpr::all(typed_wire_requirements),
+        ]);
+    } else if let Some(wire) = ir_request
+        .extensions
+        .get("responses_wire_requirements")
+        .and_then(Value::as_array)
+    {
+        // Older IR snapshots contain only the legacy ID list.  Use it only
+        // when no typed expressions are available, otherwise an untyped
+        // duplicate would produce a different shape hash for feedback than
+        // the request planner used.
+        let wire_requirements = wire
+            .iter()
+            .filter_map(Value::as_str)
+            .map(tiygate_core::RequirementExpr::required)
+            .collect::<Vec<_>>();
+        ids.extend(
+            wire.iter()
+                .filter_map(Value::as_str)
+                .map(tiygate_core::CapabilityId::from),
+        );
+        if !wire_requirements.is_empty() {
+            exchange.request = tiygate_core::RequirementExpr::all([
+                exchange.request,
+                tiygate_core::RequirementExpr::all(wire_requirements),
+            ]);
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    (exchange, ids)
+}
 
 type CodexWebSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -463,10 +763,13 @@ fn check_nonstream_error_body(
     if let Some(c) = code {
         app_err = app_err.with_upstream_code(c);
     }
+    if is_target_capability_rejection(400, &response_body.to_string()) {
+        app_err = app_err.with_target_capability_error();
+    }
     if let Some(ra) = retry_after {
         app_err = app_err.with_retry_after_header(ra);
     }
-    app_err.rate_limit_headers = rate_limit_headers;
+    app_err.rate_limit_headers = Arc::new(rate_limit_headers);
     Some(app_err)
 }
 
@@ -770,10 +1073,16 @@ pub(super) async fn execute_upstream(
                 Some(status.as_u16()),
                 None,
             ));
+            if is_target_capability_rejection(status.as_u16(), &error_body) {
+                app_err = app_err.with_target_capability_error();
+            }
+            if let Some(code) = upstream_error_code_from_body(&error_body) {
+                app_err = app_err.with_upstream_code(code);
+            }
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
-            app_err.rate_limit_headers = rate_limit_headers_vec;
+            app_err.rate_limit_headers = Arc::new(rate_limit_headers_vec);
             return Err(app_err);
         }
 
@@ -954,7 +1263,7 @@ pub(super) async fn execute_upstream(
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
-            app_err.rate_limit_headers = rate_limit_headers_vec;
+            app_err.rate_limit_headers = Arc::new(rate_limit_headers_vec);
             return Err(app_err);
         }
 
@@ -989,6 +1298,8 @@ pub(super) async fn execute_upstream(
             );
             return Err(app_err);
         }
+
+        emit_verified_tool_feedback(state, ir_request, target, request_id, &response_body).await;
 
         // Keep a copy of the raw upstream body for the capture before
         // any cross-protocol re-encoding.
@@ -1496,7 +1807,7 @@ pub(super) async fn execute_messages_upstream(
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
-            app_err.rate_limit_headers = rate_limit_headers_vec;
+            app_err.rate_limit_headers = Arc::new(rate_limit_headers_vec);
             return Err(app_err);
         }
 
@@ -1530,6 +1841,8 @@ pub(super) async fn execute_messages_upstream(
             );
             return Err(app_err);
         }
+
+        emit_verified_tool_feedback(state, ir_request, target, request_id, &response_body).await;
 
         let upstream_resp_body_capture = if openai_codex_profile {
             Some(response_text)
@@ -1836,6 +2149,12 @@ pub(super) async fn execute_embeddings_upstream(
             Some(status.as_u16()),
             None,
         ));
+        if is_target_capability_rejection(status.as_u16(), &response_body.to_string()) {
+            app_err = app_err.with_target_capability_error();
+        }
+        if let Some(code) = upstream_error_code_from_body(&response_body.to_string()) {
+            app_err = app_err.with_upstream_code(code);
+        }
         if let Some(c) = response_body["error"]["code"]
             .as_str()
             .or_else(|| response_body["error"]["type"].as_str())
@@ -2158,6 +2477,12 @@ pub(super) async fn execute_responses_upstream(
                 Some(status.as_u16()),
                 None,
             ));
+            if is_target_capability_rejection(status.as_u16(), &error_body) {
+                app_err = app_err.with_target_capability_error();
+            }
+            if let Some(code) = upstream_error_code_from_body(&error_body) {
+                app_err = app_err.with_upstream_code(code);
+            }
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
@@ -2306,6 +2631,12 @@ pub(super) async fn execute_responses_upstream(
             Some(status.as_u16()),
             None,
         ));
+        if is_target_capability_rejection(status.as_u16(), &response_body.to_string()) {
+            app_err = app_err.with_target_capability_error();
+        }
+        if let Some(code) = upstream_error_code_from_body(&response_body.to_string()) {
+            app_err = app_err.with_upstream_code(code);
+        }
         if let Some(c) = response_body["error"]["code"]
             .as_str()
             .or_else(|| response_body["error"]["type"].as_str())
@@ -2315,7 +2646,7 @@ pub(super) async fn execute_responses_upstream(
         if let Some(ra) = retry_after {
             app_err = app_err.with_retry_after_header(ra);
         }
-        app_err.rate_limit_headers = rate_limit_headers_vec;
+        app_err.rate_limit_headers = Arc::new(rate_limit_headers_vec);
         return Err(app_err);
     }
 
@@ -2360,6 +2691,8 @@ pub(super) async fn execute_responses_upstream(
         );
         return Err(app_err);
     }
+
+    emit_verified_tool_feedback(state, ir_request, target, request_id, &response_body).await;
 
     let upstream_resp_body_capture = if openai_codex_profile {
         Some(response_text)
@@ -3137,7 +3470,7 @@ pub(super) async fn execute_gemini_upstream(
         if let Some(ra) = retry_after {
             app_err = app_err.with_retry_after_header(ra);
         }
-        app_err.rate_limit_headers = rate_limit_headers_vec;
+        app_err.rate_limit_headers = Arc::new(rate_limit_headers_vec);
         return Err(app_err);
     }
 
@@ -3390,7 +3723,7 @@ pub(super) async fn execute_images_generations_upstream(
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
-            app_err.rate_limit_headers = rate_limit_headers_vec;
+            app_err.rate_limit_headers = Arc::new(rate_limit_headers_vec);
             return Err(app_err);
         }
 
@@ -3549,7 +3882,7 @@ pub(super) async fn execute_images_generations_upstream(
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
-            app_err.rate_limit_headers = rate_limit_headers_vec;
+            app_err.rate_limit_headers = Arc::new(rate_limit_headers_vec);
             return Err(app_err);
         }
 
@@ -3756,7 +4089,7 @@ pub(super) async fn execute_images_edits_upstream(
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
-            app_err.rate_limit_headers = rate_limit_headers_vec;
+            app_err.rate_limit_headers = Arc::new(rate_limit_headers_vec);
             return Err(app_err);
         }
 
@@ -3911,7 +4244,7 @@ pub(super) async fn execute_images_edits_upstream(
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
-            app_err.rate_limit_headers = rate_limit_headers_vec;
+            app_err.rate_limit_headers = Arc::new(rate_limit_headers_vec);
             return Err(app_err);
         }
 
@@ -4003,6 +4336,102 @@ mod tests {
     use futures::{SinkExt, StreamExt};
 
     #[test]
+    fn capability_rejection_requires_structured_tool_signal() {
+        assert!(is_target_capability_rejection(
+            400,
+            r#"{"error":{"type":"invalid_request_error","param":"tools","message":"tools are not supported"}}"#
+        ));
+        assert!(!is_target_capability_rejection(400, "unsupported tools"));
+        assert!(!is_target_capability_rejection(
+            400,
+            r#"{"error":{"type":"invalid_request_error","param":"model","message":"model is not supported"}}"#
+        ));
+        assert!(!is_target_capability_rejection(
+            400,
+            r#"{"error":{"type":"invalid_request_error","param":"tools","message":"function schema is invalid"}}"#
+        ));
+        assert_eq!(
+            upstream_error_code_from_body(
+                r#"{"error":{"code":"unsupported_parameter","message":"tools"}}"#
+            ),
+            Some("unsupported_parameter".to_string())
+        );
+    }
+
+    #[test]
+    fn feedback_shape_prefers_typed_responses_requirements() {
+        let mut extensions = std::collections::HashMap::new();
+        extensions.insert(
+            "responses_wire_requirements".to_string(),
+            json!(["tools.crl.additional_tools", "tools.namespace"]),
+        );
+        extensions.insert(
+            "responses_wire_requirement_exprs".to_string(),
+            json!([
+                {
+                    "op": "capability",
+                    "items": {
+                        "id": "tools.crl.additional_tools",
+                        "strength": "required"
+                    }
+                },
+                {
+                    "op": "capability",
+                    "items": {
+                        "id": "tools.namespace",
+                        "strength": "required",
+                        "value": {"kind": "enum_set", "value": ["functions"]}
+                    }
+                }
+            ]),
+        );
+        let request = IrRequest {
+            model: "model".to_string(),
+            system: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            params: Default::default(),
+            response_format: None,
+            stream: false,
+            ingress_protocol: tiygate_core::ProtocolEndpoint::new(
+                tiygate_core::ProtocolSuite::OpenAiResponses,
+                "responses",
+                "v1",
+            ),
+            metadata: None,
+            extensions,
+        };
+        let (exchange, ids) = capability_feedback_exchange(&request);
+        assert!(ids.contains(&tiygate_core::CapabilityId::from(
+            "tools.crl.additional_tools"
+        )));
+        assert_eq!(
+            tiygate_core::capability_shape_hash(&exchange),
+            tiygate_core::capability_shape_hash_from_requirements(&[
+                tiygate_core::CapabilityRequirement::required("transport.http"),
+                tiygate_core::CapabilityRequirement::required("tools.crl.additional_tools"),
+                tiygate_core::CapabilityRequirement::with_value(
+                    "tools.namespace",
+                    tiygate_core::RequirementStrength::Required,
+                    tiygate_core::CapabilityValue::EnumSet(
+                        ["functions".to_string()].into_iter().collect(),
+                    ),
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn namespace_tool_calls_are_separate_feedback_evidence() {
+        assert!(response_has_namespace_tool_call(&json!({
+            "output": [{"type": "function_call", "namespace": "functions", "name": "wait"}]
+        })));
+        assert!(!response_has_namespace_tool_call(&json!({
+            "output": [{"type": "function_call", "name": "wait"}]
+        })));
+    }
+
+    #[test]
     fn check_nonstream_error_body_detects_pure_error() {
         let body = json!({
             "error": {
@@ -4045,6 +4474,20 @@ mod tests {
         assert!(result.is_some());
         let err = result.unwrap();
         assert_eq!(err.retry_after_header, Some("30".to_string()));
+    }
+
+    #[test]
+    fn check_nonstream_error_body_flags_structured_capability_error() {
+        let body = json!({
+            "error": {
+                "type": "invalid_request_error",
+                "param": "tools",
+                "message": "tools are unsupported"
+            }
+        });
+        let result = check_nonstream_error_body(&body, 200, None, Vec::new());
+        assert!(result.is_some());
+        assert!(result.unwrap().is_target_capability_error());
     }
 
     #[test]

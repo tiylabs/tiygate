@@ -75,6 +75,12 @@ pub struct App {
     /// Stateless OAuth keepalive task. None without a control-plane database.
     #[allow(dead_code)]
     pub oauth_refresh: Option<crate::oauth_refresh_worker::OAuthRefreshWorkerHandle>,
+    /// Startup-loaded capability snapshot shared with the ingress router.
+    pub(crate) capability_snapshot: Arc<crate::ingress::capabilities::CapabilitySnapshotStore>,
+    /// Owned ingress background tasks. They are stopped explicitly before
+    /// process exit so probe/reloader work is not detached.
+    pub(crate) ingress_background:
+        Arc<std::sync::Mutex<Option<crate::ingress::IngressBackgroundHandles>>>,
 }
 
 /// State attached to the control plane — held so the binary can
@@ -88,11 +94,20 @@ pub struct ControlPlane {
 
 impl App {
     pub async fn new() -> anyhow::Result<Self> {
-        let server_config = ServerConfig::from_env();
+        let mut server_config = ServerConfig::from_env();
         let health = Arc::new(tiygate_core::HealthRegistry::with_defaults());
 
         // -- Control plane (DB + admin) --
         let control_plane = boot_control_plane(&server_config).await?;
+        let capability_snapshot = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::ingress::capabilities::CapabilitySnapshot::default(),
+        ));
+        if let Some(cp) = &control_plane {
+            match crate::ingress::capabilities::load_snapshot(cp.store.as_ref()).await {
+                Ok(snapshot) => capability_snapshot.store(Arc::new(snapshot)),
+                Err(error) => warn!(error = %error, "initial capability snapshot load failed"),
+            }
+        }
         let config = match &control_plane {
             Some(cp) => cp.store.config_store(),
             None => {
@@ -153,6 +168,25 @@ impl App {
                 // Bootstrap settings from env on first start, then
                 // spawn the settings-driven archive worker.
                 bootstrap_settings(&cp.store, &server_config).await;
+                // The settings table is the runtime source of truth. Load
+                // capability mode/transform switches before constructing the
+                // data-plane router so an env value cannot briefly enable a
+                // stale enforce policy during the first watcher interval.
+                server_config.capability_routing_mode = tiygate_core::CapabilityRoutingMode::parse(
+                    &tiygate_store::settings_keys::get_string(
+                        cp.store.as_ref(),
+                        tiygate_store::settings_keys::CAPABILITY_ROUTING_MODE,
+                        server_config.capability_routing_mode.as_str(),
+                    )
+                    .await,
+                )
+                .unwrap_or(tiygate_core::CapabilityRoutingMode::Off);
+                server_config.crl_tool_promotion_enabled = tiygate_store::settings_keys::get_bool(
+                    cp.store.as_ref(),
+                    tiygate_store::settings_keys::RESPONSES_CRL_TOOL_PROMOTION_ENABLED,
+                    server_config.crl_tool_promotion_enabled,
+                )
+                .await;
                 let handle =
                     tiygate_store::archive::spawn_from_store(cp.pool.clone(), cp.store.clone());
                 // Build a one-time S3 client for the admin replay
@@ -228,6 +262,8 @@ impl App {
             model_catalog_refresh,
             oauth_manager,
             oauth_refresh,
+            capability_snapshot,
+            ingress_background: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -242,20 +278,27 @@ impl App {
         // `admin` nor `webui` feature is enabled, those reassignments
         // are compiled out, so silence the spurious unused_mut.
         #[allow(unused_mut)]
-        let mut router = crate::ingress::router_with_telemetry_full_and_oauth(
-            self.config.clone(),
-            self.health.clone(),
-            &self.server_config,
-            Arc::new(self.telemetry.clone()),
-            self.quota.clone(),
-            #[cfg(feature = "cache")]
-            self.embedding_cache.clone(),
-            #[cfg(not(feature = "cache"))]
-            None,
-            db_store,
-            self.model_catalog.clone(),
-            self.oauth_manager.clone(),
-        );
+        let (mut router, background) =
+            crate::ingress::router_with_telemetry_full_and_oauth_with_background(
+                self.config.clone(),
+                self.health.clone(),
+                &self.server_config,
+                Arc::new(self.telemetry.clone()),
+                self.quota.clone(),
+                #[cfg(feature = "cache")]
+                self.embedding_cache.clone(),
+                #[cfg(not(feature = "cache"))]
+                None,
+                db_store,
+                self.model_catalog.clone(),
+                self.oauth_manager.clone(),
+                self.capability_snapshot.clone(),
+            );
+        if let Ok(mut slot) = self.ingress_background.lock() {
+            *slot = Some(background);
+        } else {
+            tracing::warn!("failed to retain ingress background task handles");
+        }
         if let Some(cp) = &self.control_plane {
             // Mount the admin router under `/admin`. Phase 4 splits
             // the surface: in `proxy` mode we omit the admin routes
@@ -321,6 +364,23 @@ impl App {
             .expose_headers(Any);
 
         router.layer(cors)
+    }
+
+    /// Stop ingress capability/reloader tasks before the process exits.
+    pub async fn stop_background_tasks(&self) {
+        let background = self
+            .ingress_background
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(background) = background {
+            background.stop().await;
+        }
+        // Flush and join the telemetry drain after ingress workers stop
+        // producing capability/probe events.  This keeps the asynchronous
+        // OLTP consumer owned by the App rather than leaving a detached task
+        // at process shutdown.
+        self.telemetry.shutdown().await;
     }
 }
 
@@ -488,6 +548,54 @@ async fn bootstrap_settings(store: &Arc<DbConfigStore>, cfg: &ServerConfig) {
         store,
         sk::ROUTING_DEFAULT_STRATEGY,
         cfg.routing_strategy.as_str(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::CAPABILITY_ROUTING_MODE,
+        cfg.capability_routing_mode.as_str(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::CAPABILITY_PROBE_ENABLED,
+        &env_or("TIYGATE_CAPABILITY_PROBE_ENABLED", "true"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::RESPONSES_CRL_TOOL_PROMOTION_ENABLED,
+        &env_or("TIYGATE_RESPONSES_CRL_TOOL_PROMOTION_ENABLED", "false"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::CAPABILITY_PROBE_DAILY_BUDGET,
+        &env_or("TIYGATE_CAPABILITY_PROBE_DAILY_BUDGET", "64"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::CAPABILITY_PROBE_GLOBAL_BUDGET,
+        &env_or("TIYGATE_CAPABILITY_PROBE_GLOBAL_BUDGET", "512"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::CAPABILITY_PROBE_GLOBAL_CONCURRENCY,
+        &env_or("TIYGATE_CAPABILITY_PROBE_GLOBAL_CONCURRENCY", "4"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::CAPABILITY_PROBE_PROVIDER_CONCURRENCY,
+        &env_or("TIYGATE_CAPABILITY_PROBE_PROVIDER_CONCURRENCY", "2"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::CAPABILITY_PROBE_ACCOUNT_CONCURRENCY,
+        &env_or("TIYGATE_CAPABILITY_PROBE_ACCOUNT_CONCURRENCY", "1"),
     )
     .await;
 
@@ -692,6 +800,7 @@ async fn boot_control_plane(cfg: &ServerConfig) -> anyhow::Result<Option<Control
         }
     };
     let store = Arc::new(DbConfigStore::new((*pool).clone(), encryption.clone()));
+    store.ensure_fingerprint_secret().await?;
     store.refresh().await?;
 
     info!(

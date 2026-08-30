@@ -40,6 +40,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 use thiserror::Error;
@@ -48,6 +49,7 @@ use zeroize::Zeroizing;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 const HKDF_INFO_PREFIX: &[u8] = b"tiygate/v1/";
+const FINGERPRINT_INFO: &[u8] = b"tiygate/target-scope/v1";
 
 /// Errors emitted by [`KeyEncryption`].
 #[derive(Debug, Error)]
@@ -172,6 +174,22 @@ impl KeyEncryption {
             return "[encrypted: <short>]".to_string();
         }
         format!("[encrypted: {}…]", &blob[..12])
+    }
+
+    /// Derive a stable, non-reversible credential-scope fingerprint.  The
+    /// master key never leaves this type; callers receive only the hex digest.
+    pub fn fingerprint_scope(&self, material: &str) -> String {
+        type HmacSha256 = Hmac<Sha256>;
+        let hk = Hkdf::<Sha256>::new(None, self.master.as_ref());
+        let mut key = [0u8; KEY_LEN];
+        if hk.expand(FINGERPRINT_INFO, &mut key).is_err() {
+            return String::new();
+        }
+        let Ok(mut mac) = <HmacSha256 as Mac>::new_from_slice(&key) else {
+            return String::new();
+        };
+        mac.update(material.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
     }
 
     /// Derive the subkey for `purpose` and return an `Aes256Gcm`

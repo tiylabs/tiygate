@@ -125,6 +125,10 @@ pub struct RouteTarget {
     pub api_key_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base_override: Option<String>,
+    /// Optional target-side wire dialect. Missing values use `auto`, which
+    /// preserves the historical provider/model endpoint selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_dialect_id: Option<String>,
 }
 
 /// Default weight for a [`RouteTarget`] when the field is omitted from input.
@@ -149,6 +153,10 @@ pub struct Route {
     /// route inherits the gateway-wide default (`ServerConfig.routing_strategy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
+    /// Optional capability-aware routing mode. `None` inherits the global
+    /// setting and keeps legacy route JSON compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_routing_mode: Option<tiygate_core::CapabilityRoutingMode>,
     /// Optional persisted metadata for the client-facing virtual model card.
     /// When absent, `/v1/models` falls back to the runtime model catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +254,37 @@ pub struct ExportTokenDailyStat {
     pub longest_task_ms: i64,
 }
 
+/// A non-secret selector that lets an exported capability override be bound to
+/// the corresponding target after import. TargetKey itself is installation
+/// scoped (its credential fingerprint uses an installation HMAC secret), so a
+/// portable bundle must not rely on the source TargetKey alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportTargetSelector {
+    pub route_id: String,
+    pub target_index: usize,
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_dialect_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+}
+
+/// A manually configured capability conclusion included only when the
+/// operator explicitly selects capability overrides for export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportCapabilityOverride {
+    pub selector: ExportTargetSelector,
+    pub capability_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    pub reason: String,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Operator-selected subset of an import bundle. Each vec carries
 /// the ids (or setting keys) the user explicitly chose to import.
 /// Items present in the bundle but absent from the selection are
@@ -268,6 +307,10 @@ pub struct ImportSelection {
     /// import repeatedly.
     #[serde(default)]
     pub token_stats: Vec<String>,
+    /// Selected capability override ids. The id is the stable
+    /// `route_id#target_index#capability_id` selector emitted by export.
+    #[serde(default)]
+    pub capability_overrides: Vec<String>,
 }
 
 /// A serializable bundle of all configurable entities, used by the
@@ -299,6 +342,10 @@ pub struct ConfigExport {
     /// makes old bundles deserialize cleanly to an empty vec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub token_daily_stats: Vec<ExportTokenDailyStat>,
+    /// Optional, explicitly selected capability overrides. Profiles,
+    /// observations, probe jobs and installation secrets are never exported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_overrides: Vec<ExportCapabilityOverride>,
 }
 
 /// Summary of an import operation, returned to the caller so the UI
@@ -316,6 +363,10 @@ pub struct ImportReport {
     pub settings_skipped: usize,
     pub token_stats_imported: usize,
     pub token_stats_skipped: usize,
+    #[serde(default)]
+    pub capability_overrides_imported: usize,
+    #[serde(default)]
+    pub capability_overrides_skipped: usize,
 }
 
 /// The full in-memory snapshot used by the data plane. Built from

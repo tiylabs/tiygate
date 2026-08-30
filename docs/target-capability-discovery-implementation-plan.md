@@ -1,6 +1,7 @@
 # Target 能力发现与协议转换实施方案
 
 > 状态：修订后实施基线
+> 首期交付：阶段 0–6C 的可实施、可验证计划；阶段 7 仅保留为 Roadmap
 > 适用范围：TiyGate 当前支持的 Chat Completions、Anthropic Messages、OpenAI Responses、Gemini GenerateContent 与 Embeddings 协议
 > 目标读者：`core`、`protocols`、`store`、`server`、`admin` 与 `webui` 维护者
 
@@ -154,6 +155,7 @@ openai-embeddings-standard
 Ingress dialect 根据实际 wire 特征解析，不依赖客户端名称：
 
 - `input[].type == "additional_tools"` 产生 `tools.crl.additional_tools` requirement。
+- CRL `namespace` 递归产生带完整 namespace path 的 typed `tools.namespace` constraint；仅验证某个 namespace 不得授权其他 path。
 - Codex/Multi-agent Beta header 或 item 只影响其对应 extension requirement。
 - 未出现私有特征时保持标准 dialect。
 
@@ -164,6 +166,12 @@ Egress dialect 支持 `explicit` 与 `auto`：
 - 探测可以给出 `detected_extensions`，只有能够唯一证明完整方言契约时才给出 `detected_dialect_id`。
 
 `RouteTarget` 增加可选 `egress_dialect_id`；未设置时为 `auto`。dialect 参与 TargetKey、能力解析、探针选择和 Admin 展示。
+
+对于未注册的 OpenAI-compatible Provider，显式设置
+`egress_dialect_id=openai-responses-standard` 或
+`openai-responses-codex-lite` 同时选择 Responses egress endpoint；未设置时仍使用
+Provider 的默认 Chat Completions endpoint。该快捷配置只改变 wire profile，不宣称
+目标已支持任何能力，仍必须经过对应 TargetKey 的探测或显式证据。
 
 ### 4.3 Target 身份
 
@@ -222,6 +230,7 @@ pub enum CapabilityValue {
     DecimalRange { min: Option<f64>, max: Option<f64> },
     SchemaKeywordSet(BTreeSet<String>),
     Opaque(serde_json::Value),
+    Unknown { kind: String, value: serde_json::Value },
 }
 
 pub enum EvidenceSource {
@@ -252,6 +261,7 @@ pub struct CapabilityObservation {
 - Bool 能力的 Supported/Unsupported 不携带任意对象。
 - Constrained 必须携带与 descriptor `value_kind` 一致的非空 value。
 - Opaque 值可以存储和往返，但不得用于 conversion-relevant capability 的自动满足判断。
+- 未知 value kind 反序列化为保留原始 `kind/value` 的 `Unknown`（等价于 Opaque），可在 DB、Admin 和导入导出中往返，但不得参与自动路由。
 - Unknown 是解析结果，不作为比已有明确证据优先级更高的新 observation。
 
 约束匹配由 descriptor 声明，planner 不解释任意 JSON：
@@ -273,6 +283,8 @@ opaque            仅展示和往返，不参与自动路由
 5. ExactModelCatalog 高于 ProviderDocumentation；两者都低于 VerifiedWire。
 6. ProtocolDefault 仅提供非 hard-ceiling 的初始值；过期、版本不匹配或作用域不匹配的证据不参与解析。
 7. 每个 capability 独立保存 TTL；负面语义证据使用比稳定正面证据更短的默认 TTL。
+
+首期默认 TTL 固定为：SemanticProbe/SuccessfulTraffic 正面证据 fresh 24 小时、stale grace 7 天；明确拒绝的负面证据 fresh 6 小时、stale grace 24 小时；Inconclusive 诊断保留 1 小时且永不改变路由结论；ProviderDocumentation/ExactModelCatalog 由来源版本控制，版本失效立即转为 Unknown。override 的 `expires_at` 由 API 明确返回，设置时最长 30 天；兼容旧数据的空值 override 必须在 Admin/UI 标为长期人工结论并要求重新确认，续期需要新的 actor/reason 和审计事件。TTL 默认值随 capability schema/evidence 版本管理，变更时必须触发受影响画像重建，不把空值解释为永久有效。
 
 ### 4.5 能力描述注册表
 
@@ -327,6 +339,7 @@ RoutingEligibility
 ```text
 protocol-specs/capabilities/
 ├── registry.toml
+├── matrix.toml
 ├── baselines/
 │   ├── chat-completions.toml
 │   ├── messages.toml
@@ -339,7 +352,12 @@ protocol-specs/capabilities/
     └── tools.toml
 ```
 
-完整能力目录可以先处于 Cataloged/Disabled；第一版只有 CRL 工具闭环所需条目进入 Implemented，并根据证据确定性分别设置 ShadowEligible 或 EnforceEligible。
+完整能力目录可以先处于 Cataloged/Disabled；第一版只有 CRL 工具闭环所需的 HTTP/SSE、函数/continuation、`tool_choice` required/specific、namespace、custom 和 `additional_tools` 条目进入 Implemented，并根据证据确定性分别设置 ShadowEligible 或 EnforceEligible。通用能力过滤不等于新增转换维度，未登记 transform 的协议组合仍保持旧路径或 fail-closed。
+
+`registry.toml` 中的 `enforce_eligible_ids` 是首期 Enforce 白名单；构建期要求每个
+`EnforceEligible` descriptor 都在该列表中，且列表中的 ID 必须是已实现的
+`EnforceEligible` descriptor。新增 descriptor 即使完成 codec，也必须先更新白名单、
+matrix、版本与验收 fixture，不能仅修改状态字段扩大生产路由范围。
 
 `protocol-specs` 不在请求热路径动态读取。构建校验和静态描述符生成位于 `crates/protocols`；`core` 只提供通用类型、匹配器和 planner 输入输出，不包含具体协议 baseline 或 CRL transform。探针 TOML 只能引用受审计的 `probe_id`，不得携带任意命令、URL 或可执行脚本。
 
@@ -716,11 +734,11 @@ CRL `additional_tools` 的要求不是单一 capability，而是两条可替代�
 ```text
 Native Plan:
   baseline tools.crl.additional_tools != Forbidden
-  requires tools.crl.additional_tools
+  requires tools.crl.additional_tools = Supported（或满足约束的 Constrained）
   transform responses.pass_through
 
 Promotion Plan:
-  requires tools.namespace
+  requires egress 顶层 tools carrier 且 tools.namespace = Supported（或满足约束的 Constrained）
   requires tools.custom（仅当载体包含 custom）
   requires tools.function（仅当载体包含 function）
   transform responses.promote_crl_additional_tools
@@ -757,7 +775,7 @@ Target C
 8. 保留 `tool_choice` 与 `parallel_tool_calls`。
 9. 不自动把 namespace 展开或重命名为普通 function。
 
-Responses decoder 扩展现有 `responses_opaque_input_items` 有序机制保存 `additional_tools` 的原始 item 和 index，同时解析内部工具类型生成 requirements；不得另建平行 opaque carrier，也不得继续退化为空 developer message。
+Responses decoder 扩展现有 `responses_opaque_input_items` 有序机制保存 `additional_tools` 的原始 item 和 index，同时解析内部工具类型生成 requirements；namespace requirement 同步保存完整 path 的 typed constraint；不得另建平行 opaque carrier，也不得继续退化为空 developer message。
 
 原生计划使用入口原始 body，仅应用必须的 model、认证和已登记 egress normalization。提升计划从同一原始 body 生成目标 body，不能先经过会丢失未知字段的通用 IR 重编码。
 
@@ -812,11 +830,14 @@ CREATE TABLE target_capability_profiles (
     model_id TEXT NOT NULL,
 
     schema_version INTEGER NOT NULL,
+    registry_version INTEGER NOT NULL,
+    baseline_version INTEGER NOT NULL,
     profile_status TEXT NOT NULL,
     resolved_capabilities_json TEXT NOT NULL,
     observations_json TEXT NOT NULL,
 
     last_probe_suite_version INTEGER,
+    last_probe_judge_version INTEGER,
     last_successful_probe_at TEXT,
     last_probe_error_class TEXT,
     last_probe_error_redacted TEXT,
@@ -839,6 +860,22 @@ error
 
 `fresh_until` 到期后进入 stale-while-revalidate；在 `stale_until` 前继续使用最后一次已验证结果并异步重探测。超过 `stale_until` 后，过期 observation 不参与 enforce 解析，但仍保留用于诊断。
 
+安装级 fingerprint secret 单独管理，不与当前 `TIYGATE_MASTER_KEY` 的轮换耦合：
+
+```sql
+CREATE TABLE installation_secrets (
+    name TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    encrypted_value TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+```
+
+首次启动在事务中以 CSPRNG 创建 `target-key-hmac/v1`；读取和 HMAC 计算只发生在 `store`，明文只存在于进程内短生命周期。配置了 `TIYGATE_MASTER_KEY` 时，`encrypted_value` 使用独立 purpose 加密；无主密钥的开发/兼容模式只允许持久化随机 base64 材料并明确告警，生产部署必须配置主密钥。主密钥轮换仅重新加密 `encrypted_value`。如确需主动更换 fingerprint secret，必须先建立旧 key → 新 key 的受控重建窗口，在所有 Target profile/job/admission 重算前保持 `off`，不得静默造成 TargetKey 碰撞或画像错配。
+
+`capability_probe_budgets(scope, day, used)` 与 installation secret 一并由 config migration 建立；`scope` 使用 TargetKey 或 `__global__`，`day` 为 UTC 日期，消费通过事务同时更新两级计数，任一级超限即回滚。
+
 ### 8.2 Override
 
 人工覆盖独立存储，重探测不得修改：
@@ -860,6 +897,21 @@ CREATE TABLE target_capability_overrides (
 
 override 必须通过 registry 校验 state/value；未知 capability ID 可以存储和导入导出，但在当前版本不参与 enforce。协议 baseline 为 `Forbidden` 时拒绝 Supported override。
 
+首期配置导出不包含 profile、observation、probe job 或 fingerprint secret；若管理员选择导出
+override，新增 `capability_overrides` 数组，并用不含凭证的目标定位器绑定到导出中的
+`route_id + target_index + provider_id + model_id + egress_dialect_id + account_label`。导入时
+先完成 Provider/Route 写入，再按定位器在当前安装重新计算 TargetKey；定位不到、匹配不唯一或
+身份字段不一致的 override 必须跳过并在 ImportReport 中计数，禁止按“相同模型名”静默套用到
+其他 Target。`capability_id`、state、typed value、reason 和 expires_at 原样保留并限长，未知
+ID 仍可往返但不能参与 enforce；该定位规则和跨安装失败/恢复样例纳入 `V-IDENTITY`、
+`V-DB-RECOVERY` 与 `AC-PERSISTENCE`。
+
+`capability_overrides` 作为 `ConfigExport.schema_version=2` 的可选扩展加入（不改变既有
+字段语义）；新字段使用 `#[serde(default)]`，新导入器读取旧 bundle 时视为空，旧导入器
+可安全忽略该未知字段。若后续改变 selector 或状态语义再提升 schema 版本，遇到新版本
+时必须返回明确的 unsupported-version 错误。`ImportSelection` 与 `ImportReport` 同步
+增加 override 的选择和 imported/skipped 计数，选择集合为空仍表示不导入任何 override。
+
 ### 8.3 持久化探测任务
 
 ```sql
@@ -872,6 +924,7 @@ CREATE TABLE target_probe_jobs (
     priority INTEGER NOT NULL,
     attempt_count INTEGER NOT NULL,
     max_attempts INTEGER NOT NULL,
+    next_probe_index INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT NOT NULL,
     lease_owner TEXT,
     lease_until TEXT,
@@ -883,7 +936,7 @@ CREATE TABLE target_probe_jobs (
 );
 ```
 
-`probe_set_hash` 基于排序后的 capability ID 和 probe version 生成；相同 TargetKey/probe set 的重探测复用并重置同一 job。任务状态为 `pending/running/complete/partial/cancelled/failed`。worker 使用单条条件更新原子 claim 到期或未持有 lease 的任务；lease 到期后可由其他副本接管，执行和结果提交均幂等。
+`probe_set_hash` 基于排序后的 capability ID 和 probe version 生成；相同 TargetKey/probe set 的重探测复用并重置同一 job。任务状态为 `pending/running/complete/partial/cancelled/failed`。`partial` 状态同时保存 `next_probe_index`：优雅停止或预算耗尽时从游标继续，语义结果 Inconclusive 时将游标归零并延迟重试，避免重复调用或对静默响应热循环。worker 使用单条条件更新原子 claim 到期或未持有 lease 的任务；lease 到期后可由其他副本接管，执行和结果提交均幂等。
 
 进程启动时扫描 pending、lease 已过期的 running 和需要重探测的 stale profile。任务不保存凭证，执行时通过 TargetKey 从当前配置快照取得有效 Target；身份已变化或 Target 已无引用时取消。
 
@@ -894,7 +947,9 @@ CREATE TABLE target_probe_jobs (
 ```rust
 pub struct CapabilitySnapshot {
     pub epoch: i64,
-    pub profiles: HashMap<TargetKey, ResolvedTargetCapabilities>,
+    pub loaded: bool,
+    pub profiles: HashMap<TargetKey, TargetCapabilityProfile>,
+    pub admissions: HashMap<(String, String), CapabilityRouteAdmission>,
 }
 ```
 
@@ -902,9 +957,109 @@ pub struct CapabilitySnapshot {
 - 服务启动时从 profile 与 override 表构建；正常请求只读取内存，不同步查询 DB。
 - profile/override 提交后递增独立 `capability_epoch`，本地 write-through 更新，其他副本由后台 watcher 刷新。
 - capability epoch 与配置 epoch 分离，频繁探测结果不得触发完整 Provider/Route 配置重载。
-- snapshot 中保存已应用 baseline、observation、override 和 TTL 后的 resolved 结果，planner 不在热路径解析数据库 JSON。
+- snapshot 中保存已应用 baseline、observation、override 和 TTL 后的 resolved 结果，以及当前版本的 Route × shape admission；planner 不在热路径解析数据库 JSON。`loaded=false` 或版本/迁移校验失败的快照只能提供诊断，不能参与 Shadow/Enforce。
 
 能力画像默认保留 JSON，以便新增能力不做表结构迁移。常用筛选字段后续可以增加索引投影，但第一阶段不提前优化。
+
+### 8.5 Route × capability shape 准入记录
+
+全局/per-route `CapabilityRoutingMode` 只提供模式上限；要满足“按能力形状灰度、准入和自动回退”，必须另存一条最小准入记录。该记录在阶段 6A 建立（配置迁移版本为 `20260829000003_capability_route_admissions`，typed requirement 列由 `20260829000008_capability_admission_requirements` 补充，PostgreSQL 使用同名迁移），阶段 2 只预留 epoch/版本边界：
+
+```sql
+CREATE TABLE capability_route_admissions (
+    route_id TEXT NOT NULL,
+    capability_shape_hash TEXT NOT NULL,
+    required_capabilities_json TEXT NOT NULL,
+    required_requirements_json TEXT NOT NULL DEFAULT '[]',
+    mode TEXT NOT NULL,
+    gate_policy_version INTEGER NOT NULL,
+    report_json TEXT NOT NULL,
+    approved_by TEXT,
+    approved_at TEXT,
+    expires_at TEXT,
+    revision INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (route_id, capability_shape_hash)
+);
+```
+
+约束：
+
+- `capability_shape_hash` 由排序、去重后的 Required capability ID 与 constraint 摘要计算，不包含请求内容、TargetKey 或凭证。
+- `required_capabilities_json` 是兼容展示字段；`required_requirements_json` 保存规范化的 Required 叶子及 typed constraint。旧行为空数组时按 ID 恢复无约束 requirement，新写入必须同时校验两者的 ID 集合一致。
+- shape hash 算法带版本前缀（当前 `shape/v1`）；Required capability 与 constraint 数量、`report_json` 大小有上限，报告只保存脱敏摘要而非原始请求/响应。
+- `mode=enforce` 必须有通过当前 gate policy 的 `report_json`、批准人和批准时间；`expires_at` 到期自动回到 shadow。
+- Route 级 mode 是上限：Route 为 `off` 时所有 shape 均 off；Route 为 `shadow` 时不得执行 shape enforce；只有 Route 与 shape 均为 enforce 才能过滤目标。
+- planner、Admin API 和 watcher 只按 `(route_id, shape_hash, revision)` 读取；准入记录更新递增 capability epoch，不触发完整配置重载。
+- Route 删除或能力 registry/evidence 版本变化时，相关 admission 标记 stale，不能继续 enforce，历史报告保留用于审计。
+
+SQLite/PostgreSQL 迁移、CRUD、条件更新和过期处理纳入 `AC-ADMIN` 与 `AC-PERSISTENCE`；没有该记录时保持现有 `off/shadow` 行为。
+
+### 8.6 Shadow 计划与业务反馈遥测
+
+Shadow 诊断与请求主日志分离，但必须使用同一套异步 OLTP 管道持久化，不能只依赖进程内计数器：
+
+```sql
+CREATE TABLE request_capability_plans (
+    request_id TEXT NOT NULL,
+    route_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    shape_hash TEXT NOT NULL,
+    planning_micros INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    requirements_json TEXT NOT NULL,
+    missing_json TEXT NOT NULL,
+    unknown_json TEXT NOT NULL,
+    transform TEXT,
+    evidence_json TEXT NOT NULL,
+    UNIQUE (request_id, target)
+);
+
+CREATE TABLE request_capability_feedback (
+    request_id TEXT NOT NULL,
+    route_id TEXT NOT NULL,
+    shape_hash TEXT NOT NULL,
+    target TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    UNIQUE (request_id, target, capability)
+);
+
+CREATE TABLE request_capability_telemetry_gaps (
+    request_id TEXT NOT NULL,
+    route_id TEXT NOT NULL,
+    shape_hash TEXT NOT NULL,
+    target TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL,
+    dropped_count INTEGER NOT NULL DEFAULT 1,
+    first_ts TEXT NOT NULL,
+    last_ts TEXT NOT NULL,
+    PRIMARY KEY (request_id, route_id, shape_hash, target, reason)
+);
+
+CREATE TABLE capability_probe_runs (
+    run_id TEXT PRIMARY KEY,
+    target TEXT NOT NULL,
+    probe_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    duration_micros INTEGER NOT NULL DEFAULT 0,
+    budget_weight INTEGER NOT NULL DEFAULT 1,
+    error_class TEXT,
+    ts TEXT NOT NULL
+);
+```
+
+- `status` 固定为 `compatible`、`incompatible`、`unknown` 或 `planner_error`；`outcome` 固定为 `success`、`capability_rejection`、`inconclusive` 或 `error`，其中 `error` 必须带受限 `error_class`。
+- `request_capability_telemetry_gaps` 记录计划/反馈无法确认落盘的窗口；相同 request、Route、shape、target 和 reason 幂等累加 `dropped_count`，窗口存在任一 gap 即不可准入。
+- `capability_probe_runs` 只记录受审计的 probe id、TargetKey、结果、时延和预算权重，用于独立探针审计/成本统计，不进入业务 request quota、HealthRegistry 或 EWMA。
+- `target` 只存内部 TargetKey/health key，表中不得出现 API Base、账号、凭证、prompt、工具 schema 或原始上下游 body；`requirements_json`、`missing_json`、`unknown_json` 和 `evidence_json` 均有条数与字节上限。
+- 写入采用至少一次投递和幂等 upsert；乱序、重复、进程重启和消费失败不得重复放大分子。能力计划/反馈属于准入关键事件，队列背压时必须进入可恢复 outbox 或明确计入 `telemetry_gap`，不能静默丢弃；存在 gap 的观察窗口不得通过 enforce 门禁。聚合查询按 `route_id × shape_hash × [since, until)` 计算，并同时读取 probe job 的终结错误窗口。
+- 聚合结果必须显式给出 `profile_resolution_coverage`、`compatible_shape_coverage`、`verified_success_disagreement_rate`、`planner_unknown_rate`、`probe_terminal_error_rate`、`planner_internal_error_rate` 和 `planning_latency_p95`；没有对应分母时返回“无样本”，不能返回伪造的 100%。
+- 遥测表遵循 request log 的保留期与清理策略；迁移、索引、幂等和脱敏列入 `V-SHADOW`、`V-DB-RECOVERY` 和 `AC-PERSISTENCE`。
 
 ## 9. 探测生命周期
 
@@ -950,8 +1105,9 @@ Target 在 `pending` 时：
 - 每个探针设置独立超时和最大输出 token。
 - 默认不对能力错误重试；瞬时网络错误最多进行一次受限重试。
 - 设置单 Target 每日探测预算和全局预算。
-- 探测请求标记内部 `probe_run_id`，不计入下游 API Key 配额。
-- 探测产生的上游费用仍需在 Admin UI 中可观测。
+- 探测请求标记内部 `probe_run_id`，不计入 TiyGate 客户端配额、业务请求计数或 fallback 预算；
+  上游服务商的 API Key 限流与计费不假定可绕过。
+- 探测产生的上游费用和限流响应仍需在 Admin UI 中可观测。
 - 达到预算时任务保持 pending 并设置 `next_attempt_at`，已有 profile 不被降级。
 - 默认只运行基础 bundle；工具、PTC、reasoning、structured output 和多模态 bundle 按 endpoint、请求需求和管理员策略选择。
 
@@ -960,10 +1116,27 @@ Target 在 `pending` 时：
 运行时设置使用枚举而不是单一 bool：
 
 ```text
-target_capability_routing_mode = off | shadow | enforce
+gateway.capabilities.routing_mode = off | shadow | enforce
 ```
 
-- 新版本默认 `off`，ProbeWorker 可以独立启用并回填现有 Target。
+探测控制采用以下运行时设置（均为可热更新的非敏感值）：
+
+```text
+gateway.capabilities.probe_enabled
+gateway.capabilities.probe_daily_budget
+gateway.capabilities.probe_global_budget
+gateway.capabilities.probe_global_concurrency
+gateway.capabilities.probe_provider_concurrency
+gateway.capabilities.probe_account_concurrency
+gateway.responses.crl_tool_promotion_enabled
+```
+
+预算在数据库中按 `scope × UTC day` 原子计数，跨进程共享；并发限制在进程内按全局、Provider 和 account 三层动态 gate 生效。预算耗尽的 job 延迟到下一个 UTC 日，不消耗重试次数；并发/网络错误仍遵循 job 的有限重试策略。
+
+- 新版本 `gateway.capabilities.routing_mode` 默认 `off`；ProbeWorker 默认按
+  `gateway.capabilities.probe_enabled` 异步回填现有 Target，且不改变业务路由。
+- `gateway.responses.crl_tool_promotion_enabled` 默认 `false`；只有管理员显式开启且
+  Route/shape 通过准入后才可生成 promotion body，历史部署的显式设置按配置优先级保留。
 - profile 覆盖率、probe error 和 shadow exclusion 指标达到管理员设定门槛后切换 `shadow`。
 - `shadow` 不改变业务路由，request attempt 同时记录实际选择和能力规划选择。
 - `enforce` 可全局启用，也可由 Route 设置覆盖；未显式设置的 Route 继承全局模式。
@@ -985,6 +1158,8 @@ target_capability_routing_mode = off | shadow | enforce
 | `probe_terminal_error_rate` | rolling window 内 Auth、RateLimited、Transient 等 ProbeError 数 / 已终结 probe 数；Unsupported 与 Inconclusive 不计错误 |
 | `planner_internal_error_rate` | requirement 提取、profile 解析或 transform 规划发生内部错误的相关请求数 / 相关请求总数 |
 | `planning_latency_p95` | 只计算内存 requirement、resolver、planner 和过滤的 p95 时延，不含上游请求与异步 telemetry |
+
+业务流量的可验证成功语义另存于 `request_capability_feedback`（按 request、Target、shape、capability 幂等），用于计算 `verified_success_disagreement_rate`；未调用工具、普通 `message` 或无法归因的输出不写入成功或负面证据。
 
 第一版 CRL enforce 的默认准入门槛：
 
@@ -1018,15 +1193,58 @@ planning_latency_p95            <= 1 ms（发布基准）；生产环境只告�
 新增接口：
 
 ```text
+GET  /admin/v1/target-capabilities
 GET  /admin/v1/target-capabilities/:target_key
 POST /admin/v1/target-capabilities/:target_key/probe
+GET  /admin/v1/target-capabilities/:target_key/probe-runs
 PUT  /admin/v1/target-capabilities/:target_key/overrides
 DELETE /admin/v1/target-capabilities/:target_key/overrides/:capability_id
 GET  /admin/v1/capability-registry
+GET  /admin/v1/capability-metrics
 GET  /admin/v1/probe-jobs/:job_id
+PUT  /admin/v1/capability-probes
+GET  /admin/v1/routes/:route_id/capability-admissions
+POST /admin/v1/routes/:route_id/capability-admissions
+DELETE /admin/v1/routes/:route_id/capability-admissions/:shape_hash
 ```
 
-现有 request attempt 详情增加内部 `CompatibilityReport`，不新增面向普通客户端的逐 Target 诊断接口。所有列表接口必须分页，错误和 observation detail 必须脱敏、限长。
+现有 request attempt 详情增加内部 `CompatibilityReport`，不新增面向普通客户端的逐 Target 诊断接口。profile、job、metrics、admission 和 report 列表必须分页；registry 是编译期的有界静态集合（超过上限时也按相同分页契约返回），并返回 `contract_schema_version` 与 registry/baseline/matrix/probe 数量摘要。所有错误和 observation detail 必须脱敏、限长。
+
+Admin mutation 的统一响应契约：
+
+| 情况 | HTTP | 稳定 code | 处理要求 |
+|------|------|-----------|----------|
+| probe 入队 | `202` | `probe_queued` | 返回 job 摘要，不等待上游探测 |
+| 同一幂等键重放 | 原操作状态 | `replayed` | 返回首次响应，不能重复写状态或审计 |
+| 同键不同载荷 | `409` | `idempotency_conflict` | 返回冲突，不执行 mutation |
+| revision/ETag 过期 | `409` | `revision_conflict` | 返回当前 revision 摘要，要求客户端重新读取 |
+| 请求违反 registry、baseline 或门禁 | `400`/`409` | `invalid_capability` / `admission_required` | 不产生部分写入 |
+| capability store/migration/snapshot 不可用 | `503` | `capability_unavailable` | 返回受限原因和 request_id，不伪造 Unknown 报告 |
+
+错误体只允许 `code`、限长 `message`、`request_id` 和脱敏 `details`；响应状态、错误 code、幂等重放和审计结果必须在 OpenAPI/JSON fixture 中固定。
+
+准入写入请求同时支持兼容的 ID 形式和带约束的规范形式：
+
+```json
+{
+  "required_capabilities": ["transport.http", "tools.namespace"],
+  "required_requirements": [
+    {"id": "transport.http", "strength": "required"},
+    {
+      "id": "tools.namespace",
+      "strength": "required",
+      "value": {"kind": "enum_set", "value": ["functions"]}
+    }
+  ],
+  "mode": "enforce",
+  "shape_hash": "shape/v1:…",
+  "expected_revision": 1,
+  "expires_at": "…",
+  "reason": "已验证 functions namespace"
+}
+```
+
+`required_requirements` 省略时，服务端把 `required_capabilities` 展开为无约束 Required 叶子；两者同时提供时必须拥有相同的 ID 集合。服务端按规范化 requirement 重新计算 `shape_hash`，校验 descriptor 的 value kind/matcher、Forbidden baseline、门禁报告和版本，再写入 `required_requirements_json`；客户端提交的 hash、指标或通过标记不具备授权效力。带 namespace、范围或枚举约束的真实请求必须使用带约束的独立 shape，不能复用无约束 admission。
 
 Route 创建和查询响应增加：
 
@@ -1076,6 +1294,132 @@ Route Target 行增加能力状态入口，详情页显示：
 
 ## 12. 实施步骤
 
+### 12.0 阶段编排与通用交付约束
+
+阶段 0–6C 是首期可交付闭环；阶段 7 只保留为 Roadmap，不纳入本期实现、资源和发布验收。
+
+| 阶段 | 主要代码边界 | 前置阶段 | 允许并行关系 | 生产数据路径上限 |
+|------|--------------|----------|--------------|------------------|
+| 0 | `protocol-specs`、`docs`、`crates/protocols` 校验 | 无 | 无 | `off` |
+| 1 | `crates/core`、`crates/protocols` | 0 | 无 | `off` |
+| 2 | `crates/store`、`crates/server` 快照与配置写入 | 1 | 无 | `off` |
+| 3 | `crates/server` 探针、`crates/store` 任务恢复 | 2 | 可与阶段 4 的离线 transform 开发并行 | `off` + 独立 ProbeWorker |
+| 4 | `crates/protocols` CRL codec/transform、`crates/server` 计划执行 | 1、2；生产准入依赖 3 | 可与阶段 3 并行开发 | `off` |
+| 5 | `crates/core` planner 输入、`crates/server` shadow、`crates/store` 遥测 | 2、3、4 | 无 | `off` 或 `shadow` |
+| 6A | `crates/admin`、`crates/store`、`crates/server` 控制面 | 5 | 无 | `off` 或 `shadow` |
+| 6B | `crates/server` enforce/fallback、`crates/protocols` 目标计划执行 | 5、6A | 可与 6C 并行 | 仅通过门禁的 per-route/per-shape `enforce` |
+| 6C | `webui`、`crates/admin` API 契约适配 | 6A | 可与 6B 并行 | 不改变数据路径 |
+
+表中的“并行”只允许在不改变生产数据路径的离线代码、fixture 和契约工作包之间进行；任何
+worker 启动、Shadow 采样、准入计算或 Enforce 流量都必须等待对应前置阶段的退出标准，不能以
+并行开发代替阶段交接。
+
+#### 12.0.1 首期范围与运行前提
+
+阶段 0–6C 交付一个可发布的垂直闭环，而不是一次性实现目录中的全部能力：
+
+- **可进入 Enforce 的完整转换闭环**是 OpenAI Responses ingress/egress 的 CRL `input[].additional_tools`，包括 native passthrough、提升到顶层 `tools`、function/custom/namespace、`tool_choice` required/specific、SSE 和 continuation。通用 function/transport 能力仍可用于跨协议的目标过滤，但没有已注册 transform 的组合不得改变请求编码；其余高级能力保持 Shadow/Disabled。
+- **通用基础设施必须跨协议可复用**：Chat Completions、Anthropic Messages、Responses、Gemini 和 Embeddings 都必须能生成稳定的 capability shape 与 CompatibilityReport；没有已注册 transform 的组合保持旧路径或 fail-closed。
+- **持久化是 Shadow/Enforce 的硬前提**：没有 `database_url`、能力 migration 未完成或 capability snapshot 无法建立时，只允许 `off`；不得在内存模式中伪造 profile、lease、准入或跨进程预算。Admin 控制面应返回明确的不可用状态，而不是创建易失任务。
+- **模式解析是确定性的**：`effective_route_mode = route.capability_routing_mode ?? global_mode`；`off` 始终优先，`shadow` 只记录规划，`enforce` 还必须同时满足未过期的 Route × shape admission、有效 gate policy、可用 snapshot 和目标级计划。缺少任一条件自动按 `shadow` 处理。
+- **首期默认值固定为**：`gateway.capabilities.routing_mode=off`、`gateway.capabilities.probe_enabled=true`、`gateway.responses.crl_tool_promotion_enabled=false`。路由模式关闭保证既有业务请求不改变；探测可通过运行时设置独立关闭，CRL 提升必须显式开启，历史部署若已有显式设置必须优先保留该设置。
+
+首期能力白名单与交付边界固定如下；不在表内的能力不得因“已有 codec 支持”自动进入 Enforce：
+
+| Capability ID | 首期用途 | 主要阶段 | 首期路由资格 | 确定性证据 |
+|---------------|----------|----------|--------------|------------|
+| `transport.http` | 出站端点可用性前置条件 | 3 | EnforceEligible | 基础非流探针/精确目录 |
+| `transport.sse` | Responses 流式生命周期 | 3、4 | EnforceEligible | SSE 生命周期探针/被动成功 |
+| `tools.function` | 顶层函数及 promotion 依赖 | 3、4 | EnforceEligible | 强制函数调用/显式拒绝 |
+| `tools.function.continuation` | tool output 后继续生成 | 3、4 | EnforceEligible | call_id 对应的 continuation |
+| `tools.choice.required` | 保留 `tool_choice=required` | 3、4 | EnforceEligible | 强制 required 调用/结构化拒绝 |
+| `tools.choice.specific` | 保留指定函数选择 | 3、4 | EnforceEligible | 指定函数调用/结构化拒绝 |
+| `tools.namespace` | promotion 的 namespace 能力与路径约束 | 3、4 | EnforceEligible | namespace 唯一函数调用 |
+| `tools.custom` | promotion 的 custom 工具依赖 | 3、4 | EnforceEligible | custom call 与 nonce |
+| `tools.crl.additional_tools` | native carrier 识别与 A/B 判定 | 3、4 | EnforceEligible | control 成功后的受控 A/B |
+
+`shape/v1` 只允许扁平 `AllOf` 中的 `Required` 叶子；每个叶子包含 capability ID 和可选的规范化 typed constraint。首期 Admin 请求可只提交 ID（等价于 constraint 为 null），但带约束的真实请求不得复用无约束 admission；包含 `AnyOf`、`Not` 或仅 `Preferred` 的形状保持 Shadow，直到后续版本明确其 hash 与准入语义。shape hash 必须由相同的规范化输入重新计算，服务端不得信任客户端传入的 hash。
+
+首期 gate policy 对 CRL shape 启用完整 native/promotion 转换准入；不含 CRL carrier 的普通 Responses、Chat、Messages、Gemini 和 Embeddings shape 只能执行已注册的通用能力过滤，不得因本期 CRL transform 证据而自动改变其请求编码。`tools.function`、`tools.choice.*`、namespace、custom 与 transport 条目既可作为 CRL 依赖，也可在自身已有确定性 transform/过滤契约时单独参与 Shadow/Enforce。
+
+阶段 6B 的发布对象仅是“通过准入的 Route × capability shape”；不能用一次全局开关或一次全量 profile 成功替代逐项准入。阶段 7 不得作为本期任何阶段的隐含依赖。
+
+#### 12.0.2 阶段交付记录与回滚边界
+
+每个阶段的验收记录使用同一最小字段：`stage_id`、代码/配置版本、migration/schema 版本、输入契约版本、交付物清单、验证命令及 fixture、指标窗口、已知限制、回滚开关、批准人。记录必须能由下一阶段直接复核。
+
+回滚边界按阶段固定：阶段 0–4 只能关闭新增 worker/transform 并回到 `off`；阶段 5–6A 只能撤销 shadow/admission；阶段 6B 先把受影响 shape 降为 `shadow`，必要时再把全局模式设为 `off`；阶段 6C 只回滚 UI 资产，不回滚数据表或数据路径。任何回滚都保留 profile、observation、job 和审计记录，避免重新探测时失去诊断依据。
+
+#### 12.0.3 跨阶段版本、状态机与异步可靠性契约
+
+阶段 0–6C 共用同一组可审计的版本元组。版本元组必须随 profile、probe job、admission、telemetry 事件和验收记录保存；只增加可选字段时使用向后兼容的 `serde(default)`，改变 matcher、baseline、transform、hash 或判定语义时提升对应版本并使受影响结论失效。
+
+| 契约 | 首期版本 | 失配处理 | 验证集 |
+|------|----------|----------|--------|
+| registry/baseline schema | `1` | 构建失败；运行时不发布描述符 | `V-REG` |
+| capability profile schema | `1` | profile 仅可诊断，resolved 结果按 Unknown 处理 | `V-DB-RECOVERY` |
+| Target identity | `identity/v1` | 重新计算 TargetKey，旧 profile/job/admission 不得写入新身份 | `V-IDENTITY` |
+| probe suite/judge | `suite/1`、`judge/1` | 受影响 observation 过期并重新入队；旧证据不得直接授权 enforce | `V-PROBE` |
+| capability shape hash | `shape/v1` | admission 立即变为 shadow，必须重新计算 hash 和报告 | `V-SHADOW` |
+| gate policy | `1` | admission 不得 enforce，等待新的准入报告 | `V-SHADOW`、`V-ADMIN-UI` |
+| config export | `2` | 旧 bundle 可导入；未知主版本返回稳定的 unsupported-version 错误 | `V-IDENTITY`、`V-ADMIN-UI` |
+| capability telemetry/migration | `20260829000001`–`20260829000004`（log）及对应 config profile/job/admission versions `20260829000006`–`20260829000008` | sink 不得静默丢弃事件；迁移未完成时保持 off-only | `V-TELEMETRY-GAP`、`V-DB-RECOVERY` |
+
+启动和热路径都遵循 fail-closed：未知主版本、迁移缺失、registry 校验失败、shape hash 或 gate policy 失配，只能保留诊断和历史数据，不能生成 Supported、compatible 或 enforce 结论。版本失配、TTL 过期和 Target 身份变化不得删除原始 observation；清理只在诊断保留期之后执行。
+
+状态机固定如下：
+
+| 对象 | 合法状态转换 | 关键不变量 |
+|------|--------------|------------|
+| Profile | `pending → partial/ready`；`ready/partial → stale`；`stale/error → pending`；探测成功后回到 `ready` | stale grace 内可读，超过 grace 不参与 enforce；错误不清空最后已验证 observation |
+| Probe job | `pending → running → complete/partial/failed/cancelled`；lease 到期的 `running → pending` | claim、结果提交和取消均条件更新且幂等；凭证只在执行时从当前 Target 读取 |
+| Route × shape admission | `shadow → enforce` 仅经 Admin 准入；`enforce → shadow/off` 可由过期、撤销或 guard 触发 | 系统不得自动晋级；Route mode 是上限，缺少 admission 一律不 enforce |
+
+ProbeWorker、CapabilitySnapshot reloader、admission guard、stale/reprobe 反馈任务和 telemetry outbox consumer 必须由同一组可停止的后台句柄拥有。关闭顺序为“停止新 claim/接收 → 等待当前 I/O 到安全边界 → 释放 lease 或写入 partial → join”；禁止留下 detached task。能力计划/反馈事件只有在持久 outbox 或等价的至少一次管道确认后才算进入观察窗口；首期由保留能力队列和持久 `telemetry_gap` 作为等价路径，队列背压、数据库不可用、序列化/脱敏失败或进程退出导致事件未确认时，必须写入带 `route_id`、`shape_hash`、时间窗、原因和计数的 `telemetry_gap` 记录。存在 gap 的窗口不可通过 enforce 门禁，补偿重放完成后才重新聚合。
+
+planner 的 requirement 提取、profile 解析或 transform 规划出现内部错误时，必须生成 `status=planner_error` 的目标诊断和告警，保持旧数据路径；不得把内部错误伪装成 Unsupported、Unknown 已解决或 `no_compatible_target`。`TargetKey`、`TargetInstanceId` 和 `HealthKey` 为不同的强类型/命名空间，只有在明确的边界适配处转换，禁止以可碰撞的裸字符串混用能力画像与健康状态。
+
+#### 12.0.4 首期验证矩阵
+
+以下 fixture/测试集是阶段验收的固定输入；新增能力或协议只能追加条目，不能用“全量测试通过”替代对应语义验证。
+
+| 验证集 | 覆盖阶段 | 固定输入与判据 | 最低执行方式 |
+|--------|----------|----------------|--------------|
+| `V-REG` | 0–1 | 合法/非法 registry、baseline、dialect、probe 引用；生成描述符字节稳定 | 构建校验 + `cargo test -p tiygate-protocols capabilities` |
+| `V-IDENTITY` | 1–2 | 等价 URL、身份字段变化、API Key/OAuth/IAM scope、主密钥轮换 | core/store 单测与 property test |
+| `V-DB-RECOVERY` | 2–3、6A | 双数据库 migration、事务回滚、claim/lease、进程退出、epoch 丢事件和 stale grace | SQLite 集成；PostgreSQL CI fixture；重启脚本 |
+| `V-PROBE` | 3 | HTTP/SSE/function/continuation/CRL A/B 的 Positive、ExplicitNegative、Inconclusive、Auth/RateLimited/Transient | wiremock fixture + worker 集成测试 |
+| `V-CRL` | 4、6B | native/promotion、混合 Target、顺序/去重/冲突、malformed 与 no-compatible 错误 | protocols 快照 + server wiremock non-stream/SSE |
+| `V-SHADOW` | 5–6A | 固定 request/profile 输入、shape hash、实际/规划目标差异、planner/probe error、evidence、指标窗口和阈值 | planner replay + 持久 telemetry 聚合查询 |
+| `V-TELEMETRY-GAP` | 5–6B | 队列背压、数据库不可用、序列化/脱敏失败、进程重启、outbox 重放；gap 阻断 gate，补偿后恢复 | 可控故障注入 + outbox/聚合重放测试 |
+| `V-LIFECYCLE` | 2–6B | worker/reloader/guard/反馈任务优雅停止、lease 接管、取消和无 detached task | Tokio shutdown fixture + 进程重启脚本 |
+| `V-ENFORCE` | 6B | 过滤前置、per-target body、首字节前 fallback、流式断流、自动降级与脱敏 | server 端到端矩阵 + canary smoke |
+| `V-ADMIN-UI` | 6A–6C | API 分页/条件更新/幂等/审计/敏感字段，UI 状态、确认、权限、错误恢复 | Admin integration + `npm --prefix webui run lint` + `npm --prefix webui run build` + 浏览器 smoke |
+
+每个验证集都必须同时包含正向、负向和恢复样例；没有对应 fixture 的阶段不得标记完成。`V-DB-RECOVERY` 的 PostgreSQL 用例由 CI service container（固定镜像版本、健康检查和迁移日志）执行，开发者本地至少运行 SQLite 等价用例并记录差异；CI 未执行 PostgreSQL 时不得把阶段标记为通过。
+
+每个阶段必须同时交付以下四类可复用资产，缺一项不得进入下一阶段：
+
+1. **契约**：版本化的数据结构、状态机、错误码、配置键、API/迁移兼容规则，以及与前一阶段的输入输出边界。
+2. **实现**：按 crate 分层的代码、feature gate 和默认关闭策略；不得以临时脚本或手工数据库操作替代正式路径。
+3. **验证**：正向、负向、边界、并发/恢复（适用时）测试；测试必须能在 CI 或明确声明的 SQLite/PostgreSQL fixture 中重复执行。
+4. **运维证据**：指标/日志字段、脱敏规则、回滚开关、故障处置步骤和阶段验收报告。
+
+阶段之间的发布门禁固定为：
+
+```text
+spec/contract locked
+  → implementation compiled and layered
+  → deterministic tests passed
+  → failure/recovery tests passed
+  → telemetry and rollback verified
+  → corresponding AC group signed off
+```
+
+所有新配置默认保持兼容行为（`gateway.capabilities.routing_mode=off`、CRL promotion 独立开关关闭）；探测虽默认开启但不进入业务请求热路径，且可独立关闭。阶段验收只能提升模式上限，不能绕过上一阶段的退出标准。生产切换以 Route 与能力形状为最小作用域，禁止以全局开关代替准入报告。
+
+阶段验收记录至少包含：阶段版本与 schema/migration 版本、变更 crate/文件、执行命令及通过结果、测试 fixture/数据库类型、性能与指标窗口、已知限制、回滚开关和批准人。记录保存在仓库文档或受控构建产物中，可由下一阶段复核；未记录的人工操作不计入验收证据。
+
 ### 阶段 0：能力清单与契约冻结
 
 #### 目标
@@ -1096,13 +1440,20 @@ Route Target 行增加能力状态入口，详情页显示：
 5. 将协议矩阵条目映射到 capability ID、RequirementStrength 和 matcher；CRL 私有行为写入 dialect 文档。
 6. 实现 registry 静态校验：重复 ID、未知引用、value/matcher 不匹配、非法 lifecycle 组合、循环依赖和未审计 probe ID 均失败。
 7. 固化当前 Responses opaque input、raw passthrough、model override、header forwarding 和 cross-protocol 回归测试。
+8. 固定首期版本元组（registry/baseline `1`、capability schema `1`、identity `identity/v1`、probe suite/judge `1`、shape hash `shape/v1`、gate policy `1`）及其失效规则。
+9. 生成可审计的 registry、baseline、matrix 和 probe manifest 摘要；摘要写入构建产物，供阶段 1–6C 的验收记录和运行时诊断引用。
 
 #### 交付物
 
 - 完整 Catalog 与首期 CRL registry/baseline/dialect 文件。
+- conversion-relevant capability 到 `docs/protocol-capability-matrix.md` 的机器可校验映射文件。
 - registry schema、构建校验器和生成的静态描述符快照。
 - capability-to-matrix 映射清单和 CRL dialect 文档。
 - 修改前行为的兼容基线测试。
+- 首期范围决议：仅白名单中的 HTTP/SSE 传输、函数/continuation、
+  `tool_choice` required/specific、namespace、custom 和
+  `tools.crl.additional_tools` 进入 `Implemented`；其他 Catalog 条目保留
+  `Cataloged/Disabled` 或 `Implemented/ShadowEligible`，不得进入首期 Enforce。
 
 #### 退出标准
 
@@ -1110,11 +1461,38 @@ Route Target 行增加能力状态入口，详情页显示：
 - 每个首期 capability 都能追溯到 baseline、matrix/dialect 文档、matcher 和 owner。
 - Cataloged/Disabled 能力不会进入运行时路由判断。
 - 现有 Responses、lossy conversion 和 passthrough 测试无行为变化。
+- 版本元组、首期 Enforce 白名单和失效规则有唯一机器可读来源；修改任一语义时能确定受影响的 profile、job、admission 和 fixture。
 - 通过验收组 `AC-REG` 和适用的 `AC-QUALITY`。
 
 #### 可启用模式
 
 仅 `off`；本阶段不启动探针，不改变路由和请求编码。
+
+#### 可执行工作包与验证
+
+| 工作包 | 实施边界 | 必须产出的验证 |
+|--------|----------|----------------|
+| `S0-1` 目录盘点 | 逐项登记 Chat、Messages、Responses/CRL、Gemini、Embeddings 的 carrier、损失规则、适用 scope 和 owner | `docs/protocol-capability-matrix.md`、registry 与 baseline 的逐项映射表；缺失项构建失败 |
+| `S0-2` registry schema | 固定 TOML schema、ID 命名规则、状态组合、matcher/value kind、依赖、受审计 probe ID 和首期 Enforce 白名单 | 合法/非法 fixture 各一组；重复 ID、循环依赖、非法生命周期、白名单外 enforce 和未登记 probe 均得到稳定错误 |
+| `S0-3` CRL 契约 | 固定 `additional_tools` carrier、namespace path、function/custom 依赖、native/promotion 两条路径及冲突错误 | 脱敏请求/响应 fixture；opaque item 顺序、未知字段和错误体快照 |
+| `S0-4` 兼容基线 | 固定现有 raw passthrough、model override、header forwarding、lossy conversion 的行为 | 运行旧回归集并保存基线输出；无能力模式下请求/响应字节不变 |
+| `S0-5` 版本与生成物 | 固定版本元组、变更失效矩阵、生成描述符摘要和 fixture 命名；构建期输出不得依赖运行时文件 | 修改 schema/matcher/baseline/probe judge 的 fixture 能指出必须失效的对象；生成物在相同输入下字节稳定 |
+
+建议验证命令：
+
+```bash
+cargo test -p tiygate-core capability
+cargo test -p tiygate-protocols capabilities
+cargo test -p tiygate-protocols --test lossy_conversion
+scripts/verify-deps.sh
+```
+
+阶段 0 的唯一决策是“条目是否进入首期 Implemented/ShadowEligible/EnforceEligible”；不得在本阶段引入运行时探测、数据库表或路由过滤。
+
+#### 阶段交接与回滚
+
+- 交接给阶段 1：冻结后的 registry/baseline/dialect/probe manifest 版本、能力矩阵映射和兼容基线 fixture；后续阶段不得自行增加未登记的 capability ID。
+- 回滚：仅撤销生成的静态描述符和构建校验接线；不修改既有 codec、Route 数据或生产请求行为。
 
 ### 阶段 1：Core 数据模型
 
@@ -1138,6 +1516,14 @@ Route Target 行增加能力状态入口，详情页显示：
 7. 为 RouteTarget 增加可选 `egress_dialect_id`；缺失值兼容为 `auto`。
 8. 使 health key 使用无碰撞 TargetInstanceId，同时与 Capability Profile 状态完全分离。
 9. 保留 EndpointCapabilities 兼容适配层，现有 codec 无需一次性迁移。
+10. 明确身份计算边界：`core` 只负责 canonical identity、TargetKey/TargetInstanceId 的纯哈希和序列化；安装级 fingerprint secret、credential scope 提取和密钥生命周期只由 `store` 提供受控接口。
+11. 统一 `TargetKey`、`TargetInstanceId`、`HealthKey` 的类型转换入口；健康注册表、能力画像和 telemetry 各自只接受对应类型，禁止调用方直接拼接字符串。
+
+序列化契约必须显式带 `schema_version` 和 `identity_version`：未知枚举值、字段和
+`CapabilityValue::Opaque` 原样保留；读取旧 Route 时补 `egress_dialect_id=auto`，
+读取未知版本时只允许降级为 `Unknown`/`off`，不得猜测为 Supported。TargetKey 的
+canonical JSON 字段顺序和字符串规范化规则作为测试 fixture 固定，任何变更都必须
+提升 identity 版本并触发阶段 2 的 profile/job 重建。
 
 #### 交付物
 
@@ -1152,6 +1538,8 @@ Route Target 行增加能力状态入口，详情页显示：
 - API Key/OAuth/IAM/anonymous fingerprint 满足稳定性和不可明文恢复要求。
 - resolver 对 Unsupported、Constrained、Unknown、Forbidden 和证据冲突返回确定结果及完整原因。
 - 未知 capability/value 能往返，但不会误判为满足 Required。
+- 纯 core 构建不包含 secret、网络、数据库或 provider 依赖；credential scope 只能通过 store 的受控 provider 得到，且无法从 TargetKey 反推出原值。
+- HealthRegistry 使用 TargetInstanceId/HealthKey 的显式适配，能力画像使用 TargetKey；相同值域不会发生跨域误用。
 - `scripts/verify-deps.sh` 证明 `core` 未依赖 protocols/store/server 或网络实现。
 - 旧 Route JSON 不含 dialect 时可正常加载，路由行为与阶段 0 相同。
 - 通过验收组 `AC-REG`、`AC-IDENTITY` 和适用的 `AC-QUALITY`。
@@ -1159,6 +1547,30 @@ Route Target 行增加能力状态入口，详情页显示：
 #### 可启用模式
 
 仅 `off`；新模型仅被测试和持久化结构使用，不参与实际路由。
+
+#### 可执行工作包与验证
+
+| 工作包 | 实施边界 | 必须产出的验证 |
+|--------|----------|----------------|
+| `S1-1` 纯能力内核 | `crates/core/src/capability.rs` 只提供 typed value、matcher、requirement、resolver、report 和不透明 `TransformId`；禁止协议分支和 I/O | 单测/property test 覆盖 AllOf/AnyOf/Not、集合/范围、Unknown/Forbidden、证据冲突与 TTL |
+| `S1-2` 协议适配边界 | `crates/protocols/src/capabilities.rs` 提供静态 registry/baseline、requirement provider 和 transform provider 接口 | 编译期 registry 校验；core 不出现 Responses、CRL、Gemini 或 provider 类型引用 |
+| `S1-3` Target 身份 | 在 `core`/`store` 固定 API Base 规范化、版本化 HMAC scope fingerprint、TargetKey/TargetInstanceId 和 `egress_dialect_id=auto` 默认值 | 等价 URL、path/query 边界、API Key/OAuth/IAM/anonymous、dialect/model/account 变化的确定性测试 |
+| `S1-4` 兼容适配 | 保留 `EndpointCapabilities` 读适配层，旧 Route JSON 可反序列化；新 planner 类型不改变旧 codec 输出 | 旧 Route fixture、序列化往返、`scripts/verify-deps.sh` 和 workspace check |
+| `S1-5` 身份/健康边界 | 由 store 注入 fingerprint secret；core 仅接收脱敏 scope fingerprint；HealthRegistry 不接受 TargetKey 字符串替代 TargetInstanceId | 编译依赖检查、类型边界测试、密钥不可逆/轮换测试、健康与能力状态隔离测试 |
+
+阶段 1 必须明确两个不可变约束：TargetKey 只标识出站身份，不承载 weight/enabled/Route 顺序；`CapabilityProfile` 与 HealthRegistry 使用不同命名空间。建议验证命令：
+
+```bash
+cargo test -p tiygate-core capability
+cargo test -p tiygate-store capabilities
+cargo test -p tiygate-protocols capabilities
+scripts/verify-deps.sh
+```
+
+#### 阶段交接与回滚
+
+- 交接给阶段 2：稳定的 capability/requirement/report/TargetKey 序列化版本、未知字段保留规则和 resolver 语义测试结果；store 只能依赖公开类型，不得复制 matcher 逻辑。
+- 回滚：保留旧 Route 反序列化适配层，停止新 planner 调用即可恢复阶段 0 的路由和 codec 行为；不得删除已写入的未知 capability 数据。
 
 ### 阶段 2：持久化、快照与任务恢复
 
@@ -1173,15 +1585,25 @@ Route Target 行增加能力状态入口，详情页显示：
 
 #### 实施内容
 
-1. 增加 profile、override、probe job、安装级 fingerprint secret 和 capability epoch migration。
+1. 增加 profile、override、probe job、安装级 fingerprint secret、按日探测预算和 capability epoch migration。
 2. 实现 profile/observation CRUD、typed value 校验、能力级 TTL、fresh/stale 查询和未知 ID 保活。
 3. 实现 override CRUD、baseline Forbidden 校验、过期处理和审计所需 actor/reason 字段。
 4. 实现 probe job upsert、probe_set_hash、原子 claim、lease 续期/接管、next_attempt_at、幂等提交和取消。
 5. 启动时恢复 pending、过期 running 和 stale profile；无有效 Target 引用的任务安全取消。
 6. 在 AppState 增加 CapabilitySnapshot，使用独立 capability epoch、原子替换和后台 watcher。
 7. profile/override 写入采用本地 write-through；其他副本通过 epoch 刷新，不触发完整配置重载。
-8. 更新导入导出：profile/job 不导出，override 可选择导出，fingerprint secret 永不导出。
+8. 更新导入导出：profile/job 不导出，override 可选择导出；使用 route/target 定位器在目标安装重新计算 TargetKey，未知 capability ID 原样保留，fingerprint secret 永不导出。
 9. 增加数据库故障、并发 claim、进程退出、lease 超时、epoch 丢事件和 snapshot 重建测试。
+10. 持久化并校验 profile/job/admission 的版本元组；未知主版本、migration 缺失或 JSON 校验失败时只允许诊断读取，禁止构建可 enforce 的 snapshot。
+11. 固定 profile、job、admission 的状态机和条件更新语义；任何终态、过期或取消操作都必须保留原因、时间和最后有效 observation。
+12. 将 snapshot reload、probe worker、admission guard 和 stale/reprobe 反馈任务纳入统一生命周期句柄，定义暂停、优雅关闭、重启接管和异常恢复的顺序。
+
+迁移顺序固定为“能力旁路表 → epoch/secret/budget → profile/override/job CRUD →
+snapshot/reloader”；任一 migration 或 schema 校验失败时，启动检查必须阻止
+Shadow/Enforce，而不是以空 profile 继续运行。无 `database_url` 的 legacy/in-memory
+模式不创建能力任务、不执行主动探测，所有 capability-aware mode 保持 `off`。
+预算、并发、TTL、page size 和 stale grace 等运行参数必须有最小/最大边界；非法或
+溢出更新返回校验错误并保留上一版本，不能把 `0`、负数或极大值解释为“无限制”。
 
 #### 交付物
 
@@ -1198,11 +1620,40 @@ Route Target 行增加能力状态入口，详情页显示：
 - snapshot 在启动、write-through 和远端 epoch 更新后与数据库最终一致。
 - 请求侧 benchmark/测试证明读取 profile 不执行 SQL、不等待 watcher 且为内存只读路径。
 - 明文 credential 和 fingerprint secret 不进入 profile、job、日志、导出或错误体。
+- 版本元组失配、迁移不完整、快照重建失败和解析异常均保持 `off`/诊断模式，不产生伪造的 Supported 或 enforce 结论。
+- profile/job/admission 状态转换、条件更新和统一 shutdown 在 SQLite 与 PostgreSQL 上均可重放；不存在无法接管的 running job 或 detached background task。
 - 通过验收组 `AC-IDENTITY`、`AC-PERSISTENCE` 和适用的 `AC-QUALITY`。
 
 #### 可启用模式
 
 仅 `off`；允许后台构建空 profile/job 基础设施，但不发送主动探测请求。
+
+#### 可执行工作包与验证
+
+| 工作包 | 实施边界 | 必须产出的验证 |
+|--------|----------|----------------|
+| `S2-1` schema 与密钥 | SQLite/PostgreSQL 建立 profile、override、job、epoch、安装级 fingerprint secret 和 Route × shape admission；admission 同时保存 ID 与 typed requirement JSON；所有 JSON 字段带 schema version；在 CI 增加固定 PostgreSQL service container 与迁移门禁 | 双数据库迁移版本一致；主密钥轮换只重保护 secret，不改变既有 TargetKey；typed namespace/range shape 可往返且 hash 稳定；导出不含 profile/job/secret 且可选携带 override；CI 未运行 PostgreSQL 时阶段不通过 |
+| `S2-2` 配置写入事务 | Route、Provider credential、API Base、endpoint、model、dialect、account/scope 等身份变更与 `ensure_target_capability` 在同一事务提交；OAuth access-token refresh 不改变 scope fingerprint；配置导入按目标定位器重绑定 override | 提交成功必有对应 profile/job；任一事务回滚时配置、profile、job、epoch 均不对外可见；并发更新不产生孤儿任务；无法唯一匹配的 override 可解释地跳过 |
+| `S2-3` 任务状态机 | 固定 `pending/running/complete/partial/cancelled/failed`、lease、重试和幂等提交；`partial` 持久化 `next_probe_index` 并从游标恢复，Inconclusive 重试归零游标且受 `max_attempts` 限制；旧 TargetKey 结果不得写入新 profile；admission 采用 revision 条件更新 | 双副本并发 claim、lease 接管、worker 在 claim/执行/提交前退出、游标恢复、Inconclusive 延迟与 attempts exhausted、重复提交、admission revision 冲突和 Target 删除测试 |
+| `S2-4` snapshot 发布 | 启动加载、write-through、epoch watcher、解析失败保留旧快照；profile/override 变更不触发完整配置重载 | 快照 epoch 单调、跨副本最终一致；请求路径仅内存读取；数据库不可用时保留最后可用快照并告警 |
+| `S2-5` 生命周期与清理 | profile 过期/删除保留诊断窗口；无 Route 引用的旧画像和已完成 job 延迟清理；导入 override 时按目标定位器重绑定或显式跳过 | stale grace、清理保留期、重启恢复、清理与读取并发、跨安装 override 匹配/跳过测试 |
+| `S2-6` 版本与统一生命周期 | profile/job/admission 保存版本元组；reloader、worker、guard、反馈队列由可停止句柄拥有；失配只读诊断 | 未知版本 fail-closed、迁移缺失、snapshot 解析失败、优雅关闭、lease 接管和无 detached task 检查 |
+
+身份变更无法与现有配置事务共享连接时，必须采用带 `config_epoch` 的持久 outbox/reconciliation，并将“配置已生效但能力任务未入队”作为未通过状态；不得用内存 channel 作为唯一投递保证。
+
+建议验证命令：
+
+```bash
+cargo test -p tiygate-store capabilities
+cargo test -p tiygate-store --test postgres_capabilities -- --nocapture
+cargo test -p tiygate-server --test epoch_e2e
+cargo test -p tiygate-server --test capability_routing
+```
+
+#### 阶段交接与回滚
+
+- 交接给阶段 3/5：双数据库 migration 版本、store repository API、snapshot epoch 语义、job 状态机和恢复 fixture；没有持久化 store 的运行模式明确标记为 `off-only`。
+- 回滚：停止 ProbeWorker/reloader，保留旁路表和最后快照；旧二进制可忽略新增表，配置主表与既有 route 行为不回退或重写。
 
 ### 阶段 3：CRL 最小安全探针
 
@@ -1226,6 +1677,14 @@ Route Target 行增加能力状态入口，详情页显示：
 7. 将结果原子写入 observation/profile，递增 capability epoch 并发布 snapshot。
 8. 探针事件进入独立 audit/metrics/cost，跳过业务 ingress auth、quota、request log、HealthRegistry 和 EWMA。
 9. 实现 Target 删除、禁用、身份变更、预算耗尽和 worker 暂停的取消/延期行为。
+10. 为每次执行保存受限的 `probe_run_id`、probe/judge 版本、attempt generation 和结果摘要；同一提交键重复到达时只保留一次 observation 和一次计费/审计记录。
+11. 将认证刷新、stale 标记和重探测入队放入可恢复的后台队列；请求返回前不等待这些 I/O，关闭时按统一句柄完成或安全延期。
+
+每个 probe manifest 必须包含 `probe_id`、适用 `WireProfileId`、输入 schema、唯一
+变量、control、超时/最大 token、预算权重、`probe_suite_version` 和判定器版本。
+判定器只能读取结构化 HTTP/JSON/SSE 结果及 nonce，不得通过自由文本相似度推断支持；
+同一 job 的提交键为 `target_key + probe_set_hash + probe_id + attempt_generation`，
+重复提交只能保留一个 observation。
 
 #### 交付物
 
@@ -1241,11 +1700,37 @@ Route Target 行增加能力状态入口，详情页显示：
 - 相同 job 在多副本、重试和 lease 接管下只提交一次有效结果。
 - 探针请求与业务 egress 使用相同认证和传输安全逻辑，且不影响业务健康、延迟、配额和日志统计。
 - 所有请求/响应/错误审计内容已脱敏限长，默认探针没有外部副作用工具。
+- 每个结果都能关联 TargetKey、probe_set_hash、probe/judge 版本和唯一 attempt generation；重复运行不会重复改变 resolved profile、预算或费用统计。
+- worker、lease renew、stale/reprobe 入队和认证刷新在优雅关闭/进程重启后可恢复，不存在 detached task 或永久 running job。
 - 通过验收组 `AC-PROBE`、`AC-PERSISTENCE` 和适用的 `AC-QUALITY`。
 
 #### 可启用模式
 
 路由保持 `off`；允许显式启动 ProbeWorker 回填 profile。主动探测开关可以独立关闭。
+
+#### 可执行工作包与验证
+
+| 工作包 | 实施边界 | 必须产出的验证 |
+|--------|----------|----------------|
+| `S3-1` egress 复用 | 探针复用正常 egress 的 URL、AuthApplier、代理、TLS、redirect stripping、超时和 codec；不复制一套可漂移的 HTTP 客户端 | 相同 Target 的业务请求与探针在认证、URL 和代理配置下生成一致出站元数据 |
+| `S3-2` 安全执行器 | `probe_id` 只能来自编译后的 allow-list；nonce、最大 token、请求/响应限长、SSRF/地址安全、全局/provider/account semaphore 和预算在执行器统一校验；DNS 解析结果与每次 redirect 目标重新校验 | 未登记 probe、私网/非法地址、超预算、超时、取消和并发上限均被拒绝或延期；无 hosted/shell/MCP/写操作 |
+| `S3-3` 证据判定 | 每个 probe 明确 control、实验变量、成功条件、ExplicitNegative 条件；namespace 必须验证 namespace 身份+nonce；模型未按提示调用、静默忽略和随机输出只产生 Inconclusive | Positive、ExplicitNegative、Inconclusive、Auth/RateLimited/Transient Error 的 wiremock fixture 均有稳定结果；错误不清空旧 profile；扁平 function call 不得标记 namespace Supported |
+| `S3-4` worker 生命周期 | ProbeWorker、lease renew、恢复扫描和 snapshot 发布纳入 `App` 的 stop handle；优雅关闭先停止 claim，再等待当前 probe 到安全边界 | SIGTERM/应用 shutdown 后无新 claim，运行中任务 lease 可接管，重启后只恢复可执行任务；不会遗留 detached task |
+| `S3-5` 首期协议范围 | 首期只对 Responses/CRL 与通用 HTTP/SSE/function/continuation 产生可 enforce 证据；Anthropic/Gemini 未实现 continuation 的探针必须标记 Inconclusive，并保持非 EnforceEligible | registry 中的 probe allow-list、协议适用性和 profile 状态一致；未闭环协议不会被误判为 Unsupported |
+| `S3-6` 幂等与后台反馈 | 以 `target_key + probe_set_hash + probe_id + attempt_generation` 为唯一提交键；stale/reprobe、认证刷新和费用/审计事件走可恢复队列 | 重复提交、队列背压、进程退出和恢复扫描只产生一份结果；请求延迟不等待后台 I/O，所有句柄可 join |
+
+建议验证命令：
+
+```bash
+cargo test -p tiygate-server probe
+cargo test -p tiygate-server --test capability_routing
+cargo test -p tiygate-store capabilities
+```
+
+#### 阶段交接与回滚
+
+- 交接给阶段 5：`probe_suite_version`、allow-list、Outcome/Error 分类、预算与 lease 测试报告；只有 Positive/ExplicitNegative 能进入 resolver，Inconclusive/Error 必须可追踪但不得改变能力结论。
+- 回滚：将 `gateway.capabilities.probe_enabled` 设为 `false` 或暂停 worker；保留 profile、job 和错误证据，业务路由继续使用既有健康与 fallback 状态。
 
 ### 阶段 4：CRL 建模与提升
 
@@ -1262,13 +1747,21 @@ Route Target 行增加能力状态入口，详情页显示：
 #### 实施内容
 
 1. Responses decoder 在现有 `responses_opaque_input_items` 中保存 additional_tools 原始 item/index。
-2. 解析 carrier 内 namespace/function/custom 类型和嵌套 namespace path，生成 Required wire requirements。
+2. 解析 carrier 内 namespace/function/custom 类型和嵌套 namespace path，生成带 typed constraint 的 Required wire requirements；namespace capability 必须覆盖请求中的完整 path 集合。
 3. 注册 `responses.pass_through` 与 `responses.promote_crl_additional_tools` transform provider。
 4. 实现工具 identity、canonical JSON、稳定合并、等价去重和冲突拒绝。
 5. 原生计划使用原始 body，并仅应用 model、认证和已登记 normalization。
 6. promotion 计划从原始 body 生成 materialized body，移除 carrier、保留其他未知字段和 item 顺序。
 7. 将 raw/materialized body 选择下沉到 PlannedTarget，消除 Route 级 passthrough 对其他 Target 的影响。
 8. 确保 non-stream/SSE 的 function/custom call 和 finish reason 正确回到 Codex，continuation 可闭环。
+9. 为每个 transform 固定 `preserves/consumes/produces`、允许的 ingress/egress `WireProfileId`、body size 上限和失败错误码；planner 只能选择已注册且通过静态契约校验的 transform。
+10. 在发送前执行 materialized body 的 JSON、大小、敏感字段和 opaque-item 保留校验；校验失败不得发出上游请求，也不得退化为删除字段后透传。
+
+规划前先完成 carrier 结构校验：`additional_tools` 类型、`tools` 数组、namespace
+path 和 tool 定义不合法时，直接返回 ingress `invalid_request`；结构合法但所有
+Target 均无法选择 native 或 promotion 计划时，才返回 `no_compatible_target`。只有
+`openai-responses-standard` 或明确允许顶层 `tools` 的 egress dialect 才能生成 promotion
+计划；`auto` 不得凭一次普通文本 200 自动宣称 CRL 方言完整支持。
 
 #### 交付物
 
@@ -1283,6 +1776,7 @@ Route Target 行增加能力状态入口，详情页显示：
 - 顶层 tools、多个 carrier、嵌套 namespace、等价重复、冲突定义和混合 opaque item 均有确定结果。
 - 同 Route 内 native、promotion 和 cross-protocol Target 分别得到自己的 body 计划。
 - non-stream/SSE 工具调用均得到 ToolCalls，tool output continuation 返回最终 message。
+- transform 只在声明的 wire profile、能力依赖和版本元组均匹配时可执行；未知 transform、body 超限和保留性校验失败均产生可解释的 planner/invalid_request 结果。
 - 关闭 CRL promotion 后恢复原生 passthrough 行为，不影响其他 Responses 请求。
 - 通过验收组 `AC-CRL` 和适用的 `AC-QUALITY`。
 
@@ -1290,11 +1784,42 @@ Route Target 行增加能力状态入口，详情页显示：
 
 路由保持 `off`。transform 仅供测试和后续 Shadow planner 调用，不在生产请求中自动选择。
 
+#### 可执行工作包与验证
+
+| 工作包 | 实施边界 | 必须产出的验证 |
+|--------|----------|----------------|
+| `S4-1` ingress 识别 | Responses decoder 只在现有 `responses_opaque_input_items` 中保存 carrier 原文、index 和 dialect；IR 不吞掉未知 item | 标准 Responses、CRL、混合 opaque item 和 malformed carrier 的 decode/encode 快照 |
+| `S4-2` requirement provider | 从 carrier 递归提取 namespace path、function、custom 和 continuation 需求；namespace path 生成 typed set constraint；与 IR requirements 合并并去重 | 同一请求的 Required/Preferred/Ignorable、constraint 和 capability shape 稳定可复现；不同 namespace path 产生不同 shape |
+| `S4-3` transform | native passthrough 与 promotion 均以原始 JSON 为源；promotion 只删除已提升 carrier，保留未知字段、item 顺序、tool choice 和 parallel 标志 | 顶层工具、多 carrier、嵌套 namespace、等价重复、冲突定义、空数组和非法类型的确定性测试 |
+| `S4-4` per-target body | `PlannedTarget` 持有自己的 raw/materialized body；禁止以 Route 中任一 Target 的 suite 预先决定全局 body | native、promotion、跨协议 Target 同 Route 并存时分别收到预期 body；失败 Target 不污染后续 Target |
+| `S4-5` response/continuation | non-stream 与 SSE 的 function/custom 输出均归一为 ToolCalls；回传 tool output 后才结束为最终 message | Responses wiremock 集成测试覆盖首帧、终止帧、call_id、重复 output、断流和客户端取消 |
+| `S4-6` transform 契约与发送前校验 | descriptor 声明 wire profile、版本、preserves/consumes/produces、大小与错误码；materialized body 发送前做完整校验 | 未注册/不适用 transform、版本失配、body 超限、opaque 丢失和敏感字段泄漏均在出站前失败；不产生上游请求 |
+
+任何 transform 若不能证明字段语义被保留，必须返回规划失败并进入 `no_compatible_target`；不得以“删除未知字段”作为隐式降级。请求体 materialization 还必须经过现有 body-size、敏感字段和审计限长检查。
+
+建议验证命令：
+
+```bash
+cargo test -p tiygate-protocols responses
+cargo test -p tiygate-server --test capability_routing
+cargo test -p tiygate-server --test wiremock_providers
+```
+
+#### 阶段交接与回滚
+
+- 交接给阶段 5/6B：CRL requirement/transform provider、错误码和 per-target body 计划契约；`malformed carrier` 必须是 ingress `invalid_request`，合法但无可行计划才是 `no_compatible_target`。
+- 回滚：关闭 `gateway.responses.crl_tool_promotion_enabled`，仅保留原生 passthrough；删除或禁用 transform 不得影响普通 Responses 请求和已有 opaque item。
+
 ### 阶段 5：Shadow 能力规划
 
 #### 目标
 
 在不改变生产路由的前提下验证 requirement、profile、planner、transform 和证据反馈的正确性与性能。
+
+本阶段的跨协议接入是“统一诊断契约”，不是扩大首期转换范围：所有当前 ingress 都生成
+generic plan 和 shape，但只有阶段 4 定义的 Responses/CRL transform 可以被标记为
+EnforceEligible；Chat、Messages、Gemini、Embeddings 的未实现转换必须保持
+`ShadowEligible` 或 `Disabled`。
 
 #### 进入条件
 
@@ -1313,6 +1838,9 @@ Route Target 行增加能力状态入口，详情页显示：
 7. 从明确 capability-related 4xx 写入 stale/reprobe 事件，但不将普通 BadRequest 误分类。
 8. 实现第 9.5 节全部指标、rolling window、per-route/per-shape 聚合和准入报告。
 9. 建立 replay fixture，将已脱敏真实请求离线重放给 planner，与预期兼容结论比较。
+10. 为 planner、telemetry sink 和聚合器固定事件状态：`compatible`、`incompatible`、`unknown`、`planner_error`；内部异常必须带受限 reason、版本元组和 request/route/shape 关联。
+11. 实现能力计划/反馈的可恢复投递：入队返回“已持久化/待重试/gap”三态，gap 记录原因、计数和时间窗；补偿重放按唯一键 upsert，不重复放大分母或分子。
+12. 按真实 `missing`/`unknown` 结果计算 Target × capability 判定对和请求级分母；禁止用 required capability 数量或进程内计数器替代实际样本。
 
 #### 交付物
 
@@ -1328,11 +1856,41 @@ Route Target 行增加能力状态入口，详情页显示：
 - `planning_latency_p95 <= 1 ms` 的发布基准通过，telemetry 写入不阻塞请求路径。
 - 每条候选 Route/CRL 能力形状满足第 9.5 节默认门槛，或保持 shadow 并明确列出未满足项。
 - 高置信实际成功与 shadow incompatible 的冲突为零；普通 message 不被误当作工具能力成功证据。
+- planner 内部异常均以 `planner_error` 记录并触发告警，业务请求仍沿用旧数据路径；不存在被伪装成 Unknown、Unsupported 或 `no_compatible_target` 的内部错误。
+- 队列背压、数据库/序列化/脱敏失败和进程重启都会产生可查询的 `telemetry_gap`；gap 窗口不能通过准入，补偿重放后指标分母/分子保持幂等。
+- profile resolution coverage、compatible shape coverage、unknown/error rate 的分母与第 9.5 节定义一致，低流量和无样本明确区分。
 - 通过验收组 `AC-SHADOW`、`AC-ROUTING` 和适用的 `AC-QUALITY`。
 
 #### 可启用模式
 
 允许 `off` 和 `shadow`；禁止 `enforce`。未达到准入门槛的 Route 必须保持 shadow。
+
+#### 可执行工作包与验证
+
+| 工作包 | 实施边界 | 必须产出的验证 |
+|--------|----------|----------------|
+| `S5-1` planner 接线 | Chat、Messages、Responses、Gemini、Embeddings 在策略排序前调用同一 generic planner；协议差异仅由 `protocols` provider 提供；Responses opaque requirement expression 必须保留 typed constraint | 每种 ingress/egress 组合的 requirement、plan、missing/unknown 和 transform snapshot；普通文本与 CRL shape 分开统计；同 ID 不同 constraint 生成不同 shape |
+| `S5-2` deterministic plan | Target 按配置顺序生成诊断，再交给既有 weighted/priority/cooldown/latency 仅做 shadow 排序；同输入/profile 输出必须稳定 | property/replay 测试证明排序、去重、constraint 和错误原因稳定；无 DB/网络调用的 planner benchmark |
+| `S5-3` telemetry persistence | 记录实际目标、shadow 目标、capability shape、missing/unknown、evidence、transform、planning latency、planner/probe error 和 outcome；聚合必须可跨进程、重启和时间窗口查询；关键事件背压写入可恢复 outbox，无法落盘时写入 `telemetry_gap` | OLTP/request-attempt schema 与聚合查询测试；进程重启后指标连续，不能只依赖原子内存计数；无样本分母明确返回无样本；存在 gap 时 gate 不通过 |
+| `S5-4` passive feedback | 仅可验证 tool call/continuation 写 SuccessfulTraffic；明确 capability 4xx 标 stale/reprobe；普通 200、未调用工具和缺少 reasoning 不产生负证据 | 正/负/不可归因响应 fixture；feedback 不改 HealthRegistry、quota、EWMA 或业务 fallback 状态 |
+| `S5-5` shadow report | 以 Route × capability shape 输出第 9.5 节覆盖率、Unknown、disagreement、probe error、planner error 和 p95，并限制 cardinality/采样；shape 必须包含规范化 typed constraint | 固定观察窗口报告、带 namespace/range 约束的 shape hash、告警和低流量例外报告；指标分母、时间窗和脱敏字段有契约测试 |
+| `S5-6` planner error 与 gap | requirement/profile/transform 异常输出 `planner_error`；队列、数据库、序列化/脱敏失败输出带时间窗的 gap；补偿按唯一键重放 | 故障注入、outbox 重放、重复/乱序事件、窗口 gate 阻断与补偿后恢复测试 |
+
+Shadow 阶段的“兼容”只表示 planner 结论，不代表改变实际选择；任何 planner 内部错误都必须保留旧数据路径并产生可检索告警。指标不能从 request hot path 同步写数据库，使用现有异步 telemetry/OLTP 管道或等价的批量缓冲。
+
+建议验证命令：
+
+```bash
+cargo test -p tiygate-core capability
+cargo test -p tiygate-server --test capability_routing
+cargo test -p tiygate-store log_sink::oltp::tests::write_capability_plan_persists_target_diagnostics
+cargo test -p tiygate-server --test wiremock_providers
+```
+
+#### 阶段交接与回滚
+
+- 交接给阶段 6A/6B：planner 输入输出版本、shape hash 版本、异步 telemetry schema、准入报告和观察窗口基线；报告必须能重放并解释每个 Target 的排除原因。
+- 回滚：把受影响 Route 的 mode 降为 `off`，停止写入新的 enforce 计划但保留 shadow telemetry；planner 出错时无条件走旧数据路径。
 
 ### 阶段 6A：Admin API 与运营控制
 
@@ -1354,6 +1912,40 @@ Route Target 行增加能力状态入口，详情页显示：
 5. 实现低流量 Route 例外确认、门槛下调二次确认和作用域限定。
 6. 所有 mode、probe、override 和例外操作记录 actor、reason、before/after 和 Target/Route scope。
 7. API 输出对 credential、API Base query、错误文本和大 JSON 做脱敏、分页和限长。
+8. 配置导入的 override 先按 route/target 定位器唯一匹配并重新计算 TargetKey，再执行 registry、typed value、baseline Forbidden、TTL 和 scope 校验；未知 capability ID 只保留往返，不参与 enforce。
+9. admission 报告、shape hash、gate policy、snapshot epoch 和 revision 全部由服务端重算/核对；客户端提交的 hash、指标和“通过”标记不得直接授权 enforce。
+10. 将 mutation 幂等记录、审计事件、admission/profile/job 状态和 capability epoch 放入同一事务或可证明的持久 outbox，避免“响应成功但状态/审计缺失”。
+
+控制面必须固定以下状态转换和请求契约：
+
+```text
+off → shadow                         允许
+shadow → enforce                    仅当 shape admission 通过且未过期
+enforce → shadow|off                允许，立即生效
+off → enforce                       拒绝，必须先建立 shadow 观察窗口
+```
+
+Route mode 只表达上限，shape admission 才表达实际放行范围。写入 admission 至少携带
+`route_id`、`capability_shape_hash`、`required_capabilities`、`gate_policy_version`、
+`report`、`expires_at` 和 `expected_revision`；低流量例外/门槛下调的 `reason`、
+`exception_type` 和批准信息写入 `report_json` 与审计记录。服务端重新计算 shape hash、校验
+报告与当前 snapshot/指标的一致性，并使用条件更新避免并发覆盖。所有 mutation 支持
+`Idempotency-Key`（或等价的请求指纹），重复请求返回原结果而不重复创建 job 或 audit。
+幂等键及请求摘要必须与 mutation/audit 原子落库；同一键提交不同 payload 返回
+`409 idempotency_conflict`，幂等记录按审计保留期清理，不把原始凭证或请求体写入记录。
+这里的 mutation 不仅包括 probe、override、admission 和 worker pause/resume，也包括通过
+通用 settings/route API 修改 capability routing mode、probe budget/concurrency 或 CRL
+promotion 开关的请求；若复用通用接口，必须在同一入口执行 capability mutation 的幂等、
+条件更新和审计事务，不能以“普通设置更新”绕过门禁。
+低流量例外和门槛下调必须额外携带 `exception_type`、`expires_at`、批准人和补充证据，
+不得创建永久例外；到期或 gate policy 版本变化时自动撤销 enforce。
+
+查询接口统一返回 `{items, total, limit, offset, next_cursor}`，服务端限制最大 `limit`；
+`entries` 仅作为现有 WebUI 的兼容别名，不能替代 `items`；写入
+接口按操作返回 `202 Accepted`（异步 job）、`200`（幂等重复）或 `409 revision_conflict`。
+能力存储未配置、migration 未完成或 snapshot 不可用时返回受限的
+`capability_unavailable`（管理端可见原因），不返回空的“全部 Unknown”报告来诱导
+管理员批准 enforce。
 
 #### 交付物
 
@@ -1367,12 +1959,41 @@ Route Target 行增加能力状态入口，详情页显示：
 - override 不能越过 baseline Forbidden，重探测不覆盖 override，过期 override 自动退出 resolved profile。
 - manual probe、暂停/恢复和 mode 更新在多副本下最终一致。
 - 所有写操作均有完整审计，所有敏感字段在 API 和 audit 中不可见。
+- override 导入在唯一目标匹配、身份不一致、重复目标、未知 capability、Forbidden 或无效 typed value 时均有确定的 imported/skipped 结果，不会部分套用或静默扩大作用域。
+- admission 只接受服务端重新计算且与当前 snapshot/指标/版本一致的报告；幂等重放返回首次响应，不重复写 job、admission 或 audit。
 - 仅使用 Admin API 即可完成 profile 检查、重探测、shadow 准入、enforce 和回滚，不依赖数据库手工操作。
 - 通过验收组 `AC-ADMIN`、`AC-PERSISTENCE` 和适用的 `AC-QUALITY`。
 
 #### 可启用模式
 
 允许 `off` 和 `shadow`；API 中存在 enforce 枚举，但在阶段 6B 发布前由 feature gate 禁止实际启用。
+
+#### 可执行工作包与验证
+
+| 工作包 | 实施边界 | 必须产出的验证 |
+|--------|----------|----------------|
+| `S6A-1` 查询契约 | registry/profile/job/report 列表统一分页、排序、最大 page size 和脱敏；detail 返回 schema/probe/evidence/TTL 摘要 | OpenAPI/JSON fixture、分页边界、未知 capability 往返、敏感字段扫描测试 |
+| `S6A-2` 写入契约 | probe、override、pause/resume、mode mutation 使用幂等请求；override 校验 descriptor/value/baseline Forbidden | 重复请求不产生重复 job/audit；非法 state/value、过期 override 和 Forbidden override 返回稳定错误 |
+| `S6A-3` 并发与授权 | 所有写接口检查 Admin 权限、scope、revision/ETag（或等价条件更新），记录 actor/reason/before/after | 并发更新只接受一个版本；越权、重放、错误 TargetKey 和跨 Route 操作均被拒绝 |
+| `S6A-4` 准入门禁 | 增加 `capability_route_admissions`（SQLite/PostgreSQL）；服务端基于持久 shadow report 计算 Route × shape 门槛，并持久化 `required_requirements_json`；CRL shape 可授权完整转换，其他 shape 只能执行其已注册的通用过滤/转换；低流量例外和门槛下调必须二次确认且有期限 | 不满足门槛无法启用 enforce；带不同 namespace/range constraint 的 shape 不会复用同一 admission；未注册 transform 的 shape 保持 shadow；批准、撤销、过期、条件更新和审计回滚均可重复测试 |
+| `S6A-5` 运维闭环 | 提供仅靠 Admin API 完成诊断、重探测、暂停/恢复、shadow 准入和回滚的顺序操作；不依赖 SQL | 从空 profile 到 ready/stale/error 的端到端集成 fixture；API 故障时旧模式保持不变 |
+| `S6A-6` 导入与版本核验 | override 按 route/target 定位器重绑定；服务端重算 typed requirement shape/hash/report 并在同一事务写 mutation、审计和 epoch | 跨安装成功/跳过、未知 ID 往返、Forbidden/typed value 拒绝、不同约束 shape 隔离、幂等重放/冲突、版本失配和部分失败回滚测试 |
+
+阶段 6A 只能通过 `capability_route_admissions` 授权“某 Route 的某能力形状”进入 enforce，不能以全局 mode 写入替代逐项准入。Admin 返回的逐 Target 报告可包含 TargetKey，但不得包含 API Base 敏感 query、账号、凭证材料或原始上游错误。
+
+建议验证命令：
+
+```bash
+cargo test -p tiygate-admin --test integration target_capability
+cargo test -p tiygate-server --test capability_routing
+cargo test -p tiygate-store capabilities
+npm --prefix webui run lint
+```
+
+#### 阶段交接与回滚
+
+- 交接给阶段 6B/6C：已版本化的 Admin API/JSON schema、审计事件、gate policy、条件更新语义和 admission fixture；6B 只能消费服务端计算出的 admission，不能在 executor 内自行放宽门槛。
+- 回滚：撤销或过期指定 Route × shape admission，Route mode 回到 `shadow`/`off`；profile、job、审计和历史报告继续保留。
 
 ### 阶段 6B：Enforce 数据路径
 
@@ -1384,7 +2005,11 @@ Route Target 行增加能力状态入口，详情页显示：
 
 - 阶段 6A 的服务端准入、审计和回滚 API 已通过退出标准。
 - 目标 Route/能力形状满足第 9.5 节门槛并由管理员显式批准。
+- `capability_route_admissions` 中存在未过期、revision 匹配且 gate policy 版本有效的 enforce 记录。
 - 至少一个 compatible Target 具有 fresh 或 stale-valid profile，且端到端 continuation 已验证。
+- 若兼容路径依赖 `responses.promote_crl_additional_tools`，运行时
+  `gateway.responses.crl_tool_promotion_enabled` 必须已显式开启，且目标 egress dialect
+  允许顶层 `tools`；仅有能力画像不等于允许提升。
 
 #### 实施内容
 
@@ -1395,6 +2020,25 @@ Route Target 行增加能力状态入口，详情页显示：
 5. 明确 target-specific capability 4xx 在未发送客户端字节时跳到下一个已规划 Target；普通 BadRequest 保持失败。
 6. 实现 per-route/per-shape 自动降回 shadow、告警和 feature flag 紧急回退。
 7. 对 non-stream、SSE、fallback、断流和 client disconnect 保持现有一次发送与计费语义。
+8. 将“客户端是否已提交字节”作为 executor/fallback 的显式状态传递，而不是使用固定值或错误文本推断；首字节后 capability error、断流和取消均禁止切换 Target。
+9. 在 fallback、HealthRegistry、capability feedback 和 stale/reprobe 入队之间使用明确的 TargetInstanceId/TargetKey 适配；能力失败不得污染健康、熔断、延迟 EWMA 或业务 quota。
+10. planner、snapshot、admission 或 transform 内部错误统一走旧数据路径并触发受限告警；仅结构化且首字节前的 capability rejection 才能消耗既有 fallback 预算。
+
+请求执行顺序固定为：
+
+```text
+读取 RuntimeTunables 与 Route mode
+  → 提取 ExchangeRequirements、shape hash
+  → 读取 CapabilitySnapshot 与 admission（只读内存/已发布准入）
+  → 为每个 Target 生成 CompatibilityReport 与 PlannedTransform
+  → enforce 时先过滤 Required 不满足者，再进入既有策略排序
+  → 发送当前 PlannedTarget 的 raw/materialized body
+  → 仅在首字节前且错误满足结构化 capability-rejection 契约时尝试下一个已规划 Target
+```
+
+`shadow` 与 `off` 的实际目标列表、请求体和 fallback 必须与旧路径一致；`enforce` 的
+过滤结果只能来自当前 Route × shape admission。若 snapshot、admission 或 planner 发生
+内部错误，保留旧路径并将该 shape 降为 `shadow`，不得把内部错误转换为“不支持”。
 
 #### 交付物
 
@@ -1409,12 +2053,42 @@ Route Target 行增加能力状态入口，详情页显示：
 - 无 compatible Target 的客户端错误不泄露 TargetKey、account、API Base 或路由拓扑。
 - target-specific 4xx 只有满足明确分类且未发送字节时 fallback；流开始后不切换 Target。
 - 自动降级触发器能只把受影响 Route/能力形状降到 shadow，其他 Route 不受影响。
+- 首字节状态由实际 response body/stream 驱动，非流和流式路径在错误、取消、重试时均不会误切换或重复计费。
+- planner/transform/snapshot 失败不会产生 `no_compatible_target` 或 Unsupported；旧路径可用且受影响 shape 会被记录为 shadow/告警。
+- stale/reprobe 的后台任务在 shutdown、重启和多副本场景下可恢复，且不阻塞业务响应。
 - canary 中第 9.5 节指标持续满足一个完整观察窗口，且现有 fallback、health、quota、SSE 和 telemetry 回归全部通过。
 - 通过验收组 `AC-ROUTING`、`AC-CRL`、`AC-SHADOW` 和适用的 `AC-QUALITY`。
 
 #### 可启用模式
 
 允许 `off`、`shadow` 和通过门禁的 per-route/per-shape `enforce`；全局 enforce 必须在所有纳入范围的 Route 分别通过门禁后启用。
+
+#### 可执行工作包与验证
+
+| 工作包 | 实施边界 | 必须产出的验证 |
+|--------|----------|----------------|
+| `S6B-1` 准入过滤 | 先读取 Route mode 与 `capability_route_admissions` 的 shape gate，再在既有权重、优先级、cooldown、latency 和 HealthRegistry 排序前过滤 Required 不满足的 Target；Unknown 的处理只按注册表/门禁策略决定 | 第一目标 incompatible 时零业务出站；第二目标 compatible 时直接使用其计划；未获 shape 准入时保持 shadow/off；普通请求仍与旧排序一致 |
+| `S6B-2` per-target 执行 | executor 使用 `PlannedTarget` 自己的 raw/materialized body、dialect 和模型，不共享 Route 级缓存 | native/promotion/cross-protocol 混合 Route 的 wiremock 请求体、header、stream/non-stream 快照 |
+| `S6B-3` 错误与 fallback | 只依据结构化 provider code、明确 status/header 和 codec 语义将 capability rejection 分类；禁止仅凭模糊错误文本；客户端已收到字节后不得切换 | capability-specific 4xx、普通 400、401/403、429、5xx、首字节前/后断流的 fallback 矩阵测试 |
+| `S6B-4` 外部错误 | 无兼容 Target 返回协议原生 `no_compatible_target`，只输出限长 required/unknown/request_id；完整报告写内部 telemetry/Admin | 各协议 error encoder 一致；响应与日志中无 TargetKey、API Base、account、credential 或拓扑泄露 |
+| `S6B-5` 运行时回退 | 高置信冲突、planner error、唯一 Target 画像失效等触发器只降级受影响 Route/shape 到 shadow；紧急开关可立即回到 off | canary 期间自动降级和恢复、其他 Route 隔离、SSE 已发送首字节不重试/不换目标 |
+| `S6B-6` 计费与容量 | 探针与 shadow telemetry 不计入业务 quota；enforce 过滤不扩大重试预算、并发和请求体限制 | quota、fallback budget、request log、TTFB/latency、client disconnect 与现有回归集保持一致 |
+| `S6B-7` 提交状态与后台恢复 | executor 显式维护首字节/客户端提交状态；stale/reprobe 和 feedback 走可恢复句柄；TargetKey/TargetInstanceId 只在边界转换 | 首字节前后错误矩阵、流取消、重复计费、健康隔离、shutdown/restart、planner error 旧路径回归测试 |
+
+结构化 capability rejection 至少需要：上游 HTTP status、协议错误 code/type、被拒绝字段或 capability 的明确指示、请求是否已向客户端发送字节；无法满足这些条件时保持原错误，不进行 target-specific fallback。
+
+建议验证命令：
+
+```bash
+cargo test -p tiygate-server --test capability_routing
+cargo test -p tiygate-server --test wiremock_providers
+cargo test --workspace --all-features
+```
+
+#### 阶段交接与回滚
+
+- 交接给阶段 6C/运营：可观测的 enforce 结果、fallback 分类、canary 观察窗口和自动降级事件；每次降级都必须能定位到 Route、shape 和 gate policy 版本。
+- 回滚：先把单个 shape 的 admission 设为 `shadow`，若仍有风险再把 Route 或全局 mode 设为 `off`；流式响应已发送首字节后不得尝试回滚到另一 Target。
 
 ### 阶段 6C：WebUI 与运营可视化
 
@@ -1432,9 +2106,12 @@ Route Target 行增加能力状态入口，详情页显示：
 1. Route Target 展示 dialect、profile summary、fresh/stale、probe job 和 capability routing mode。
 2. 能力详情展示 state、constraint、evidence source、时间、版本和脱敏 reason。
 3. 展示 per-route/per-shape Shadow 指标、门槛、未满足项和 planner 差异。
-4. 提供 manual probe、override、worker pause/resume、shadow/enforce 和回滚操作。
-5. Unsupported→Supported override、门槛下调、低流量例外和 enforce 使用二次确认，并要求 reason。
+4. 提供 manual probe、override、worker pause/resume、shadow/enforce 和回滚操作；准入表单支持 `required_requirements` typed constraint JSON，并在提交前校验为数组。
+5. Unsupported→Supported override、门槛下调、低流量例外和 enforce 使用二次确认，并要求 reason；没有现有 Shadow shape admission 时禁用 Enforce 选项。
 6. CompatibilityReport、job 和 audit 列表分页，长值折叠且不渲染未转义上游内容。
+7. 所有异步操作显示 job 状态、revision/ETag 和重试入口；提交成功后按服务端返回的 snapshot epoch 刷新，不用本地乐观状态绕过门禁。
+8. UI 以 registry/API 返回的状态为唯一事实来源；未知字段保留展示，未知版本、`capability_unavailable` 和过期游标进入只读/可恢复状态。
+9. 将高风险操作、准入报告和回滚 runbook 的作用域、过期时间、批准人和审计链接完整展示，避免把“HTTP 200”或“探针完成”显示为能力已支持。
 
 #### 交付物
 
@@ -1447,12 +2124,39 @@ Route Target 行增加能力状态入口，详情页显示：
 - UI 明确区分 Unknown、Inconclusive、ProbeError、Unsupported 和 stale，不将 HTTP 200 展示为能力成功。
 - enforce 前显示作用域、门槛结果、受影响 Target 和回滚方式；高风险操作均有二次确认与审计 reason。
 - 分页、错误恢复、并发更新冲突和 HTML/JSON 转义通过前端测试。
+- capability store 不可用时展示 `capability_unavailable` 和只读降级状态，不提供可提交的 enforce 控件。
+- 异步 job、revision 冲突、幂等重放、过期游标和 snapshot epoch 变化均有可恢复交互；UI 不依赖本地缓存决定 enforce 是否可用。
+- 高风险操作完成后可从 UI 追溯 actor、reason、作用域、版本和回滚入口，且未知上游文本不会被当作 HTML 执行。
 - WebUI TypeScript、lint 和构建通过，后端 API 契约测试保持通过。
 - 通过验收组 `AC-ADMIN` 和 `AC-QUALITY`。
 
 #### 可启用模式
 
 不改变数据路径模式；UI 仅调用阶段 6A/6B 已授权的服务端能力。
+
+#### 可执行工作包与验证
+
+| 工作包 | 实施边界 | 必须产出的验证 |
+|--------|----------|----------------|
+| `S6C-1` 数据模型 | `webui/src/api/types.ts` 与 API schema 对齐 profile/job/report、mode、shape、audit 和分页；未知 capability 保留为可展示数据；列表必须按 `next_cursor`/受限 page size 分页拉取，不得用无限制全量请求 | fixture 版本兼容、未知字段往返、分页/排序、游标失效和错误码映射测试 |
+| `S6C-2` Target 详情 | Route Target 行与详情页展示 dialect、profile 状态、fresh/stale、证据、TTL、job lease、missing capability 和 transform | Supported/Unsupported/Constrained/Unknown/Inconclusive/ProbeError/stale 每种状态均有 UI fixture |
+| `S6C-3` 受控操作 | probe、override、pause/resume、shadow/enforce、回滚、低流量例外和门槛下调全部调用 Admin API；准入表单支持 `required_requirements` typed constraint JSON；高风险操作统一二次确认和 reason | 权限失败、typed constraint JSON 校验、并发 revision 冲突、重复提交、超时重试和成功后刷新快照测试 |
+| `S6C-4` 安全与可用性 | 长文本折叠、上游内容转义、敏感字段不渲染；加载/空/`capability_unavailable`/错误/无权限/旧 API 状态可恢复 | XSS/敏感字段扫描、键盘可达性、响应式布局和错误恢复测试 |
+| `S6C-5` 发布验证 | UI 构建产物与 Admin 路由集成；不具备 6A 准入时隐藏或禁用 enforce | TypeScript、lint、生产构建及浏览器级关键流程通过；UI 不可绕过服务端门禁 |
+| `S6C-6` 异步状态与运营证据 | 轮询 job/epoch、处理幂等/ETag/游标错误；展示 gate policy、批准、过期和回滚证据 | API/浏览器 fixture 覆盖 pending→ready/stale/error、重放、冲突、不可用和未知版本；页面不以本地状态开启 enforce |
+
+建议验证命令：
+
+```bash
+npm --prefix webui run lint
+npm --prefix webui run build
+cargo test -p tiygate-admin --test integration
+```
+
+#### 阶段交接与回滚
+
+- 交付给运营：与 Admin API schema 同版本的 UI、关键流程浏览器 fixture 和无障碍/安全扫描结果；UI 不持有数据库连接或绕过服务端准入。
+- 回滚：撤回 UI 静态资源或隐藏未授权操作即可；不撤销后端 profile、admission、审计数据，也不改变当前数据路径模式。
 
 ### 阶段 7：其他转换维度 Roadmap
 
@@ -1497,6 +2201,8 @@ Route Target 行增加能力状态入口，详情页显示：
 - [ ] 每个 conversion-relevant capability 都能追溯到协议矩阵条目或 dialect 文档。
 - [ ] `core` 不执行文件、数据库或网络 I/O，也不包含 CRL、Responses 或具体协议 transform 分支。
 - [ ] Cataloged/Disabled 能力不会进入 shadow 或 enforce 路由判断。
+- [ ] 首期 Enforce 白名单与 gate policy 版本化；白名单外 capability 即使 descriptor 标记为 Implemented，也只能用于诊断或 Shadow。
+- [ ] registry/baseline、profile、probe/judge、shape hash、gate policy 和 telemetry 版本元组均有机器可读来源；主版本失配会阻止 enforce。
 
 ### 13.3 `AC-IDENTITY`：Target 身份
 
@@ -1507,18 +2213,27 @@ Route Target 行增加能力状态入口，详情页显示：
 - [ ] 相同实际 Target 被多个 Route 引用时复用 profile；weight、enabled 和 Route 顺序不改变身份。
 - [ ] RouteTarget 未配置 dialect 时保持 auto，显式 dialect 参与 TargetKey 和 baseline 解析。
 - [ ] 明文 API Key、OAuth token、IAM session token 和 fingerprint secret 不进入 TargetKey、profile、日志或错误体。
+- [ ] TargetKey、TargetInstanceId、HealthKey 只能通过显式边界适配互转；能力画像与 HealthRegistry 不会因裸字符串复用而相互污染。
 
 ### 13.4 `AC-PERSISTENCE`：持久化、任务与快照
 
 - [ ] SQLite 和 PostgreSQL migration、profile/override/job CRUD、TTL 和 fresh/stale 行为一致。
 - [ ] Route 配置和初始 probe job 在同一事务提交，创建响应不等待完整探测。
+- [ ] Provider credential、API Base、endpoint、model、dialect、account/scope 等身份变更与 profile/job 入队具有同一事务保证；若使用 outbox/reconciliation，则可证明配置 epoch 与任务最终一致且无孤儿状态。
 - [ ] 相同 TargetKey/probe set 的并发 claim 在多副本下只有一个有效 lease。
 - [ ] 进程在任务创建、claim、执行和提交阶段退出后，任务均能恢复且结果提交幂等。
+- [ ] 应用优雅关闭停止新任务 claim、等待或安全释放当前 worker；重启后 lease 到期任务可被接管，不存在无法回收的 detached worker。
 - [ ] Target 删除、禁用或身份变化后旧任务取消，旧 observation 不进入新身份 profile。
 - [ ] fresh 到期后在 stale grace 内继续提供最后已验证结果，超过 stale_until 后不再参与 enforce。
 - [ ] profile/override 更新通过 capability epoch 最终发布到所有副本，且不触发完整配置重载。
 - [ ] 正常请求只读 CapabilitySnapshot，不执行 SQL、不等待 watcher。
-- [ ] profile/job 不随配置导出，override 可选择导出，fingerprint secret 永不导出。
+- [ ] snapshot 重建失败或数据库短暂不可用时保留最后可用快照并产生告警；profile/旧 job 的延迟清理不影响读取。
+- [ ] `capability_route_admissions` 的条件更新、revision、过期和 capability epoch 发布在两种数据库中一致；缺失或 stale admission 不会进入 enforce。
+- [ ] admission 同时保存 `required_capabilities_json` 与 `required_requirements_json`；旧空 requirement 列可按 ID 兼容读取，带 namespace/range constraint 的 shape hash 不会退化为无约束 hash。
+- [ ] `request_capability_plans`/`request_capability_feedback` 的迁移、幂等键、乱序重放和保留期在两种数据库中一致；异步 sink 重启后不会丢失已确认的 gate 样本。
+- [ ] profile/job 不随配置导出，override 可选择导出并按 route/target 定位器安全重绑定；无法唯一匹配时计数跳过，fingerprint secret 永不导出。
+- [ ] Profile、probe job、admission 状态转换只通过条件更新；版本失配、过期、取消、重启和清理均保留原因和诊断窗口。
+- [ ] snapshot reloader、ProbeWorker、admission guard、stale/reprobe 反馈和 telemetry outbox 均有可停止/可接管句柄，不存在 detached task 或永久 running job。
 
 ### 13.5 `AC-PROBE`：探测正确性与安全
 
@@ -1529,10 +2244,13 @@ Route Target 行增加能力状态入口，详情页显示：
 - [ ] `401/403`、`429`、`5xx`、timeout 不生成负面 observation，也不清空已有结论。
 - [ ] CRL A/B 只有 control 成功、实验变量唯一且结果稳定时产生 ExplicitNegative。
 - [ ] 探针与业务 egress 使用相同 AuthApplier、URL、TLS、代理和 redirect 安全规则。
+- [ ] probe_id 只能来自受审计 allow-list；地址校验、请求/响应限长、最大 token、全局/provider/account 并发和预算在执行器统一生效。
 - [ ] 探测请求不修改 HealthRegistry、EWMA、下游 quota 和业务 request log。
 - [ ] 默认探针不执行 hosted search、shell、computer use、MCP、Multi-agent 或其他外部副作用。
 - [ ] 达到预算、worker 暂停或发生瞬时错误时任务正确延期，最后已验证 profile 不被清空。
+- [ ] 未实现 continuation 的 Anthropic/Gemini 或其他协议探针返回 Inconclusive，不进入 EnforceEligible 或产生 Unsupported。
 - [ ] ProbeOutcome 的 Positive、ExplicitNegative、Inconclusive 和 Error 均有 wiremock 测试。
+- [ ] 同一 probe 提交键的重复/乱序结果只保留一个 observation、一次费用/审计记录；stale/reprobe 入队可在队列背压和重启后补偿。
 
 ### 13.6 `AC-CRL`：CRL 建模与转换
 
@@ -1543,6 +2261,7 @@ Route Target 行增加能力状态入口，详情页显示：
 - [ ] namespace/custom/function 等实际载体必需能力任一缺失时不执行提升。
 - [ ] additional_tools 复用现有 responses_opaque_input_items，不建立平行 carrier。
 - [ ] raw passthrough 与 promotion body 按 PlannedTarget 决定，不受同 Route 其他 Target 影响。
+- [ ] transform 失败、body-size 超限或未知字段无法证明保留时 fail-closed，不删除字段后继续发送。
 - [ ] non-stream/SSE 工具响应均识别为 FinishReason::ToolCalls，而不是 Stop。
 - [ ] tool result continuation 能返回最终 assistant message。
 - [ ] 关闭 promotion 后恢复原生 passthrough，不影响普通 Responses 请求。
@@ -1552,12 +2271,18 @@ Route Target 行增加能力状态入口，详情页显示：
 - [ ] capability shape 只由 Required capability/constraint 生成，普通文本不进入 CRL 指标分母。
 - [ ] shadow 同时记录实际选择与规划选择，但不改变 Target 顺序、请求体、fallback 或客户端响应。
 - [ ] profile coverage、compatible shape coverage、success disagreement、Unknown、probe error、planner error 和 planning latency 均按第 9.5 节定义计算。
+- [ ] Shadow 指标从异步 telemetry/OLTP 或等价持久聚合读取，跨进程、重启和观察窗口连续；不得只依赖进程内原子计数。
+- [ ] Shadow 聚合显式区分无样本、低流量样本和达到门槛的样本；`planner_error`、probe 终结错误、evidence 摘要和时间窗口都能追溯到原始脱敏事件。
+- [ ] 能力计划/反馈事件发生背压或落盘缺口时产生 `telemetry_gap`，相关 Route/shape 不得通过 enforce 门禁，补偿完成后才能重新计算窗口。
 - [ ] 每条申请 enforce 的 Route/shape 满足连续 24 小时、至少 100 个相关请求和全部默认门槛，或具有合规低流量例外。
 - [ ] 高置信 verified success disagreement 为零，Unknown rate 为零，每种能力形状至少有一个 compatible Target。
 - [ ] planner 对相同 request/profile 输入输出稳定，每个排除结果包含 capability 和 evidence 原因。
 - [ ] SuccessfulTraffic 只从可验证工具语义产生，普通 200 message 不作为工具能力证明。
 - [ ] 发布基准中 planning latency p95 不超过 1 ms，异步 telemetry 不阻塞请求。
 - [ ] 系统不自动从 shadow 晋级 enforce；门槛下调和低流量例外均有作用域、reason 和审计。
+- [ ] requirement/profile/transform 内部错误均记录为 `planner_error` 并保留旧数据路径，不被计为 Unsupported、Unknown 已解决或 `no_compatible_target`。
+- [ ] telemetry 背压、数据库/序列化/脱敏失败和进程重启会产生可查询 `telemetry_gap`；存在 gap 的窗口无法通过准入，补偿后按唯一键恢复。
+- [ ] coverage 与 error 指标使用实际 Target × capability 和请求级分母，明确区分无样本、低流量和完整窗口。
 
 ### 13.8 `AC-ROUTING`：Enforce 路由与转换
 
@@ -1567,35 +2292,51 @@ Route Target 行增加能力状态入口，详情页显示：
 - [ ] Unknown 对首期 Required capability 在 enforce 中视为不满足。
 - [ ] 无 compatible Target 时返回受限 no_compatible_target，完整逐 Target 报告只进入内部 telemetry/Admin。
 - [ ] target-specific capability 4xx 仅在明确分类且未发送客户端字节时 fallback；普通 BadRequest 不被误分类。
+- [ ] capability rejection 分类至少同时具备 status、结构化 code/type、被拒绝字段/能力和“客户端是否已收到字节”证据；模糊错误文本不触发 fallback。
 - [ ] 流式响应发送首字节后不切换 Target，现有断流、计费和客户端取消语义保持不变。
 - [ ] 协议 Forbidden 不能被探测或 override 越权扩展。
 - [ ] 准入指标恶化时只把受影响 Route/shape 自动降为 shadow，不影响其他 Route。
+- [ ] 客户端提交状态来自实际非流响应/流式首帧；首字节前后 capability error、取消和重试分别符合 fallback 预算，不重复计费。
+- [ ] stale/reprobe、feedback 和自动降级任务在 shutdown/restart 后可恢复，planner/snapshot 失败不会改变其他 Route。
 - [ ] 现有 fallback、health、quota、telemetry 和跨协议 lossy conversion 测试全部通过。
 
 ### 13.9 `AC-ADMIN`：管理接口、WebUI 与可观测性
 
 - [ ] Admin API 支持分页查询 registry/profile/job/report，支持 manual probe、override、worker 和 mode 控制。
 - [ ] 不满足准入门槛的 Route 无法进入 enforce；低流量例外和门槛下调要求二次确认与审计。
+- [ ] 首期 gate policy 对 Responses CRL `additional_tools` shape 授权完整 native/promotion 转换；其他 shape 即使可做通用能力过滤，也不能使用 CRL transform 或隐式丢弃字段。
+- [ ] Route 级 enforce 只能在至少一个有效 shape admission 存在时写入；shape admission 是实际执行准入的最小作用域。
+- [ ] Route mode 与 `capability_route_admissions` 的上限关系、shape hash、policy version、过期和撤销语义经过 SQLite/PostgreSQL/API 一致性测试。
 - [ ] 重探测不覆盖人工 override，Forbidden 不能被 Supported override 覆盖。
+- [ ] 写操作具备幂等键或等价条件更新；并发 revision/ETag 冲突不会覆盖他人变更，pause/resume 和 mode 更新跨副本最终一致。
+- [ ] capability 专用接口以及通过通用 settings/route 接口修改 capability 字段的请求都支持 `Idempotency-Key`；同键同载荷重放原响应，同键异载荷返回 `409 idempotency_conflict`，且 mutation、审计和状态提交不可部分成功。
 - [ ] 所有 mode、override、probe 和例外写操作记录 actor、reason、scope 与 before/after。
+- [ ] override 导入按 route/target 定位器唯一重绑定后，重新执行 registry、typed value、baseline、TTL 和 scope 校验；未知 ID 只往返，冲突/跳过均计数且不部分写入。
+- [ ] admission 的 hash、report、gate policy、snapshot epoch 和 revision 均由服务端核验；客户端不能直接提交“已通过”标记。
+- [ ] Admin 可提交 `required_requirements` 的 typed value；服务端校验 value kind/matcher、Required strength、ID 集合一致性并重新计算 shape hash。
 - [ ] Admin API 和 audit 可以使用 TargetKey 关联记录，但不暴露 credential、fingerprint secret、API Base 敏感 query 或其他可恢复身份材料。
 - [ ] 普通客户端错误不暴露 TargetKey、account、API Base 或完整路由拓扑。
 - [ ] UI 区分 Supported、Unsupported、Constrained、Unknown、Inconclusive、ProbeError 和 stale。
 - [ ] UI 展示 mode 继承、Shadow 指标、准入未满足项、证据、TTL、job 和回滚方式。
 - [ ] 高风险操作具有二次确认、reason、并发更新冲突处理和明确作用域。
 - [ ] request attempt 能解释 Target 被排除的 capability、evidence 和 transform 计划。
+- [ ] Target 详情不返回 credential scope fingerprint、canonical API Base、URL override 或任何可恢复凭证；只显示 TargetKey 和脱敏状态摘要。
 - [ ] 运维人员无需直接操作数据库即可完成日常诊断、重探测、override、准入、enforce 和回滚。
 
 ### 13.10 `AC-QUALITY`：工程质量门禁
 
+- [ ] `cargo check --workspace --all-targets`
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --workspace --all-features`
 - [ ] `scripts/verify-deps.sh`
 - [ ] `npm --prefix webui run lint`
+- [ ] `npm --prefix webui run build`
 - [ ] WebUI TypeScript 与生产构建通过。
 - [ ] `git diff --check`
 - [ ] SQLite/PostgreSQL 均有 migration、job lease、幂等提交和 capability epoch 测试。
+- [ ] CI 使用固定 PostgreSQL service container 执行迁移、事务回滚、lease/幂等和遥测聚合用例；未连接 PostgreSQL 的本地运行只作为补充，不得替代 CI 门禁。
+- [ ] `V-TELEMETRY-GAP` 与 `V-LIFECYCLE` 的故障注入、outbox 重放、shutdown/restart 和 lease 接管在 CI 或受控脚本中可重复执行。
 - [ ] 新增探针具有 wiremock Positive、ExplicitNegative、Inconclusive 和 ProbeError 测试。
 - [ ] 新增转换具有 protocols 单测、server 集成测试及 non-stream/SSE 回归测试。
 - [ ] 阶段 6B 发布前保存完整命令输出、Shadow 准入报告和 canary 观察结果。
@@ -1620,8 +2361,8 @@ Route Target 行增加能力状态入口，详情页显示：
 
 ## 15. 回滚策略
 
-1. 所有能力感知路由由 `target_capability_routing_mode=off|shadow|enforce` 控制，紧急回退设置为 `off`。
-2. CRL 提升由独立设置 `responses_crl_tool_promotion_enabled` 控制。
+1. 所有能力感知路由由 `gateway.capabilities.routing_mode=off|shadow|enforce` 控制，紧急回退设置为 `off`。
+2. CRL 提升由独立设置 `gateway.responses.crl_tool_promotion_enabled` 控制。
 3. 关闭能力路由后恢复现有目标排序和 fallback，不删除已存 profile。
 4. ProbeWorker 可以独立暂停，不影响正常请求。
 5. 数据库新增表为旁路表，回滚二进制后旧版本忽略，不修改现有 Provider/Route 主表语义。

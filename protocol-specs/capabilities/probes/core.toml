@@ -1,0 +1,27 @@
+schema_version = 1
+
+[[probe]]
+id = "http.basic"
+kind = "non_stream_text"
+wire_profiles = ["*generation", "*embeddings"]
+input_schema = "protocol-minimal-text"
+unique_variable = "nonce"
+control = "single_request"
+timeout_secs = 30
+max_output_tokens = 32
+budget_weight = 1
+probe_suite_version = 1
+judge_version = 1
+
+[[probe]]
+id = "transport.sse"
+kind = "sse_lifecycle"
+wire_profiles = ["openai-responses-standard", "openai-responses-codex-lite", "openai-chat-standard", "anthropic-messages-standard", "gemini-generate-content-standard"]
+input_schema = "protocol-minimal-stream"
+unique_variable = "nonce"
+control = "single_request"
+timeout_secs = 30
+max_output_tokens = 32
+budget_weight = 1
+probe_suite_version = 1
+judge_version = 1

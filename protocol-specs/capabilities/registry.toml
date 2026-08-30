@@ -1,0 +1,194 @@
+# TiyGate capability registry v1.
+# This file is a build-time contract. It is not read from the request path.
+schema_version = 1
+
+# Cataloged entries are intentionally data-only in the first release. They
+# remain round-trippable and visible to Admin, but cannot participate in
+# routing until a concrete codec/planner and deterministic discovery evidence
+# are implemented.
+catalog_ids = [
+  "transport.websocket",
+  "generation.max_output_tokens",
+  "generation.temperature",
+  "generation.top_p",
+  "generation.top_k",
+  "generation.stop_sequences",
+  "generation.frequency_penalty",
+  "generation.presence_penalty",
+  "generation.seed",
+  "tools.parallel",
+  "tools.hosted.web_search",
+  "tools.hosted.file_search",
+  "tools.hosted.code_interpreter",
+  "tools.hosted.computer_use",
+  "tools.remote_mcp",
+  "tools.programmatic",
+  "reasoning.plaintext",
+  "reasoning.summary",
+  "reasoning.encrypted_replay",
+  "reasoning.effort.values",
+  "reasoning.budget_tokens",
+  "reasoning.mode",
+  "reasoning.context",
+  "structured.json_object",
+  "structured.json_schema",
+  "structured.json_schema.strict",
+  "structured.json_schema.keywords",
+  "media.input.image.inline",
+  "media.input.image.url",
+  "media.input.file_id",
+  "media.input.audio.inline",
+  "media.input.video.inline",
+  "media.image.detail.values",
+  "cache.prompt.key",
+  "cache.prompt.retention",
+  "cache.prompt.options",
+  "cache.prompt.breakpoint",
+  "output.annotations.url",
+  "output.annotations.file",
+  "output.refusal",
+  "output.stop_details",
+  "output.usage.reasoning_tokens",
+  "output.usage.cache_read_tokens",
+  "output.usage.cache_write_tokens",
+  "extensions.codex.local_shell",
+  "extensions.codex.custom_tool",
+  "extensions.codex.tool_search_items",
+  "extensions.multi_agent",
+  "embeddings.input.batch",
+  "embeddings.dimensions",
+  "embeddings.encoding_formats",
+]
+
+# The only capability IDs that may participate in first-release Enforce after
+# the Route × shape gate passes. Keeping this allow-list separate from the
+# catalog prevents a future Implemented descriptor from silently widening the
+# production data path.
+enforce_eligible_ids = [
+  "transport.http",
+  "transport.sse",
+  "tools.function",
+  "tools.function.continuation",
+  "tools.choice.required",
+  "tools.choice.specific",
+  "tools.namespace",
+  "tools.custom",
+  "tools.crl.additional_tools",
+]
+
+[[capability]]
+id = "transport.http"
+value_kind = "bool"
+matcher = "boolean"
+scope = "endpoint"
+implementation_status = "implemented"
+discovery_methods = ["exact_model_catalog", "provider_documentation", "active_probe"]
+routing_eligibility = "enforce_eligible"
+dependencies = []
+conversion_relevant = true
+probe_id = "http.basic"
+owner = "core"
+
+[[capability]]
+id = "transport.sse"
+value_kind = "bool"
+matcher = "boolean"
+scope = "endpoint"
+implementation_status = "implemented"
+discovery_methods = ["active_probe", "passive_traffic"]
+routing_eligibility = "enforce_eligible"
+dependencies = ["transport.http"]
+conversion_relevant = true
+probe_id = "transport.sse"
+owner = "core"
+
+[[capability]]
+id = "tools.function"
+value_kind = "bool"
+matcher = "boolean"
+scope = "model"
+implementation_status = "implemented"
+discovery_methods = ["explicit_override", "exact_model_catalog", "active_probe", "passive_traffic"]
+routing_eligibility = "enforce_eligible"
+dependencies = ["transport.http"]
+conversion_relevant = true
+probe_id = "tools.function"
+owner = "protocols"
+
+[[capability]]
+id = "tools.function.continuation"
+value_kind = "bool"
+matcher = "boolean"
+scope = "model"
+implementation_status = "implemented"
+discovery_methods = ["explicit_override", "active_probe", "passive_traffic"]
+routing_eligibility = "enforce_eligible"
+dependencies = ["tools.function"]
+conversion_relevant = true
+probe_id = "tools.function.continuation"
+owner = "protocols"
+
+[[capability]]
+id = "tools.choice.required"
+value_kind = "bool"
+matcher = "boolean"
+scope = "model"
+implementation_status = "implemented"
+discovery_methods = ["explicit_override", "active_probe", "passive_traffic"]
+routing_eligibility = "enforce_eligible"
+dependencies = ["tools.function"]
+conversion_relevant = true
+probe_id = "tools.choice.required"
+owner = "protocols"
+
+[[capability]]
+id = "tools.choice.specific"
+value_kind = "bool"
+matcher = "boolean"
+scope = "model"
+implementation_status = "implemented"
+discovery_methods = ["explicit_override", "active_probe", "passive_traffic"]
+routing_eligibility = "enforce_eligible"
+dependencies = ["tools.function"]
+conversion_relevant = true
+probe_id = "tools.choice.specific"
+owner = "protocols"
+
+[[capability]]
+id = "tools.namespace"
+value_kind = "enum_set"
+matcher = "set_contains"
+scope = "model"
+implementation_status = "implemented"
+discovery_methods = ["explicit_override", "active_probe", "passive_traffic"]
+routing_eligibility = "enforce_eligible"
+dependencies = ["tools.function"]
+conversion_relevant = true
+probe_id = "tools.namespace"
+owner = "protocols"
+
+[[capability]]
+id = "tools.custom"
+value_kind = "bool"
+matcher = "boolean"
+scope = "model"
+implementation_status = "implemented"
+discovery_methods = ["explicit_override", "active_probe", "passive_traffic"]
+routing_eligibility = "enforce_eligible"
+dependencies = ["tools.function"]
+conversion_relevant = true
+probe_id = "tools.custom"
+owner = "protocols"
+
+[[capability]]
+id = "tools.crl.additional_tools"
+value_kind = "bool"
+matcher = "boolean"
+scope = "dialect"
+implementation_status = "implemented"
+discovery_methods = ["explicit_override", "active_probe", "passive_traffic"]
+routing_eligibility = "enforce_eligible"
+dependencies = []
+conversion_relevant = true
+probe_id = "tools.crl.additional_tools"
+owner = "protocols"

@@ -10,7 +10,7 @@
 use axum::routing::{patch, post, put};
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -20,6 +20,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use tiygate_store::archive::{gzip_decompress, sha256_hex, PayloadArchiveManifest};
+use tiygate_store::capabilities::{
+    CapabilityMutationIdempotency, CapabilityProfileSummary, CapabilityRouteAdmission,
+    TargetCapabilityOverride,
+};
 use tiygate_store::config_store::{validate_provider_auth_mode, StoreError};
 use tiygate_store::model_catalog::ModelMetadata;
 use tiygate_store::models::{
@@ -85,6 +89,14 @@ pub fn router() -> Router<AdminState> {
             get(get_route).put(update_route).delete(delete_route),
         )
         .route(
+            "/admin/v1/routes/:id/capability-admissions",
+            get(list_capability_route_admissions).post(upsert_capability_route_admission),
+        )
+        .route(
+            "/admin/v1/routes/:id/capability-admissions/:shape_hash",
+            axum::routing::delete(delete_capability_route_admission),
+        )
+        .route(
             "/admin/v1/api-keys",
             get(list_api_keys).post(create_api_key),
         )
@@ -131,6 +143,1784 @@ pub fn router() -> Router<AdminState> {
         )
         .route("/admin/v1/providers/:id/models", get(list_provider_models))
         .route("/admin/v1/info", get(info))
+        .route(
+            "/admin/v1/target-capabilities",
+            get(list_target_capabilities),
+        )
+        .route(
+            "/admin/v1/target-capabilities/:target_key",
+            get(get_target_capability),
+        )
+        .route(
+            "/admin/v1/target-capabilities/:target_key/probe",
+            post(start_target_capability_probe),
+        )
+        .route(
+            "/admin/v1/target-capabilities/:target_key/probe-runs",
+            get(list_target_capability_probe_runs),
+        )
+        .route(
+            "/admin/v1/target-capabilities/:target_key/overrides",
+            put(upsert_target_capability_override),
+        )
+        .route(
+            "/admin/v1/target-capabilities/:target_key/overrides/:capability_id",
+            axum::routing::delete(delete_target_capability_override),
+        )
+        .route(
+            "/admin/v1/capability-registry",
+            get(get_capability_registry),
+        )
+        .route("/admin/v1/capability-metrics", get(list_capability_metrics))
+        .route(
+            "/admin/v1/capability-probes",
+            axum::routing::put(update_capability_probe_worker),
+        )
+        .route("/admin/v1/probe-jobs/:job_id", get(get_probe_job))
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityListQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CapabilityRevisionQuery {
+    expected_revision: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityProbeRequest {
+    #[serde(default)]
+    probe_set: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityOverrideRequest {
+    capability_id: String,
+    state: String,
+    value: Option<Value>,
+    reason: String,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityAdmissionRequest {
+    #[serde(default)]
+    shape_hash: Option<String>,
+    #[serde(default)]
+    required_capabilities: Vec<String>,
+    /// Optional typed required leaves.  When omitted, each
+    /// `required_capabilities` entry is treated as an unconstrained boolean
+    /// requirement for backwards compatibility.
+    #[serde(default)]
+    required_requirements: Vec<tiygate_core::CapabilityRequirement>,
+    mode: tiygate_core::CapabilityRoutingMode,
+    #[serde(default)]
+    expected_revision: Option<i64>,
+    #[serde(default)]
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    low_traffic_exception: bool,
+    reason: String,
+}
+
+/// Normalize the admission shape supplied by the Admin API.  The legacy
+/// `required_capabilities` form remains valid and expands to unconstrained
+/// required leaves; callers that need a constrained shape (for example a
+/// particular CRL namespace path) provide `required_requirements`.
+fn normalize_admission_requirements(
+    required_capabilities: &[String],
+    supplied_requirements: &[tiygate_core::CapabilityRequirement],
+) -> Result<
+    (
+        Vec<tiygate_core::CapabilityId>,
+        Vec<tiygate_core::CapabilityRequirement>,
+    ),
+    AdminError,
+> {
+    if required_capabilities.len() > 64 || supplied_requirements.len() > 64 {
+        return Err(AdminError::InvalidCapability(
+            "required capabilities exceeds the limit".to_string(),
+        ));
+    }
+    let mut requirements = if supplied_requirements.is_empty() {
+        required_capabilities
+            .iter()
+            .map(|value| tiygate_core::CapabilityRequirement::required(value.as_str()))
+            .collect::<Vec<_>>()
+    } else {
+        supplied_requirements.to_vec()
+    };
+    if requirements.is_empty() {
+        return Err(AdminError::InvalidCapability(
+            "required_capabilities or required_requirements must not be empty".to_string(),
+        ));
+    }
+    if requirements.iter().any(|requirement| {
+        requirement.id.as_str().is_empty()
+            || requirement.strength != tiygate_core::RequirementStrength::Required
+    }) {
+        return Err(AdminError::InvalidCapability(
+            "admission requirements must have non-empty IDs and required strength".to_string(),
+        ));
+    }
+    requirements.sort_by(|left, right| {
+        let left_key = serde_json::to_string(left).unwrap_or_default();
+        let right_key = serde_json::to_string(right).unwrap_or_default();
+        left_key.cmp(&right_key)
+    });
+    requirements.dedup();
+    let mut ids = requirements
+        .iter()
+        .map(|requirement| requirement.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    if !required_capabilities.is_empty() {
+        let mut supplied_ids = required_capabilities
+            .iter()
+            .map(|value| tiygate_core::CapabilityId::from(value.as_str()))
+            .collect::<Vec<_>>();
+        supplied_ids.sort();
+        supplied_ids.dedup();
+        if supplied_ids != ids {
+            return Err(AdminError::InvalidCapability(
+                "required_capabilities does not match required_requirements".to_string(),
+            ));
+        }
+    }
+    Ok((ids, requirements))
+}
+
+/// Verify that the capability control-plane migrations are available before a
+/// control request proceeds. A missing/partially migrated capability schema is
+/// a deployment condition, not an empty all-Unknown profile that an operator
+/// could accidentally approve for enforce.
+async fn ensure_capability_store_available(state: &AdminState) -> Result<(), AdminError> {
+    let required_tables = [
+        "target_capability_profiles",
+        "target_capability_overrides",
+        "target_probe_jobs",
+        "capability_epoch",
+        "installation_secrets",
+        "capability_probe_budgets",
+        "capability_route_admissions",
+        "request_capability_plans",
+        "request_capability_feedback",
+        "request_capability_telemetry_gaps",
+        "capability_probe_runs",
+    ];
+    for table in required_tables {
+        let present = match state.pool.kind() {
+            tiygate_store::db::DbKind::Sqlite => {
+                sqlx::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=$1 LIMIT 1")
+                    .bind(table)
+                    .fetch_optional(state.pool.any())
+                    .await
+            }
+            tiygate_store::db::DbKind::Postgres => {
+                sqlx::query(
+                    "SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = current_schema() AND table_name = $1 LIMIT 1",
+                )
+                .bind(table)
+                .fetch_optional(state.pool.any())
+                .await
+            }
+        };
+        match present {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                return Err(AdminError::CapabilityUnavailable(format!(
+                    "capability storage migration is missing table {table}"
+                )));
+            }
+        }
+    }
+    let required_migrations = [
+        ("config", 20260829000001_i64),
+        ("config", 20260829000002_i64),
+        ("config", 20260829000003_i64),
+        ("config", 20260829000005_i64),
+        ("config", 20260829000006_i64),
+        ("config", 20260829000007_i64),
+        ("config", 20260829000008_i64),
+        ("log", 20260829000001_i64),
+        ("log", 20260829000002_i64),
+        ("log", 20260829000003_i64),
+        ("log", 20260829000004_i64),
+    ];
+    for (sequence, version) in required_migrations {
+        let present: Option<i64> = sqlx::query_scalar(
+            "SELECT version FROM _migrations WHERE sequence = $1 AND version = $2 LIMIT 1",
+        )
+        .bind(sequence)
+        .bind(version)
+        .fetch_optional(state.pool.any())
+        .await
+        .map_err(|_| {
+            AdminError::CapabilityUnavailable(
+                "capability migration bookkeeping is unavailable".to_string(),
+            )
+        })?;
+        if present != Some(version) {
+            return Err(AdminError::CapabilityUnavailable(format!(
+                "capability migration {sequence}/{version} is not applied"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn list_target_capabilities(
+    State(state): State<AdminState>,
+    axum::extract::Query(query): axum::extract::Query<CapabilityListQuery>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0);
+    let profiles = state.store.list_capability_profiles(limit, offset).await?;
+    let total = state.store.count_capability_profiles().await?;
+    let summaries: Vec<CapabilityProfileSummary> = profiles.iter().map(Into::into).collect();
+    let next_cursor = (offset.saturating_add(summaries.len() as u32) < total as u32)
+        .then(|| offset.saturating_add(summaries.len() as u32).to_string());
+    Ok(Json(json!({
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "next_cursor": next_cursor,
+        "items": summaries,
+        "entries": summaries
+    }))
+    .into_response())
+}
+
+async fn get_target_capability(
+    State(state): State<AdminState>,
+    Path(target_key): Path<String>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let key = tiygate_core::TargetKey(target_key);
+    let profile = state
+        .store
+        .get_capability_profile(&key)
+        .await?
+        .ok_or_else(|| AdminError::NotFound("target capability profile".to_string()))?;
+    let overrides = state
+        .store
+        .list_capability_overrides(&key)
+        .await?
+        .into_iter()
+        .map(capability_override_view)
+        .collect::<Vec<_>>();
+    let probe_job = state.store.latest_probe_job_for_target(&key).await?;
+    Ok(Json(json!({
+        "profile": capability_profile_view(&profile),
+        "overrides": overrides,
+        "probe_job": probe_job
+    }))
+    .into_response())
+}
+
+async fn list_target_capability_probe_runs(
+    State(state): State<AdminState>,
+    Path(target_key): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<CapabilityListQuery>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    if state
+        .store
+        .get_capability_profile(&tiygate_core::TargetKey(target_key.clone()))
+        .await?
+        .is_none()
+    {
+        return Err(AdminError::NotFound(
+            "target capability profile".to_string(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0);
+    let (items, total) = tiygate_store::log_sink::oltp::list_capability_probe_runs(
+        state.pool.as_ref(),
+        &target_key,
+        limit,
+        offset,
+    )
+    .await
+    .map_err(AdminError::Db)?;
+    let next_cursor = (offset.saturating_add(items.len() as u32) < total as u32)
+        .then(|| offset.saturating_add(items.len() as u32).to_string());
+    Ok(Json(json!({
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "next_cursor": next_cursor,
+        "items": items,
+        "entries": items
+    }))
+    .into_response())
+}
+
+/// Build the capability detail payload exposed to Admin callers. TargetKey is
+/// an intentionally opaque correlation identifier; credential scope material
+/// and canonical API bases are never returned by this endpoint.
+fn capability_profile_view(
+    profile: &tiygate_store::capabilities::TargetCapabilityProfile,
+) -> Value {
+    let now = chrono::Utc::now();
+    let profile_status = if profile
+        .fresh_until
+        .is_some_and(|fresh_until| fresh_until <= now)
+    {
+        tiygate_store::capabilities::ProfileStatus::Stale
+    } else {
+        profile.profile_status
+    };
+    let mut resolved_capabilities =
+        serde_json::to_value(&profile.resolved_capabilities).unwrap_or_else(|_| json!({}));
+    let mut observations =
+        serde_json::to_value(&profile.observations).unwrap_or_else(|_| json!([]));
+    sanitize_capability_json(&mut resolved_capabilities, 0);
+    sanitize_capability_json(&mut observations, 0);
+    let mut view = json!({
+        "target_key": profile.target_key,
+        "identity_version": profile.identity_version,
+        "provider_id": profile.provider_id,
+        "protocol_suite": profile.protocol_suite,
+        "endpoint_name": profile.endpoint_name,
+        "endpoint_version": profile.endpoint_version,
+        "dialect_id": profile.dialect_id,
+        "model_id": profile.model_id,
+        "schema_version": profile.schema_version,
+        "registry_version": profile.registry_version,
+        "baseline_version": profile.baseline_version,
+        "profile_status": profile_status,
+        "resolved_capabilities": resolved_capabilities,
+        "observations": observations,
+        "last_probe_suite_version": profile.last_probe_suite_version,
+        "last_probe_judge_version": profile.last_probe_judge_version,
+        "last_successful_probe_at": profile.last_successful_probe_at,
+        "last_probe_error_class": profile.last_probe_error_class,
+        "last_probe_error_redacted": profile.last_probe_error_redacted,
+        "fresh_until": profile.fresh_until,
+        "stale_until": profile.stale_until,
+        "created_at": profile.created_at,
+        "updated_at": profile.updated_at
+    });
+    const MAX_PROFILE_VIEW_BYTES: usize = 256 * 1024;
+    if serde_json::to_vec(&view)
+        .map(|encoded| encoded.len() > MAX_PROFILE_VIEW_BYTES)
+        .unwrap_or(true)
+    {
+        if let Some(object) = view.as_object_mut() {
+            object.insert("observations".to_string(), Value::Array(Vec::new()));
+            object.insert(
+                "resolved_capabilities".to_string(),
+                Value::Object(serde_json::Map::new()),
+            );
+            object.insert("profile_view_truncated".to_string(), Value::Bool(true));
+        }
+    }
+    view
+}
+
+fn sanitize_capability_json(value: &mut Value, depth: usize) {
+    const MAX_STRING_BYTES: usize = 4096;
+    const MAX_ARRAY_ITEMS: usize = 256;
+    if depth > 8 {
+        *value = json!("[TRUNCATED]");
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                let lower = key.to_ascii_lowercase();
+                if [
+                    "token",
+                    "secret",
+                    "password",
+                    "api_key",
+                    "credential",
+                    "authorization",
+                ]
+                .iter()
+                .any(|needle| lower.contains(needle))
+                {
+                    *child = json!("[REDACTED]");
+                } else {
+                    sanitize_capability_json(child, depth + 1);
+                }
+            }
+        }
+        Value::Array(items) => {
+            if items.len() > MAX_ARRAY_ITEMS {
+                items.truncate(MAX_ARRAY_ITEMS);
+            }
+            for child in items {
+                sanitize_capability_json(child, depth + 1);
+            }
+        }
+        Value::String(text) if text.len() > MAX_STRING_BYTES => {
+            let mut end = MAX_STRING_BYTES;
+            while !text.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            text.truncate(end);
+            text.push('…');
+        }
+        _ => {}
+    }
+}
+
+fn capability_override_view(
+    override_record: tiygate_store::capabilities::TargetCapabilityOverride,
+) -> Value {
+    let value = override_record.value.and_then(|value| {
+        let mut value = serde_json::to_value(value).ok()?;
+        sanitize_capability_json(&mut value, 0);
+        serde_json::to_vec(&value)
+            .ok()
+            .filter(|encoded| encoded.len() <= 16 * 1024)
+            .map_or_else(|| Some(json!({"truncated": true})), |_| Some(value))
+    });
+    json!({
+        "target_key": override_record.target_key,
+        "capability_id": override_record.capability_id,
+        "state": override_record.state,
+        "value": value,
+        "reason": truncate_admin_text(&override_record.reason, 2048),
+        "actor": truncate_admin_text(&override_record.actor, 256),
+        "expires_at": override_record.expires_at,
+        "created_at": override_record.created_at,
+        "updated_at": override_record.updated_at
+    })
+}
+
+fn truncate_admin_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}…", &value[..end])
+}
+
+fn validate_capability_setting(key: &str, value: &str) -> Result<(), String> {
+    use tiygate_store::settings_keys as sk;
+    let trimmed = value.trim();
+    if matches!(
+        key,
+        sk::CAPABILITY_PROBE_ENABLED | sk::RESPONSES_CRL_TOOL_PROMOTION_ENABLED
+    ) {
+        if !matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "true" | "false" | "1" | "0" | "yes" | "no" | "on" | "off"
+        ) {
+            return Err(format!("{key} must be a boolean"));
+        }
+        return Ok(());
+    }
+    let bounds = match key {
+        sk::CAPABILITY_PROBE_DAILY_BUDGET => Some((1_u64, 10_000_u64)),
+        sk::CAPABILITY_PROBE_GLOBAL_BUDGET => Some((1_u64, 100_000_u64)),
+        sk::CAPABILITY_PROBE_GLOBAL_CONCURRENCY
+        | sk::CAPABILITY_PROBE_PROVIDER_CONCURRENCY
+        | sk::CAPABILITY_PROBE_ACCOUNT_CONCURRENCY => Some((1_u64, 64_u64)),
+        _ => None,
+    };
+    if let Some((min, max)) = bounds {
+        let parsed = trimmed
+            .parse::<u64>()
+            .map_err(|_| format!("{key} must be an integer"))?;
+        if !(min..=max).contains(&parsed) {
+            return Err(format!("{key} must be between {min} and {max}"));
+        }
+    }
+    Ok(())
+}
+
+fn capability_idempotency_key(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+async fn begin_capability_idempotency(
+    state: &AdminState,
+    operation: &str,
+    headers: &HeaderMap,
+    payload: &Value,
+) -> Result<Option<(String, String, Option<Response>)>, AdminError> {
+    let Some(key) = capability_idempotency_key(headers) else {
+        return Ok(None);
+    };
+    match state
+        .store
+        .begin_capability_mutation(operation, key, payload)
+        .await?
+    {
+        CapabilityMutationIdempotency::New { request_hash } => {
+            Ok(Some((key.to_string(), request_hash, None)))
+        }
+        CapabilityMutationIdempotency::Replay { status, response } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+            Ok(Some((
+                key.to_string(),
+                String::new(),
+                Some((status, Json(response)).into_response()),
+            )))
+        }
+        CapabilityMutationIdempotency::Conflict(message) => {
+            Err(AdminError::IdempotencyConflict(message))
+        }
+    }
+}
+
+async fn start_target_capability_probe(
+    State(state): State<AdminState>,
+    Path(target_key): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<CapabilityProbeRequest>>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let key = tiygate_core::TargetKey(target_key);
+    let profile = state
+        .store
+        .get_capability_profile(&key)
+        .await?
+        .ok_or_else(|| AdminError::NotFound("target capability profile".to_string()))?;
+    let probe_set = body
+        .map(|Json(request)| request.probe_set)
+        .filter(|set| !set.is_empty())
+        .unwrap_or_else(|| tiygate_store::capabilities::manual_probe_set_for_profile(&profile));
+    let allowed = tiygate_protocols::capabilities::registry()
+        .iter()
+        .filter_map(|descriptor| descriptor.probe_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let applicable = tiygate_store::capabilities::manual_probe_set_for_profile(&profile)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if probe_set.len() > 32
+        || probe_set
+            .iter()
+            .any(|probe| !allowed.contains(probe.as_str()) || !applicable.contains(probe))
+    {
+        return Err(AdminError::InvalidCapability(
+            "probe_set contains an unknown or excessive probe id".to_string(),
+        ));
+    }
+    let idempotency_payload = json!({
+        "target_key": key,
+        "probe_set": probe_set,
+    });
+    let reservation = begin_capability_idempotency(
+        &state,
+        "target_capability_probe",
+        &headers,
+        &idempotency_payload,
+    )
+    .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
+    let audit_details = json!({
+        "target_key": key,
+        "probe_set": probe_set,
+        "reason": "admin_manual_probe"
+    });
+    let job = match state
+        .store
+        .enqueue_probe_job_with_audit(&key, &probe_set, 10, 3, "admin", &audit_details)
+        .await
+    {
+        Ok(job) => job,
+        Err(error) => {
+            if let Some((idempotency_key, request_hash)) = reservation.as_ref() {
+                let _ = state
+                    .store
+                    .release_capability_mutation(
+                        "target_capability_probe",
+                        idempotency_key,
+                        request_hash,
+                    )
+                    .await;
+            }
+            return Err(AdminError::Store(error));
+        }
+    };
+    if let Some((idempotency_key, request_hash)) = reservation {
+        state
+            .store
+            .complete_capability_mutation(
+                "target_capability_probe",
+                &idempotency_key,
+                &request_hash,
+                StatusCode::ACCEPTED.as_u16(),
+                &serde_json::to_value(&job).map_err(|error| {
+                    AdminError::Internal(format!("serialize probe job response: {error}"))
+                })?,
+            )
+            .await?;
+    }
+    Ok((StatusCode::ACCEPTED, Json(job)).into_response())
+}
+
+async fn upsert_target_capability_override(
+    State(state): State<AdminState>,
+    Path(target_key): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CapabilityOverrideRequest>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let key = tiygate_core::TargetKey(target_key);
+    let profile = state
+        .store
+        .get_capability_profile(&key)
+        .await?
+        .ok_or_else(|| AdminError::NotFound("target capability profile".to_string()))?;
+    let baseline =
+        tiygate_protocols::capabilities::baseline_for(&tiygate_core::WireProfileId::new(
+            profile.protocol_suite.clone(),
+            profile.endpoint_name.clone(),
+            profile.endpoint_version.clone(),
+            profile.dialect_id.clone(),
+        ));
+    let state_value = match request.state.trim().to_ascii_lowercase().as_str() {
+        "supported" => tiygate_core::CapabilityState::Supported,
+        "unsupported" => tiygate_core::CapabilityState::Unsupported,
+        "constrained" => tiygate_core::CapabilityState::Constrained,
+        "unknown" => tiygate_core::CapabilityState::Unknown,
+        _ => {
+            return Err(AdminError::InvalidCapability(
+                "invalid capability state".to_string(),
+            ))
+        }
+    };
+    let capability_id = tiygate_core::CapabilityId::from(request.capability_id.clone());
+    if capability_id.as_str().is_empty() || capability_id.as_str().len() > 256 {
+        return Err(AdminError::InvalidCapability(
+            "capability_id must be between 1 and 256 bytes".to_string(),
+        ));
+    }
+    if baseline.get(&capability_id) == Some(&tiygate_core::BaselineSupport::Forbidden)
+        && matches!(
+            state_value,
+            tiygate_core::CapabilityState::Supported | tiygate_core::CapabilityState::Constrained
+        )
+    {
+        return Err(AdminError::InvalidCapability(
+            "a protocol-forbidden capability cannot be overridden as supported".to_string(),
+        ));
+    }
+    let value = request
+        .value
+        .map(serde_json::from_value::<tiygate_core::CapabilityValue>)
+        .transpose()
+        .map_err(|error| {
+            AdminError::InvalidCapability(format!("invalid capability value: {error}"))
+        })?;
+    if let Some(descriptor) = tiygate_protocols::capabilities::descriptor_for(&capability_id) {
+        if let Some(value) = &value {
+            if value.kind() != descriptor.value_kind {
+                return Err(AdminError::InvalidCapability(format!(
+                    "capability value kind does not match {}",
+                    descriptor.id
+                )));
+            }
+        }
+        if state_value == tiygate_core::CapabilityState::Constrained && value.is_none() {
+            return Err(AdminError::InvalidCapability(
+                "constrained capability overrides require a value".to_string(),
+            ));
+        }
+        if state_value == tiygate_core::CapabilityState::Constrained
+            && value
+                .as_ref()
+                .is_some_and(tiygate_core::CapabilityValue::is_empty)
+        {
+            return Err(AdminError::InvalidCapability(
+                "constrained capability overrides require a non-empty value".to_string(),
+            ));
+        }
+        let mut observation = tiygate_core::CapabilityObservation::now(
+            capability_id.clone(),
+            state_value,
+            tiygate_core::EvidenceSource::ExplicitOverride,
+            1,
+        );
+        observation.value = value.clone();
+        tiygate_core::validate_capability_observation(descriptor, &observation)
+            .map_err(AdminError::InvalidCapability)?;
+    }
+    if request.reason.trim().is_empty() {
+        return Err(AdminError::InvalidCapability(
+            "override reason is required".to_string(),
+        ));
+    }
+    if request.reason.len() > 2048 {
+        return Err(AdminError::InvalidCapability(
+            "override reason exceeds 2048 bytes".to_string(),
+        ));
+    }
+    let now = chrono::Utc::now();
+    if request
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Err(AdminError::InvalidCapability(
+            "override expires_at must be in the future".to_string(),
+        ));
+    }
+    if request
+        .expires_at
+        .is_some_and(|expires_at| expires_at > now + chrono::Duration::days(30))
+    {
+        return Err(AdminError::InvalidCapability(
+            "override expires_at may not exceed 30 days".to_string(),
+        ));
+    }
+    // Hash only caller-supplied fields for idempotency.  Server timestamps
+    // are intentionally excluded; otherwise a retry with the same key/body
+    // would look like a different mutation a few microseconds later.
+    let idempotency_payload = json!({
+        "target_key": key,
+        "capability_id": capability_id,
+        "state": state_value,
+        "value": value,
+        "reason": request.reason,
+        "expires_at": request.expires_at,
+    });
+    let record = TargetCapabilityOverride {
+        target_key: key,
+        capability_id,
+        state: state_value,
+        value,
+        reason: request.reason,
+        actor: "admin".to_string(),
+        expires_at: request.expires_at,
+        created_at: now,
+        updated_at: now,
+    };
+    let reservation = begin_capability_idempotency(
+        &state,
+        "target_capability_override",
+        &headers,
+        &idempotency_payload,
+    )
+    .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
+    let audit_details = match serde_json::to_value(&record) {
+        Ok(value) => value,
+        Err(_) => json!({"redacted": true}),
+    };
+    if let Err(error) = state
+        .store
+        .upsert_capability_override_with_audit(
+            &record,
+            record.capability_id.as_str(),
+            &audit_details,
+        )
+        .await
+    {
+        if let Some((idempotency_key, request_hash)) = reservation.as_ref() {
+            let _ = state
+                .store
+                .release_capability_mutation(
+                    "target_capability_override",
+                    idempotency_key,
+                    request_hash,
+                )
+                .await;
+        }
+        return Err(error.into());
+    }
+    if let Some((idempotency_key, request_hash)) = reservation {
+        state
+            .store
+            .complete_capability_mutation(
+                "target_capability_override",
+                &idempotency_key,
+                &request_hash,
+                StatusCode::OK.as_u16(),
+                &serde_json::to_value(&record).map_err(|error| {
+                    AdminError::Internal(format!("serialize override response: {error}"))
+                })?,
+            )
+            .await?;
+    }
+    Ok((StatusCode::OK, Json(record)).into_response())
+}
+
+async fn delete_target_capability_override(
+    State(state): State<AdminState>,
+    Path((target_key, capability_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let idempotency_payload = json!({
+        "target_key": target_key,
+        "capability_id": capability_id
+    });
+    let reservation = begin_capability_idempotency(
+        &state,
+        "target_capability_override_delete",
+        &headers,
+        &idempotency_payload,
+    )
+    .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
+    let audit_details = json!({"target_key": target_key});
+    let removed = match state
+        .store
+        .delete_capability_override_with_audit(
+            &tiygate_core::TargetKey(target_key.clone()),
+            &tiygate_core::CapabilityId::from(capability_id.clone()),
+            "admin",
+            &audit_details,
+        )
+        .await
+    {
+        Ok(removed) => removed,
+        Err(error) => {
+            if let Some((idempotency_key, request_hash)) = reservation.as_ref() {
+                let _ = state
+                    .store
+                    .release_capability_mutation(
+                        "target_capability_override_delete",
+                        idempotency_key,
+                        request_hash,
+                    )
+                    .await;
+            }
+            return Err(AdminError::Store(error));
+        }
+    };
+    if !removed {
+        if let Some((idempotency_key, request_hash)) = reservation.as_ref() {
+            let _ = state
+                .store
+                .release_capability_mutation(
+                    "target_capability_override_delete",
+                    idempotency_key,
+                    request_hash,
+                )
+                .await;
+        }
+        return Err(AdminError::NotFound(
+            "target capability override".to_string(),
+        ));
+    }
+    if let Some((idempotency_key, request_hash)) = reservation {
+        state
+            .store
+            .complete_capability_mutation(
+                "target_capability_override_delete",
+                &idempotency_key,
+                &request_hash,
+                StatusCode::NO_CONTENT.as_u16(),
+                &json!({}),
+            )
+            .await?;
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn get_capability_registry(
+    axum::extract::Query(query): axum::extract::Query<CapabilityListQuery>,
+) -> Result<Response, AdminError> {
+    let registry = tiygate_protocols::capabilities::registry();
+    let limit = query.limit.unwrap_or(100).clamp(1, 500) as usize;
+    let offset = query.offset.unwrap_or(0) as usize;
+    let items = registry
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_cursor = (offset.saturating_add(items.len()) < registry.len())
+        .then(|| offset.saturating_add(items.len()).to_string());
+    Ok(Json(json!({
+        "total": registry.len(),
+        "limit": limit,
+        "offset": offset,
+        "next_cursor": next_cursor,
+        "contract_schema_version": 1,
+        "contract_summary": tiygate_protocols::capabilities::contract_summary(),
+        "items": items,
+        "entries": items
+    }))
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityMetricsQuery {
+    route_id: Option<String>,
+    shape_hash: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+async fn list_capability_metrics(
+    State(state): State<AdminState>,
+    axum::extract::Query(query): axum::extract::Query<CapabilityMetricsQuery>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    for (name, value) in [
+        ("since", query.since.as_deref()),
+        ("until", query.until.as_deref()),
+    ] {
+        if value.is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_err()) {
+            return Err(AdminError::BadRequest(format!(
+                "{name} must be an RFC3339 timestamp"
+            )));
+        }
+    }
+    let metrics = tiygate_store::log_sink::oltp::list_capability_shadow_metrics(
+        state.pool.as_ref(),
+        query.route_id.as_deref(),
+        query.shape_hash.as_deref(),
+        query.since.as_deref(),
+        query.until.as_deref(),
+    )
+    .await
+    .map_err(AdminError::Db)?;
+    let total = metrics.len() as u64;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500) as usize;
+    let offset = query.offset.unwrap_or(0) as usize;
+    let items = metrics
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_cursor =
+        (offset + items.len() < total as usize).then(|| (offset + items.len()).to_string());
+    Ok(Json(json!({
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "next_cursor": next_cursor,
+        "items": items,
+        "entries": items
+    }))
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityProbeWorkerRequest {
+    enabled: bool,
+    reason: String,
+}
+
+async fn update_capability_probe_worker(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<CapabilityProbeWorkerRequest>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    if request.reason.trim().is_empty() {
+        return Err(AdminError::BadRequest(
+            "probe worker reason is required".to_string(),
+        ));
+    }
+    if request.reason.len() > 2048 {
+        return Err(AdminError::BadRequest(
+            "probe worker reason exceeds 2048 bytes".to_string(),
+        ));
+    }
+    let idempotency_payload = json!({
+        "enabled": request.enabled,
+        "reason": request.reason
+    });
+    let reservation = begin_capability_idempotency(
+        &state,
+        "capability_probe_worker",
+        &headers,
+        &idempotency_payload,
+    )
+    .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
+    let key = tiygate_store::settings_keys::CAPABILITY_PROBE_ENABLED;
+    let before = state.store.get_setting(key).await?;
+    let details = json!({
+        "before": before,
+        "after": request.enabled,
+        "reason": request.reason
+    });
+    if let Err(error) = state
+        .store
+        .set_settings_batch_with_audit(
+            &[(
+                key.to_string(),
+                if request.enabled { "true" } else { "false" }.to_string(),
+                false,
+            )],
+            "admin",
+            "capability_probe_worker",
+            &details,
+        )
+        .await
+    {
+        if let Some((idempotency_key, request_hash)) = reservation.as_ref() {
+            let _ = state
+                .store
+                .release_capability_mutation(
+                    "capability_probe_worker",
+                    idempotency_key,
+                    request_hash,
+                )
+                .await;
+        }
+        return Err(AdminError::Store(error));
+    }
+    if let Some((idempotency_key, request_hash)) = reservation {
+        state
+            .store
+            .complete_capability_mutation(
+                "capability_probe_worker",
+                &idempotency_key,
+                &request_hash,
+                StatusCode::OK.as_u16(),
+                &json!({"enabled": request.enabled}),
+            )
+            .await?;
+    }
+    Ok(Json(json!({"enabled": request.enabled})).into_response())
+}
+
+async fn get_probe_job(
+    State(state): State<AdminState>,
+    Path(job_id): Path<String>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let job = state
+        .store
+        .get_probe_job(&job_id)
+        .await?
+        .ok_or_else(|| AdminError::NotFound(format!("probe job {job_id}")))?;
+    Ok(Json(job).into_response())
+}
+
+async fn list_capability_route_admissions(
+    State(state): State<AdminState>,
+    Path(route_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<CapabilityListQuery>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    if state.store.get_route(&route_id).await?.is_none() {
+        return Err(AdminError::NotFound(format!("route {route_id}")));
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0);
+    let entries = state
+        .store
+        .list_capability_route_admissions(&route_id, limit, offset)
+        .await?;
+    let total = state
+        .store
+        .count_capability_route_admissions(&route_id)
+        .await?;
+    let next_cursor = (offset.saturating_add(entries.len() as u32) < total as u32)
+        .then(|| offset.saturating_add(entries.len() as u32).to_string());
+    Ok(Json(json!({
+        "route_id": route_id,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "next_cursor": next_cursor,
+        "items": entries,
+        "entries": entries
+    }))
+    .into_response())
+}
+
+async fn upsert_capability_route_admission(
+    State(state): State<AdminState>,
+    Path(route_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CapabilityAdmissionRequest>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let route = state
+        .store
+        .get_route(&route_id)
+        .await?
+        .ok_or_else(|| AdminError::NotFound(format!("route {route_id}")))?;
+    let (required_ids, required_requirements) = normalize_admission_requirements(
+        &request.required_capabilities,
+        &request.required_requirements,
+    )?;
+    if request.reason.trim().is_empty() {
+        return Err(AdminError::InvalidCapability(
+            "admission reason is required".to_string(),
+        ));
+    }
+    if request.reason.len() > 2048 {
+        return Err(AdminError::InvalidCapability(
+            "admission reason exceeds 2048 bytes".to_string(),
+        ));
+    }
+    if request.mode == tiygate_core::CapabilityRoutingMode::Off {
+        return Err(AdminError::InvalidCapability(
+            "shape admission mode must be shadow or enforce".to_string(),
+        ));
+    }
+    let now = chrono::Utc::now();
+    if request
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Err(AdminError::InvalidCapability(
+            "admission expires_at must be in the future".to_string(),
+        ));
+    }
+    if request
+        .expires_at
+        .is_some_and(|expires_at| expires_at > now + chrono::Duration::days(30))
+    {
+        return Err(AdminError::InvalidCapability(
+            "admission expires_at may not exceed 30 days".to_string(),
+        ));
+    }
+    let expected_shape_hash =
+        tiygate_core::capability_shape_hash_from_requirements(&required_requirements);
+    let before_admission = state
+        .store
+        .get_capability_route_admission(route_id.as_str(), &expected_shape_hash)
+        .await?;
+    if request
+        .shape_hash
+        .as_deref()
+        .is_some_and(|shape_hash| !shape_hash.is_empty() && shape_hash != expected_shape_hash)
+    {
+        return Err(AdminError::InvalidCapability(
+            "shape_hash does not match required_requirements".to_string(),
+        ));
+    }
+    for id in &required_ids {
+        let Some(descriptor) = tiygate_protocols::capabilities::descriptor_for(id) else {
+            return Err(AdminError::InvalidCapability(format!(
+                "unknown capability {}",
+                id
+            )));
+        };
+        for requirement in required_requirements
+            .iter()
+            .filter(|requirement| &requirement.id == id)
+        {
+            if let Some(value) = requirement.value.as_ref() {
+                if value.kind() != descriptor.value_kind {
+                    return Err(AdminError::InvalidCapability(format!(
+                        "capability {} requirement value kind {:?} does not match {:?}",
+                        id,
+                        value.kind(),
+                        descriptor.value_kind
+                    )));
+                }
+                if descriptor.matcher == tiygate_core::CapabilityMatcher::Boolean
+                    && !matches!(value, tiygate_core::CapabilityValue::Bool(_))
+                {
+                    return Err(AdminError::InvalidCapability(format!(
+                        "capability {} requires a boolean value",
+                        id
+                    )));
+                }
+            }
+        }
+        if descriptor.routing_eligibility == tiygate_core::RoutingEligibility::Disabled {
+            return Err(AdminError::InvalidCapability(format!(
+                "capability {} is not eligible for routing",
+                id
+            )));
+        }
+        if request.mode == tiygate_core::CapabilityRoutingMode::Enforce
+            && (descriptor.routing_eligibility != tiygate_core::RoutingEligibility::EnforceEligible
+                || !tiygate_protocols::capabilities::enforce_eligible_ids().contains(&id.as_str()))
+        {
+            return Err(AdminError::InvalidCapability(format!(
+                "capability {} is not eligible for enforce",
+                id
+            )));
+        }
+    }
+
+    let mut report = build_shape_admission_report(&state, &route, &required_requirements).await?;
+    let gate_passed = report
+        .get("gate_passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let low_traffic_eligible = report
+        .get("low_traffic_eligible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if request.mode == tiygate_core::CapabilityRoutingMode::Enforce
+        && !gate_passed
+        && (!request.low_traffic_exception || !low_traffic_eligible)
+    {
+        return Err(AdminError::AdmissionRequired(
+            "capability shape has not passed the admission gate; a low_traffic_exception requires an eligible CRL probe/continuation report"
+                .to_string(),
+        ));
+    }
+    if let Some(object) = report.as_object_mut() {
+        object.insert(
+            "low_traffic_exception".to_string(),
+            Value::Bool(request.low_traffic_exception),
+        );
+        if request.low_traffic_exception {
+            object.insert("gate_passed_by_exception".to_string(), Value::Bool(true));
+        }
+    }
+    let expires_at = request.expires_at.or_else(|| {
+        (request.mode == tiygate_core::CapabilityRoutingMode::Enforce)
+            .then_some(now + chrono::Duration::days(7))
+    });
+    let admission = CapabilityRouteAdmission {
+        route_id: route_id.clone(),
+        capability_shape_hash: expected_shape_hash,
+        required_capabilities: required_ids,
+        required_requirements: required_requirements.clone(),
+        mode: request.mode,
+        gate_policy_version: 1,
+        report,
+        approved_by: (request.mode == tiygate_core::CapabilityRoutingMode::Enforce)
+            .then(|| "admin".to_string()),
+        approved_at: (request.mode == tiygate_core::CapabilityRoutingMode::Enforce).then_some(now),
+        expires_at,
+        revision: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    let idempotency_payload = json!({
+        "route_id": route_id,
+        "shape_hash": admission.capability_shape_hash,
+        "required_capabilities": admission.required_capabilities,
+        "required_requirements": admission.required_requirements,
+        "mode": admission.mode,
+        "expected_revision": request.expected_revision,
+        "expires_at": admission.expires_at,
+        "low_traffic_exception": request.low_traffic_exception,
+        "reason": request.reason
+    });
+    let reservation = begin_capability_idempotency(
+        &state,
+        "capability_route_admission",
+        &headers,
+        &idempotency_payload,
+    )
+    .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
+    let admission_audit_details = json!({
+        "diff": audit_details(
+            before_admission
+                .as_ref()
+                .and_then(|value| serde_json::to_value(value).ok())
+                .as_ref(),
+            serde_json::to_value(&admission).ok().as_ref(),
+        ),
+        "reason": request.reason,
+        "low_traffic_exception": request.low_traffic_exception,
+    });
+    let saved = match state
+        .store
+        .upsert_capability_route_admission_with_audit(
+            &admission,
+            request.expected_revision,
+            "admin",
+            if request.mode == tiygate_core::CapabilityRoutingMode::Enforce {
+                "enforce_approval"
+            } else {
+                "upsert"
+            },
+            &format!("{route_id}:{}", admission.capability_shape_hash),
+            &admission_audit_details,
+        )
+        .await
+    {
+        Ok(saved) => saved,
+        Err(error) => {
+            if let Some((idempotency_key, request_hash)) = reservation.as_ref() {
+                let _ = state
+                    .store
+                    .release_capability_mutation(
+                        "capability_route_admission",
+                        idempotency_key,
+                        request_hash,
+                    )
+                    .await;
+            }
+            return Err(match error {
+                StoreError::Invalid(message) if message.contains("revision") => {
+                    AdminError::Conflict(message)
+                }
+                other => AdminError::Store(other),
+            });
+        }
+    };
+    if let Some((idempotency_key, request_hash)) = reservation {
+        state
+            .store
+            .complete_capability_mutation(
+                "capability_route_admission",
+                &idempotency_key,
+                &request_hash,
+                StatusCode::OK.as_u16(),
+                &serde_json::to_value(&saved).map_err(|error| {
+                    AdminError::Internal(format!("serialize admission response: {error}"))
+                })?,
+            )
+            .await?;
+    }
+    Ok(Json(saved).into_response())
+}
+
+async fn delete_capability_route_admission(
+    State(state): State<AdminState>,
+    Path((route_id, shape_hash)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<CapabilityRevisionQuery>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let idempotency_payload = json!({
+        "route_id": route_id,
+        "shape_hash": shape_hash,
+        "expected_revision": query.expected_revision
+    });
+    let reservation = begin_capability_idempotency(
+        &state,
+        "capability_route_admission_delete",
+        &headers,
+        &idempotency_payload,
+    )
+    .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
+    let audit_details = json!({"route_id": route_id, "shape_hash": shape_hash});
+    let removed = match state
+        .store
+        .delete_capability_route_admission_with_audit(
+            &route_id,
+            &shape_hash,
+            query.expected_revision,
+            "admin",
+            &audit_details,
+        )
+        .await
+    {
+        Ok(removed) => removed,
+        Err(error) => {
+            if let Some((idempotency_key, request_hash)) = reservation.as_ref() {
+                let _ = state
+                    .store
+                    .release_capability_mutation(
+                        "capability_route_admission_delete",
+                        idempotency_key,
+                        request_hash,
+                    )
+                    .await;
+            }
+            return Err(AdminError::Store(error));
+        }
+    };
+    if !removed {
+        if let Some((idempotency_key, request_hash)) = reservation.as_ref() {
+            let _ = state
+                .store
+                .release_capability_mutation(
+                    "capability_route_admission_delete",
+                    idempotency_key,
+                    request_hash,
+                )
+                .await;
+        }
+        return Err(AdminError::NotFound(
+            "capability route admission".to_string(),
+        ));
+    }
+    if let Some((idempotency_key, request_hash)) = reservation {
+        state
+            .store
+            .complete_capability_mutation(
+                "capability_route_admission_delete",
+                &idempotency_key,
+                &request_hash,
+                StatusCode::NO_CONTENT.as_u16(),
+                &json!({}),
+            )
+            .await?;
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn build_shape_admission_report(
+    state: &AdminState,
+    route: &Route,
+    required_requirements: &[tiygate_core::CapabilityRequirement],
+) -> Result<Value, AdminError> {
+    let promotion_enabled = tiygate_store::settings_keys::get_bool(
+        state.store.as_ref(),
+        tiygate_store::settings_keys::RESPONSES_CRL_TOOL_PROMOTION_ENABLED,
+        false,
+    )
+    .await;
+    let runtime = state.store.config_store();
+    let targets = runtime
+        .routing_table
+        .resolve(&route.virtual_model)
+        .unwrap_or_default();
+    let required = required_requirements
+        .iter()
+        .map(|requirement| requirement.id.clone())
+        .collect::<Vec<_>>();
+    let expression = tiygate_core::RequirementExpr::all(
+        required_requirements
+            .iter()
+            .cloned()
+            .map(tiygate_core::RequirementExpr::Capability)
+            .collect::<Vec<_>>(),
+    );
+    let mut target_reports = Vec::new();
+    let mut resolved_pairs = 0usize;
+    let total_pairs = targets.len().saturating_mul(required.len());
+    let mut compatible_targets = 0usize;
+    let mut probe_error_count = 0usize;
+    let mut auth_error_count = 0usize;
+    let mut continuation_verified_targets = 0usize;
+    let now = chrono::Utc::now();
+    for target in targets {
+        let (key, _) = state.store.target_key_for(&target)?;
+        let profile = state.store.get_capability_profile(&key).await?;
+        let (status, missing, unknown) = if let Some(profile) = profile {
+            if profile.last_probe_error_class.is_some() {
+                probe_error_count += 1;
+                if profile.last_probe_error_class.as_deref() == Some("auth") {
+                    auth_error_count += 1;
+                }
+            }
+            // Re-apply current overrides instead of trusting the
+            // denormalized resolved JSON alone. Overrides are a separate
+            // evidence source and may have been written after the last
+            // probe result.
+            let overrides = state.store.list_capability_overrides(&key).await?;
+            let has_active_override = overrides
+                .iter()
+                .any(|record| record.expires_at.is_none_or(|expires_at| expires_at > now));
+            let fresh_valid = profile
+                .fresh_until
+                .is_some_and(|fresh_until| fresh_until > now);
+            let stale_grace_valid = profile
+                .stale_until
+                .is_some_and(|stale_until| stale_until > now);
+            let profile_versions_valid = profile.schema_version
+                == tiygate_store::capabilities::CAPABILITY_SCHEMA_VERSION
+                && profile.identity_version == 1
+                && profile.registry_version
+                    == tiygate_store::capabilities::CAPABILITY_REGISTRY_VERSION
+                && profile.baseline_version
+                    == tiygate_store::capabilities::CAPABILITY_BASELINE_VERSION
+                && profile.last_probe_suite_version
+                    == Some(tiygate_store::capabilities::PROBE_SUITE_VERSION)
+                && profile.last_probe_judge_version
+                    == Some(tiygate_store::capabilities::PROBE_JUDGE_VERSION);
+            if (!profile_versions_valid || (!fresh_valid && !stale_grace_valid))
+                && !has_active_override
+            {
+                ("stale", required.clone(), Vec::new())
+            } else {
+                let mut observations = if profile_versions_valid {
+                    profile.observations.clone()
+                } else {
+                    // Future-version probe/registry observations are retained
+                    // for diagnostics but cannot participate in a current
+                    // admission. Explicit overrides are reapplied below.
+                    Vec::new()
+                };
+                if stale_grace_valid && !fresh_valid {
+                    for observation in &mut observations {
+                        if observation
+                            .expires_at
+                            .is_some_and(|expires_at| expires_at <= now)
+                        {
+                            observation.expires_at = None;
+                        }
+                    }
+                }
+                for override_record in overrides {
+                    if override_record
+                        .expires_at
+                        .is_some_and(|expires_at| expires_at <= now)
+                    {
+                        continue;
+                    }
+                    let mut observation = tiygate_core::CapabilityObservation::now(
+                        override_record.capability_id,
+                        override_record.state,
+                        tiygate_core::EvidenceSource::ExplicitOverride,
+                        1,
+                    );
+                    observation.value = override_record.value;
+                    observation.expires_at = override_record.expires_at;
+                    observations.push(observation);
+                }
+                let baseline = tiygate_protocols::capabilities::baseline_for(
+                    &tiygate_core::WireProfileId::new(
+                        profile.protocol_suite.clone(),
+                        profile.endpoint_name.clone(),
+                        profile.endpoint_version.clone(),
+                        profile.dialect_id.clone(),
+                    ),
+                );
+                let resolved = tiygate_core::resolve_capabilities_with_matchers(
+                    &baseline,
+                    &tiygate_protocols::capabilities::matcher_map(),
+                    observations,
+                    now,
+                );
+                let report = admission_compatibility_report(
+                    &resolved,
+                    &expression,
+                    required_requirements,
+                    &target,
+                    promotion_enabled,
+                );
+                if resolved
+                    .get(&tiygate_core::CapabilityId::from(
+                        "tools.function.continuation",
+                    ))
+                    .state
+                    == tiygate_core::CapabilityState::Supported
+                    && resolved
+                        .get(&tiygate_core::CapabilityId::from(
+                            "tools.function.continuation",
+                        ))
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| {
+                            matches!(
+                                observation.source,
+                                tiygate_core::EvidenceSource::SemanticProbe
+                                    | tiygate_core::EvidenceSource::SuccessfulTraffic
+                            )
+                        })
+                {
+                    continuation_verified_targets = continuation_verified_targets.saturating_add(1);
+                }
+                let crl_promotable = required.iter().any(|id| {
+                    id.as_str() == "tools.crl.additional_tools"
+                        && resolved.get(id).state == tiygate_core::CapabilityState::Unknown
+                        && promotion_enabled
+                        && target.api_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses
+                        && report.compatible
+                });
+                let resolved = required
+                    .iter()
+                    .filter(|id| resolved.get(id).state != tiygate_core::CapabilityState::Unknown)
+                    .count()
+                    + usize::from(crl_promotable);
+                resolved_pairs = resolved_pairs.saturating_add(resolved);
+                (
+                    if report.compatible {
+                        "compatible"
+                    } else {
+                        "incompatible"
+                    },
+                    report.missing,
+                    report.unknown,
+                )
+            }
+        } else {
+            ("unknown", Vec::new(), required.clone())
+        };
+        if status == "compatible" {
+            compatible_targets += 1;
+        }
+        target_reports.push(json!({
+            "target_key": key,
+            "status": status,
+            "missing": missing.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "unknown": unknown.iter().map(ToString::to_string).collect::<Vec<_>>()
+        }));
+    }
+    let profile_coverage = if total_pairs == 0 {
+        0.0
+    } else {
+        resolved_pairs as f64 / total_pairs as f64
+    };
+    let shape_hash = tiygate_core::capability_shape_hash_from_requirements(required_requirements);
+    let persisted_metrics = tiygate_store::log_sink::oltp::list_capability_shadow_metrics(
+        state.pool.as_ref(),
+        Some(&route.id),
+        Some(&shape_hash),
+        None,
+        None,
+    )
+    .await
+    .map_err(AdminError::Db)?;
+    let metric = persisted_metrics.first();
+    let traffic_sample_count = metric.map_or(0, |value| value.relevant_requests);
+    let compatible_shape_coverage = metric.map_or(0.0, |value| value.compatible_shape_coverage);
+    let planner_unknown_rate = metric.map_or(0.0, |value| value.planner_unknown_rate);
+    let verified_success_disagreements =
+        metric.map_or(0, |value| value.verified_success_disagreements);
+    let verified_success_disagreement_rate =
+        metric.map_or(0.0, |value| value.verified_success_disagreement_rate);
+    let probe_terminal_error_rate = metric.map_or_else(
+        || {
+            if target_reports.is_empty() {
+                0.0
+            } else {
+                probe_error_count as f64 / target_reports.len() as f64
+            }
+        },
+        |value| {
+            value
+                .probe_terminal_error_rate
+                .max(if target_reports.is_empty() {
+                    0.0
+                } else {
+                    probe_error_count as f64 / target_reports.len() as f64
+                })
+        },
+    );
+    let planner_internal_error_rate = metric.map_or(0.0, |value| value.planner_internal_error_rate);
+    let telemetry_gap = metric.is_some_and(|value| value.telemetry_gap);
+    let observation_window_seconds = metric.map_or(0, |value| value.observation_window_seconds);
+    let observation_window_complete = metric.is_some_and(|value| {
+        value.observation_window_complete && observation_window_seconds >= 24 * 60 * 60
+    });
+    let planning_latency_p95_micros = metric.map_or(0, |value| value.planning_latency_p95_micros);
+    let metric_truncated = metric.is_some_and(|value| value.truncated);
+    let low_traffic_eligible = required
+        .iter()
+        .any(|id| id.as_str() == "tools.crl.additional_tools")
+        && profile_coverage == 1.0
+        && compatible_targets > 0
+        && continuation_verified_targets > 0
+        && planner_unknown_rate == 0.0
+        && planner_internal_error_rate == 0.0
+        && !telemetry_gap
+        && auth_error_count == 0;
+    // The default admission gate follows §9.5: a complete profile, one
+    // compatible target, zero unknown planner decisions, and at least 100
+    // relevant requests in the observation window. Low-traffic exceptions
+    // are explicitly audited by the caller.
+    let crl_shape_requires_continuation = required
+        .iter()
+        .any(|id| id.as_str() == "tools.crl.additional_tools");
+    let gate_passed = profile_coverage == 1.0
+        && compatible_targets > 0
+        && (!crl_shape_requires_continuation || continuation_verified_targets > 0)
+        && traffic_sample_count >= 100
+        && compatible_shape_coverage == 1.0
+        && planner_unknown_rate == 0.0
+        && verified_success_disagreements == 0
+        && verified_success_disagreement_rate == 0.0
+        && probe_terminal_error_rate <= 0.05
+        && planner_internal_error_rate == 0.0
+        && !telemetry_gap
+        && observation_window_complete
+        && metric.is_some_and(|value| value.minimum_sample_met)
+        && !metric_truncated
+        && planning_latency_p95_micros <= 1_000
+        && auth_error_count == 0;
+    Ok(json!({
+        "gate_policy_version": 1,
+        "registry_version": tiygate_store::capabilities::CAPABILITY_REGISTRY_VERSION,
+        "baseline_version": tiygate_store::capabilities::CAPABILITY_BASELINE_VERSION,
+        "shape_hash_version": tiygate_core::CAPABILITY_SHAPE_HASH_VERSION,
+        "route_id": route.id,
+        "required_capabilities": required.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "target_count": target_reports.len(),
+        "compatible_target_count": compatible_targets,
+        "profile_resolution_coverage": profile_coverage,
+        "compatible_shape_coverage": compatible_shape_coverage,
+        "traffic_sample_count": traffic_sample_count,
+        "planner_unknown_rate": planner_unknown_rate,
+        "verified_success_disagreements": verified_success_disagreements,
+        "verified_success_disagreement_rate": verified_success_disagreement_rate,
+        "probe_terminal_error_rate": probe_terminal_error_rate,
+        "probe_terminal_errors": metric.map_or(0, |value| value.probe_terminal_errors),
+        "probe_auth_errors": metric.map_or(auth_error_count as u64, |value| value.probe_auth_errors),
+        "planner_internal_errors": metric.map_or(0, |value| value.planner_internal_errors),
+        "planner_internal_error_rate": planner_internal_error_rate,
+        "has_samples": metric.is_some_and(|value| value.has_samples),
+        "minimum_sample_met": metric.is_some_and(|value| value.minimum_sample_met),
+        "telemetry_gap": telemetry_gap,
+        "probe_auth_error_count": auth_error_count,
+        "planning_latency_p95_micros": planning_latency_p95_micros,
+        "observation_window_seconds": observation_window_seconds,
+        "observation_window_complete": observation_window_complete,
+        "metric_truncated": metric_truncated,
+        "continuation_verified_target_count": continuation_verified_targets,
+        "low_traffic_eligible": low_traffic_eligible,
+        "gate_passed": gate_passed,
+        "targets": target_reports
+    }))
+}
+
+fn admission_compatibility_report(
+    capabilities: &tiygate_core::ResolvedTargetCapabilities,
+    expression: &tiygate_core::RequirementExpr,
+    required_requirements: &[tiygate_core::CapabilityRequirement],
+    target: &tiygate_core::RoutingTarget,
+    promotion_enabled: bool,
+) -> tiygate_core::CompatibilityReport {
+    let native = tiygate_core::compatibility_report(capabilities, expression);
+    let crl_id = tiygate_core::CapabilityId::from("tools.crl.additional_tools");
+    let required_ids = required_requirements
+        .iter()
+        .map(|requirement| requirement.id.clone())
+        .collect::<Vec<_>>();
+    if !promotion_enabled
+        || !required_ids.contains(&crl_id)
+        || target.api_protocol.suite != tiygate_core::ProtocolSuite::OpenAiResponses
+        || !matches!(
+            target.effective_egress_dialect_id(),
+            "auto" | "openai-responses-standard" | "openai-responses-codex-lite"
+        )
+        || capabilities.satisfies(&tiygate_core::RequirementExpr::required(crl_id.clone()))
+    {
+        return native;
+    }
+    // A standard Responses target may satisfy a CRL shape through the same
+    // promotion transform used by the request planner. Remove only the CRL
+    // carrier requirement and require every concrete nested tool capability.
+    let promotion = tiygate_core::RequirementExpr::all(
+        required_requirements
+            .iter()
+            .filter(|requirement| requirement.id != crl_id)
+            .cloned()
+            .map(tiygate_core::RequirementExpr::Capability)
+            .collect::<Vec<_>>(),
+    );
+    let promotion_report = tiygate_core::compatibility_report(capabilities, &promotion);
+    if promotion_report.compatible {
+        promotion_report
+    } else {
+        native
+    }
 }
 
 // ---- provider model discovery ----
@@ -1565,13 +3355,31 @@ fn provider_snapshot(p: &Provider) -> serde_json::Value {
     })
 }
 
-/// Build a JSON snapshot of a route, including full target details.
+/// Build a redacted JSON snapshot of a route. Target credential and URL
+/// override values are represented only by presence flags.
 fn route_snapshot(r: &Route) -> serde_json::Value {
+    let targets = r
+        .targets
+        .iter()
+        .map(|target| {
+            json!({
+                "provider_id": target.provider_id,
+                "model_id": target.model_id,
+                "weight": target.weight,
+                "enabled": target.enabled,
+                "egress_dialect_id": target.egress_dialect_id,
+                "account_label_present": target.account_label.is_some(),
+                "api_key_override_configured": target.api_key_override.is_some(),
+                "api_base_override_configured": target.api_base_override.is_some()
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "id": r.id,
         "virtual_model": r.virtual_model,
-        "targets": r.targets,
+        "targets": targets,
         "routing_strategy": r.routing_strategy,
+        "capability_routing_mode": r.capability_routing_mode,
         "model_metadata": r.model_metadata,
         "enabled": r.enabled,
     })
@@ -1891,6 +3699,7 @@ async fn create_provider(
             req.enabled.unwrap_or(true),
         )
         .await?;
+    enqueue_provider_capability_jobs(&state, &p.id).await?;
     let snap = provider_snapshot(&p);
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
@@ -2019,6 +3828,7 @@ async fn update_provider(
             )
             .await?
     };
+    enqueue_provider_capability_jobs(&state, &p.id).await?;
     let snap = provider_snapshot(&p);
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
@@ -2238,13 +4048,15 @@ async fn list_provider_catalog() -> Result<Response, AdminError> {
 
 // ---- routes ----
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RouteRequest {
     id: Option<String>,
     virtual_model: String,
     targets: Vec<RouteTarget>,
     #[serde(default)]
     routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
+    #[serde(default)]
+    capability_routing_mode: Option<tiygate_core::CapabilityRoutingMode>,
     #[serde(default)]
     model_metadata: Option<ModelMetadata>,
     enabled: Option<bool>,
@@ -2254,9 +4066,11 @@ struct RouteRequest {
 struct RouteView {
     id: String,
     virtual_model: String,
-    targets: Vec<RouteTarget>,
+    targets: Vec<RouteTargetView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability_routing_mode: Option<tiygate_core::CapabilityRoutingMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_metadata: Option<ModelMetadata>,
     enabled: bool,
@@ -2264,17 +4078,104 @@ struct RouteView {
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Route target representation safe for the Admin read surface. Secrets and
+/// URL override values are accepted on writes but never echoed back; only
+/// presence flags are returned so the UI can explain that an override exists.
+#[derive(Debug, Serialize)]
+struct RouteTargetView {
+    provider_id: String,
+    model_id: String,
+    weight: f64,
+    enabled: bool,
+    account_label_present: bool,
+    api_key_override_configured: bool,
+    api_base_override_configured: bool,
+    egress_dialect_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_status: Option<tiygate_store::capabilities::ProfileStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_job_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability_summary: Option<Value>,
+}
+
 impl From<Route> for RouteView {
     fn from(r: Route) -> Self {
         Self {
             id: r.id,
             virtual_model: r.virtual_model,
-            targets: r.targets,
+            targets: r
+                .targets
+                .into_iter()
+                .map(|target| RouteTargetView {
+                    provider_id: target.provider_id,
+                    model_id: target.model_id,
+                    weight: target.weight,
+                    enabled: target.enabled,
+                    account_label_present: target.account_label.is_some(),
+                    api_key_override_configured: target.api_key_override.is_some(),
+                    api_base_override_configured: target.api_base_override.is_some(),
+                    egress_dialect_id: target.egress_dialect_id,
+                    target_key: None,
+                    profile_status: None,
+                    probe_job_status: None,
+                    capability_summary: None,
+                })
+                .collect(),
             routing_strategy: r.routing_strategy,
+            capability_routing_mode: r.capability_routing_mode,
             model_metadata: r.model_metadata,
             enabled: r.enabled,
             created_at: r.created_at,
             updated_at: r.updated_at,
+        }
+    }
+}
+
+async fn enrich_route_view(state: &AdminState, route: &Route, view: &mut RouteView) {
+    let runtime_targets = state
+        .store
+        .config_store()
+        .routing_table
+        .resolve(&route.virtual_model)
+        .unwrap_or_default();
+    let mut used_runtime_targets = std::collections::HashSet::new();
+    for target_view in &mut view.targets {
+        let Some((runtime_index, target)) =
+            runtime_targets.iter().enumerate().find(|(index, target)| {
+                !used_runtime_targets.contains(index)
+                    && target.provider_id == target_view.provider_id
+                    && target.model_id == target_view.model_id
+                    && target.effective_egress_dialect_id()
+                        == target_view.egress_dialect_id.as_deref().unwrap_or("auto")
+                    && target.account_label.as_ref().is_some_and(|account| {
+                        target_view.account_label_present && !account.is_empty()
+                    }) == target_view.account_label_present
+            })
+        else {
+            continue;
+        };
+        used_runtime_targets.insert(runtime_index);
+        let Ok((key, _)) = state.store.target_key_for(target) else {
+            continue;
+        };
+        target_view.target_key = Some(key.0.clone());
+        if let Ok(Some(profile)) = state.store.get_capability_profile(&key).await {
+            let summary = tiygate_store::capabilities::CapabilityProfileSummary::from(&profile);
+            target_view.profile_status = Some(summary.profile_status);
+            target_view.capability_summary = Some(json!({
+                "supported": summary.supported,
+                "unsupported": summary.unsupported,
+                "constrained": summary.constrained,
+                "unknown": summary.unknown,
+                "fresh_until": summary.fresh_until,
+                "stale_until": summary.stale_until
+            }));
+        }
+        if let Ok(Some(job)) = state.store.latest_probe_job_for_target(&key).await {
+            target_view.probe_job_status = Some(job.status);
         }
     }
 }
@@ -2286,6 +4187,44 @@ struct RouteListQuery {
     offset: Option<u32>,
 }
 
+/// Enqueue the minimal capability bundle for every enabled runtime Target in
+/// a route. The DB-backed profile/job methods are idempotent, so route updates
+/// and repeated refreshes do not create duplicate work.
+async fn enqueue_route_capability_jobs(
+    state: &AdminState,
+    route: &Route,
+) -> Result<(), AdminError> {
+    let runtime = state.store.config_store();
+    let Some(targets) = runtime.routing_table.resolve(&route.virtual_model) else {
+        return Ok(());
+    };
+    for target in targets {
+        let probe_set = tiygate_store::capabilities::default_probe_set_for_target(&target);
+        state
+            .store
+            .ensure_target_capability(&target, &probe_set)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn enqueue_provider_capability_jobs(
+    state: &AdminState,
+    provider_id: &str,
+) -> Result<(), AdminError> {
+    let (routes, _) = state.store.list_routes_paginated(500, 0).await?;
+    for route in routes {
+        if route
+            .targets
+            .iter()
+            .any(|target| target.provider_id == provider_id)
+        {
+            enqueue_route_capability_jobs(state, &route).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn list_routes(
     State(state): State<AdminState>,
     axum::extract::Query(q): axum::extract::Query<RouteListQuery>,
@@ -2293,11 +4232,20 @@ async fn list_routes(
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let offset = q.offset.unwrap_or(0);
     let (routes, total) = state.store.list_routes_paginated(limit, offset).await?;
-    let entries: Vec<RouteView> = routes.into_iter().map(Into::into).collect();
+    let mut entries = Vec::with_capacity(routes.len());
+    for route in routes {
+        let mut view = RouteView::from(route.clone());
+        enrich_route_view(&state, &route, &mut view).await;
+        entries.push(view);
+    }
+    let next_cursor = (offset.saturating_add(entries.len() as u32) < total as u32)
+        .then(|| offset.saturating_add(entries.len() as u32).to_string());
     Ok(Json(json!({
         "total": total,
         "limit": limit,
         "offset": offset,
+        "next_cursor": next_cursor,
+        "items": entries,
         "entries": entries
     }))
     .into_response())
@@ -2312,7 +4260,9 @@ async fn get_route(
         .get_route(&id)
         .await?
         .ok_or_else(|| AdminError::NotFound(format!("route {id}")))?;
-    Ok(Json(RouteView::from(r)).into_response())
+    let mut view = RouteView::from(r.clone());
+    enrich_route_view(&state, &r, &mut view).await;
+    Ok(Json(view).into_response())
 }
 
 /// Best-effort initialization of virtual-model metadata for `create_route`
@@ -2362,81 +4312,326 @@ fn auto_resolve_model_metadata(
 
 async fn create_route(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(req): Json<RouteRequest>,
 ) -> Result<Response, AdminError> {
-    let id = req.id.unwrap_or_else(|| Uuid::now_v7().to_string());
+    let id = req.id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
+    let idempotency_payload = json!({
+        "route_id": id,
+        "request": serde_json::to_value(&req).map_err(|error| {
+            AdminError::Internal(format!("serialize route request: {error}"))
+        })?
+    });
+    let reservation =
+        begin_capability_idempotency(&state, "route_create", &headers, &idempotency_payload)
+            .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
+    if let Err(error) = ensure_route_mode_allowed(&state, &id, req.capability_routing_mode).await {
+        if let Some((key, hash)) = reservation.as_ref() {
+            let _ = state
+                .store
+                .release_capability_mutation("route_create", key, hash)
+                .await;
+        }
+        return Err(error);
+    }
     let model_metadata = match req.model_metadata {
         Some(m) => Some(m),
         None => auto_resolve_model_metadata(&state, &req.virtual_model, &req.targets),
     };
-    let r = state
+    let audit_after = json!({
+        "id": id,
+        "virtual_model": req.virtual_model,
+        "target_count": req.targets.len(),
+        "routing_strategy": req.routing_strategy,
+        "capability_routing_mode": req.capability_routing_mode,
+        "enabled": req.enabled.unwrap_or(true),
+    });
+    let audit = audit_details(None, Some(&audit_after));
+    let r = match state
         .store
-        .upsert_route(
+        .upsert_route_with_mode_with_audit(
+            tiygate_store::config_store::RouteUpsert {
+                id: &id,
+                virtual_model: &req.virtual_model,
+                targets: &req.targets,
+                routing_strategy: req.routing_strategy,
+                capability_routing_mode: req.capability_routing_mode,
+                model_metadata: model_metadata.as_ref(),
+                enabled: req.enabled.unwrap_or(true),
+            },
+            "admin",
+            "upsert",
             &id,
-            &req.virtual_model,
-            &req.targets,
-            req.routing_strategy,
-            model_metadata.as_ref(),
-            req.enabled.unwrap_or(true),
+            &audit,
         )
-        .await?;
-    let snap = route_snapshot(&r);
-    let _ = tiygate_store::audit::record(
-        state.pool.as_ref(),
-        "admin",
-        "upsert",
-        "route",
-        &r.id,
-        &audit_details(None, Some(&snap)),
-    )
-    .await;
-    Ok((StatusCode::CREATED, Json(RouteView::from(r))).into_response())
+        .await
+    {
+        Ok(route) => route,
+        Err(error) => {
+            if let Some((key, hash)) = reservation.as_ref() {
+                let _ = state
+                    .store
+                    .release_capability_mutation("route_create", key, hash)
+                    .await;
+            }
+            return Err(error.into());
+        }
+    };
+    let mut view = RouteView::from(r.clone());
+    enrich_route_view(&state, &r, &mut view).await;
+    if let Some((key, hash)) = reservation {
+        let response = serde_json::to_value(&view)
+            .map_err(|error| AdminError::Internal(format!("serialize route response: {error}")))?;
+        state
+            .store
+            .complete_capability_mutation(
+                "route_create",
+                &key,
+                &hash,
+                StatusCode::CREATED.as_u16(),
+                &response,
+            )
+            .await?;
+    }
+    Ok((StatusCode::CREATED, Json(view)).into_response())
 }
 
 async fn update_route(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<RouteRequest>,
 ) -> Result<Response, AdminError> {
-    let before = state
-        .store
-        .get_route(&id)
-        .await
-        .ok()
-        .flatten()
-        .map(|r| route_snapshot(&r));
+    let idempotency_payload = json!({
+        "route_id": id,
+        "request": serde_json::to_value(&req).map_err(|error| {
+            AdminError::Internal(format!("serialize route request: {error}"))
+        })?
+    });
+    let reservation =
+        begin_capability_idempotency(&state, "route_update", &headers, &idempotency_payload)
+            .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
+    let existing = match state.store.get_route(&id).await {
+        Ok(route) => route,
+        Err(error) => {
+            if let Some((key, hash)) = reservation.as_ref() {
+                let _ = state
+                    .store
+                    .release_capability_mutation("route_update", key, hash)
+                    .await;
+            }
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = ensure_route_mode_allowed(&state, &id, req.capability_routing_mode).await {
+        if let Some((key, hash)) = reservation.as_ref() {
+            let _ = state
+                .store
+                .release_capability_mutation("route_update", key, hash)
+                .await;
+        }
+        return Err(error);
+    }
+    let before = existing.as_ref().map(route_snapshot);
+    let targets = preserve_route_target_secrets(existing.as_ref(), req.targets);
     let model_metadata = match req.model_metadata {
         Some(m) => Some(m),
-        None => auto_resolve_model_metadata(&state, &req.virtual_model, &req.targets),
+        None => auto_resolve_model_metadata(&state, &req.virtual_model, &targets),
     };
-    let r = state
+    let audit_after = json!({
+        "id": id,
+        "virtual_model": req.virtual_model,
+        "target_count": targets.len(),
+        "routing_strategy": req.routing_strategy,
+        "capability_routing_mode": req.capability_routing_mode,
+        "enabled": req.enabled.unwrap_or(true),
+    });
+    let audit = audit_details(before.as_ref(), Some(&audit_after));
+    let r = match state
         .store
-        .upsert_route(
+        .upsert_route_with_mode_with_audit(
+            tiygate_store::config_store::RouteUpsert {
+                id: &id,
+                virtual_model: &req.virtual_model,
+                targets: &targets,
+                routing_strategy: req.routing_strategy,
+                capability_routing_mode: req.capability_routing_mode,
+                model_metadata: model_metadata.as_ref(),
+                enabled: req.enabled.unwrap_or(true),
+            },
+            "admin",
+            "upsert",
             &id,
-            &req.virtual_model,
-            &req.targets,
-            req.routing_strategy,
-            model_metadata.as_ref(),
-            req.enabled.unwrap_or(true),
+            &audit,
         )
+        .await
+    {
+        Ok(route) => route,
+        Err(error) => {
+            if let Some((key, hash)) = reservation.as_ref() {
+                let _ = state
+                    .store
+                    .release_capability_mutation("route_update", key, hash)
+                    .await;
+            }
+            return Err(error.into());
+        }
+    };
+    let mut view = RouteView::from(r.clone());
+    enrich_route_view(&state, &r, &mut view).await;
+    if let Some((key, hash)) = reservation {
+        let response = serde_json::to_value(&view)
+            .map_err(|error| AdminError::Internal(format!("serialize route response: {error}")))?;
+        state
+            .store
+            .complete_capability_mutation(
+                "route_update",
+                &key,
+                &hash,
+                StatusCode::OK.as_u16(),
+                &response,
+            )
+            .await?;
+    }
+    Ok(Json(view).into_response())
+}
+
+async fn ensure_route_mode_allowed(
+    state: &AdminState,
+    route_id: &str,
+    mode: Option<tiygate_core::CapabilityRoutingMode>,
+) -> Result<(), AdminError> {
+    if mode != Some(tiygate_core::CapabilityRoutingMode::Enforce) {
+        return Ok(());
+    }
+    let admissions = state
+        .store
+        .list_capability_route_admissions(route_id, 500, 0)
         .await?;
-    let snap = route_snapshot(&r);
-    let _ = tiygate_store::audit::record(
-        state.pool.as_ref(),
-        "admin",
-        "upsert",
-        "route",
-        &r.id,
-        &audit_details(before.as_ref(), Some(&snap)),
-    )
-    .await;
-    Ok(Json(RouteView::from(r)).into_response())
+    if admissions.into_iter().any(is_valid_enforce_admission) {
+        return Ok(());
+    }
+    Err(AdminError::AdmissionRequired(
+        "route enforce requires at least one valid capability-shape admission".to_string(),
+    ))
+}
+
+fn is_valid_enforce_admission(
+    admission: tiygate_store::capabilities::CapabilityRouteAdmission,
+) -> bool {
+    let requirements = if admission.required_requirements.is_empty() {
+        admission
+            .required_capabilities
+            .iter()
+            .cloned()
+            .map(tiygate_core::CapabilityRequirement::required)
+            .collect::<Vec<_>>()
+    } else {
+        admission.required_requirements.clone()
+    };
+    let legacy_shape = admission.required_requirements.is_empty();
+    admission.mode == tiygate_core::CapabilityRoutingMode::Enforce
+        && admission.gate_policy_version == 1
+        && admission
+            .expires_at
+            .is_none_or(|expires_at| expires_at > chrono::Utc::now())
+        && !admission
+            .report
+            .get("telemetry_gap")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        && tiygate_core::capability_shape_hash_from_requirements(&requirements)
+            == admission.capability_shape_hash
+        && (admission
+            .report
+            .get("registry_version")
+            .and_then(Value::as_u64)
+            .map_or(legacy_shape, |version| {
+                version == u64::from(tiygate_store::capabilities::CAPABILITY_REGISTRY_VERSION)
+            }))
+        && (admission
+            .report
+            .get("baseline_version")
+            .and_then(Value::as_u64)
+            .map_or(legacy_shape, |version| {
+                version == u64::from(tiygate_store::capabilities::CAPABILITY_BASELINE_VERSION)
+            }))
+        && (admission
+            .report
+            .get("shape_hash_version")
+            .and_then(Value::as_str)
+            .map_or(legacy_shape, |version| {
+                version == tiygate_core::CAPABILITY_SHAPE_HASH_VERSION
+            }))
+        && requirements.iter().all(|requirement| {
+            tiygate_protocols::capabilities::enforce_eligible_ids()
+                .contains(&requirement.id.as_str())
+        })
+        && (admission
+            .report
+            .get("gate_passed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || admission
+                .report
+                .get("gate_passed_by_exception")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+}
+
+fn preserve_route_target_secrets(
+    existing: Option<&Route>,
+    mut requested: Vec<RouteTarget>,
+) -> Vec<RouteTarget> {
+    let Some(existing) = existing else {
+        return requested;
+    };
+    for (index, target) in requested.iter_mut().enumerate() {
+        let previous = existing
+            .targets
+            .iter()
+            .find(|candidate| {
+                candidate.provider_id == target.provider_id
+                    && candidate.model_id == target.model_id
+                    && candidate.egress_dialect_id == target.egress_dialect_id
+            })
+            .or_else(|| existing.targets.get(index));
+        let Some(previous) = previous else {
+            continue;
+        };
+        if target.account_label.is_none() {
+            target.account_label = previous.account_label.clone();
+        }
+        if target.api_key_override.is_none() {
+            target.api_key_override = previous.api_key_override.clone();
+        }
+        if target.api_base_override.is_none() {
+            target.api_base_override = previous.api_base_override.clone();
+        }
+    }
+    requested
 }
 
 async fn delete_route(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, AdminError> {
+    let reservation =
+        begin_capability_idempotency(&state, "route_delete", &headers, &json!({"route_id": id}))
+            .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
     let before = state
         .store
         .get_route(&id)
@@ -2444,16 +4639,32 @@ async fn delete_route(
         .ok()
         .flatten()
         .map(|r| route_snapshot(&r));
-    state.store.delete_route(&id).await?;
-    let _ = tiygate_store::audit::record(
-        state.pool.as_ref(),
-        "admin",
-        "delete",
-        "route",
-        &id,
-        &audit_details(before.as_ref(), None),
-    )
-    .await;
+    let audit = audit_details(before.as_ref(), None);
+    if let Err(error) = state
+        .store
+        .delete_route_with_audit(&id, "admin", &audit)
+        .await
+    {
+        if let Some((key, hash)) = reservation.as_ref() {
+            let _ = state
+                .store
+                .release_capability_mutation("route_delete", key, hash)
+                .await;
+        }
+        return Err(error.into());
+    }
+    if let Some((key, hash)) = reservation {
+        state
+            .store
+            .complete_capability_mutation(
+                "route_delete",
+                &key,
+                &hash,
+                StatusCode::NO_CONTENT.as_u16(),
+                &json!({}),
+            )
+            .await?;
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -3249,9 +5460,66 @@ async fn import_config(
     State(state): State<AdminState>,
     Json(req): Json<ImportRequest>,
 ) -> Result<Response, AdminError> {
+    // The store deliberately does not depend on concrete protocol crates.
+    // Inject the current registry/baseline validator so portable capability
+    // overrides cannot bypass the wire contract during import.
+    let capability_validator = |target: &tiygate_core::RoutingTarget,
+                                capability_id: &tiygate_core::CapabilityId,
+                                capability_state: tiygate_core::CapabilityState,
+                                value: Option<&tiygate_core::CapabilityValue>|
+     -> Result<(), String> {
+        let Some(descriptor) = tiygate_protocols::capabilities::descriptor_for(capability_id)
+        else {
+            // Unknown IDs remain round-trippable but are never eligible for
+            // automatic routing in the current registry.
+            return Ok(());
+        };
+        if value.is_some_and(|candidate| candidate.kind() != descriptor.value_kind) {
+            return Err(format!(
+                "capability value kind does not match {}",
+                descriptor.id
+            ));
+        }
+        if capability_state == tiygate_core::CapabilityState::Constrained
+            && value.is_none_or(tiygate_core::CapabilityValue::is_empty)
+        {
+            return Err(format!(
+                "constrained capability {} requires a non-empty value",
+                descriptor.id
+            ));
+        }
+        let baseline = tiygate_protocols::capabilities::baseline_for(
+            &tiygate_store::capabilities::wire_profile_for_target(target),
+        );
+        if baseline.get(capability_id) == Some(&tiygate_core::BaselineSupport::Forbidden)
+            && matches!(
+                capability_state,
+                tiygate_core::CapabilityState::Supported
+                    | tiygate_core::CapabilityState::Constrained
+            )
+        {
+            return Err(format!(
+                "capability {} is forbidden by the target wire baseline",
+                descriptor.id
+            ));
+        }
+        let mut observation = tiygate_core::CapabilityObservation::now(
+            capability_id.clone(),
+            capability_state,
+            tiygate_core::EvidenceSource::ExplicitOverride,
+            1,
+        );
+        observation.value = value.cloned();
+        tiygate_core::validate_capability_observation(descriptor, &observation)
+    };
     let report = state
         .store
-        .import_config(&req.config, &req.master_key, &req.selection)
+        .import_config_with_capability_validator(
+            &req.config,
+            &req.master_key,
+            &req.selection,
+            Some(&capability_validator),
+        )
         .await?;
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
@@ -3270,6 +5538,8 @@ async fn import_config(
             "settings_skipped": report.settings_skipped,
             "token_stats_imported": report.token_stats_imported,
             "token_stats_skipped": report.token_stats_skipped,
+            "capability_overrides_imported": report.capability_overrides_imported,
+            "capability_overrides_skipped": report.capability_overrides_skipped,
         }),
     )
     .await;
@@ -3278,7 +5548,7 @@ async fn import_config(
 
 // ---- settings ----
 
-fn settings_response(state: &AdminState, rows: Vec<(String, String)>) -> Response {
+fn settings_response_value(state: &AdminState, rows: Vec<(String, String)>) -> Value {
     let mut map = serde_json::Map::new();
     for (k, v) in rows {
         let value = if tiygate_store::settings_keys::is_encrypted_key(&k) {
@@ -3292,13 +5562,16 @@ fn settings_response(state: &AdminState, rows: Vec<(String, String)>) -> Respons
         tiygate_store::db::DbKind::Sqlite => "sqlite",
         tiygate_store::db::DbKind::Postgres => "postgres",
     };
-    Json(json!({
+    json!({
         "settings": map,
         "database": {
             "kind": database_kind,
         },
-    }))
-    .into_response()
+    })
+}
+
+fn settings_response(state: &AdminState, rows: Vec<(String, String)>) -> Response {
+    Json(settings_response_value(state, rows)).into_response()
 }
 
 /// GET /admin/v1/settings — returns every setting as a flat
@@ -3311,7 +5584,7 @@ async fn list_settings(State(state): State<AdminState>) -> Result<Response, Admi
     Ok(settings_response(&state, rows))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct UpdateSettingsRequest {
     /// A flat map of `key → value`. Every value is treated as a
     /// string (matching the `settings` table schema). Encrypted keys
@@ -3326,6 +5599,7 @@ struct UpdateSettingsRequest {
 /// as `GET`).
 async fn update_settings(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(req): Json<UpdateSettingsRequest>,
 ) -> Result<Response, AdminError> {
     use tiygate_store::encryption::KeyEncryption;
@@ -3345,12 +5619,32 @@ async fn update_settings(
 
     let mut before_map = serde_json::Map::new();
     let mut after_map = serde_json::Map::new();
+    let mut updates = Vec::<(String, String, bool)>::new();
+    let mut requires_global_capability_enforce = false;
 
     for (key, val) in &req.settings {
         let s = match val {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
+        if key.starts_with("gateway.capabilities.")
+            || key == tiygate_store::settings_keys::RESPONSES_CRL_TOOL_PROMOTION_ENABLED
+        {
+            validate_capability_setting(key, &s).map_err(AdminError::BadRequest)?;
+        }
+        if key == tiygate_store::settings_keys::CAPABILITY_ROUTING_MODE
+            && tiygate_core::CapabilityRoutingMode::parse(&s).is_none()
+        {
+            return Err(AdminError::BadRequest(
+                "capability routing mode must be off, shadow, or enforce".to_string(),
+            ));
+        }
+        if key == tiygate_store::settings_keys::CAPABILITY_ROUTING_MODE
+            && tiygate_core::CapabilityRoutingMode::parse(&s)
+                == Some(tiygate_core::CapabilityRoutingMode::Enforce)
+        {
+            requires_global_capability_enforce = true;
+        }
         if is_encrypted_key(key) && s.trim().is_empty() {
             // Leave the stored secret untouched.
             continue;
@@ -3364,29 +5658,86 @@ async fn update_settings(
             before_map.insert(key.clone(), serde_json::Value::Null);
         }
         after_map.insert(key.clone(), redact_setting(key, &s));
-
-        if is_encrypted_key(key) {
-            state.store.set_setting_encrypted(key, &s).await?;
-        } else {
-            state.store.set_setting(key, &s).await?;
-        }
+        updates.push((key.clone(), s, is_encrypted_key(key)));
     }
 
+    let idempotency_payload = serde_json::to_value(&req)
+        .map_err(|error| AdminError::Internal(format!("serialize settings request: {error}")))?;
+    let reservation =
+        begin_capability_idempotency(&state, "settings_update", &headers, &idempotency_payload)
+            .await?;
+    if let Some((_, _, Some(response))) = reservation {
+        return Ok(response);
+    }
+    let reservation = reservation.map(|(key, hash, _)| (key, hash));
+    if requires_global_capability_enforce {
+        if let Err(error) = ensure_global_capability_enforce_allowed(&state).await {
+            if let Some((key, hash)) = reservation.as_ref() {
+                let _ = state
+                    .store
+                    .release_capability_mutation("settings_update", key, hash)
+                    .await;
+            }
+            return Err(error);
+        }
+    }
     let before_val = serde_json::Value::Object(before_map);
     let after_val = serde_json::Value::Object(after_map);
     let details = audit_details(Some(&before_val), Some(&after_val));
-    let _ = tiygate_store::audit::record(
-        state.pool.as_ref(),
-        "admin",
-        "upsert",
-        "settings",
-        "bulk",
-        &details,
-    )
-    .await;
+    if let Err(error) = state
+        .store
+        .set_settings_batch_with_audit(&updates, "admin", "bulk", &details)
+        .await
+    {
+        if let Some((key, hash)) = reservation.as_ref() {
+            let _ = state
+                .store
+                .release_capability_mutation("settings_update", key, hash)
+                .await;
+        }
+        return Err(error.into());
+    }
+
     // Return the fresh redacted view.
     let rows = state.store.list_settings().await?;
-    Ok(settings_response(&state, rows))
+    let response_value = settings_response_value(&state, rows);
+    if let Some((key, hash)) = reservation {
+        state
+            .store
+            .complete_capability_mutation(
+                "settings_update",
+                &key,
+                &hash,
+                StatusCode::OK.as_u16(),
+                &response_value,
+            )
+            .await?;
+    }
+    Ok(Json(response_value).into_response())
+}
+
+async fn ensure_global_capability_enforce_allowed(state: &AdminState) -> Result<(), AdminError> {
+    let (routes, total) = state.store.list_routes_paginated(500, 0).await?;
+    if total > routes.len() as u64 {
+        return Err(AdminError::Conflict(
+            "global capability enforce requires checking every route; reduce the route count or enable per-route gates first"
+                .to_string(),
+        ));
+    }
+    for route in routes.into_iter().filter(|route| route.enabled) {
+        let admissions = state
+            .store
+            .list_capability_route_admissions(&route.id, 500, 0)
+            .await?;
+        let has_valid_enforce = admissions.into_iter().any(is_valid_enforce_admission);
+        if !has_valid_enforce {
+            return Err(AdminError::AdmissionRequired(format!(
+                "route {} has no valid capability-shape enforce admission",
+                route.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---- error type ----
@@ -3403,49 +5754,111 @@ pub enum AdminError {
     BadRequest(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("capability admission required: {0}")]
+    AdmissionRequired(String),
+    #[error("invalid capability: {0}")]
+    InvalidCapability(String),
+    #[error("idempotency conflict: {0}")]
+    IdempotencyConflict(String),
+    #[error("revision conflict: {0}")]
+    RevisionConflict(String),
+    #[error("capability unavailable: {0}")]
+    CapabilityUnavailable(String),
     #[error("internal: {0}")]
     Internal(String),
 }
 
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
-        let (status, body) = match &self {
-            AdminError::Db(e) => (
+        let public_message = self.public_message();
+        let (status, mut body) = match &self {
+            AdminError::Db(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": {"message": e.to_string(), "type": "db", "source": "gateway"}}),
+                json!({"error": {"message": public_message, "type": "db", "code": "internal_error", "source": "gateway"}}),
             ),
             AdminError::Store(e) => match e {
                 StoreError::NotFound(_) => (
                     StatusCode::NOT_FOUND,
-                    json!({"error": {"message": e.to_string(), "type": "not_found", "source": "gateway"}}),
+                    json!({"error": {"message": e.to_string(), "type": "not_found", "code": "not_found", "source": "gateway"}}),
                 ),
                 StoreError::Invalid(_) => (
                     StatusCode::BAD_REQUEST,
-                    json!({"error": {"message": e.to_string(), "type": "bad_request", "source": "gateway"}}),
+                    json!({"error": {"message": e.to_string(), "type": "bad_request", "code": "bad_request", "source": "gateway"}}),
                 ),
                 _ => (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({"error": {"message": e.to_string(), "type": "store", "source": "gateway"}}),
+                    json!({"error": {"message": public_message, "type": "store", "code": "internal_error", "source": "gateway"}}),
                 ),
             },
             AdminError::NotFound(_) => (
                 StatusCode::NOT_FOUND,
-                json!({"error": {"message": self.to_string(), "type": "not_found", "source": "gateway"}}),
+                json!({"error": {"message": public_message, "type": "not_found", "code": "not_found", "source": "gateway"}}),
             ),
             AdminError::BadRequest(_) => (
                 StatusCode::BAD_REQUEST,
-                json!({"error": {"message": self.to_string(), "type": "bad_request", "source": "gateway"}}),
+                json!({"error": {"message": public_message, "type": "bad_request", "code": "bad_request", "source": "gateway"}}),
             ),
             AdminError::Conflict(_) => (
                 StatusCode::CONFLICT,
-                json!({"error": {"message": self.to_string(), "type": "conflict", "source": "gateway"}}),
+                json!({"error": {"message": public_message, "type": "conflict", "code": "conflict", "source": "gateway"}}),
+            ),
+            AdminError::AdmissionRequired(_) => (
+                StatusCode::CONFLICT,
+                json!({"error": {"message": public_message, "type": "conflict", "code": "admission_required", "source": "gateway"}}),
+            ),
+            AdminError::InvalidCapability(_) => (
+                StatusCode::BAD_REQUEST,
+                json!({"error": {"message": public_message, "type": "bad_request", "code": "invalid_capability", "source": "gateway"}}),
+            ),
+            AdminError::IdempotencyConflict(_) => (
+                StatusCode::CONFLICT,
+                json!({"error": {"message": public_message, "type": "conflict", "code": "idempotency_conflict", "source": "gateway"}}),
+            ),
+            AdminError::RevisionConflict(_) => (
+                StatusCode::CONFLICT,
+                json!({"error": {"message": public_message, "type": "conflict", "code": "revision_conflict", "source": "gateway"}}),
+            ),
+            AdminError::CapabilityUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": {"message": public_message, "type": "capability_unavailable", "code": "capability_unavailable", "source": "gateway"}}),
             ),
             AdminError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": {"message": self.to_string(), "type": "internal", "source": "gateway"}}),
+                json!({"error": {"message": public_message, "type": "internal", "code": "internal_error", "source": "gateway"}}),
             ),
         };
+        if let Some(error) = body.get_mut("error").and_then(Value::as_object_mut) {
+            error.insert(
+                "request_id".to_string(),
+                Value::String(Uuid::now_v7().to_string()),
+            );
+        }
         (status, Json(body)).into_response()
+    }
+}
+
+impl AdminError {
+    fn public_message(&self) -> String {
+        match self {
+            // SQLx can include bound values, table names or connection URLs in
+            // its Display implementation. Keep those details in server logs,
+            // not in the Admin response body.
+            Self::Db(_) => "database operation failed".to_string(),
+            Self::Store(StoreError::Db(_)) | Self::Store(StoreError::DbLayer(_)) => {
+                "store operation failed".to_string()
+            }
+            Self::Store(StoreError::Decrypt(_)) => "credential operation failed".to_string(),
+            Self::Store(error) => truncate_admin_text(&error.to_string(), 1024),
+            Self::Internal(_) => "internal admin operation failed".to_string(),
+            Self::NotFound(message) => truncate_admin_text(message, 1024),
+            Self::BadRequest(message)
+            | Self::Conflict(message)
+            | Self::AdmissionRequired(message)
+            | Self::InvalidCapability(message)
+            | Self::IdempotencyConflict(message)
+            | Self::RevisionConflict(message)
+            | Self::CapabilityUnavailable(message) => truncate_admin_text(message, 1024),
+        }
     }
 }
 

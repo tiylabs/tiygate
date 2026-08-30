@@ -1,0 +1,62 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-and-web:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.4
+        env:
+          POSTGRES_USER: tiygate
+          POSTGRES_PASSWORD: tiygate
+          POSTGRES_DB: tiygate_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U tiygate -d tiygate_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      TIYGATE_DATABASE_URL: postgres://tiygate:tiygate@127.0.0.1:5432/tiygate_ci
+      TIYGATE_MASTER_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - name: Install WebUI dependencies
+        run: npm ci --prefix webui
+      - name: Rust format
+        run: cargo fmt --all -- --check
+      - name: Rust check
+        run: cargo check --workspace --all-targets
+      - name: Rust clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace --all-features
+      - name: PostgreSQL capability fixture
+        run: cargo test -p tiygate-store --test postgres_capabilities -- --nocapture
+      - name: WebUI lint
+        run: npm run lint --prefix webui
+      - name: WebUI build
+        run: npm run build --prefix webui
+      - name: Dependency layering
+        run: scripts/verify-deps.sh
+      - name: Diff whitespace
+        run: git diff --check

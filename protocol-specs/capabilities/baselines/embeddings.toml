@@ -1,0 +1,242 @@
+schema_version = 1
+wire_profile = "openai-embeddings-standard"
+
+[[capability]]
+id = "transport.http"
+support = "supported"
+
+[[capability]]
+id = "transport.sse"
+support = "forbidden"
+
+[[capability]]
+id = "tools.function"
+support = "forbidden"
+
+[[capability]]
+id = "tools.function.continuation"
+support = "forbidden"
+
+[[capability]]
+id = "tools.choice.required"
+support = "forbidden"
+
+[[capability]]
+id = "tools.choice.specific"
+support = "forbidden"
+
+[[capability]]
+id = "tools.namespace"
+support = "forbidden"
+
+[[capability]]
+id = "tools.custom"
+support = "forbidden"
+
+[[capability]]
+id = "tools.crl.additional_tools"
+support = "forbidden"
+
+[[capability]]
+id = "transport.websocket"
+support = "forbidden"
+
+[[capability]]
+id = "generation.max_output_tokens"
+support = "forbidden"
+
+[[capability]]
+id = "generation.temperature"
+support = "forbidden"
+
+[[capability]]
+id = "generation.top_p"
+support = "forbidden"
+
+[[capability]]
+id = "generation.top_k"
+support = "forbidden"
+
+[[capability]]
+id = "generation.stop_sequences"
+support = "forbidden"
+
+[[capability]]
+id = "generation.frequency_penalty"
+support = "forbidden"
+
+[[capability]]
+id = "generation.presence_penalty"
+support = "forbidden"
+
+[[capability]]
+id = "generation.seed"
+support = "forbidden"
+
+[[capability]]
+id = "tools.parallel"
+support = "forbidden"
+
+[[capability]]
+id = "tools.hosted.web_search"
+support = "forbidden"
+
+[[capability]]
+id = "tools.hosted.file_search"
+support = "forbidden"
+
+[[capability]]
+id = "tools.hosted.code_interpreter"
+support = "forbidden"
+
+[[capability]]
+id = "tools.hosted.computer_use"
+support = "forbidden"
+
+[[capability]]
+id = "tools.remote_mcp"
+support = "forbidden"
+
+[[capability]]
+id = "tools.programmatic"
+support = "forbidden"
+
+[[capability]]
+id = "reasoning.plaintext"
+support = "forbidden"
+
+[[capability]]
+id = "reasoning.summary"
+support = "forbidden"
+
+[[capability]]
+id = "reasoning.encrypted_replay"
+support = "forbidden"
+
+[[capability]]
+id = "reasoning.effort.values"
+support = "forbidden"
+
+[[capability]]
+id = "reasoning.budget_tokens"
+support = "forbidden"
+
+[[capability]]
+id = "reasoning.mode"
+support = "forbidden"
+
+[[capability]]
+id = "reasoning.context"
+support = "forbidden"
+
+[[capability]]
+id = "structured.json_object"
+support = "forbidden"
+
+[[capability]]
+id = "structured.json_schema"
+support = "forbidden"
+
+[[capability]]
+id = "structured.json_schema.strict"
+support = "forbidden"
+
+[[capability]]
+id = "structured.json_schema.keywords"
+support = "forbidden"
+
+[[capability]]
+id = "media.input.image.inline"
+support = "forbidden"
+
+[[capability]]
+id = "media.input.image.url"
+support = "forbidden"
+
+[[capability]]
+id = "media.input.file_id"
+support = "forbidden"
+
+[[capability]]
+id = "media.input.audio.inline"
+support = "forbidden"
+
+[[capability]]
+id = "media.input.video.inline"
+support = "forbidden"
+
+[[capability]]
+id = "media.image.detail.values"
+support = "forbidden"
+
+[[capability]]
+id = "cache.prompt.key"
+support = "forbidden"
+
+[[capability]]
+id = "cache.prompt.retention"
+support = "forbidden"
+
+[[capability]]
+id = "cache.prompt.options"
+support = "forbidden"
+
+[[capability]]
+id = "cache.prompt.breakpoint"
+support = "forbidden"
+
+[[capability]]
+id = "output.annotations.url"
+support = "forbidden"
+
+[[capability]]
+id = "output.annotations.file"
+support = "forbidden"
+
+[[capability]]
+id = "output.refusal"
+support = "forbidden"
+
+[[capability]]
+id = "output.stop_details"
+support = "forbidden"
+
+[[capability]]
+id = "output.usage.reasoning_tokens"
+support = "forbidden"
+
+[[capability]]
+id = "output.usage.cache_read_tokens"
+support = "forbidden"
+
+[[capability]]
+id = "output.usage.cache_write_tokens"
+support = "forbidden"
+
+[[capability]]
+id = "extensions.codex.local_shell"
+support = "forbidden"
+
+[[capability]]
+id = "extensions.codex.custom_tool"
+support = "forbidden"
+
+[[capability]]
+id = "extensions.codex.tool_search_items"
+support = "forbidden"
+
+[[capability]]
+id = "extensions.multi_agent"
+support = "forbidden"
+
+[[capability]]
+id = "embeddings.input.batch"
+support = "supported"
+
+[[capability]]
+id = "embeddings.dimensions"
+support = "supported"
+
+[[capability]]
+id = "embeddings.encoding_formats"
+support = "supported"

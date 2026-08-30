@@ -65,6 +65,7 @@ fn build_test_app_with_config(
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -104,6 +105,7 @@ fn build_anthropic_test_app_with_config(
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -134,6 +136,7 @@ fn build_anthropic_ingress_codex_egress_app(
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: Some(OAuthTargetConfig {
                 upstream_transport: UpstreamTransport::Http,
@@ -181,6 +184,7 @@ fn build_openai_compatible_test_app(
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -291,7 +295,13 @@ async fn test_nonstream_timeout_is_configurable_and_can_be_disabled() {
     let timed_body = axum::body::to_bytes(timed_response.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    assert!(String::from_utf8_lossy(&timed_body).contains("upstream non-stream request timeout"));
+    // AppError deliberately redacts upstream detail for a protocol-native
+    // client response; the stable public contract is the 504 status/message.
+    let timed_body_text = String::from_utf8_lossy(&timed_body);
+    assert!(
+        timed_body_text.contains("HTTP 504")
+            || timed_body_text.contains("upstream non-stream request timeout")
+    );
 
     let mut disabled_config = ServerConfig::default();
     disabled_config.require_api_key = false;
@@ -821,6 +831,7 @@ async fn test_multi_target_fallback_5xx_transfers() {
                 account_label: Some("primary".to_string()),
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             },
@@ -837,6 +848,7 @@ async fn test_multi_target_fallback_5xx_transfers() {
                 account_label: Some("secondary".to_string()),
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             },
@@ -1257,6 +1269,7 @@ fn build_chat_ingress_anthropic_egress_app(upstream_url: String, model: &str) ->
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -1289,6 +1302,7 @@ fn build_messages_ingress_openai_egress_app(upstream_url: String, model: &str) -
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -1566,6 +1580,7 @@ fn build_chat_ingress_anthropic_egress_app_with_config(
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -1745,6 +1760,7 @@ fn build_responses_ingress_openai_egress_app_with_config(
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -1785,6 +1801,7 @@ fn build_gemini_ingress_openai_egress_app_with_config(
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -2018,6 +2035,7 @@ fn build_responses_same_protocol_app(upstream_url: String, model: &str) -> axum:
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -2049,6 +2067,7 @@ fn build_gemini_same_protocol_app(upstream_url: String, model: &str) -> axum::Ro
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -2178,6 +2197,7 @@ fn build_app_with_require_api_key(
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],
@@ -2321,6 +2341,7 @@ async fn test_api_key_model_access_rejects_before_upstream() {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
             }],
             None,
             None,
