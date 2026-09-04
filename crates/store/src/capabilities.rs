@@ -2417,7 +2417,6 @@ pub fn manual_probe_set_for_profile(profile: &TargetCapabilityProfile) -> Vec<St
             probes.extend(
                 [
                     "tools.function",
-                    "tools.function.continuation",
                     "tools.choice.required",
                     "tools.choice.specific",
                 ]
@@ -2643,6 +2642,27 @@ mod tests {
             oauth: None,
         };
         assert_eq!(default_probe_set_for_target(&target), vec!["http.basic"]);
+    }
+
+    #[test]
+    fn manual_chat_probe_bundle_excludes_unsupported_continuation_probe() {
+        let identity = CanonicalTargetIdentity {
+            identity_version: 1,
+            provider_id: "p".to_string(),
+            credential_scope_fingerprint: "scope".to_string(),
+            canonical_api_base: "https://example.com/v1".to_string(),
+            egress_protocol_suite: "openaicompatible".to_string(),
+            egress_endpoint_name: "chat-completions".to_string(),
+            egress_endpoint_version: "v1".to_string(),
+            egress_dialect_id: "openai-chat-standard".to_string(),
+            exact_model_id: "m".to_string(),
+        };
+        let profile = TargetCapabilityProfile::pending(&identity, TargetKey("key".to_string()));
+        let probes = manual_probe_set_for_profile(&profile);
+        assert!(probes.iter().any(|probe| probe == "tools.function"));
+        assert!(!probes
+            .iter()
+            .any(|probe| probe == "tools.function.continuation"));
     }
 
     #[test]

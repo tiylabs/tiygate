@@ -789,7 +789,12 @@ export default function CapabilitiesPage() {
                                   {t("capabilities.probeJobAttempts")}: {job.attempt_count}/{job.max_attempts} · {t("capabilities.probeJobProgress")}: {job.next_probe_index}/{job.probe_set.length}
                                 </span>
                               </span>
-                              <Badge tone={probeStatusTone(job.status)}>{probeLabel("probeStatuses", job.status)}</Badge>
+                              <Badge
+                                tone={probeStatusTone(job.status)}
+                                className="shrink-0 whitespace-nowrap"
+                              >
+                                {probeLabel("probeStatuses", job.status)}
+                              </Badge>
                             </button>
                             {expanded ? (
                               <div className="border-t border-border/70 px-2 py-2">
@@ -808,17 +813,19 @@ export default function CapabilitiesPage() {
                                         <div key={run.run_id} className="rounded">
                                           <button
                                             type="button"
-                                            className={`flex min-h-10 w-full items-center justify-between gap-2 rounded px-1.5 py-1 text-left ${runExpanded ? "bg-primary-soft/50" : "hover:bg-surface-muted"}`}
+                                            className={`grid min-h-10 w-full grid-cols-[minmax(9rem,auto)_minmax(0,1fr)_auto] items-center gap-2 rounded px-1.5 py-1 text-left ${runExpanded ? "bg-primary-soft/50" : "hover:bg-surface-muted"}`}
                                             aria-expanded={runExpanded}
                                             onClick={() => setSelectedProbeRunId(
                                               runExpanded ? null : run.run_id,
                                             )}
                                           >
-                                            <span className="min-w-0 truncate">
-                                              <span className="font-mono text-text">{run.probe_id}</span>
-                                              <span className="ml-2 text-text-subtle">{fmtTime(run.ts)}</span>
+                                            <span className="min-w-0 truncate whitespace-nowrap text-[11px] text-text-subtle" title={fmtTime(run.ts)}>
+                                              {fmtTime(run.ts)}
                                             </span>
-                                            <span className="shrink-0 text-text-muted">
+                                            <span className="min-w-0 truncate font-mono text-text" title={run.probe_id}>
+                                              {run.probe_id}
+                                            </span>
+                                            <span className="justify-self-end whitespace-nowrap text-text-muted">
                                               {probeLabel("probeOutcomes", run.outcome)} · {Math.round(run.duration_micros / 1000)}ms
                                             </span>
                                           </button>

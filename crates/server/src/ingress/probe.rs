@@ -881,7 +881,7 @@ fn is_valid_basic_response(target: &tiygate_core::RoutingTarget, body: &str) -> 
         return false;
     }
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        if value.get("error").is_some() {
+        if value.get("error").is_some_and(|error| !error.is_null()) {
             return false;
         }
         if !value.is_object() {
@@ -1224,7 +1224,7 @@ fn has_final_message(body: &str) -> bool {
         match value {
             Value::Array(items) => items.iter().any(visit),
             Value::Object(object) => {
-                if object.get("error").is_some() {
+                if object.get("error").is_some_and(|error| !error.is_null()) {
                     return false;
                 }
                 if object.get("type").and_then(Value::as_str) == Some("message")
@@ -1391,7 +1391,11 @@ fn probe_body(
             }
         }
         tiygate_core::ProtocolSuite::OpenAiCompatible => {
-            body["tools"] = json!([function]);
+            // Chat Completions wraps each function definition in a
+            // `function` member; the Responses wire uses the flat shape
+            // above. Keeping these shapes separate avoids classifying a
+            // probe-body serialization error as an upstream capability miss.
+            body["tools"] = json!([{"type": "function", "function": function}]);
             body["tool_choice"] =
                 if probe_id == "tools.function" || probe_id == "tools.function.continuation" {
                     json!({"type": "function", "function": {"name": "__tiygate_probe"}})
@@ -1645,8 +1649,7 @@ async fn send_probe(
     // JSON redaction handles structured credential fields; the target-aware
     // pass also removes API keys, API-base strings and URL-like tokens from
     // plain-text upstream errors before they reach profile diagnostics.
-    let redacted = redact_target_error(target, &redacted);
-    let redacted = truncate(&redacted, MAX_PROBE_RESPONSE_BYTES);
+    let redacted = redact_probe_response(target, &redacted);
     trace.exchanges.push(ProbeExchange {
         request_path,
         request_headers,
@@ -2202,6 +2205,17 @@ fn redact_error(error: &str) -> String {
 }
 
 fn redact_target_error(target: &tiygate_core::RoutingTarget, error: &str) -> String {
+    truncate(&sanitize_target_text(target, error), MAX_ERROR_BYTES)
+}
+
+fn redact_probe_response(target: &tiygate_core::RoutingTarget, response: &str) -> String {
+    // Probe response bodies are parsed by the semantic judge. Do not use the
+    // short error-detail truncation here: appending an ellipsis can turn a
+    // valid JSON response into an artificial inconclusive result.
+    sanitize_target_text(target, response)
+}
+
+fn sanitize_target_text(target: &tiygate_core::RoutingTarget, error: &str) -> String {
     let mut sanitized = error.to_string();
     if !target.effective_api_base().is_empty() {
         sanitized = sanitized.replace(target.effective_api_base(), "[TARGET]");
@@ -2220,7 +2234,7 @@ fn redact_target_error(target: &tiygate_core::RoutingTarget, error: &str) -> Str
         })
         .collect::<Vec<_>>()
         .join(" ");
-    redact_error(&sanitized)
+    sanitized
 }
 
 fn truncate(value: &str, max_bytes: usize) -> String {
@@ -2294,6 +2308,34 @@ mod tests {
             &target,
             r#"{"id":"resp_1","output":[]}"#
         ));
+    }
+
+    #[test]
+    fn chat_probe_uses_chat_completions_tool_shape() {
+        let mut target = test_responses_target();
+        target.api_protocol = tiygate_core::ProtocolEndpoint::new(
+            tiygate_core::ProtocolSuite::OpenAiCompatible,
+            "chat-completions",
+            "v1",
+        );
+        let (body, _, _) = probe_body(&target, "tools.function", "tiygate-probe-1");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "__tiygate_probe");
+        assert!(body["tools"][0].get("name").is_none());
+    }
+
+    #[test]
+    fn probe_response_redaction_preserves_json_for_semantic_judges() {
+        let target = test_responses_target();
+        let body = serde_json::json!({
+            "id": "response-1",
+            "output": [],
+            "reasoning": "x".repeat(1024),
+        })
+        .to_string();
+        let redacted = redact_probe_response(&target, &body);
+        assert!(redacted.len() > MAX_ERROR_BYTES);
+        assert!(is_valid_basic_response(&target, &redacted));
     }
 
     #[test]
