@@ -250,6 +250,28 @@ pub(super) fn extract_rate_limit_headers(headers: &HeaderMap) -> Vec<(&'static s
     out
 }
 
+/// Inject provider-specific extra headers into the upstream request.
+///
+/// Some providers require custom headers (e.g. OpenCode requires
+/// `x-opencode-session`) that clients don't know about. The provider
+/// generates these based on the upstream API key. This function is
+/// called *after* `apply_provider_auth` so provider auth headers
+/// always win.
+pub(super) fn inject_provider_extra_headers(
+    provider: &dyn tiygate_core::Provider,
+    api_key: &str,
+    upstream: &mut http::HeaderMap,
+) {
+    for (name, value) in provider.extra_headers(api_key) {
+        if let (Ok(hn), Ok(hv)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) {
+            upstream.insert(hn, hv);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +316,51 @@ mod tests {
             &tiygate_core::ProtocolSuite::OpenAiResponses,
             "other"
         ));
+    }
+
+    #[test]
+    fn inject_provider_extra_headers_adds_headers() {
+        use tiygate_core::{ProtocolEndpoint, Provider, ProviderMetadata};
+        use std::sync::Arc;
+
+        struct TestProvider;
+        impl Provider for TestProvider {
+            fn id(&self) -> &str { "test" }
+            fn metadata(&self) -> &ProviderMetadata { unreachable!() }
+            fn supported_protocols(&self) -> &[ProtocolEndpoint] { unreachable!() }
+            fn auth(&self) -> Arc<dyn tiygate_core::AuthApplier> { unreachable!() }
+            fn extra_headers(&self, api_key: &str) -> Vec<(&'static str, String)> {
+                vec![("x-test-header", format!("session-{api_key}"))]
+            }
+        }
+
+        let provider = TestProvider;
+        let mut headers = http::HeaderMap::new();
+        inject_provider_extra_headers(&provider, "my-key", &mut headers);
+
+        assert_eq!(
+            headers.get("x-test-header").unwrap().to_str().unwrap(),
+            "session-my-key"
+        );
+    }
+
+    #[test]
+    fn inject_provider_extra_headers_empty_by_default() {
+        use tiygate_core::{ProtocolEndpoint, Provider, ProviderMetadata};
+        use std::sync::Arc;
+
+        struct DefaultProvider;
+        impl Provider for DefaultProvider {
+            fn id(&self) -> &str { "default" }
+            fn metadata(&self) -> &ProviderMetadata { unreachable!() }
+            fn supported_protocols(&self) -> &[ProtocolEndpoint] { unreachable!() }
+            fn auth(&self) -> Arc<dyn tiygate_core::AuthApplier> { unreachable!() }
+        }
+
+        let provider = DefaultProvider;
+        let mut headers = http::HeaderMap::new();
+        inject_provider_extra_headers(&provider, "any-key", &mut headers);
+
+        assert!(headers.is_empty());
     }
 }

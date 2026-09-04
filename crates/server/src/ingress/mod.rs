@@ -36,6 +36,8 @@ use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use tiygate_core::{HealthRegistry, TelemetryBus};
 
+use headers::inject_provider_extra_headers;
+
 /// Construct a `Strategy` from the `RoutingStrategyName` carried on
 /// `AppState`. §3.4 names `Weighted` as the document-level default; we honor
 /// that here. The `Latency` strategy needs the `HealthRegistry` handle, so it
@@ -825,7 +827,10 @@ pub async fn apply_provider_auth(
         }
     }
 
-    if let Some(provider) = tiygate_core::provider::find_provider(&target.provider_id) {
+    // Use vendor (if available) for registered-provider lookup, falling back
+    // to provider_id for legacy targets that predate the vendor field.
+    let lookup_key = target.vendor.as_deref().unwrap_or(&target.provider_id);
+    if let Some(provider) = tiygate_core::provider::find_provider(lookup_key) {
         let auth = provider.auth();
         if let Err(e) = auth.apply(upstream_headers, target).await {
             return Err(AppError::new(
@@ -833,6 +838,10 @@ pub async fn apply_provider_auth(
                 format!("Provider auth applier failed: {e}"),
             ));
         }
+        // Inject provider-specific extra headers (e.g. x-opencode-session)
+        // after auth so provider auth headers always win.
+        let api_key = target.effective_api_key().to_string();
+        inject_provider_extra_headers(&*provider, &api_key, upstream_headers);
         return Ok(());
     }
     // Protocol-aware fallback when no provider is registered for the

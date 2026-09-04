@@ -120,6 +120,7 @@ impl ConfigStore {
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
             let openai_targets = vec![RoutingTarget {
                 provider_id: "openai".to_string(),
+                vendor: None,
                 model_id: "gpt-4o".to_string(),
                 api_base: "https://api.openai.com/v1".to_string(),
                 api_key: key.clone(),
@@ -151,6 +152,7 @@ impl ConfigStore {
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             let anthropic_targets = vec![RoutingTarget {
                 provider_id: "anthropic".to_string(),
+                vendor: None,
                 model_id: "claude-sonnet-4-20250514".to_string(),
                 api_base: "https://api.anthropic.com/v1".to_string(),
                 api_key: key.clone(),
@@ -305,6 +307,7 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
                 provider_egress_for_target(provider, &t.model_id, &raw_base);
             targets.push(RoutingTarget {
                 provider_id: provider.id.clone(),
+                vendor: Some(provider.vendor.clone()),
                 model_id: t.model_id.clone(),
                 api_base,
                 api_key,
