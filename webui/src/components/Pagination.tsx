@@ -26,6 +26,21 @@ interface PaginationProps {
   labels: PaginationLabels;
 }
 
+export interface CompactPaginationLabels {
+  pageOf: string;
+  prev: string;
+  next: string;
+  goTo: string;
+  go: string;
+}
+
+interface CompactPaginationProps {
+  page: number;
+  pageCount: number;
+  onPageChange: (next: number) => void;
+  labels: CompactPaginationLabels;
+}
+
 function interpolate(template: string, values: Record<string, string | number>) {
   return template.replace(/{{\s*(\w+)\s*}}/g, (match, key) =>
     Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : match,
@@ -79,6 +94,50 @@ export function Pagination({
         onChange={onPageChange}
         labels={labels}
       />
+    </div>
+  );
+}
+
+/** Minimal pager for dense nested lists: previous/next, page count and jump. */
+export function CompactPagination({
+  page,
+  pageCount,
+  onPageChange,
+  labels,
+}: CompactPaginationProps) {
+  const atFirst = page <= 1;
+  const atLast = page >= pageCount;
+  const buttonClass =
+    "inline-flex h-8 min-w-[2rem] items-center justify-center rounded-md px-2 text-xs text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-40";
+  return (
+    <div className="flex flex-wrap items-center justify-end gap-2 pt-2 text-xs text-text-muted">
+      <button
+        type="button"
+        className={buttonClass}
+        aria-label={labels.prev}
+        disabled={atFirst}
+        onClick={() => onPageChange(page - 1)}
+      >
+        ‹
+      </button>
+      <span className="tabular-nums">
+        {interpolate(labels.pageOf, { page, total: pageCount })}
+      </span>
+      <CompactGotoPage
+        page={page}
+        pageCount={pageCount}
+        onChange={onPageChange}
+        labels={labels}
+      />
+      <button
+        type="button"
+        className={buttonClass}
+        aria-label={labels.next}
+        disabled={atLast}
+        onClick={() => onPageChange(page + 1)}
+      >
+        ›
+      </button>
     </div>
   );
 }
@@ -209,6 +268,58 @@ function GotoPage({
       <button
         type="submit"
         className="inline-flex h-8 items-center rounded-md border border-border bg-surface px-2 text-xs text-text hover:bg-surface-muted"
+      >
+        {labels.go}
+      </button>
+    </form>
+  );
+}
+
+function CompactGotoPage({
+  page,
+  pageCount,
+  onChange,
+  labels,
+}: {
+  page: number;
+  pageCount: number;
+  onChange: (next: number) => void;
+  labels: Pick<CompactPaginationLabels, "goTo" | "go">;
+}) {
+  const [draft, setDraft] = useState(String(page));
+  useEffect(() => setDraft(String(page)), [page]);
+  function commit() {
+    const parsed = Number(draft);
+    if (!Number.isFinite(parsed)) {
+      setDraft(String(page));
+      return;
+    }
+    const next = Math.max(1, Math.min(pageCount, Math.trunc(parsed)));
+    setDraft(String(next));
+    if (next !== page) onChange(next);
+  }
+  return (
+    <form
+      className="flex items-center gap-1"
+      onSubmit={(event) => {
+        event.preventDefault();
+        commit();
+      }}
+    >
+      <span className="text-text-subtle">{labels.goTo}</span>
+      <input
+        type="number"
+        min={1}
+        max={pageCount}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        aria-label={labels.goTo}
+        className="h-8 w-12 rounded-md border border-border bg-surface px-2 text-center text-xs text-text outline-none focus:border-primary tabular-nums"
+      />
+      <button
+        type="submit"
+        className="inline-flex h-8 items-center rounded-md px-1.5 text-xs text-text hover:bg-surface-muted"
       >
         {labels.go}
       </button>

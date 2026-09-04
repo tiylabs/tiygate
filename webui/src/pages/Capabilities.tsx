@@ -36,12 +36,11 @@ import {
   useToast,
 } from "@/components/ui";
 import { PageHeader, fmtTime } from "@/components/PageHeader";
-import { Pagination } from "@/components/Pagination";
+import { CompactPagination, Pagination } from "@/components/Pagination";
 
 const DEFAULT_TARGET_PAGE_SIZE = 10;
 const TARGET_PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
 const DEFAULT_PROBE_JOB_PAGE_SIZE = 10;
-const PROBE_JOB_PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
 const PROFILE_PANEL_CLASS =
   "flex min-h-0 flex-col overflow-hidden xl:max-h-[calc(100vh-10rem)]";
 
@@ -139,7 +138,7 @@ function ProbeRunDetailView({ detail }: { detail: CapabilityProbeRunDetail }) {
     return i18n.exists(key) ? t(key) : value;
   };
   return (
-    <div className="mt-2 space-y-2 rounded border border-primary/30 bg-primary-soft/20 p-2">
+    <div className="mt-1 space-y-3 rounded-lg bg-primary-soft/20 p-3">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-text-muted">
         <span className="font-medium text-text">{t("capabilities.probeRunDetail")}</span>
         <span>{t("capabilities.probeRunOutcome")}: {probeLabel("probeOutcomes", detail.outcome)}</span>
@@ -157,7 +156,7 @@ function ProbeRunDetailView({ detail }: { detail: CapabilityProbeRunDetail }) {
         <section className="space-y-2">
           <div className="font-medium text-text">{t("capabilities.probeExchanges")}</div>
           {exchanges.map((exchange, index) => (
-            <div key={`${exchange.request_path}:${index}`} className="rounded border border-border bg-surface px-2 py-2">
+            <div key={`${exchange.request_path}:${index}`} className="rounded-lg bg-surface/80 px-2 py-2">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-text-muted">
                 <span className="font-medium text-text">{t("capabilities.probeExchange", { index: index + 1 })}</span>
                 <code>{exchange.request_path}</code>
@@ -177,7 +176,7 @@ function ProbeRunDetailView({ detail }: { detail: CapabilityProbeRunDetail }) {
                 </>
               ) : null}
               {exchange.error ? (
-                <div className="mt-2 rounded border border-danger/30 bg-danger/5 px-2 py-1 text-danger">
+                <div className="mt-2 rounded bg-danger/10 px-2 py-1 text-danger">
                   {t("capabilities.probeExchangeError")}: {exchange.error}
                 </div>
               ) : null}
@@ -230,7 +229,6 @@ export default function CapabilitiesPage() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [targetPageSize, setTargetPageSize] = useState(DEFAULT_TARGET_PAGE_SIZE);
   const [targetOffset, setTargetOffset] = useState(0);
-  const [probeJobPageSize, setProbeJobPageSize] = useState(DEFAULT_PROBE_JOB_PAGE_SIZE);
   const [probeJobOffset, setProbeJobOffset] = useState(0);
   const [expandedProbeJobId, setExpandedProbeJobId] = useState<string | null>(null);
   const [selectedProbeRunId, setSelectedProbeRunId] = useState<string | null>(null);
@@ -264,10 +262,10 @@ export default function CapabilitiesPage() {
     refetchInterval: selectedKey !== null ? 3000 : false,
   });
   const probeJobsQuery = useQuery({
-    queryKey: ["target-capability-probe-jobs", selectedKey, probeJobPageSize, probeJobOffset],
+    queryKey: ["target-capability-probe-jobs", selectedKey, probeJobOffset],
     queryFn: () =>
       capabilitiesApi.probeJobs(selectedKey ?? "", {
-        limit: probeJobPageSize,
+        limit: DEFAULT_PROBE_JOB_PAGE_SIZE,
         offset: probeJobOffset,
       }),
     enabled: selectedKey !== null,
@@ -464,9 +462,9 @@ export default function CapabilitiesPage() {
   const targetPageCount =
     targetTotal === 0 ? 1 : Math.ceil(targetTotal / targetPageSize);
   const probeJobTotal = probeJobsQuery.data?.total ?? 0;
-  const probeJobPage = Math.floor(probeJobOffset / probeJobPageSize) + 1;
+  const probeJobPage = Math.floor(probeJobOffset / DEFAULT_PROBE_JOB_PAGE_SIZE) + 1;
   const probeJobPageCount =
-    probeJobTotal === 0 ? 1 : Math.ceil(probeJobTotal / probeJobPageSize);
+    probeJobTotal === 0 ? 1 : Math.ceil(probeJobTotal / DEFAULT_PROBE_JOB_PAGE_SIZE);
   const routes = routesQuery.data?.entries ?? [];
   const providerNameById = useMemo(
     () =>
@@ -537,17 +535,11 @@ export default function CapabilitiesPage() {
 
   function changeProbeJobPage(next: number) {
     const clamped = Math.max(1, Math.min(probeJobPageCount, next));
-    setProbeJobOffset((clamped - 1) * probeJobPageSize);
+    setProbeJobOffset((clamped - 1) * DEFAULT_PROBE_JOB_PAGE_SIZE);
     setExpandedProbeJobId(null);
     setSelectedProbeRunId(null);
   }
 
-  function changeProbeJobPageSize(next: number) {
-    setProbeJobPageSize(next);
-    setProbeJobOffset(0);
-    setExpandedProbeJobId(null);
-    setSelectedProbeRunId(null);
-  }
 
   return (
     <div>
@@ -810,36 +802,44 @@ export default function CapabilitiesPage() {
                                 ) : (
                                   <div className="space-y-1">
                                     <div className="text-text-subtle">{t("capabilities.probeJobRuns")}</div>
-                                    {probeJobRuns.map((run) => (
-                                      <button
-                                        key={run.run_id}
-                                        type="button"
-                                        className="flex min-h-10 w-full items-center justify-between gap-2 rounded px-1.5 py-1 text-left hover:bg-surface-muted"
-                                        aria-expanded={selectedProbeRunId === run.run_id}
-                                        onClick={() => setSelectedProbeRunId(
-                                          selectedProbeRunId === run.run_id ? null : run.run_id,
-                                        )}
-                                      >
-                                        <span className="min-w-0 truncate">
-                                          <span className="font-mono text-text">{run.probe_id}</span>
-                                          <span className="ml-2 text-text-subtle">{fmtTime(run.ts)}</span>
-                                        </span>
-                                        <span className="shrink-0 text-text-muted">
-                                          {probeLabel("probeOutcomes", run.outcome)} · {Math.round(run.duration_micros / 1000)}ms
-                                        </span>
-                                      </button>
-                                    ))}
+                                    {probeJobRuns.map((run) => {
+                                      const runExpanded = selectedProbeRunId === run.run_id;
+                                      return (
+                                        <div key={run.run_id} className="rounded">
+                                          <button
+                                            type="button"
+                                            className={`flex min-h-10 w-full items-center justify-between gap-2 rounded px-1.5 py-1 text-left ${runExpanded ? "bg-primary-soft/50" : "hover:bg-surface-muted"}`}
+                                            aria-expanded={runExpanded}
+                                            onClick={() => setSelectedProbeRunId(
+                                              runExpanded ? null : run.run_id,
+                                            )}
+                                          >
+                                            <span className="min-w-0 truncate">
+                                              <span className="font-mono text-text">{run.probe_id}</span>
+                                              <span className="ml-2 text-text-subtle">{fmtTime(run.ts)}</span>
+                                            </span>
+                                            <span className="shrink-0 text-text-muted">
+                                              {probeLabel("probeOutcomes", run.outcome)} · {Math.round(run.duration_micros / 1000)}ms
+                                            </span>
+                                          </button>
+                                          {runExpanded ? (
+                                            probeRunDetail ? (
+                                              <ProbeRunDetailView detail={probeRunDetail} />
+                                            ) : probeRunDetailQuery.isLoading ? (
+                                              <div className="bg-primary-soft/20 px-2 py-2 text-text-muted">
+                                                {t("common.loading")}
+                                              </div>
+                                            ) : probeRunDetailQuery.error ? (
+                                              <div className="bg-danger/10 px-2 py-2 text-danger">
+                                                {(probeRunDetailQuery.error as Error).message}
+                                              </div>
+                                            ) : null
+                                          ) : null}
+                                        </div>
+                                      );
+                                    })}
                                   </div>
                                 )}
-                                {selectedProbeRunId && probeRunDetail ? (
-                                  <ProbeRunDetailView
-                                    detail={probeRunDetail}
-                                  />
-                                ) : selectedProbeRunId && probeRunDetailQuery.isLoading ? (
-                                  <div className="mt-2 text-text-muted">{t("common.loading")}</div>
-                                ) : selectedProbeRunId && probeRunDetailQuery.error ? (
-                                  <div className="mt-2 text-danger">{(probeRunDetailQuery.error as Error).message}</div>
-                                ) : null}
                               </div>
                             ) : null}
                           </div>
@@ -849,25 +849,14 @@ export default function CapabilitiesPage() {
                   )}
                 </div>
                 {probeJobTotal > 0 ? (
-                  <Pagination
+                  <CompactPagination
                     page={probeJobPage}
                     pageCount={probeJobPageCount}
-                    total={probeJobTotal}
-                    limit={probeJobPageSize}
-                    offset={probeJobOffset}
-                    pageSizeOptions={PROBE_JOB_PAGE_SIZE_OPTIONS}
                     onPageChange={changeProbeJobPage}
-                    onPageSizeChange={changeProbeJobPageSize}
                     labels={{
-                      pageSizeLabel: t("capabilities.pageSizeLabel"),
-                      pageSizeOption: t("capabilities.pageSizeOption"),
-                      total: t("capabilities.probeJobsTotal"),
-                      range: t("capabilities.range"),
                       pageOf: t("capabilities.pageOf"),
-                      first: t("capabilities.firstPage"),
                       prev: t("capabilities.prevPage"),
                       next: t("capabilities.nextPage"),
-                      last: t("capabilities.lastPage"),
                       goTo: t("capabilities.goToPage"),
                       go: t("capabilities.go"),
                     }}
