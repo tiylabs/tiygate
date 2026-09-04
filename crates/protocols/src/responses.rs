@@ -269,7 +269,14 @@ fn collect_crl_tool_requirements(
             Some("function") | None => {
                 required.insert("tools.function".to_string(), None);
             }
-            Some(_) => {}
+            Some(_) => {
+                // Carrier support proven with a function probe says nothing
+                // about a private embedded tool kind. Keep the opaque item
+                // replayable, but add an intentionally unregistered leaf so
+                // capability Enforce remains fail-closed until that kind gets
+                // its own descriptor and semantic evidence.
+                required.insert("tools.crl.unknown_tool_type".to_string(), None);
+            }
         }
     }
 }
@@ -6073,6 +6080,9 @@ mod tests {
                 "tools": [{"type": "computer", "name": "use_computer"}]
             }]
         });
+        let required = crl_required_capability_ids(&body);
+        assert!(required.contains("tools.crl.additional_tools"));
+        assert!(required.contains("tools.crl.unknown_tool_type"));
         let error = promote_crl_additional_tools(&body).expect_err("unknown CRL type");
         assert!(error.contains("not safe to promote"));
     }

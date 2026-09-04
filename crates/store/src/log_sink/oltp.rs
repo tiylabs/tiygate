@@ -3812,13 +3812,13 @@ pub async fn list_capability_shadow_metrics(
          WHERE last_ts >= $1 AND first_ts < $2",
     );
     if route_id.is_some() {
-        gap_sql.push_str(" AND route_id = $3");
+        gap_sql.push_str(" AND (route_id = $3 OR route_id = '')");
     }
     if shape_hash.is_some() {
         gap_sql.push_str(if route_id.is_some() {
-            " AND shape_hash = $4"
+            " AND (shape_hash = $4 OR shape_hash = '')"
         } else {
-            " AND shape_hash = $3"
+            " AND (shape_hash = $3 OR shape_hash = '')"
         });
     }
     gap_sql.push_str(" ORDER BY last_ts LIMIT 100001");
@@ -3833,12 +3833,29 @@ pub async fn list_capability_shadow_metrics(
     if gap_rows.len() > 100_000 {
         truncated = true;
     }
+    let mut global_gap = false;
     for row in gap_rows.into_iter().take(100_000) {
         let key = (
             row.get::<String, _>("route_id"),
             row.get::<String, _>("shape_hash"),
         );
-        aggregates.entry(key).or_default().telemetry_gap = true;
+        if key.0.is_empty() && key.1.is_empty() {
+            global_gap = true;
+        } else {
+            aggregates.entry(key).or_default().telemetry_gap = true;
+        }
+    }
+    if global_gap {
+        if aggregates.is_empty() {
+            if let (Some(route_id), Some(shape_hash)) = (route_id, shape_hash) {
+                aggregates
+                    .entry((route_id.to_string(), shape_hash.to_string()))
+                    .or_default();
+            }
+        }
+        for aggregate in aggregates.values_mut() {
+            aggregate.telemetry_gap = true;
+        }
     }
     // Probe failures are target-scoped. Use the per-probe audit stream as the
     // denominator (a job can contain several probes and may retry); join each
@@ -4628,6 +4645,41 @@ mod tests {
         assert_eq!(metrics.len(), 1);
         assert!(metrics[0].observation_window_complete);
         assert!(metrics[0].observation_window_seconds >= 23 * 60 * 60);
+    }
+
+    #[tokio::test]
+    async fn global_telemetry_gap_blocks_a_filtered_admission_window() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+        sink.write_event(&PipelineEvent {
+            request_id: "telemetry-gap-overflow".to_string(),
+            timestamp: Utc::now(),
+            stage: "capability_telemetry_gap".to_string(),
+            payload: EventPayload::CapabilityTelemetryGap {
+                route_id: String::new(),
+                shape_hash: String::new(),
+                target: String::new(),
+                reason: "telemetry_gap_queue_overflow".to_string(),
+                dropped_count: 7,
+            },
+        })
+        .await
+        .expect("write global gap");
+
+        let metrics = list_capability_shadow_metrics(
+            &pool,
+            Some("route-under-review"),
+            Some("shape/v1:under-review"),
+            None,
+            None,
+        )
+        .await
+        .expect("filtered metrics");
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].route_id, "route-under-review");
+        assert_eq!(metrics[0].shape_hash, "shape/v1:under-review");
+        assert!(metrics[0].telemetry_gap);
     }
 
     #[test]

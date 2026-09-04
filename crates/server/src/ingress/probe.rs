@@ -707,11 +707,12 @@ fn probe_details(trace: &ProbeTrace, outcome: &ProbeOutcome) -> Value {
 
 fn probe_run_id(job: &ProbeJob, probe_id: &str) -> String {
     let material = format!(
-        "probe-run/v1\0{}\0{}\0{}\0{}",
+        "probe-run/v1\0{}\0{}\0{}\0{}\0{}",
         job.target_key.as_str(),
         job.probe_set_hash,
         probe_id,
-        job.attempt_count
+        job.attempt_count,
+        job.updated_at.to_rfc3339(),
     );
     format!("probe-{}", hex::encode(Sha256::digest(material.as_bytes())))
 }
@@ -1395,7 +1396,12 @@ fn probe_body(
             // `function` member; the Responses wire uses the flat shape
             // above. Keeping these shapes separate avoids classifying a
             // probe-body serialization error as an upstream capability miss.
-            body["tools"] = json!([{"type": "function", "function": function}]);
+            let chat_function = json!({
+                "name": function["name"],
+                "description": function["description"],
+                "parameters": function["parameters"],
+            });
+            body["tools"] = json!([{"type": "function", "function": chat_function}]);
             body["tool_choice"] =
                 if probe_id == "tools.function" || probe_id == "tools.function.continuation" {
                     json!({"type": "function", "function": {"name": "__tiygate_probe"}})
@@ -2293,6 +2299,33 @@ mod tests {
     }
 
     #[test]
+    fn probe_run_id_changes_when_a_terminal_job_starts_a_new_generation() {
+        let now = Utc::now();
+        let mut job = ProbeJob {
+            id: "job".to_string(),
+            target_key: tiygate_core::TargetKey("target".to_string()),
+            probe_set: vec!["http.basic".to_string()],
+            probe_set_hash: "set".to_string(),
+            status: "running".to_string(),
+            priority: 0,
+            attempt_count: 1,
+            max_attempts: 3,
+            next_probe_index: 0,
+            next_attempt_at: now,
+            lease_owner: Some("worker".to_string()),
+            lease_until: None,
+            last_error_class: None,
+            last_error_redacted: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let first = probe_run_id(&job, "http.basic");
+        job.updated_at = now + chrono::Duration::milliseconds(1);
+        let second = probe_run_id(&job, "http.basic");
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn truncate_preserves_utf8() {
         assert_eq!(truncate("你好世界", 4), "你…");
     }
@@ -2322,6 +2355,7 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "__tiygate_probe");
         assert!(body["tools"][0].get("name").is_none());
+        assert!(body["tools"][0]["function"].get("type").is_none());
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! - Events are emitted in order with a non-blocking send
 //! - Channel backpressure drops overflow events but never blocks the producer
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,10 +40,12 @@ pub struct ChannelTelemetryBus {
     /// admission metrics and therefore must not compete with verbose hop or
     /// capture telemetry on the normal queue.
     capability_tx: mpsc::Sender<BusMessage>,
-    /// A low-volume, unbounded gap path.  It is used only after the reserved
-    /// capability queue is full, so the data plane remains non-blocking while
-    /// still recording the reason that an observation window is incomplete.
-    gap_tx: mpsc::UnboundedSender<BusMessage>,
+    /// A bounded gap path used after the reserved capability queue is full.
+    /// If this queue also fills, overflow is collapsed into one global marker
+    /// so database outages cannot turn telemetry backpressure into unbounded
+    /// process memory growth.
+    gap_tx: mpsc::Sender<BusMessage>,
+    gap_overflow: Arc<AtomicU64>,
     stop_tx: watch::Sender<bool>,
     worker: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
 }
@@ -79,18 +82,22 @@ impl ChannelTelemetryBus {
         let (tx, mut rx) = mpsc::channel::<BusMessage>(capacity.max(1));
         let capability_capacity = capacity.max(1).saturating_mul(2).max(64);
         let (capability_tx, mut capability_rx) = mpsc::channel::<BusMessage>(capability_capacity);
-        let (gap_tx, mut gap_rx) = mpsc::unbounded_channel::<BusMessage>();
+        let (gap_tx, mut gap_rx) = mpsc::channel::<BusMessage>(capability_capacity);
+        let gap_overflow = Arc::new(AtomicU64::new(0));
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let worker = Arc::new(std::sync::Mutex::new(None));
         let bus = Self {
             tx,
             capability_tx,
             gap_tx,
+            gap_overflow: gap_overflow.clone(),
             stop_tx,
             worker: worker.clone(),
         };
 
         let join = tokio::spawn(async move {
+            let mut gap_flush = tokio::time::interval(std::time::Duration::from_millis(250));
+            gap_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 let msg = tokio::select! {
                     biased;
@@ -105,8 +112,13 @@ impl ChannelTelemetryBus {
                             while let Ok(msg) = rx.try_recv() {
                                 write_bus_message(&sink, msg).await;
                             }
+                            flush_gap_overflow(&sink, &gap_overflow).await;
                             break;
                         }
+                        continue;
+                    }
+                    _ = gap_flush.tick() => {
+                        flush_gap_overflow(&sink, &gap_overflow).await;
                         continue;
                     }
                     Some(msg) = gap_rx.recv() => Some(msg),
@@ -176,6 +188,34 @@ async fn write_bus_message(sink: &Arc<dyn EventSink>, msg: BusMessage) {
     }
 }
 
+async fn flush_gap_overflow(sink: &Arc<dyn EventSink>, overflow: &AtomicU64) {
+    let dropped_count = overflow.swap(0, Ordering::AcqRel);
+    if dropped_count == 0 {
+        return;
+    }
+    let timestamp = chrono::Utc::now();
+    let event = PipelineEvent {
+        // Bound accumulation in the OLTP upsert key to one hour so a long-lived
+        // process cannot overflow the persisted BIGINT counter.
+        request_id: format!("telemetry-gap-overflow:{}", timestamp.format("%Y%m%d%H")),
+        timestamp,
+        stage: "capability_telemetry_gap".to_string(),
+        payload: tiygate_core::telemetry::EventPayload::CapabilityTelemetryGap {
+            route_id: String::new(),
+            shape_hash: String::new(),
+            target: String::new(),
+            reason: "telemetry_gap_queue_overflow".to_string(),
+            dropped_count,
+        },
+    };
+    if let Err(error) = sink.write_event(&event).await {
+        let _ = overflow.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_add(dropped_count))
+        });
+        warn!(error = %error, "telemetry sink: failed to flush collapsed capability gap");
+    }
+}
+
 #[async_trait]
 impl TelemetryBus for ChannelTelemetryBus {
     async fn send(&self, event: PipelineEvent) {
@@ -193,8 +233,20 @@ impl TelemetryBus for ChannelTelemetryBus {
                 // The gap channel is intentionally separate from both data
                 // queues.  Sending the marker is still non-blocking and does
                 // not recurse through the capability queue.
-                let _ = self.gap_tx.send(BusMessage::Pipeline(Box::new(gap)));
-                warn!("telemetry bus: capability event queued as telemetry gap");
+                if self
+                    .gap_tx
+                    .try_send(BusMessage::Pipeline(Box::new(gap)))
+                    .is_err()
+                {
+                    let _ = self.gap_overflow.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_add(1)),
+                    );
+                    warn!("telemetry bus: capability gap collapsed after queue overflow");
+                } else {
+                    warn!("telemetry bus: capability event queued as telemetry gap");
+                }
             } else {
                 warn!("telemetry bus: pipeline event dropped (channel full)");
             }
@@ -289,6 +341,7 @@ mod tests {
         requests: Arc<AtomicUsize>,
         captures: Arc<AtomicUsize>,
         capability_gaps: Arc<AtomicUsize>,
+        collapsed_gaps: Arc<AtomicUsize>,
         write_delay: Duration,
     }
 
@@ -298,6 +351,13 @@ mod tests {
             tokio::time::sleep(self.write_delay).await;
             if matches!(&_event.payload, EventPayload::CapabilityTelemetryGap { .. }) {
                 self.capability_gaps.fetch_add(1, Ordering::SeqCst);
+            }
+            if matches!(
+                &_event.payload,
+                EventPayload::CapabilityTelemetryGap { reason, .. }
+                    if reason == "telemetry_gap_queue_overflow"
+            ) {
+                self.collapsed_gaps.fetch_add(1, Ordering::SeqCst);
             }
             self.events.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -376,6 +436,7 @@ mod tests {
             requests: requests.clone(),
             captures: captures.clone(),
             capability_gaps: Arc::new(AtomicUsize::new(0)),
+            collapsed_gaps: Arc::new(AtomicUsize::new(0)),
             write_delay: Duration::from_millis(1),
         });
         let bus = ChannelTelemetryBus::spawn(sink, 16);
@@ -410,6 +471,7 @@ mod tests {
             requests: requests.clone(),
             captures: captures.clone(),
             capability_gaps: Arc::new(AtomicUsize::new(0)),
+            collapsed_gaps: Arc::new(AtomicUsize::new(0)),
             write_delay: Duration::from_millis(50),
         });
         let bus = ChannelTelemetryBus::spawn(sink, 1);
@@ -447,14 +509,17 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let captures = Arc::new(AtomicUsize::new(0));
         let capability_gaps = Arc::new(AtomicUsize::new(0));
+        let collapsed_gaps = Arc::new(AtomicUsize::new(0));
         let sink = Arc::new(CountingSink {
             events,
             requests,
             captures,
             capability_gaps: capability_gaps.clone(),
+            collapsed_gaps: collapsed_gaps.clone(),
             write_delay: Duration::from_millis(20),
         });
         let bus = ChannelTelemetryBus::spawn(sink, 1);
+        assert_eq!(bus.gap_tx.max_capacity(), 64);
         for index in 0..256 {
             bus.send(PipelineEvent {
                 request_id: format!("cap-{index}"),
@@ -476,10 +541,14 @@ mod tests {
             })
             .await;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(
             capability_gaps.load(Ordering::SeqCst) > 0,
             "capability queue overflow did not produce a gap marker"
+        );
+        assert!(
+            collapsed_gaps.load(Ordering::SeqCst) > 0,
+            "bounded gap queue overflow was not collapsed into a global marker"
         );
     }
 

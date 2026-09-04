@@ -701,8 +701,11 @@ impl DbConfigStore {
              VALUES ($1,$2,$3,$4,'pending',0,0,3,$5,NULL,NULL,NULL,NULL,$5,$5)
              ON CONFLICT(target_key, probe_set_hash) DO UPDATE SET
               status=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN 'pending' ELSE target_probe_jobs.status END,
+              attempt_count=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN 0 ELSE target_probe_jobs.attempt_count END,
               next_attempt_at=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN excluded.next_attempt_at ELSE target_probe_jobs.next_attempt_at END,
               next_probe_index=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN 0 ELSE target_probe_jobs.next_probe_index END,
+              last_error_class=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN NULL ELSE target_probe_jobs.last_error_class END,
+              last_error_redacted=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN NULL ELSE target_probe_jobs.last_error_redacted END,
               updated_at=excluded.updated_at"
         } else {
             "INSERT INTO target_probe_jobs
@@ -1075,8 +1078,11 @@ impl DbConfigStore {
              ON CONFLICT(target_key, probe_set_hash) DO UPDATE SET
               probe_set_json=excluded.probe_set_json, priority=excluded.priority, max_attempts=excluded.max_attempts,
               status=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN 'pending' ELSE target_probe_jobs.status END,
+              attempt_count=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN 0 ELSE target_probe_jobs.attempt_count END,
               next_attempt_at=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN excluded.next_attempt_at ELSE target_probe_jobs.next_attempt_at END,
               next_probe_index=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN 0 ELSE target_probe_jobs.next_probe_index END,
+              last_error_class=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN NULL ELSE target_probe_jobs.last_error_class END,
+              last_error_redacted=CASE WHEN target_probe_jobs.status IN ('complete','partial','failed','cancelled') THEN NULL ELSE target_probe_jobs.last_error_redacted END,
               updated_at=excluded.updated_at",
         )
         .bind(&id)
@@ -1982,6 +1988,7 @@ impl DbConfigStore {
     ) -> Result<bool, StoreError> {
         let result = sqlx::query(
             "UPDATE target_probe_jobs SET status='pending', next_attempt_at=$1,
+             attempt_count=CASE WHEN attempt_count > 0 THEN attempt_count-1 ELSE 0 END,
              lease_owner=NULL, lease_until=NULL, updated_at=$2
              WHERE id=$3 AND status='running' AND lease_owner=$4",
         )
@@ -2827,6 +2834,86 @@ mod tests {
             .expect("resume with cursor")
             .expect("resumed cursor job");
         assert_eq!(resumed_again.next_probe_index, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_probe_job_requeue_starts_a_new_attempt_budget() {
+        let pool = crate::db::open_pool("sqlite::memory:").await.expect("pool");
+        crate::db::run_migrations(&pool).await.expect("migrations");
+        let store = DbConfigStore::new(pool, None);
+        let key = TargetKey("requeued-target".to_string());
+        let probes = ["http.basic".to_string()];
+        let job = store
+            .enqueue_probe_job(&key, &probes, 0, 1)
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_probe_job("worker-a", 60)
+            .await
+            .expect("claim")
+            .expect("claimed");
+        assert_eq!(claimed.attempt_count, 1);
+        assert!(store
+            .complete_probe_job_with_error(
+                &job.id,
+                "worker-a",
+                "failed",
+                "auth",
+                "credential rejected",
+            )
+            .await
+            .expect("fail"));
+
+        let requeued = store
+            .enqueue_probe_job(&key, &probes, 0, 1)
+            .await
+            .expect("requeue");
+        assert_eq!(requeued.status, "pending");
+        assert_eq!(requeued.attempt_count, 0);
+        assert!(requeued.last_error_class.is_none());
+        assert!(requeued.last_error_redacted.is_none());
+        assert!(store
+            .claim_probe_job("worker-b", 60)
+            .await
+            .expect("requeue claim")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn budget_defer_does_not_consume_an_attempt() {
+        let pool = crate::db::open_pool("sqlite::memory:").await.expect("pool");
+        crate::db::run_migrations(&pool).await.expect("migrations");
+        let store = DbConfigStore::new(pool, None);
+        let job = store
+            .enqueue_probe_job(
+                &TargetKey("deferred-target".to_string()),
+                &["http.basic".to_string()],
+                0,
+                1,
+            )
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_probe_job("worker-a", 60)
+            .await
+            .expect("claim")
+            .expect("claimed");
+        assert_eq!(claimed.attempt_count, 1);
+        assert!(store
+            .defer_probe_job(
+                &job.id,
+                "worker-a",
+                Utc::now() + chrono::Duration::hours(24),
+            )
+            .await
+            .expect("defer"));
+        let deferred = store
+            .get_probe_job(&job.id)
+            .await
+            .expect("read deferred")
+            .expect("deferred job");
+        assert_eq!(deferred.status, "pending");
+        assert_eq!(deferred.attempt_count, 0);
     }
 
     #[tokio::test]
