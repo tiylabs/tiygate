@@ -1,10 +1,10 @@
 //! Higher-level wrappers around [`crate::encryption::KeyEncryption`].
 //!
 //! These are the functions the rest of the gateway uses to encrypt
-//! and decrypt provider API keys. They are deliberately tiny so the
+//! and decrypt provider credentials. They are deliberately tiny so the
 //! auth-mode branching lives in one place and so that switching
-//! purposes (provider API key vs. OAuth refresh token) does not
-//! require changes in any other file.
+//! purposes (provider API key, management key, or OAuth refresh token)
+//! does not require changes in any other file.
 
 use crate::encryption::{EncryptionError, KeyEncryption};
 
@@ -12,6 +12,10 @@ use crate::encryption::{EncryptionError, KeyEncryption};
 /// API key. Distinct from the OAuth purpose so an operator can
 /// rotate one without invalidating the other.
 pub const PURPOSE_PROVIDER_API_KEY: &str = "provider-api-key";
+/// Purpose label used to derive the subkey for an optional provider
+/// subscription-management key. This must remain distinct from the
+/// upstream API key because the two credentials have different scopes.
+pub const PURPOSE_USAGE_MANAGEMENT_KEY: &str = "usage-management-key";
 /// Purpose label used to derive the subkey for OAuth refresh tokens.
 pub const PURPOSE_OAUTH_REFRESH_TOKEN: &str = "oauth-refresh-token";
 /// Purpose label used for short-lived OAuth access tokens cached in the
@@ -31,6 +35,22 @@ pub fn encrypt_api_key(enc: &KeyEncryption, api_key: &str) -> Result<String, Enc
 /// Decrypt a provider API key.
 pub fn decrypt_api_key(enc: &KeyEncryption, blob: &str) -> Result<String, EncryptionError> {
     enc.decrypt(PURPOSE_PROVIDER_API_KEY, blob)
+}
+
+/// Encrypt a provider subscription-management key.
+pub fn encrypt_usage_management_key(
+    enc: &KeyEncryption,
+    key: &str,
+) -> Result<String, EncryptionError> {
+    enc.encrypt(PURPOSE_USAGE_MANAGEMENT_KEY, key)
+}
+
+/// Decrypt a provider subscription-management key.
+pub fn decrypt_usage_management_key(
+    enc: &KeyEncryption,
+    blob: &str,
+) -> Result<String, EncryptionError> {
+    enc.decrypt(PURPOSE_USAGE_MANAGEMENT_KEY, blob)
 }
 
 /// Encrypt an OAuth refresh token JSON blob.
@@ -114,5 +134,12 @@ mod tests {
             "access-token"
         );
         assert!(decrypt_oauth_meta(&e, &access).is_err());
+
+        let usage = encrypt_usage_management_key(&e, "manage-key").unwrap();
+        assert_eq!(
+            decrypt_usage_management_key(&e, &usage).unwrap(),
+            "manage-key"
+        );
+        assert!(decrypt_api_key(&e, &usage).is_err());
     }
 }

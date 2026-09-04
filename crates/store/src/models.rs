@@ -78,6 +78,10 @@ pub struct Provider {
     /// Encrypted API key (or empty). Set at upsert time; the
     /// `DbConfigStore` populates `api_key_cleartext` on read.
     pub encrypted_api_key: String,
+    /// Optional encrypted provider-management key used for subscription
+    /// usage queries (or empty). It is never used for upstream inference.
+    #[serde(default)]
+    pub encrypted_usage_management_key: String,
     pub auth_mode: AuthMode,
     /// Encrypted OAuth metadata JSON, or empty.
     pub encrypted_oauth_meta: String,
@@ -93,6 +97,11 @@ pub struct Provider {
     /// and the cleartext lives in `encrypted_api_key` verbatim).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_cleartext: Option<String>,
+    /// Decrypted cleartext of `encrypted_usage_management_key`. Populated
+    /// only for direct provider reads that need to make an Admin usage
+    /// request; the regular data-plane snapshot leaves this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_management_key_cleartext: Option<String>,
     /// Decrypted cleartext of `encrypted_oauth_meta`. Populated by
     /// `DbConfigStore::refresh()` for OAuth-mode providers so
     /// `snapshot_to_routing_table` can extract the refresh token
@@ -325,7 +334,8 @@ pub struct ConfigExport {
     /// RFC-3339 timestamp of when the export was produced.
     pub exported_at: String,
     /// Whether the source instance had a master key configured. When
-    /// `true`, provider `encrypted_api_key` / `encrypted_oauth_meta`
+    /// `true`, provider `encrypted_api_key` / `encrypted_oauth_meta` /
+    /// `encrypted_usage_management_key`
     /// are real AES-GCM blobs that need the source master key to
     /// decrypt. When `false`, those columns hold cleartext.
     pub encrypted: bool,

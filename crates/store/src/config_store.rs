@@ -1034,7 +1034,7 @@ impl DbConfigStore {
     pub async fn get_provider(&self, id: &str) -> Result<Option<Provider>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-                    encrypted_oauth_meta, metadata_json, enabled, \
+                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, \
                     created_at, updated_at FROM providers WHERE id = $1",
         )
         .bind(id)
@@ -1044,6 +1044,7 @@ impl DbConfigStore {
         if let Some(provider) = provider.as_mut() {
             populate_provider_api_key_cleartext(self.encryption.as_ref(), provider);
             populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
+            populate_provider_usage_management_key_cleartext(self.encryption.as_ref(), provider);
         }
         Ok(provider)
     }
@@ -1058,7 +1059,7 @@ impl DbConfigStore {
     ) -> Result<Option<Provider>, StoreError> {
         let row = sqlx::query(
             "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-                    encrypted_oauth_meta, metadata_json, enabled, \
+                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, \
                     created_at, updated_at FROM providers WHERE id = $1",
         )
         .bind(id)
@@ -1068,6 +1069,7 @@ impl DbConfigStore {
         if let Some(provider) = provider.as_mut() {
             populate_provider_api_key_cleartext(self.encryption.as_ref(), provider);
             populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
+            populate_provider_usage_management_key_cleartext(self.encryption.as_ref(), provider);
         }
         Ok(provider)
     }
@@ -1085,6 +1087,41 @@ impl DbConfigStore {
         oauth_meta_plain: Option<&str>,
         metadata_json: serde_json::Value,
         enabled: bool,
+    ) -> Result<Provider, StoreError> {
+        self.upsert_provider_with_usage_management_key(
+            id,
+            name,
+            vendor,
+            api_base,
+            models_endpoint,
+            api_key_plain,
+            auth_mode,
+            oauth_meta_plain,
+            metadata_json,
+            enabled,
+            None,
+        )
+        .await
+    }
+
+    /// Upsert a provider and optionally replace its subscription-management
+    /// key. `None` preserves the existing key, while `Some("")` clears it.
+    /// The extra key is stored separately from the upstream API key because it
+    /// is used only for provider-specific Admin usage requests.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_provider_with_usage_management_key(
+        &self,
+        id: &str,
+        name: &str,
+        vendor: &str,
+        api_base: &str,
+        models_endpoint: &str,
+        api_key_plain: Option<&str>,
+        auth_mode: AuthMode,
+        oauth_meta_plain: Option<&str>,
+        metadata_json: serde_json::Value,
+        enabled: bool,
+        usage_management_key_plain: Option<&str>,
     ) -> Result<Provider, StoreError> {
         validate_provider_auth_mode(vendor, auth_mode)
             .map_err(|message| StoreError::Invalid(message.to_string()))?;
@@ -1115,6 +1152,30 @@ impl DbConfigStore {
                 .map(|p| p.encrypted_oauth_meta.clone())
                 .unwrap_or_default(),
         };
+        let encrypted_usage_management_key = match (
+            usage_management_key_plain,
+            self.encryption.as_ref(),
+        ) {
+            (Some(plain), Some(enc)) => {
+                let plain = plain.trim();
+                if plain.is_empty() {
+                    String::new()
+                } else {
+                    keys::encrypt_usage_management_key(enc, plain)
+                        .map_err(|e| StoreError::Decrypt(e.to_string()))?
+                }
+            }
+            (Some(plain), None) => {
+                warn!(
+                    "TIYGATE_MASTER_KEY not set; storing usage management key in cleartext (NOT FOR PRODUCTION)"
+                );
+                plain.trim().to_string()
+            }
+            (None, _) => existing
+                .as_ref()
+                .map(|p| p.encrypted_usage_management_key.clone())
+                .unwrap_or_default(),
+        };
         let metadata_str = serde_json::to_string(&metadata_json)?;
         let enabled_int: i32 = if enabled { 1 } else { 0 };
         let created_at = existing
@@ -1138,6 +1199,7 @@ impl DbConfigStore {
             models_endpoint: models_endpoint.to_string(),
             encrypted_api_key: encrypted_api_key.clone(),
             auth_mode,
+            encrypted_usage_management_key: encrypted_usage_management_key.clone(),
             encrypted_oauth_meta: encrypted_oauth_meta.clone(),
             metadata_json: metadata_json.clone(),
             enabled,
@@ -1163,6 +1225,7 @@ impl DbConfigStore {
             } else {
                 None
             },
+            usage_management_key_cleartext: None,
         };
         let mut prospective_providers = self.list_providers().await?;
         if let Some(provider) = prospective_providers
@@ -1200,12 +1263,13 @@ impl DbConfigStore {
         let mut tx = self.pool.any().begin().await?;
         sqlx::query(
             "INSERT INTO providers (id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-             encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
              ON CONFLICT(id) DO UPDATE SET \
                 name=excluded.name, vendor=excluded.vendor, api_base=excluded.api_base, \
                 models_endpoint=excluded.models_endpoint, \
                 encrypted_api_key=excluded.encrypted_api_key, auth_mode=excluded.auth_mode, \
+                encrypted_usage_management_key=excluded.encrypted_usage_management_key, \
                 encrypted_oauth_meta=excluded.encrypted_oauth_meta, metadata_json=excluded.metadata_json, \
                 enabled=excluded.enabled, updated_at=excluded.updated_at",
         )
@@ -1216,6 +1280,7 @@ impl DbConfigStore {
         .bind(models_endpoint)
         .bind(&encrypted_api_key)
         .bind(auth_mode.as_str())
+        .bind(&encrypted_usage_management_key)
         .bind(&encrypted_oauth_meta)
         .bind(&metadata_str)
         .bind(enabled_int)
@@ -1565,7 +1630,7 @@ impl DbConfigStore {
     async fn load_providers(&self) -> Result<Vec<Provider>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-                    encrypted_oauth_meta, metadata_json, enabled, \
+                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, \
                     created_at, updated_at FROM providers",
         )
         .fetch_all(self.pool.any())
@@ -2035,6 +2100,7 @@ impl DbConfigStore {
         // cannot leak the decrypted secret.
         for p in providers.iter_mut() {
             p.api_key_cleartext = None;
+            p.usage_management_key_cleartext = None;
         }
         let routes = self.load_routes().await?;
         let api_keys = self.list_api_keys().await?;
@@ -2259,6 +2325,22 @@ impl DbConfigStore {
                     None => plain,
                 }
             };
+            let enc_usage_management_key = if p.encrypted_usage_management_key.is_empty() {
+                String::new()
+            } else {
+                let plain = match &source_enc {
+                    Some(src) => {
+                        keys::decrypt_usage_management_key(src, &p.encrypted_usage_management_key)
+                            .map_err(|e| StoreError::Decrypt(e.to_string()))?
+                    }
+                    None => p.encrypted_usage_management_key.clone(),
+                };
+                match self.encryption.as_ref() {
+                    Some(enc) => keys::encrypt_usage_management_key(enc, &plain)
+                        .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+                    None => plain,
+                }
+            };
             let metadata_str = serde_json::to_string(&p.metadata_json)?;
             let enabled_int: i32 = if p.enabled { 1 } else { 0 };
             let created_at = p.created_at.to_rfc3339();
@@ -2268,12 +2350,13 @@ impl DbConfigStore {
             // effect.
             sqlx::query(
                 "INSERT INTO providers (id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-                 encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
                  ON CONFLICT(id) DO UPDATE SET \
                     name=excluded.name, vendor=excluded.vendor, api_base=excluded.api_base, \
                     models_endpoint=excluded.models_endpoint, \
                     encrypted_api_key=excluded.encrypted_api_key, auth_mode=excluded.auth_mode, \
+                    encrypted_usage_management_key=excluded.encrypted_usage_management_key, \
                     encrypted_oauth_meta=excluded.encrypted_oauth_meta, \
                     metadata_json=excluded.metadata_json, \
                     enabled=excluded.enabled, updated_at=excluded.updated_at",
@@ -2285,6 +2368,7 @@ impl DbConfigStore {
             .bind(&p.models_endpoint)
             .bind(&enc_api_key)
             .bind(p.auth_mode.as_str())
+            .bind(&enc_usage_management_key)
             .bind(&enc_oauth_meta)
             .bind(&metadata_str)
             .bind(enabled_int)
@@ -2348,7 +2432,8 @@ impl DbConfigStore {
         // visible without its durable profile/job pair.
         let mut imported_providers = sqlx::query(
             "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode,
-                    encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at
+                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled,
+                    created_at, updated_at
              FROM providers",
         )
         .fetch_all(&mut *tx)
@@ -2942,12 +3027,14 @@ fn row_to_provider(row: sqlx::any::AnyRow) -> Result<Provider, StoreError> {
         models_endpoint: row.get("models_endpoint"),
         encrypted_api_key: row.get("encrypted_api_key"),
         auth_mode,
+        encrypted_usage_management_key: row.get("encrypted_usage_management_key"),
         encrypted_oauth_meta: row.get("encrypted_oauth_meta"),
         metadata_json,
         enabled: enabled_int != 0,
         created_at: parse_dt(row.get("created_at"))?,
         updated_at: parse_dt(row.get("updated_at"))?,
         api_key_cleartext: None,
+        usage_management_key_cleartext: None,
         oauth_meta_cleartext: None,
     })
 }
@@ -3003,6 +3090,33 @@ fn populate_provider_api_key_cleartext(
         }
     } else {
         provider.api_key_cleartext = Some(provider.encrypted_api_key.clone());
+    }
+}
+
+fn populate_provider_usage_management_key_cleartext(
+    encryption: Option<&Arc<KeyEncryption>>,
+    provider: &mut Provider,
+) {
+    if provider.encrypted_usage_management_key.is_empty() {
+        provider.usage_management_key_cleartext = Some(String::new());
+        return;
+    }
+    if let Some(enc) = encryption {
+        match keys::decrypt_usage_management_key(enc, &provider.encrypted_usage_management_key) {
+            Ok(plain) => provider.usage_management_key_cleartext = Some(plain),
+            Err(error) => {
+                tracing::warn!(
+                    provider = %provider.id,
+                    error = %error,
+                    "decrypting provider usage management key failed; Admin usage will be unavailable"
+                );
+                provider.usage_management_key_cleartext = None;
+            }
+        }
+    } else {
+        // No master key: the column holds cleartext.
+        provider.usage_management_key_cleartext =
+            Some(provider.encrypted_usage_management_key.clone());
     }
 }
 
@@ -3160,6 +3274,7 @@ mod tests {
             api_base: "https://example.test/root".to_string(),
             models_endpoint: String::new(),
             encrypted_api_key: "sk-test".to_string(),
+            encrypted_usage_management_key: String::new(),
             auth_mode: AuthMode::ApiKey,
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({}),
@@ -3167,6 +3282,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: Some("sk-test".to_string()),
+            usage_management_key_cleartext: None,
             oauth_meta_cleartext: None,
         };
         let route = Route {
@@ -3219,12 +3335,14 @@ mod tests {
             models_endpoint: String::new(),
             encrypted_api_key: "sk-test".to_string(),
             auth_mode: AuthMode::ApiKey,
+            encrypted_usage_management_key: String::new(),
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({}),
             enabled: true,
             created_at: now,
             updated_at: now,
             api_key_cleartext: Some("sk-test".to_string()),
+            usage_management_key_cleartext: None,
             oauth_meta_cleartext: None,
         };
         let route = Route {
@@ -3273,6 +3391,7 @@ mod tests {
             api_base: "https://api.openai.com/v1".to_string(),
             models_endpoint: String::new(),
             encrypted_api_key: "sk-test".to_string(),
+            encrypted_usage_management_key: String::new(),
             auth_mode: AuthMode::ApiKey,
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({}),
@@ -3280,6 +3399,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: Some("sk-test".to_string()),
+            usage_management_key_cleartext: None,
             oauth_meta_cleartext: None,
         };
         // Two targets: one enabled, one disabled.
@@ -3346,6 +3466,7 @@ mod tests {
             api_base: "https://api.openai.com/v1".to_string(),
             models_endpoint: String::new(),
             encrypted_api_key: "sk-test".to_string(),
+            encrypted_usage_management_key: String::new(),
             auth_mode: AuthMode::ApiKey,
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({}),
@@ -3353,6 +3474,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: Some("sk-test".to_string()),
+            usage_management_key_cleartext: None,
             oauth_meta_cleartext: None,
         };
         let route = Route {
@@ -3489,6 +3611,48 @@ mod tests {
             provider_in_tx.oauth_meta_cleartext.as_deref(),
             Some(meta_str.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn usage_management_key_is_encrypted_and_available_for_direct_reads() {
+        let key = KeyEncryption::from_secret(&master_key_hex()).expect("key");
+        let store = boot_store(Some(Arc::new(key))).await;
+        store
+            .upsert_provider_with_usage_management_key(
+                "zenmux-usage",
+                "ZenMux",
+                "zenmux",
+                "https://zenmux.ai/api",
+                "",
+                Some("upstream-key"),
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                true,
+                Some("manage-key-secret"),
+            )
+            .await
+            .expect("upsert ZenMux provider");
+
+        let encrypted: String = sqlx::query_scalar(
+            "SELECT encrypted_usage_management_key FROM providers WHERE id = 'zenmux-usage'",
+        )
+        .fetch_one(store.pool.any())
+        .await
+        .expect("usage management key");
+        assert!(!encrypted.contains("manage-key-secret"));
+        assert!(encrypted.len() > 20);
+
+        let provider = store
+            .get_provider("zenmux-usage")
+            .await
+            .expect("get provider")
+            .expect("provider exists");
+        assert_eq!(
+            provider.usage_management_key_cleartext.as_deref(),
+            Some("manage-key-secret")
+        );
+        assert_eq!(provider.encrypted_usage_management_key, encrypted);
     }
 
     #[tokio::test]
@@ -3630,6 +3794,7 @@ mod tests {
             api_base: OPENAI_PLATFORM_BASE_URL.to_string(),
             models_endpoint: String::new(),
             encrypted_api_key: String::new(),
+            encrypted_usage_management_key: String::new(),
             auth_mode: AuthMode::OAuth,
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({
@@ -3643,6 +3808,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: None,
+            usage_management_key_cleartext: None,
             oauth_meta_cleartext: Some(
                 serde_json::json!({
                     "refresh_token": "refresh",
@@ -3679,6 +3845,7 @@ mod tests {
             api_base: "https://api.anthropic.com".to_string(),
             models_endpoint: String::new(),
             encrypted_api_key: String::new(),
+            encrypted_usage_management_key: String::new(),
             auth_mode: AuthMode::OAuth,
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({
@@ -3691,6 +3858,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: None,
+            usage_management_key_cleartext: None,
             oauth_meta_cleartext: Some(serde_json::json!({"refresh_token": "refresh"}).to_string()),
         };
 
@@ -3709,6 +3877,7 @@ mod tests {
             api_base: "https://api.x.ai/v1".to_string(),
             models_endpoint: String::new(),
             encrypted_api_key: String::new(),
+            encrypted_usage_management_key: String::new(),
             auth_mode: AuthMode::OAuth,
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({
@@ -3721,6 +3890,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: None,
+            usage_management_key_cleartext: None,
             oauth_meta_cleartext: Some(serde_json::json!({"refresh_token": "refresh"}).to_string()),
         };
 
@@ -4394,6 +4564,7 @@ mod tests {
                     api_base: "https://api.openai.com/v1".into(),
                     models_endpoint: String::new(),
                     encrypted_api_key: "sk-exported".into(),
+                    encrypted_usage_management_key: String::new(),
                     auth_mode: AuthMode::ApiKey,
                     encrypted_oauth_meta: String::new(),
                     metadata_json: serde_json::json!({}),
@@ -4401,6 +4572,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     api_key_cleartext: None,
+                    usage_management_key_cleartext: None,
                     oauth_meta_cleartext: None,
                 },
                 Provider {
@@ -4410,6 +4582,7 @@ mod tests {
                     api_base: "https://api.anthropic.com".into(),
                     models_endpoint: String::new(),
                     encrypted_api_key: "sk-new".into(),
+                    encrypted_usage_management_key: String::new(),
                     auth_mode: AuthMode::ApiKey,
                     encrypted_oauth_meta: String::new(),
                     metadata_json: serde_json::json!({}),
@@ -4417,6 +4590,7 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     api_key_cleartext: None,
+                    usage_management_key_cleartext: None,
                     oauth_meta_cleartext: None,
                 },
             ],
@@ -4685,6 +4859,7 @@ mod tests {
                 api_base: "https://api.openai.com/v1".into(),
                 models_endpoint: String::new(),
                 encrypted_api_key: "sk-new".into(),
+                encrypted_usage_management_key: String::new(),
                 auth_mode: AuthMode::ApiKey,
                 encrypted_oauth_meta: String::new(),
                 metadata_json: serde_json::json!({}),
@@ -4692,6 +4867,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 api_key_cleartext: None,
+                usage_management_key_cleartext: None,
                 oauth_meta_cleartext: None,
             }],
             routes: vec![],
@@ -4736,6 +4912,7 @@ mod tests {
                 api_base: "https://api.openai.com/v1".into(),
                 models_endpoint: String::new(),
                 encrypted_api_key: "sk-x".into(),
+                encrypted_usage_management_key: String::new(),
                 auth_mode: AuthMode::ApiKey,
                 encrypted_oauth_meta: String::new(),
                 metadata_json: serde_json::json!({}),
@@ -4743,6 +4920,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 api_key_cleartext: None,
+                usage_management_key_cleartext: None,
                 oauth_meta_cleartext: None,
             }],
             routes: vec![],

@@ -466,6 +466,8 @@ const zh: Translation = {
     },
     apiKey: "API 密钥",
     apiKeyHint: "留空则保留现有密钥。",
+    usageManagementKey: "用量管理 Key",
+    usageManagementKeyHint: "留空则保留现有用量管理 Key。",
     redacted: "密钥加密存储，永不返回明文。",
     deleteConfirm: "删除供应商 {{name}}？此操作不可撤销。",
     deleteImpactLoading: "正在检查关联路由…",

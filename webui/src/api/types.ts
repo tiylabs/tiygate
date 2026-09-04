@@ -9,6 +9,7 @@ export interface Provider {
   models_endpoint: string;
   auth_mode: string;
   encrypted_api_key: string;
+  encrypted_usage_management_key?: string;
   encrypted_oauth_meta: string;
   oauth_status?: {
     state: "not_connected" | "connected" | "healthy" | "invalid" | "error";
@@ -28,6 +29,7 @@ export interface ProviderInput {
   api_base: string;
   models_endpoint?: string;
   api_key?: string;
+  usage_management_key?: string;
   auth_mode?: string;
   oauth_meta?: string;
   metadata?: Record<string, unknown>;
@@ -732,6 +734,7 @@ export interface ExportProvider {
   api_base: string;
   models_endpoint: string;
   encrypted_api_key: string;
+  encrypted_usage_management_key?: string;
   auth_mode: string;
   encrypted_oauth_meta: string;
   metadata_json: Record<string, unknown>;

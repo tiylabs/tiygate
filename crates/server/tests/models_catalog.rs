@@ -115,6 +115,7 @@ async fn models_endpoint_prefers_persisted_route_metadata_over_catalog() {
         api_base: "https://api.openai.com/v1".to_string(),
         models_endpoint: String::new(),
         encrypted_api_key: String::new(),
+        encrypted_usage_management_key: String::new(),
         auth_mode: AuthMode::None,
         encrypted_oauth_meta: String::new(),
         metadata_json: json!({}),
@@ -122,6 +123,7 @@ async fn models_endpoint_prefers_persisted_route_metadata_over_catalog() {
         created_at: now,
         updated_at: now,
         api_key_cleartext: None,
+        usage_management_key_cleartext: None,
         oauth_meta_cleartext: None,
     };
     let route = Route {

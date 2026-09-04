@@ -196,7 +196,7 @@ export default function RoutesPage() {
     queryKey: ["routes", filter],
     queryFn: () => routesApi.list(filter),
   });
-  const { data: providers } = useQuery({
+  const { data: providers, refetch: refetchProviders } = useQuery({
     queryKey: ["providers"],
     queryFn: providersApi.list,
   });
@@ -703,10 +703,15 @@ export default function RoutesPage() {
 
   const routes = data?.entries ?? [];
 
+  async function refreshPage() {
+    await Promise.all([refetch(), refetchProviders()]);
+  }
+
   return (
     <div>
       <PageHeader
         title={t("routes.title")}
+        onRefresh={refreshPage}
         action={
           <Button
             variant="primary"

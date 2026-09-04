@@ -110,6 +110,7 @@ interface FormState {
   api_base: string;
   models_endpoint: string;
   api_key: string;
+  usage_management_key: string;
   auth_mode: string;
   enabled: boolean;
 }
@@ -128,6 +129,7 @@ function emptyForm(): FormState {
     api_base: "",
     models_endpoint: "",
     api_key: "",
+    usage_management_key: "",
     auth_mode: "api_key",
     enabled: true,
   };
@@ -163,6 +165,17 @@ function supportsOAuthUsage(provider: Provider): boolean {
   return (
     provider.auth_mode === "oauth" &&
     (provider.vendor === "openai" || provider.vendor === "anthropic")
+  );
+}
+
+function hasUsageManagementKey(provider: Provider): boolean {
+  return (provider.encrypted_usage_management_key?.trim() ?? "") !== "";
+}
+
+function supportsProviderUsage(provider: Provider): boolean {
+  return (
+    supportsOAuthUsage(provider) ||
+    (provider.vendor === "zenmux" && hasUsageManagementKey(provider))
   );
 }
 
@@ -529,7 +542,7 @@ function UsageWindowSummary({
   );
 }
 
-function OpenAiUsageLayout({
+function SubscriptionUsageLayout({
   providerId,
   usage,
   loading,
@@ -571,7 +584,7 @@ function OpenAiUsageLayout({
   const firstUsed = usageWindowPercent(ringWindows[0]);
   const secondUsed = usageWindowPercent(ringWindows[1]);
   return (
-    <div className="flex min-w-0 items-center gap-4">
+    <div className="flex w-fit min-w-0 shrink-0 items-center gap-4">
       <div className="relative grid h-11 w-11 shrink-0 place-items-center">
         <svg
           viewBox="0 0 80 80"
@@ -668,11 +681,13 @@ function OpenAiUsageLayout({
           </Badge>
         ) : null}
       </div>
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 shrink-0">
         <div
           className={cn(
-            "grid min-w-0 gap-y-2",
-            hasMultipleWindows ? "grid-cols-2 gap-x-4" : "grid-cols-1",
+            "grid w-fit min-w-0 gap-y-2",
+            hasMultipleWindows
+              ? "grid-flow-col auto-cols-max gap-x-4"
+              : "grid-cols-1",
           )}
         >
           {windows.map((window, index) => (
@@ -706,6 +721,7 @@ export default function Providers() {
     data: catalog,
     isLoading: catalogLoading,
     isError: catalogError,
+    refetch: refetchCatalog,
   } = useQuery({
     queryKey: ["provider-catalog"],
     queryFn: providerCatalogApi.list,
@@ -714,7 +730,7 @@ export default function Providers() {
     queries: (data ?? []).map((provider) => ({
       queryKey: ["provider-usage", provider.id],
       queryFn: () => providersApi.usage(provider.id),
-      enabled: supportsOAuthUsage(provider),
+      enabled: supportsProviderUsage(provider),
       staleTime: 60_000,
       retry: false,
     })),
@@ -737,6 +753,17 @@ export default function Providers() {
     }
     return result;
   }, [data, usageQueries]);
+
+  async function refreshPage() {
+    const usageRefetches = usageQueries.flatMap((query, index) => {
+      const provider = data?.[index];
+      return provider && supportsProviderUsage(provider)
+        ? [query.refetch()]
+        : [];
+    });
+    await Promise.all([refetch(), refetchCatalog(), ...usageRefetches]);
+  }
+
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm());
   const [editing, setEditing] = useState<Provider | null>(null);
@@ -933,6 +960,7 @@ export default function Providers() {
       api_base: p.api_base,
       models_endpoint: p.models_endpoint,
       api_key: "",
+      usage_management_key: "",
       auth_mode: p.auth_mode,
       enabled: p.enabled,
     });
@@ -1002,6 +1030,11 @@ export default function Providers() {
     // Only send api_key when the operator typed one — blank keeps the
     // existing encrypted secret untouched.
     if (form.api_key.trim()) body.api_key = form.api_key.trim();
+    // The ZenMux Management API key is independent from the upstream API
+    // key. Blank keeps the existing encrypted management key untouched.
+    if (form.usage_management_key.trim()) {
+      body.usage_management_key = form.usage_management_key.trim();
+    }
 
     // For OAuth providers, embed the OAuth preset metadata so the
     // backend's snapshot_to_routing_table can build OAuthTargetConfig
@@ -1049,6 +1082,7 @@ export default function Providers() {
     <div>
       <PageHeader
         title={t("providers.title")}
+        onRefresh={refreshPage}
         action={
           <Button
             variant="primary"
@@ -1095,7 +1129,7 @@ export default function Providers() {
               <colgroup>
                 <col style={{ width: "20rem" }} />
                 <col style={{ width: "16%" }} />
-                <col />
+                <col style={{ width: "24rem" }} />
                 <col style={{ width: "6rem" }} />
                 <col style={{ width: "6rem" }} />
                 <col style={{ width: "9rem" }} />
@@ -1113,7 +1147,7 @@ export default function Providers() {
                     {t("common.name")}
                   </Th>
                   <Th>{t("providers.vendor")}</Th>
-                  <Th>{t("providers.apiBase")}</Th>
+                  <Th className="min-w-[24rem]">{t("providers.apiBase")}</Th>
                   <Th>{t("providers.authMode")}</Th>
                   <Th className="text-center">{t("common.status")}</Th>
                   <Th>{t("common.updatedAt")}</Th>
@@ -1161,8 +1195,8 @@ export default function Providers() {
                         </span>
                       </div>
                     </Td>
-                    <Td className="align-middle">
-                      {!isOAuthProvider(p) ? (
+                    <Td className="min-w-[24rem] align-middle">
+                      {!isOAuthProvider(p) && !supportsProviderUsage(p) ? (
                         <div
                           className="truncate font-mono text-xs"
                           title={p.api_base}
@@ -1170,12 +1204,14 @@ export default function Providers() {
                           {p.api_base}
                         </div>
                       ) : null}
-                      {supportsOAuthUsage(p) ? (
+                      {supportsProviderUsage(p) ? (
                         <div
                           className={cn(
                             "mt-1.5 min-w-[16rem]",
-                            p.vendor === "openai" && "min-w-[18rem]",
+                            (p.vendor === "openai" || p.vendor === "zenmux") &&
+                              "min-w-[18rem]",
                             p.vendor !== "openai" &&
+                              p.vendor !== "zenmux" &&
                               "grid grid-cols-2 gap-x-3 gap-y-1",
                           )}
                         >
@@ -1186,9 +1222,9 @@ export default function Providers() {
                             const windows = providerUsageWindows(usage);
                             const visibleWindows =
                               windows.length > 0 ? windows : [undefined];
-                            if (p.vendor === "openai") {
+                            if (p.vendor === "openai" || p.vendor === "zenmux") {
                               return (
-                                <OpenAiUsageLayout
+                                <SubscriptionUsageLayout
                                   providerId={p.id}
                                   usage={usage}
                                   loading={usageQuery?.isFetching ?? true}
@@ -1577,6 +1613,26 @@ export default function Providers() {
                 onChange={(e) => setForm({ ...form, api_key: e.target.value })}
                 placeholder={editing ? "••••••••" : "sk-…"}
                 toggleLabel={t("providers.apiKey")}
+                autoComplete="off"
+              />
+            </Field>
+          ) : null}
+          {form.vendor === "zenmux" ? (
+            <Field
+              label={t("providers.usageManagementKey")}
+              hint={
+                editing
+                  ? t("providers.usageManagementKeyHint")
+                  : t("providers.redacted")
+              }
+            >
+              <PasswordInput
+                value={form.usage_management_key}
+                onChange={(e) =>
+                  setForm({ ...form, usage_management_key: e.target.value })
+                }
+                placeholder={editing ? "••••••••" : "zm-…"}
+                toggleLabel={t("providers.usageManagementKey")}
                 autoComplete="off"
               />
             </Field>

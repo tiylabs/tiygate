@@ -66,7 +66,7 @@ Settings 页面分为五个卡片:
 | **后台任务** | 日志保留间隔与天数、epoch 轮询间隔、token 统计间隔与回看天数 | `TIYGATE_LOG_RETENTION_*`、`TIYGATE_EPOCH_POLL_INTERVAL_SECS`、`TIYGATE_TOKEN_STATS_*` |
 
 - **epoch 版本号**:数据面轮询配置变更,原子切换到新快照;**在途请求保持旧 epoch 直到结束**——不会看到半新半旧配置。
-- **密钥加密**:provider key / OAuth token / 加密的 S3 设置在数据库中 AES-GCM 静态加密,主密钥来自 `TIYGATE_MASTER_KEY`。加密设置在 `GET /admin/v1/settings` 时脱敏返回。
+- **密钥加密**: provider key、OAuth token、ZenMux 用量管理 key 和加密的 S3 设置在数据库中 AES-GCM 静态加密,主密钥来自 `TIYGATE_MASTER_KEY`。加密设置在 `GET /admin/v1/settings` 时脱敏返回。
 
 ### 缓存
 

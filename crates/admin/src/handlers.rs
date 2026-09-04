@@ -34,6 +34,8 @@ use crate::state::AdminState;
 
 const OPENAI_PLATFORM_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const ZENMUX_DEFAULT_API_BASE_URL: &str = "https://zenmux.ai/api";
+const ZENMUX_MANAGEMENT_USAGE_PATH: &str = "/v1/management/subscription/detail";
 /// ChatGPT/Codex subscription usage endpoint. This endpoint is used only for
 /// OpenAI OAuth providers; OpenAI API-key providers have platform billing
 /// semantics rather than the ChatGPT 5-hour / 7-day windows.
@@ -2272,6 +2274,13 @@ fn parse_reset_credit_list(value: &Value) -> Vec<ProviderResetCredit> {
         .collect()
 }
 
+fn reconcile_reset_credit_count(explicit_count: Option<usize>, observed_count: usize) -> usize {
+    // A returned credit record is direct evidence that the credit is
+    // available. Keep a larger explicit count when the endpoint returns only
+    // partial details, but never let a stale summary hide returned credits.
+    explicit_count.map_or(observed_count, |count| count.max(observed_count))
+}
+
 fn parse_reset_credits(value: &Value) -> Option<ProviderResetCredits> {
     if value.is_array() {
         let credits = parse_reset_credit_list(value);
@@ -2286,20 +2295,27 @@ fn parse_reset_credits(value: &Value) -> Option<ProviderResetCredits> {
         .get("available_count")
         .or_else(|| object.get("availableCount"))
         .and_then(|value| parse_non_negative_count(Some(value)));
-    let credit_payload = ["credits", "items", "data"]
-        .into_iter()
-        .find_map(|key| object.get(key));
-    if let Some(credit_payload) = credit_payload {
-        let credits = parse_reset_credit_list(credit_payload);
-        return Some(ProviderResetCredits {
-            available_count: available_count.unwrap_or(credits.len()),
-            credits,
-        });
+
+    // The detail endpoint has returned both flat arrays and wrapper objects
+    // (for example {"data": {"credits": [...]}}). Walk each supported
+    // container instead of treating a non-array container as an empty list.
+    for key in ["credits", "items", "data"] {
+        let Some(credit_payload) = object.get(key) else {
+            continue;
+        };
+        let Some(mut parsed) = parse_reset_credits(credit_payload) else {
+            continue;
+        };
+        parsed.available_count =
+            reconcile_reset_credit_count(available_count, parsed.available_count);
+        return Some(parsed);
     }
 
     for key in ["rate_limit_reset_credits", "rateLimitResetCredits"] {
         if let Some(nested) = object.get(key) {
-            if let Some(parsed) = parse_reset_credits(nested) {
+            if let Some(mut parsed) = parse_reset_credits(nested) {
+                parsed.available_count =
+                    reconcile_reset_credit_count(available_count, parsed.available_count);
                 return Some(parsed);
             }
         }
@@ -2481,6 +2497,154 @@ fn parse_anthropic_usage(body: &str) -> Result<ParsedProviderUsage, String> {
         return Err("usage response has no supported rate-limit windows".to_string());
     }
     Ok(ParsedProviderUsage { plan_type, windows })
+}
+
+fn parse_json_f64(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|value| value as f64))
+        .or_else(|| value.as_u64().map(|value| value as f64))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|raw| raw.trim().parse::<f64>().ok())
+        })
+}
+
+fn parse_json_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_zenmux_used_percent(value: f64) -> Option<f64> {
+    value.is_finite().then(|| {
+        let percent = if (-1.0..=1.0).contains(&value) {
+            value * 100.0
+        } else {
+            value
+        };
+        percent.clamp(0.0, 100.0)
+    })
+}
+
+fn map_zenmux_usage_window(
+    value: Option<&Value>,
+    default_window_seconds: i64,
+) -> Option<ProviderUsageWindow> {
+    let object = value?.as_object()?;
+    let max_flows = parse_json_f64(object.get("max_flows").or_else(|| object.get("maxFlows")));
+    let used_flows = parse_json_f64(object.get("used_flows").or_else(|| object.get("usedFlows")));
+    let remaining_flows = parse_json_f64(
+        object
+            .get("remaining_flows")
+            .or_else(|| object.get("remainingFlows")),
+    );
+    let used_percent = parse_json_f64(
+        object
+            .get("usage_percentage")
+            .or_else(|| object.get("usagePercentage"))
+            .or_else(|| object.get("used_percent"))
+            .or_else(|| object.get("used_percentage")),
+    )
+    .and_then(normalize_zenmux_used_percent)
+    .or_else(|| {
+        let max_flows = max_flows.filter(|value| value.is_finite() && *value > 0.0)?;
+        let used_flows = used_flows.filter(|value| value.is_finite())?;
+        normalize_zenmux_used_percent((used_flows / max_flows).clamp(0.0, 1.0))
+    })
+    .or_else(|| {
+        let max_flows = max_flows.filter(|value| value.is_finite() && *value > 0.0)?;
+        let remaining_flows = remaining_flows.filter(|value| value.is_finite())?;
+        normalize_zenmux_used_percent(((max_flows - remaining_flows) / max_flows).clamp(0.0, 1.0))
+    });
+    let reset_at = parse_usage_reset_at(
+        object
+            .get("resets_at")
+            .or_else(|| object.get("resetsAt"))
+            .or_else(|| object.get("reset_at"))
+            .or_else(|| object.get("resetAt")),
+    );
+    let limit_window_seconds = object
+        .get("limit_window_seconds")
+        .or_else(|| object.get("limitWindowSeconds"))
+        .and_then(|value| parse_json_f64(Some(value)))
+        .and_then(|value| i64::try_from(value as i128).ok())
+        .filter(|seconds| *seconds > 0)
+        .or(Some(default_window_seconds));
+    (used_percent.is_some() || reset_at.is_some()).then_some(ProviderUsageWindow {
+        label: None,
+        used_percent,
+        reset_at,
+        limit_window_seconds,
+    })
+}
+
+fn zenmux_plan_type(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    parse_json_string(Some(value)).or_else(|| {
+        let object = value.as_object()?;
+        ["tier", "name", "type", "plan_type"]
+            .into_iter()
+            .find_map(|key| parse_json_string(object.get(key)))
+    })
+}
+
+fn parse_zenmux_usage(body: &str) -> Result<ParsedProviderUsage, String> {
+    let response: Value =
+        serde_json::from_str(body).map_err(|error| format!("invalid usage response: {error}"))?;
+    let object = response
+        .as_object()
+        .ok_or_else(|| "usage response is not an object".to_string())?;
+    if object.get("success").and_then(Value::as_bool) == Some(false) {
+        let message = parse_json_string(object.get("message"))
+            .unwrap_or_else(|| "ZenMux subscription API returned success=false".to_string());
+        return Err(message);
+    }
+    let data = object
+        .get("data")
+        .filter(|value| !value.is_null())
+        .unwrap_or(&response);
+    let data_object = data
+        .as_object()
+        .ok_or_else(|| "subscription response data is not an object".to_string())?;
+    let plan_type = zenmux_plan_type(data_object.get("plan"))
+        .or_else(|| parse_json_string(data_object.get("plan_type")))
+        .or_else(|| parse_json_string(data_object.get("subscription_type")))
+        .or_else(|| zenmux_plan_type(data_object.get("tier")));
+    let windows = [
+        ("quota_5_hour", FIVE_HOURS_SECONDS),
+        ("quota_7_day", SEVEN_DAYS_SECONDS),
+    ]
+    .into_iter()
+    .filter_map(|(key, duration)| map_zenmux_usage_window(data_object.get(key), duration))
+    .collect::<Vec<_>>();
+    if windows.is_empty() {
+        return Err("subscription response has no supported quota windows".to_string());
+    }
+    Ok(ParsedProviderUsage { plan_type, windows })
+}
+
+fn zenmux_subscription_usage_url(provider: &Provider) -> Option<String> {
+    let configured = provider.api_base.trim().trim_end_matches('/');
+    let configured = if configured.is_empty() {
+        ZENMUX_DEFAULT_API_BASE_URL
+    } else {
+        configured
+    };
+    if configured.is_empty() {
+        return None;
+    }
+    let base = configured.strip_suffix("/v1").unwrap_or(configured);
+    let api_base = if base.ends_with("/api") {
+        base.to_string()
+    } else {
+        format!("{base}/api")
+    };
+    Some(format!("{api_base}{ZENMUX_MANAGEMENT_USAGE_PATH}"))
 }
 
 fn provider_oauth_account_email(provider: &Provider) -> Option<String> {
@@ -2693,9 +2857,151 @@ async fn prepare_oauth_usage_request(
     Ok((client, headers, account_email))
 }
 
-/// Fetch subscription usage windows for one supported OAuth provider. The
-/// OAuth cache is keyed by provider/account, so multiple providers can safely
-/// use different upstream accounts in one process.
+async fn fetch_zenmux_usage(provider_id: &str, provider: &Provider) -> ProviderUsageResponse {
+    let missing_key_reason = if provider.encrypted_usage_management_key.is_empty() {
+        "management_key_missing"
+    } else {
+        "management_key_unavailable"
+    };
+    let Some(management_key) = provider
+        .usage_management_key_cleartext
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return provider_usage_response(
+            provider_id,
+            if missing_key_reason == "management_key_missing" {
+                "not_connected"
+            } else {
+                "unavailable"
+            },
+            Some(missing_key_reason),
+            Vec::new(),
+            None,
+        );
+    };
+    let Some(usage_url) = zenmux_subscription_usage_url(provider) else {
+        return provider_usage_response(
+            provider_id,
+            "unavailable",
+            Some("invalid_api_base"),
+            Vec::new(),
+            None,
+        );
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider_id,
+                error = %error,
+                "ZenMux usage HTTP client build failed"
+            );
+            return provider_usage_response(
+                provider_id,
+                "unavailable",
+                Some("http_client_unavailable"),
+                Vec::new(),
+                None,
+            );
+        }
+    };
+    let response = match client
+        .get(&usage_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {management_key}"),
+        )
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider_id,
+                error = %error,
+                "ZenMux subscription usage request failed"
+            );
+            return provider_usage_response(
+                provider_id,
+                "unavailable",
+                Some("upstream_request_failed"),
+                Vec::new(),
+                None,
+            );
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        tracing::warn!(
+            provider = %provider_id,
+            status = %status,
+            "ZenMux subscription usage endpoint returned an error"
+        );
+        return provider_usage_response(
+            provider_id,
+            "unavailable",
+            Some(
+                if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    "management_key_rejected"
+                } else {
+                    "upstream_http_error"
+                },
+            ),
+            Vec::new(),
+            None,
+        );
+    }
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider_id,
+                error = %error,
+                "ZenMux subscription usage response read failed"
+            );
+            return provider_usage_response(
+                provider_id,
+                "unavailable",
+                Some("upstream_response_read_failed"),
+                Vec::new(),
+                None,
+            );
+        }
+    };
+    let parsed = match parse_zenmux_usage(&body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider_id,
+                error = %error,
+                "ZenMux subscription usage response parse failed"
+            );
+            return provider_usage_response(
+                provider_id,
+                "unavailable",
+                Some("invalid_upstream_response"),
+                Vec::new(),
+                None,
+            );
+        }
+    };
+    let mut usage = provider_usage_response(provider_id, "available", None, parsed.windows, None);
+    usage.plan_type = parsed.plan_type;
+    usage
+}
+
+/// Fetch subscription usage windows for supported OAuth providers and the
+/// optional ZenMux Management API key. The OAuth cache is keyed by
+/// provider/account, so multiple providers can safely use different upstream
+/// accounts in one process.
 async fn provider_usage(
     State(state): State<AdminState>,
     Path(id): Path<String>,
@@ -2705,6 +3011,9 @@ async fn provider_usage(
         .get_provider(&id)
         .await?
         .ok_or_else(|| AdminError::NotFound(format!("provider {id}")))?;
+    if provider.vendor.eq_ignore_ascii_case("zenmux") {
+        return Ok(Json(fetch_zenmux_usage(&id, &provider).await).into_response());
+    }
     let stored_account_email = provider_oauth_account_email(&provider);
 
     if !matches!(provider.auth_mode, AuthMode::OAuth) {
@@ -3450,7 +3759,8 @@ async fn info() -> impl IntoResponse {
 // delete records the snapshot of the removed object.
 
 /// Build a redacted JSON snapshot of a provider. Sensitive credentials
-/// (`api_key`, `oauth_meta`) go through [`KeyEncryption::redact`] so the
+/// (`api_key`, `usage_management_key`, `oauth_meta`) go through
+/// [`KeyEncryption::redact`] so the
 /// audit table never stores cleartext secrets.
 fn provider_snapshot(p: &Provider) -> serde_json::Value {
     json!({
@@ -3463,6 +3773,9 @@ fn provider_snapshot(p: &Provider) -> serde_json::Value {
         "enabled": p.enabled,
         "metadata": p.metadata_json,
         "api_key": tiygate_store::encryption::KeyEncryption::redact(&p.encrypted_api_key),
+        "usage_management_key": tiygate_store::encryption::KeyEncryption::redact(
+            &p.encrypted_usage_management_key,
+        ),
         "oauth_meta": tiygate_store::encryption::KeyEncryption::redact(&p.encrypted_oauth_meta),
     })
 }
@@ -3570,6 +3883,9 @@ struct ProviderRequest {
     api_base: String,
     models_endpoint: Option<String>,
     api_key: Option<String>,
+    /// Optional provider-specific key used only for subscription usage
+    /// requests (currently supported by ZenMux). Blank clears it.
+    usage_management_key: Option<String>,
     auth_mode: Option<String>,
     oauth_meta: Option<String>,
     metadata: Option<serde_json::Value>,
@@ -3592,6 +3908,7 @@ struct ProviderView {
     models_endpoint: String,
     auth_mode: String,
     encrypted_api_key: String,
+    encrypted_usage_management_key: String,
     encrypted_oauth_meta: String,
     oauth_status: Option<ProviderOAuthStatusView>,
     metadata: serde_json::Value,
@@ -3616,6 +3933,9 @@ impl From<Provider> for ProviderView {
             auth_mode: p.auth_mode.as_str().to_string(),
             encrypted_api_key: tiygate_store::encryption::KeyEncryption::redact(
                 &p.encrypted_api_key,
+            ),
+            encrypted_usage_management_key: tiygate_store::encryption::KeyEncryption::redact(
+                &p.encrypted_usage_management_key,
             ),
             encrypted_oauth_meta: tiygate_store::encryption::KeyEncryption::redact(
                 &p.encrypted_oauth_meta,
@@ -3683,6 +4003,9 @@ fn provider_oauth_status(provider: &Provider) -> ProviderOAuthStatusView {
 
 fn normalized_api_base(vendor: &str, auth_mode: AuthMode, configured: &str) -> String {
     let configured = configured.trim_end_matches('/');
+    if vendor.eq_ignore_ascii_case("zenmux") && configured.is_empty() {
+        return ZENMUX_DEFAULT_API_BASE_URL.to_string();
+    }
     if vendor == "openai" && matches!(auth_mode, AuthMode::OAuth) {
         if configured.is_empty() || configured == OPENAI_PLATFORM_BASE_URL {
             return OPENAI_CODEX_BASE_URL.to_string();
@@ -3746,6 +4069,20 @@ fn normalized_provider_metadata(
     metadata
 }
 
+fn validate_usage_management_key_request(
+    vendor: &str,
+    usage_management_key: Option<&str>,
+) -> Result<(), AdminError> {
+    if usage_management_key.is_some_and(|key| !key.trim().is_empty())
+        && !vendor.eq_ignore_ascii_case("zenmux")
+    {
+        return Err(AdminError::BadRequest(
+            "usage_management_key is only supported by the ZenMux provider".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct ListProvidersQuery {
     enabled: Option<bool>,
@@ -3788,6 +4125,7 @@ async fn create_provider(
         .unwrap_or(AuthMode::ApiKey);
     validate_provider_auth_mode(&req.vendor, auth_mode)
         .map_err(|message| AdminError::BadRequest(message.to_string()))?;
+    validate_usage_management_key_request(&req.vendor, req.usage_management_key.as_deref())?;
     let api_base = normalized_api_base(&req.vendor, auth_mode, &req.api_base);
     let models_endpoint = normalized_models_endpoint(
         &req.vendor,
@@ -3798,7 +4136,7 @@ async fn create_provider(
     let metadata = normalized_provider_metadata(&req.vendor, auth_mode, req.metadata);
     let p = state
         .store
-        .upsert_provider(
+        .upsert_provider_with_usage_management_key(
             &id,
             &req.name,
             &req.vendor,
@@ -3809,6 +4147,7 @@ async fn create_provider(
             req.oauth_meta.as_deref(),
             metadata,
             req.enabled.unwrap_or(true),
+            req.usage_management_key.as_deref(),
         )
         .await?;
     enqueue_provider_capability_jobs(&state, &p.id).await?;
@@ -3837,6 +4176,7 @@ async fn update_provider(
         .unwrap_or(AuthMode::ApiKey);
     validate_provider_auth_mode(&req.vendor, auth_mode)
         .map_err(|message| AdminError::BadRequest(message.to_string()))?;
+    validate_usage_management_key_request(&req.vendor, req.usage_management_key.as_deref())?;
     let api_base = normalized_api_base(&req.vendor, auth_mode, &req.api_base);
     let models_endpoint = normalized_models_endpoint(
         &req.vendor,
@@ -3866,6 +4206,7 @@ async fn update_provider(
             let models_endpoint = models_endpoint.clone();
             let api_key = req.api_key.clone();
             let oauth_meta = req.oauth_meta.clone();
+            let usage_management_key = req.usage_management_key.clone();
             let metadata = metadata.clone();
             let enabled = req.enabled.unwrap_or(true);
             service
@@ -3874,7 +4215,7 @@ async fn update_provider(
                     Box::new(move || {
                         Box::pin(async move {
                             store
-                                .upsert_provider(
+                                .upsert_provider_with_usage_management_key(
                                     &mutation_id,
                                     &name,
                                     &vendor,
@@ -3885,6 +4226,7 @@ async fn update_provider(
                                     oauth_meta.as_deref(),
                                     metadata,
                                     enabled,
+                                    usage_management_key.as_deref(),
                                 )
                                 .await
                                 .map(|_| ())
@@ -3902,7 +4244,7 @@ async fn update_provider(
         } else {
             let provider = state
                 .store
-                .upsert_provider(
+                .upsert_provider_with_usage_management_key(
                     &id,
                     &req.name,
                     &req.vendor,
@@ -3913,6 +4255,7 @@ async fn update_provider(
                     req.oauth_meta.as_deref(),
                     metadata,
                     req.enabled.unwrap_or(true),
+                    req.usage_management_key.as_deref(),
                 )
                 .await?;
             state
@@ -3926,7 +4269,7 @@ async fn update_provider(
     } else {
         state
             .store
-            .upsert_provider(
+            .upsert_provider_with_usage_management_key(
                 &id,
                 &req.name,
                 &req.vendor,
@@ -3937,6 +4280,7 @@ async fn update_provider(
                 req.oauth_meta.as_deref(),
                 metadata,
                 req.enabled.unwrap_or(true),
+                req.usage_management_key.as_deref(),
             )
             .await?
     };
@@ -6006,6 +6350,7 @@ mod tests {
             api_base: api_base.to_string(),
             models_endpoint: models_endpoint.to_string(),
             encrypted_api_key: String::new(),
+            encrypted_usage_management_key: String::new(),
             auth_mode,
             encrypted_oauth_meta: String::new(),
             metadata_json: json!({}),
@@ -6013,6 +6358,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             api_key_cleartext: None,
+            usage_management_key_cleartext: None,
             oauth_meta_cleartext: None,
         }
     }
@@ -6137,6 +6483,87 @@ mod tests {
     }
 
     #[test]
+    fn parses_zenmux_subscription_tier_and_quota_windows() {
+        let body = json!({
+            "success": true,
+            "data": {
+                "plan": {"tier": "pro"},
+                "quota_5_hour": {
+                    "usage_percentage": 0.25,
+                    "resets_at": "2026-08-30T00:00:00Z"
+                },
+                "quota_7_day": {
+                    "usage_percentage": "10",
+                    "resets_at": "2026-09-01T00:00:00Z"
+                }
+            }
+        })
+        .to_string();
+
+        let parsed = parse_zenmux_usage(&body).expect("ZenMux usage JSON");
+        assert_eq!(parsed.plan_type.as_deref(), Some("pro"));
+        assert_eq!(parsed.windows.len(), 2);
+        assert_eq!(parsed.windows[0].used_percent, Some(25.0));
+        assert_eq!(
+            parsed.windows[0].limit_window_seconds,
+            Some(FIVE_HOURS_SECONDS)
+        );
+        assert_eq!(
+            parsed.windows[0].reset_at,
+            chrono::DateTime::parse_from_rfc3339("2026-08-30T00:00:00Z")
+                .ok()
+                .map(|timestamp| timestamp.timestamp())
+        );
+        assert_eq!(parsed.windows[1].used_percent, Some(10.0));
+        assert_eq!(
+            parsed.windows[1].limit_window_seconds,
+            Some(SEVEN_DAYS_SECONDS)
+        );
+    }
+
+    #[test]
+    fn derives_zenmux_usage_percentage_from_flow_counts() {
+        let body = json!({
+            "plan": "team",
+            "quota_5_hour": {
+                "max_flows": 200,
+                "used_flows": 30,
+                "resets_at": 1_800_000_000_i64
+            },
+            "quota_7_day": {
+                "max_flows": 100,
+                "remaining_flows": 40
+            }
+        })
+        .to_string();
+
+        let parsed = parse_zenmux_usage(&body).expect("ZenMux usage JSON");
+        assert_eq!(parsed.plan_type.as_deref(), Some("team"));
+        assert_eq!(parsed.windows[0].used_percent, Some(15.0));
+        assert_eq!(parsed.windows[1].used_percent, Some(60.0));
+    }
+
+    #[test]
+    fn builds_zenmux_management_usage_url_from_provider_api_base() {
+        let provider = |api_base: &str| Provider {
+            api_base: api_base.to_string(),
+            ..openai_provider(AuthMode::ApiKey, api_base, "")
+        };
+        assert_eq!(
+            zenmux_subscription_usage_url(&provider("https://zenmux.ai")),
+            Some("https://zenmux.ai/api/v1/management/subscription/detail".to_string())
+        );
+        assert_eq!(
+            zenmux_subscription_usage_url(&provider("https://zenmux.dev/api/v1/")),
+            Some("https://zenmux.dev/api/v1/management/subscription/detail".to_string())
+        );
+        assert_eq!(
+            zenmux_subscription_usage_url(&provider("")),
+            Some("https://zenmux.ai/api/v1/management/subscription/detail".to_string())
+        );
+    }
+
+    #[test]
     fn parses_openai_reset_credits_and_filters_unavailable_entries() {
         let body = json!({
             "available_count": "2",
@@ -6177,6 +6604,39 @@ mod tests {
         let empty = parse_reset_credits(&json!([])).expect("empty reset credits JSON");
         assert_eq!(empty.available_count, 0);
         assert!(empty.credits.is_empty());
+    }
+
+    #[test]
+    fn does_not_underreport_credits_when_explicit_count_is_smaller() {
+        let body = json!({
+            "available_count": 1,
+            "credits": [
+                {"status": "available", "expires_at": "2026-08-30T00:00:00Z"},
+                {"status": "available", "expires_at": "2026-09-01T00:00:00Z"},
+                {"status": "available", "expires_at": "2026-09-03T00:00:00Z"}
+            ]
+        });
+
+        let parsed = parse_reset_credits(&body).expect("reset credits JSON");
+        assert_eq!(parsed.available_count, 3);
+        assert_eq!(parsed.credits.len(), 3);
+    }
+
+    #[test]
+    fn parses_reset_credits_from_nested_data_object() {
+        let body = json!({
+            "available_count": 1,
+            "data": {
+                "credits": [
+                    {"status": "available", "expires_at": "2026-08-30T00:00:00Z"},
+                    {"status": "available", "expires_at": "2026-09-01T00:00:00Z"}
+                ]
+            }
+        });
+
+        let parsed = parse_reset_credits(&body).expect("nested reset credits JSON");
+        assert_eq!(parsed.available_count, 2);
+        assert_eq!(parsed.credits.len(), 2);
     }
 
     #[test]
@@ -6414,6 +6874,7 @@ mod tests {
     fn provider_view_exposes_sanitized_invalid_oauth_status() {
         let mut provider = openai_provider(AuthMode::OAuth, OPENAI_CODEX_BASE_URL, "");
         provider.encrypted_oauth_meta = "encrypted-secret".to_string();
+        provider.encrypted_usage_management_key = "manage-secret".to_string();
         provider.oauth_meta_cleartext = Some(
             json!({
                 "refresh_token": "never-return-this",
@@ -6424,6 +6885,7 @@ mod tests {
             .to_string(),
         );
 
+        let audit = provider_snapshot(&provider);
         let view = ProviderView::from(provider);
         let status = view.oauth_status.as_ref().expect("OAuth status");
         assert_eq!(status.state, "invalid");
@@ -6431,6 +6893,10 @@ mod tests {
         assert_eq!(status.checked_at.as_deref(), Some("2026-07-12T06:00:00Z"));
         let serialized = serde_json::to_string(&view).expect("serialize provider view");
         assert!(!serialized.contains("never-return-this"));
+        assert!(audit["usage_management_key"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("[encrypted:")));
+        assert!(!audit.to_string().contains("manage-secret"));
     }
 
     #[derive(Default)]
