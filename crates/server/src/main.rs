@@ -266,6 +266,7 @@ async fn run(_args: cli::RunArgs) -> anyhow::Result<()> {
         }
     }
 
+    app.stop_background_tasks().await;
     if let Some(handle) = app.oauth_refresh.take() {
         handle.stop().await;
     }

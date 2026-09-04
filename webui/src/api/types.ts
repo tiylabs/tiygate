@@ -158,9 +158,14 @@ export interface ModelCatalogResolveRequest {
 export type RoutingStrategyName =
   "weighted" | "priority" | "cooldown" | "latency";
 
+export type CapabilityRoutingMode = "off" | "shadow" | "enforce";
+
 export interface RouteTarget {
   provider_id: string;
   model_id: string;
+  egress_dialect_id?: string | null;
+  /** Resolved target-side protocol, e.g. openai-responses/responses/v1. */
+  egress_protocol?: string | null;
   // Backend persists only `weight`. The `priority` strategy reuses this same
   // value (sorted descending), so the UI just relabels the column per strategy.
   //
@@ -168,6 +173,17 @@ export interface RouteTarget {
   // treated as enabled (the server defaults to `true`).
   weight?: number | null;
   enabled?: boolean;
+  target_key?: string;
+  profile_status?: CapabilityProfileStatus | null;
+  probe_job_status?: string | null;
+  capability_summary?: {
+    supported: number;
+    unsupported: number;
+    constrained: number;
+    unknown: number;
+    fresh_until?: string | null;
+    stale_until?: string | null;
+  } | null;
 }
 
 export interface Route {
@@ -175,6 +191,7 @@ export interface Route {
   virtual_model: string;
   targets: RouteTarget[];
   routing_strategy?: RoutingStrategyName | null;
+  capability_routing_mode?: CapabilityRoutingMode | null;
   model_metadata?: ModelMetadata | null;
   enabled: boolean;
   created_at: string;
@@ -186,14 +203,283 @@ export interface RouteInput {
   virtual_model: string;
   targets: RouteTarget[];
   routing_strategy?: RoutingStrategyName | null;
+  capability_routing_mode?: CapabilityRoutingMode | null;
   model_metadata?: ModelMetadata | null;
   enabled?: boolean;
+}
+
+export type CapabilityState =
+  | "supported"
+  | "unsupported"
+  | "constrained"
+  | "unknown";
+
+export type CapabilityProfileStatus =
+  | "pending"
+  | "partial"
+  | "ready"
+  | "stale"
+  | "error";
+
+export interface CapabilityProfileSummary {
+  target_key: string;
+  provider_id: string;
+  model_id: string;
+  profile_status: CapabilityProfileStatus;
+  dialect_id: string;
+  supported: number;
+  unsupported: number;
+  constrained: number;
+  unknown: number;
+  fresh_until?: string | null;
+  stale_until?: string | null;
+}
+
+export interface CapabilityProfile {
+  target_key: string;
+  identity_version: number;
+  provider_id: string;
+  protocol_suite: string;
+  endpoint_name: string;
+  endpoint_version: string;
+  dialect_id: string;
+  model_id: string;
+  schema_version: number;
+  registry_version: number;
+  baseline_version: number;
+  profile_status: CapabilityProfileStatus;
+  resolved_capabilities: Record<
+    string,
+    { state: CapabilityState; value?: unknown; observation?: CapabilityObservation }
+  >;
+  observations: CapabilityObservation[];
+  last_probe_suite_version?: number | null;
+  last_probe_judge_version?: number | null;
+  last_successful_probe_at?: string | null;
+  last_probe_error_class?: string | null;
+  last_probe_error_redacted?: string | null;
+  fresh_until?: string | null;
+  stale_until?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CapabilityObservation {
+  capability_id: string;
+  state: CapabilityState;
+  value?: unknown;
+  source: string;
+  observed_at: string;
+  expires_at?: string | null;
+  evidence_version: number;
+  probe_suite_version?: number | null;
+  reason_code?: string | null;
+  redacted_detail?: string | null;
+}
+
+export interface CapabilityOverride {
+  target_key: string;
+  capability_id: string;
+  state: CapabilityState;
+  value?: unknown;
+  reason: string;
+  actor: string;
+  expires_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type CapabilityRequirementStrength = "required" | "preferred" | "ignorable";
+
+export interface CapabilityRequirement {
+  id: string;
+  strength: CapabilityRequirementStrength;
+  value?: unknown;
+}
+
+export interface CapabilityRouteAdmission {
+  route_id: string;
+  capability_shape_hash: string;
+  required_capabilities: string[];
+  required_requirements?: CapabilityRequirement[];
+  mode: CapabilityRoutingMode;
+  gate_policy_version: number;
+  report: Record<string, unknown>;
+  approved_by?: string | null;
+  approved_at?: string | null;
+  expires_at?: string | null;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CapabilityRouteAdmissionListResponse {
+  route_id: string;
+  total: number;
+  limit: number;
+  offset: number;
+  next_cursor?: string | null;
+  items?: CapabilityRouteAdmission[];
+  entries: CapabilityRouteAdmission[];
+}
+
+export interface CapabilityShadowMetric {
+  route_id: string;
+  shape_hash: string;
+  window_start: string;
+  window_end: string;
+  observation_window_seconds: number;
+  observation_window_complete: boolean;
+  relevant_requests: number;
+  target_pairs: number;
+  resolved_pairs: number;
+  compatible_requests: number;
+  unknown_requests: number;
+  verified_success_requests: number;
+  verified_success_disagreements: number;
+  verified_success_disagreement_rate: number;
+  profile_resolution_coverage: number;
+  compatible_shape_coverage: number;
+  planner_unknown_rate: number;
+  planner_internal_errors: number;
+  planner_internal_error_rate: number;
+  probe_terminal_errors: number;
+  probe_auth_errors: number;
+  probe_terminal_error_rate: number;
+  planning_latency_p95_micros: number;
+  has_samples: boolean;
+  minimum_sample_met: boolean;
+  telemetry_gap: boolean;
+  truncated: boolean;
+}
+
+export interface CapabilityMetricsResponse {
+  total: number;
+  limit: number;
+  offset: number;
+  next_cursor?: string | null;
+  items: CapabilityShadowMetric[];
+  /** Backward-compatible alias retained by the current UI. */
+  entries: CapabilityShadowMetric[];
+}
+
+export interface ProbeJob {
+  id: string;
+  target_key: string;
+  probe_set: string[];
+  probe_set_hash: string;
+  status: string;
+  priority: number;
+  attempt_count: number;
+  max_attempts: number;
+  next_probe_index: number;
+  next_attempt_at: string;
+  lease_owner?: string | null;
+  lease_until?: string | null;
+  last_error_class?: string | null;
+  last_error_redacted?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CapabilityProbeRun {
+  run_id: string;
+  job_id?: string | null;
+  target: string;
+  probe_id: string;
+  outcome: string;
+  duration_micros: number;
+  budget_weight: number;
+  error_class?: string | null;
+  ts: string;
+}
+
+export interface CapabilityProbeExchange {
+  request_path: string;
+  request_headers?: Record<string, string>;
+  request_body: unknown;
+  response_status?: number | null;
+  response_content_type?: string | null;
+  response_body?: string | null;
+  error?: string | null;
+}
+
+export interface CapabilityProbeJudgment {
+  classification: string;
+  capability_id?: string | null;
+  state?: CapabilityState | null;
+  value?: unknown;
+  source?: string | null;
+  reason_code?: string | null;
+  reason?: string | null;
+  error_class?: string | null;
+  detail?: string | null;
+}
+
+export interface CapabilityProbeDetails {
+  schema_version: number;
+  exchanges: CapabilityProbeExchange[];
+  judgment: CapabilityProbeJudgment;
+  truncated?: boolean;
+}
+
+export interface CapabilityProbeRunDetail extends CapabilityProbeRun {
+  details?: CapabilityProbeDetails | null;
+}
+
+export interface CapabilityProbeJobListResponse {
+  total: number;
+  limit: number;
+  offset: number;
+  next_cursor?: string | null;
+  items?: ProbeJob[];
+  entries: ProbeJob[];
+}
+
+export interface CapabilityProbeRunListResponse {
+  total: number;
+  limit: number;
+  offset: number;
+  next_cursor?: string | null;
+  items?: CapabilityProbeRun[];
+  entries: CapabilityProbeRun[];
+}
+
+export interface CapabilityListResponse {
+  total: number;
+  limit: number;
+  offset: number;
+  next_cursor?: string | null;
+  items?: CapabilityProfileSummary[];
+  entries: CapabilityProfileSummary[];
+}
+
+export interface CapabilityProfileResponse {
+  profile: CapabilityProfile;
+  overrides: CapabilityOverride[];
+  probe_job?: ProbeJob | null;
+}
+
+export interface CapabilityRegistryEntry {
+  id: string;
+  value_kind: string;
+  matcher: string;
+  scope: string;
+  implementation_status: string;
+  discovery_methods: string[];
+  routing_eligibility: string;
+  dependencies: string[];
+  conversion_relevant: boolean;
+  probe_id?: string | null;
+  owner: string;
 }
 
 export interface RouteListResponse {
   total: number;
   limit: number;
   offset: number;
+  next_cursor?: string | null;
+  items?: Route[];
   entries: Route[];
 }
 
@@ -358,6 +644,22 @@ export interface RequestReplay {
   payload_archive_locked_at?: string | null;
   payload_archived_at?: string | null;
   payload_archive_manifest_json?: string | null;
+  capability_plans?: RequestCapabilityPlan[];
+}
+
+export interface RequestCapabilityPlan {
+  request_id: string;
+  route_id: string;
+  target: string;
+  ts: string;
+  mode: string;
+  shape_hash: string;
+  planning_micros: number;
+  status: string;
+  requirements: string[];
+  missing: string[];
+  unknown: string[];
+  transform?: string | null;
 }
 
 export interface CircuitBreaker {
@@ -449,6 +751,7 @@ export interface ExportRouteTarget {
   account_label?: string | null;
   api_key_override?: string | null;
   api_base_override?: string | null;
+  egress_dialect_id?: string | null;
 }
 
 export interface ExportRoute {
@@ -456,6 +759,7 @@ export interface ExportRoute {
   virtual_model: string;
   targets: ExportRouteTarget[];
   routing_strategy?: RoutingStrategyName | null;
+  capability_routing_mode?: CapabilityRoutingMode | null;
   model_metadata?: ModelMetadata | null;
   enabled: boolean;
   created_at: string;
@@ -493,6 +797,25 @@ export interface ExportTokenDailyStat {
   longest_task_ms: number;
 }
 
+export interface ExportTargetSelector {
+  route_id: string;
+  target_index: number;
+  provider_id: string;
+  model_id: string;
+  egress_dialect_id?: string | null;
+  account_label?: string | null;
+}
+
+export interface ExportCapabilityOverride {
+  selector: ExportTargetSelector;
+  capability_id: string;
+  state: CapabilityState;
+  value?: unknown;
+  reason: string;
+  actor: string;
+  expires_at?: string | null;
+}
+
 export interface ConfigExport {
   schema_version: number;
   exported_at: string;
@@ -502,6 +825,7 @@ export interface ConfigExport {
   api_keys: ExportApiKey[];
   settings?: ExportSetting[];
   token_daily_stats?: ExportTokenDailyStat[];
+  capability_overrides?: ExportCapabilityOverride[];
 }
 
 export interface ImportSelection {
@@ -510,6 +834,7 @@ export interface ImportSelection {
   api_keys: string[];
   settings: string[];
   token_stats: string[];
+  capability_overrides: string[];
 }
 
 export interface ImportReport {
@@ -523,6 +848,8 @@ export interface ImportReport {
   settings_skipped: number;
   token_stats_imported: number;
   token_stats_skipped: number;
+  capability_overrides_imported: number;
+  capability_overrides_skipped: number;
 }
 
 // ---- Settings ----

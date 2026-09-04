@@ -50,6 +50,7 @@ fn build_images_test_app(
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],

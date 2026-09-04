@@ -1,0 +1,242 @@
+schema_version = 1
+wire_profile = "openai-responses-codex-lite"
+
+[[capability]]
+id = "transport.http"
+support = "supported"
+
+[[capability]]
+id = "transport.sse"
+support = "supported"
+
+[[capability]]
+id = "tools.function"
+support = "supported"
+
+[[capability]]
+id = "tools.function.continuation"
+support = "supported"
+
+[[capability]]
+id = "tools.choice.required"
+support = "supported"
+
+[[capability]]
+id = "tools.choice.specific"
+support = "supported"
+
+[[capability]]
+id = "tools.namespace"
+support = "supported"
+
+[[capability]]
+id = "tools.custom"
+support = "supported"
+
+[[capability]]
+id = "tools.crl.additional_tools"
+support = "supported"
+
+[[capability]]
+id = "transport.websocket"
+support = "forbidden"
+
+[[capability]]
+id = "generation.max_output_tokens"
+support = "supported"
+
+[[capability]]
+id = "generation.temperature"
+support = "supported"
+
+[[capability]]
+id = "generation.top_p"
+support = "supported"
+
+[[capability]]
+id = "generation.top_k"
+support = "forbidden"
+
+[[capability]]
+id = "generation.stop_sequences"
+support = "supported"
+
+[[capability]]
+id = "generation.frequency_penalty"
+support = "forbidden"
+
+[[capability]]
+id = "generation.presence_penalty"
+support = "forbidden"
+
+[[capability]]
+id = "generation.seed"
+support = "forbidden"
+
+[[capability]]
+id = "tools.parallel"
+support = "supported"
+
+[[capability]]
+id = "tools.hosted.web_search"
+support = "supported"
+
+[[capability]]
+id = "tools.hosted.file_search"
+support = "supported"
+
+[[capability]]
+id = "tools.hosted.code_interpreter"
+support = "supported"
+
+[[capability]]
+id = "tools.hosted.computer_use"
+support = "supported"
+
+[[capability]]
+id = "tools.remote_mcp"
+support = "supported"
+
+[[capability]]
+id = "tools.programmatic"
+support = "supported"
+
+[[capability]]
+id = "reasoning.plaintext"
+support = "supported"
+
+[[capability]]
+id = "reasoning.summary"
+support = "supported"
+
+[[capability]]
+id = "reasoning.encrypted_replay"
+support = "supported"
+
+[[capability]]
+id = "reasoning.effort.values"
+support = "supported"
+
+[[capability]]
+id = "reasoning.budget_tokens"
+support = "supported"
+
+[[capability]]
+id = "reasoning.mode"
+support = "supported"
+
+[[capability]]
+id = "reasoning.context"
+support = "supported"
+
+[[capability]]
+id = "structured.json_object"
+support = "supported"
+
+[[capability]]
+id = "structured.json_schema"
+support = "supported"
+
+[[capability]]
+id = "structured.json_schema.strict"
+support = "supported"
+
+[[capability]]
+id = "structured.json_schema.keywords"
+support = "supported"
+
+[[capability]]
+id = "media.input.image.inline"
+support = "supported"
+
+[[capability]]
+id = "media.input.image.url"
+support = "supported"
+
+[[capability]]
+id = "media.input.file_id"
+support = "supported"
+
+[[capability]]
+id = "media.input.audio.inline"
+support = "supported"
+
+[[capability]]
+id = "media.input.video.inline"
+support = "forbidden"
+
+[[capability]]
+id = "media.image.detail.values"
+support = "supported"
+
+[[capability]]
+id = "cache.prompt.key"
+support = "supported"
+
+[[capability]]
+id = "cache.prompt.retention"
+support = "supported"
+
+[[capability]]
+id = "cache.prompt.options"
+support = "supported"
+
+[[capability]]
+id = "cache.prompt.breakpoint"
+support = "supported"
+
+[[capability]]
+id = "output.annotations.url"
+support = "supported"
+
+[[capability]]
+id = "output.annotations.file"
+support = "supported"
+
+[[capability]]
+id = "output.refusal"
+support = "supported"
+
+[[capability]]
+id = "output.stop_details"
+support = "extension_unknown"
+
+[[capability]]
+id = "output.usage.reasoning_tokens"
+support = "supported"
+
+[[capability]]
+id = "output.usage.cache_read_tokens"
+support = "supported"
+
+[[capability]]
+id = "output.usage.cache_write_tokens"
+support = "supported"
+
+[[capability]]
+id = "extensions.codex.local_shell"
+support = "supported"
+
+[[capability]]
+id = "extensions.codex.custom_tool"
+support = "supported"
+
+[[capability]]
+id = "extensions.codex.tool_search_items"
+support = "supported"
+
+[[capability]]
+id = "extensions.multi_agent"
+support = "supported"
+
+[[capability]]
+id = "embeddings.input.batch"
+support = "forbidden"
+
+[[capability]]
+id = "embeddings.dimensions"
+support = "forbidden"
+
+[[capability]]
+id = "embeddings.encoding_formats"
+support = "forbidden"

@@ -50,6 +50,18 @@ pub const ARCHIVE_MAX_RETRIES: &str = "gateway.archive.max_retries";
 
 // --- Routing ---
 pub const ROUTING_DEFAULT_STRATEGY: &str = "gateway.routing.default_strategy";
+pub const CAPABILITY_ROUTING_MODE: &str = "gateway.capabilities.routing_mode";
+pub const CAPABILITY_PROBE_ENABLED: &str = "gateway.capabilities.probe_enabled";
+pub const CAPABILITY_PROBE_DAILY_BUDGET: &str = "gateway.capabilities.probe_daily_budget";
+pub const CAPABILITY_PROBE_GLOBAL_BUDGET: &str = "gateway.capabilities.probe_global_budget";
+pub const CAPABILITY_PROBE_GLOBAL_CONCURRENCY: &str =
+    "gateway.capabilities.probe_global_concurrency";
+pub const CAPABILITY_PROBE_PROVIDER_CONCURRENCY: &str =
+    "gateway.capabilities.probe_provider_concurrency";
+pub const CAPABILITY_PROBE_ACCOUNT_CONCURRENCY: &str =
+    "gateway.capabilities.probe_account_concurrency";
+pub const RESPONSES_CRL_TOOL_PROMOTION_ENABLED: &str =
+    "gateway.responses.crl_tool_promotion_enabled";
 
 // --- Ingress ---
 pub const INGRESS_MAX_BODY_BYTES: &str = "gateway.ingress.max_body_bytes";
@@ -108,6 +120,14 @@ pub const PLAIN_KEYS: &[&str] = &[
     ARCHIVE_TIMEOUT_SECS,
     ARCHIVE_MAX_RETRIES,
     ROUTING_DEFAULT_STRATEGY,
+    CAPABILITY_ROUTING_MODE,
+    CAPABILITY_PROBE_ENABLED,
+    CAPABILITY_PROBE_DAILY_BUDGET,
+    CAPABILITY_PROBE_GLOBAL_BUDGET,
+    CAPABILITY_PROBE_GLOBAL_CONCURRENCY,
+    CAPABILITY_PROBE_PROVIDER_CONCURRENCY,
+    CAPABILITY_PROBE_ACCOUNT_CONCURRENCY,
+    RESPONSES_CRL_TOOL_PROMOTION_ENABLED,
     INGRESS_MAX_BODY_BYTES,
     INGRESS_MAX_INFLIGHT,
     INGRESS_MAX_QUEUE_DEPTH,
@@ -164,7 +184,10 @@ pub async fn get_usize(store: &DbConfigStore, key: &str, default: usize) -> usiz
 /// Read a setting as `bool` ("true"/"false", case-insensitive).
 pub async fn get_bool(store: &DbConfigStore, key: &str, default: bool) -> bool {
     match store.get_setting(key).await {
-        Ok(Some(v)) => v.eq_ignore_ascii_case("true"),
+        Ok(Some(v)) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        ),
         _ => default,
     }
 }

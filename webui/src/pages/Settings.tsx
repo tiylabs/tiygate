@@ -55,6 +55,14 @@ const KEYS = {
   archiveTimeout: "gateway.archive.timeout_secs",
   archiveMaxRetries: "gateway.archive.max_retries",
   routingStrategy: "gateway.routing.default_strategy",
+  capabilityRoutingMode: "gateway.capabilities.routing_mode",
+  capabilityProbeEnabled: "gateway.capabilities.probe_enabled",
+  capabilityProbeDailyBudget: "gateway.capabilities.probe_daily_budget",
+  capabilityProbeGlobalBudget: "gateway.capabilities.probe_global_budget",
+  capabilityProbeGlobalConcurrency: "gateway.capabilities.probe_global_concurrency",
+  capabilityProbeProviderConcurrency: "gateway.capabilities.probe_provider_concurrency",
+  capabilityProbeAccountConcurrency: "gateway.capabilities.probe_account_concurrency",
+  crlToolPromotionEnabled: "gateway.responses.crl_tool_promotion_enabled",
   ingressMaxBody: "gateway.ingress.max_body_bytes",
   ingressMaxInflight: "gateway.ingress.max_inflight",
   ingressMaxQueueDepth: "gateway.ingress.max_queue_depth",
@@ -637,6 +645,90 @@ export default function SettingsPage() {
               value={getField(KEYS.routingStrategy, "weighted")}
               options={strategyOptions}
               onValueChange={(v) => updateField(KEYS.routingStrategy, v)}
+            />
+          </Field>
+          <Field
+            label={t("settings.routingIngress.capabilityRoutingMode")}
+            hint={t("settings.routingIngress.capabilityRoutingModeHint")}
+          >
+            <Select
+              value={getField(KEYS.capabilityRoutingMode, "off")}
+              options={[
+                { value: "off", label: "Off" },
+                { value: "shadow", label: "Shadow" },
+                { value: "enforce", label: "Enforce" },
+              ]}
+              onValueChange={(value) =>
+                (value === "enforce" &&
+                !window.confirm(t("settings.routingIngress.capabilityRoutingModeConfirm"))
+                  ? undefined
+                  : updateField(KEYS.capabilityRoutingMode, value))
+              }
+            />
+          </Field>
+          <Field
+            label={t("settings.routingIngress.capabilityProbeEnabled")}
+            hint={t("settings.routingIngress.capabilityProbeEnabledHint")}
+          >
+            <Switch
+              checked={getField(KEYS.capabilityProbeEnabled, "true") === "true"}
+              onCheckedChange={(checked: boolean) =>
+                updateField(KEYS.capabilityProbeEnabled, String(checked))
+              }
+            />
+          </Field>
+          <Field label={t("settings.routingIngress.capabilityProbeDailyBudget")}>
+            <Input
+              type="number"
+              min={1}
+              value={getField(KEYS.capabilityProbeDailyBudget, "64")}
+              onChange={(e) => updateField(KEYS.capabilityProbeDailyBudget, e.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.routingIngress.capabilityProbeGlobalBudget")}>
+            <Input
+              type="number"
+              min={1}
+              value={getField(KEYS.capabilityProbeGlobalBudget, "512")}
+              onChange={(e) => updateField(KEYS.capabilityProbeGlobalBudget, e.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.routingIngress.capabilityProbeGlobalConcurrency")}>
+            <Input
+              type="number"
+              min={1}
+              value={getField(KEYS.capabilityProbeGlobalConcurrency, "4")}
+              onChange={(e) => updateField(KEYS.capabilityProbeGlobalConcurrency, e.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.routingIngress.capabilityProbeProviderConcurrency")}>
+            <Input
+              type="number"
+              min={1}
+              value={getField(KEYS.capabilityProbeProviderConcurrency, "2")}
+              onChange={(e) => updateField(KEYS.capabilityProbeProviderConcurrency, e.target.value)}
+            />
+          </Field>
+          <Field label={t("settings.routingIngress.capabilityProbeAccountConcurrency")}>
+            <Input
+              type="number"
+              min={1}
+              value={getField(KEYS.capabilityProbeAccountConcurrency, "1")}
+              onChange={(e) => updateField(KEYS.capabilityProbeAccountConcurrency, e.target.value)}
+            />
+          </Field>
+          <Field
+            label={t("settings.routingIngress.crlToolPromotionEnabled")}
+            hint={t("settings.routingIngress.crlToolPromotionEnabledHint")}
+          >
+            <Switch
+            checked={getField(KEYS.crlToolPromotionEnabled, "false") === "true"}
+              onCheckedChange={(checked: boolean) => {
+                if (!checked && !window.confirm(t("settings.routingIngress.crlToolPromotionDisableConfirm"))) {
+                  return;
+                }
+                updateField(KEYS.crlToolPromotionEnabled, String(checked));
+              }}
             />
           </Field>
           <Field

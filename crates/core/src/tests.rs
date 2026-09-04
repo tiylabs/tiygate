@@ -29,6 +29,7 @@ mod tests {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }];
@@ -55,6 +56,7 @@ mod tests {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         };
@@ -64,8 +66,10 @@ mod tests {
         table.insert_entry(
             "model-a".to_string(),
             RouteEntry {
+                route_id: None,
                 targets: vec![mk_target()],
                 strategy: Some(RoutingStrategyName::Priority),
+                capability_routing_mode: None,
             },
         );
         // Route B carries no override (inherits the gateway default).
@@ -115,10 +119,38 @@ mod tests {
             account_label: None,
             api_key_override: Some("override-key".to_string()),
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         };
         assert_eq!(target.effective_api_key(), "override-key");
+    }
+
+    #[test]
+    fn health_key_normalizes_api_base_and_includes_dialect() {
+        let base = RoutingTarget {
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            api_base: "https://Example.com:443/v1/".to_string(),
+            api_key: "secret".to_string(),
+            api_protocol: ProtocolEndpoint::new(ProtocolSuite::OpenAiResponses, "responses", "v1"),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            egress_dialect_id: None,
+            weight: 1.0,
+            oauth: None,
+        };
+        let equivalent = RoutingTarget {
+            api_base: "https://example.com/v1".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(base.health_key(), equivalent.health_key());
+        let dialect = RoutingTarget {
+            egress_dialect_id: Some("openai-responses-codex-lite".to_string()),
+            ..base
+        };
+        assert_ne!(equivalent.health_key(), dialect.health_key());
     }
 
     #[test]
@@ -432,6 +464,7 @@ mod tests {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         };
@@ -458,6 +491,7 @@ mod tests {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         };
@@ -472,6 +506,7 @@ mod tests {
     fn test_protocol_endpoint_identity() {
         let ep = ProtocolEndpoint::new(ProtocolSuite::OpenAiCompatible, "chat-completions", "v1");
         assert_eq!(ep.suite, ProtocolSuite::OpenAiCompatible);
+        assert_eq!(ep.full_id(), "openai-compatible/chat-completions/v1");
         assert!(ep.full_id().contains("chat-completions"));
         assert!(ep.full_id().contains("v1"));
     }
@@ -531,6 +566,7 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 10.0,
                 oauth: None,
             },
@@ -543,6 +579,7 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             },
@@ -565,6 +602,7 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             },
@@ -577,6 +615,7 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 10.0,
                 oauth: None,
             },
@@ -604,6 +643,7 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             },
@@ -616,6 +656,7 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 10.0,
                 oauth: None,
             },
@@ -643,6 +684,7 @@ mod tests {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         };
@@ -682,6 +724,7 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             },
@@ -694,6 +737,7 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             },
@@ -706,6 +750,7 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             },
@@ -749,6 +794,7 @@ mod tests {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         };
@@ -786,6 +832,7 @@ mod tests {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         };

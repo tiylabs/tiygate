@@ -198,8 +198,12 @@ async fn apply_sequence(pool: &sqlx::AnyPool, sequence: &str, dir: &str) -> Resu
             continue;
         }
 
+        // Apply one migration and its bookkeeping row atomically.  Without a
+        // transaction, a multi-statement migration could leave half-created
+        // columns/tables and then fail permanently on the next startup.
+        let mut tx = pool.begin().await?;
         for stmt in split_sql_statements(&sql) {
-            sqlx::query(&stmt).execute(pool).await.map_err(|e| {
+            sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
                 DbError::Migration(format!(
                     "sequence={sequence} version={version} stmt={stmt}: {e}"
                 ))
@@ -210,8 +214,9 @@ async fn apply_sequence(pool: &sqlx::AnyPool, sequence: &str, dir: &str) -> Resu
             .bind(sequence)
             .bind(version)
             .bind(now)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         info!(sequence, version, "migration applied");
     }
     Ok(())
@@ -425,5 +430,50 @@ mod tests {
         run_migrations(&pool).await.expect("migrations");
         let applied = list_applied(&pool).await.expect("list applied");
         assert!(!applied.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capability_base_migration_does_not_collide_with_existing_20260829_version() {
+        let pool = open_pool("sqlite::memory:").await.expect("open pool");
+        sqlx::query(
+            "CREATE TABLE _migrations (
+                sequence TEXT NOT NULL,
+                version BIGINT NOT NULL,
+                applied_at TEXT NOT NULL,
+                PRIMARY KEY (sequence, version)
+            )",
+        )
+        .execute(pool.any())
+        .await
+        .expect("migration table");
+        // Released builds used this version for the provider usage-management
+        // key. Capability discovery must use a distinct, earlier base version
+        // so an existing installation does not skip its table creation.
+        sqlx::query(
+            "INSERT INTO _migrations (sequence, version, applied_at)
+             VALUES ('config', 20260829000001, $1)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool.any())
+        .await
+        .expect("released migration marker");
+
+        run_migrations(&pool).await.expect("capability migrations");
+        let target_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='target_capability_profiles'",
+        )
+        .fetch_one(pool.any())
+        .await
+        .expect("target profile table");
+        assert_eq!(target_table, 1);
+        let columns = sqlx::query("PRAGMA table_info(target_capability_profiles)")
+            .fetch_all(pool.any())
+            .await
+            .expect("profile columns");
+        assert!(columns.iter().any(|row| {
+            use sqlx::Row;
+            row.get::<String, _>("name") == "registry_version"
+        }));
     }
 }

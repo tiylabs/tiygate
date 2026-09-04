@@ -177,6 +177,12 @@ pub struct ServerConfig {
     /// carries no strategy override (`routing_strategy = NULL`) is served
     /// with this strategy. Set via `TIYGATE_ROUTING_STRATEGY`.
     pub routing_strategy: RoutingStrategyName,
+    /// Capability-aware routing rollout mode. Defaults to `off` so existing
+    /// routes remain behaviorally unchanged until shadow/enforce is enabled.
+    pub capability_routing_mode: tiygate_core::CapabilityRoutingMode,
+    /// Whether a CRL `input[].additional_tools` carrier may be promoted to
+    /// standard Responses `tools` for a compatible target.
+    pub crl_tool_promotion_enabled: bool,
     /// Database URL for the control plane. When unset, the server
     /// runs in legacy in-memory mode (no admin router, no log
     /// retention, no quota counters).
@@ -227,6 +233,8 @@ impl Default for ServerConfig {
             upstream_pool_idle_timeout_secs: 90,
             upstream_tcp_nodelay: true,
             routing_strategy: RoutingStrategyName::Weighted,
+            capability_routing_mode: tiygate_core::CapabilityRoutingMode::Off,
+            crl_tool_promotion_enabled: false,
             database_url: None,
             raw_envelope_capture_media: false,
             require_api_key: true,
@@ -274,6 +282,19 @@ impl ServerConfig {
                 "latency" => RoutingStrategyName::Latency,
                 _ => RoutingStrategyName::Weighted,
             };
+        }
+        let capability_mode_env = std::env::var("TIYGATE_CAPABILITY_ROUTING_MODE")
+            .or_else(|_| std::env::var("TIYGATE_TARGET_CAPABILITY_ROUTING_MODE"));
+        if let Ok(v) = capability_mode_env {
+            if let Some(mode) = tiygate_core::CapabilityRoutingMode::parse(&v) {
+                cfg.capability_routing_mode = mode;
+            }
+        }
+        if let Ok(v) = std::env::var("TIYGATE_RESPONSES_CRL_TOOL_PROMOTION_ENABLED") {
+            cfg.crl_tool_promotion_enabled = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            );
         }
         if let Ok(v) = std::env::var("TIYGATE_UPSTREAM_NONSTREAM_TIMEOUT_SECS") {
             if let Ok(n) = v.parse() {

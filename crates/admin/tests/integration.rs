@@ -64,7 +64,7 @@ async fn create_test_provider(router: &axum::Router, id: &str) {
             json!({
                 "id": id,
                 "name": id,
-                "vendor": "openai",
+                "vendor": "unknown-compatible",
                 "api_base": "https://api.openai.com/v1",
                 "api_key": format!("sk-{id}"),
                 "auth_mode": "api_key",
@@ -112,7 +112,7 @@ async fn acceptance_1_admin_crud_propagates_to_routing_table() {
             json!({
                 "id": "openai",
                 "name": "OpenAI",
-                "vendor": "openai",
+                "vendor": "unknown-compatible",
                 "api_base": "https://api.openai.com/v1",
                 "api_key": "sk-test",
                 "auth_mode": "api_key",
@@ -151,6 +151,671 @@ async fn acceptance_1_admin_crud_propagates_to_routing_table() {
     // it to the upstream call. (No master key is configured in
     // this test — `cleartext-fallback` mode is exercised.)
     assert_eq!(targets[0].api_key, "sk-test");
+}
+
+#[tokio::test]
+async fn target_capability_routes_create_profile_and_probe_job() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    create_test_provider(&router, "capability-provider").await;
+    create_test_route(
+        &router,
+        "capability-route",
+        "capability-model",
+        json!([{
+            "provider_id": "capability-provider",
+            "model_id": "gpt-4o",
+            "egress_dialect_id": "openai-responses-standard"
+        }]),
+    )
+    .await;
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/admin/v1/target-capabilities?limit=10",
+            json!({}),
+        ))
+        .await
+        .expect("capability list response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("capability list body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("capability list json");
+    assert_eq!(value["total"], 1);
+    let target_key = value["entries"][0]["target_key"]
+        .as_str()
+        .expect("target key")
+        .to_string();
+    assert_eq!(value["entries"][0]["provider_id"], "capability-provider");
+    assert_eq!(value["entries"][0]["model_id"], "gpt-4o");
+    assert_eq!(value["entries"][0]["profile_status"], "pending");
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/admin/v1/target-capabilities/{target_key}/probe-jobs?limit=10"),
+            json!({}),
+        ))
+        .await
+        .expect("probe job list response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let jobs = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("probe job list body");
+    let jobs: serde_json::Value = serde_json::from_slice(&jobs).expect("probe job list json");
+    assert_eq!(jobs["total"], 1);
+    let job_id = jobs["entries"][0]["id"].as_str().expect("probe job id");
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!(
+                "/admin/v1/target-capabilities/{target_key}/probe-jobs/{job_id}/runs?limit=10"
+            ),
+            json!({}),
+        ))
+        .await
+        .expect("probe job runs response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let job_runs = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("probe job runs body");
+    let job_runs: serde_json::Value =
+        serde_json::from_slice(&job_runs).expect("probe job runs json");
+    assert_eq!(job_runs["total"], 0);
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/admin/v1/target-capabilities/{target_key}"),
+            json!({}),
+        ))
+        .await
+        .expect("capability detail response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let detail = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("capability detail body");
+    let detail_json: serde_json::Value = serde_json::from_slice(&detail).expect("detail json");
+    assert_eq!(
+        detail_json["profile"]["dialect_id"],
+        "openai-responses-standard"
+    );
+    assert!(detail_json["profile"]
+        .get("credential_scope_fingerprint")
+        .is_none());
+    assert!(detail_json["profile"].get("canonical_api_base").is_none());
+    assert_eq!(detail_json["probe_job"]["status"], "pending");
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/admin/v1/target-capabilities/{target_key}/probe-runs?limit=10"),
+            json!({}),
+        ))
+        .await
+        .expect("probe-run list response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let probe_runs = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("probe-run list body");
+    let probe_runs: serde_json::Value =
+        serde_json::from_slice(&probe_runs).expect("probe-run json");
+    assert_eq!(probe_runs["total"], 0);
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/admin/v1/target-capabilities/{target_key}/probe"),
+            json!({"probe_set": ["http.basic"]}),
+        ))
+        .await
+        .expect("probe response");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let unknown_override = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            &format!("/admin/v1/target-capabilities/{target_key}/overrides"),
+            json!({
+                "capability_id": "tools.function",
+                "state": "unknown",
+                "reason": "must not silently retain lower-priority evidence"
+            }),
+        ))
+        .await
+        .expect("unknown override response");
+    assert_eq!(unknown_override.status(), StatusCode::BAD_REQUEST);
+
+    let override_body = json!({
+        "capability_id": "tools.function",
+        "state": "supported",
+        "reason": "idempotency fixture"
+    });
+    let build_override = || {
+        Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/admin/v1/target-capabilities/{target_key}/overrides"
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", "capability-override-1")
+            .body(Body::from(override_body.to_string()))
+            .expect("override request")
+    };
+    let first = router
+        .clone()
+        .oneshot(build_override())
+        .await
+        .expect("override response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("override body");
+    let replay = router
+        .oneshot(build_override())
+        .await
+        .expect("override replay response");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .expect("override replay body");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&first_body).expect("first override json"),
+        serde_json::from_slice::<serde_json::Value>(&replay_body).expect("replay override json")
+    );
+}
+
+#[tokio::test]
+async fn capability_registry_is_paginated() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/v1/capability-registry?limit=2")
+                .body(Body::empty())
+                .expect("registry request"),
+        )
+        .await
+        .expect("registry response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("registry body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("registry json");
+    assert_eq!(value["items"].as_array().map(Vec::len), Some(2));
+    assert!(value["next_cursor"].is_string());
+}
+
+#[tokio::test]
+async fn capability_shape_admission_is_gated_and_revisioned() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    create_test_provider(&router, "admission-provider").await;
+    create_test_route(
+        &router,
+        "admission-route",
+        "admission-model",
+        json!([{
+            "provider_id": "admission-provider",
+            "model_id": "gpt-4o"
+        }]),
+    )
+    .await;
+    let required = vec!["tools.function".to_string()];
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/routes/admission-route/capability-admissions",
+            json!({
+                "required_capabilities": required,
+                "mode": "shadow",
+                "reason": "observe function capability"
+            }),
+        ))
+        .await
+        .expect("admission create response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("admission create body");
+    let created: serde_json::Value = serde_json::from_slice(&body).expect("admission json");
+    assert_eq!(created["revision"], 1);
+    assert_eq!(created["mode"], "shadow");
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/admin/v1/routes/admission-route/capability-admissions?limit=10",
+            json!({}),
+        ))
+        .await
+        .expect("admission list response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("admission list body");
+    let listed: serde_json::Value = serde_json::from_slice(&body).expect("admission list json");
+    assert_eq!(listed["total"], 1);
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/routes/admission-route/capability-admissions",
+            json!({
+                "shape_hash": created["capability_shape_hash"],
+                "required_capabilities": ["tools.function"],
+                "mode": "enforce",
+                "expected_revision": 1,
+                "reason": "enforce without evidence"
+            }),
+        ))
+        .await
+        .expect("admission gate response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let gate_error = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("admission gate body");
+    let gate_error: serde_json::Value = serde_json::from_slice(&gate_error).expect("gate error");
+    assert_eq!(gate_error["error"]["code"], "admission_required");
+    assert!(gate_error["error"]["request_id"].is_string());
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/admin/v1/settings",
+            json!({"settings":{"gateway.capabilities.probe_enabled":"false"}}),
+        ))
+        .await
+        .expect("probe setting response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/admin/v1/capability-probes",
+            json!({"enabled":true,"reason":"resume for canary"}),
+        ))
+        .await
+        .expect("probe worker response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/routes/admission-route/capability-admissions",
+            json!({
+                "shape_hash": created["capability_shape_hash"],
+                "required_capabilities": ["tools.function"],
+                "mode": "enforce",
+                "expected_revision": 1,
+                "low_traffic_exception": true,
+                "reason": "explicit low traffic canary"
+            }),
+        ))
+        .await
+        .expect("admission exception response");
+    // An explicit low-traffic exception still requires the server-generated
+    // CRL probe/continuation eligibility report; this route has no evidence,
+    // so the request is rejected rather than creating a fail-open gate.
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let exception_error = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("exception error body");
+    let exception_error: serde_json::Value =
+        serde_json::from_slice(&exception_error).expect("exception error");
+    assert_eq!(exception_error["error"]["code"], "admission_required");
+    let encoded_shape = created["capability_shape_hash"]
+        .as_str()
+        .expect("shape hash")
+        .replace('/', "%2F");
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "DELETE",
+            &format!("/admin/v1/routes/admission-route/capability-admissions/{encoded_shape}"),
+            json!({}),
+        ))
+        .await
+        .expect("admission delete response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn capability_shape_admission_preserves_typed_constraints() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    create_test_provider(&router, "typed-admission-provider").await;
+    create_test_route(
+        &router,
+        "typed-admission-route",
+        "typed-admission-model",
+        json!([{
+            "provider_id": "typed-admission-provider",
+            "model_id": "gpt-4o"
+        }]),
+    )
+    .await;
+    let response = router
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/routes/typed-admission-route/capability-admissions",
+            json!({
+                "required_capabilities": ["tools.namespace"],
+                "required_requirements": [{
+                    "id": "tools.namespace",
+                    "strength": "required",
+                    "value": {"kind": "enum_set", "value": ["functions"]}
+                }],
+                "mode": "shadow",
+                "reason": "namespace path constraint"
+            }),
+        ))
+        .await
+        .expect("typed admission response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("typed admission body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("typed admission json");
+    assert_eq!(value["required_requirements"][0]["id"], "tools.namespace");
+    assert_ne!(
+        value["capability_shape_hash"],
+        serde_json::json!(tiygate_core::capability_shape_hash_from_ids(&[
+            tiygate_core::CapabilityId::from("tools.namespace")
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn capability_metrics_endpoint_is_persistent_and_redacted() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/admin/v1/capability-metrics?route_id=missing",
+            json!({}),
+        ))
+        .await
+        .expect("metrics response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("metrics body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("metrics json");
+    assert_eq!(value["entries"].as_array().expect("entries").len(), 0);
+}
+
+#[tokio::test]
+async fn global_capability_enforce_requires_route_admission() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    create_test_provider(&router, "global-gate-provider").await;
+    create_test_route(
+        &router,
+        "global-gate-route",
+        "global-gate-model",
+        json!([{
+            "provider_id": "global-gate-provider",
+            "model_id": "gpt-4o"
+        }]),
+    )
+    .await;
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/admin/v1/settings",
+            json!({"settings":{"gateway.capabilities.routing_mode":"enforce"}}),
+        ))
+        .await
+        .expect("global mode response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn capability_settings_reject_out_of_range_values() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/admin/v1/settings",
+            json!({"settings":{"gateway.capabilities.probe_global_concurrency":"0"}}),
+        ))
+        .await
+        .expect("settings response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = router
+        .oneshot(json_request(
+            "PUT",
+            "/admin/v1/settings",
+            json!({"settings":{"gateway.responses.crl_tool_promotion_enabled":"maybe"}}),
+        ))
+        .await
+        .expect("promotion settings response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn capability_probe_idempotency_replays_without_duplicate_job() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    create_test_provider(&router, "idempotent-provider").await;
+    create_test_route(
+        &router,
+        "idempotent-route",
+        "idempotent-model",
+        json!([{"provider_id":"idempotent-provider","model_id":"gpt-4o"}]),
+    )
+    .await;
+    let list = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/admin/v1/target-capabilities?limit=10",
+            json!({}),
+        ))
+        .await
+        .expect("list");
+    let body = axum::body::to_bytes(list.into_body(), usize::MAX)
+        .await
+        .expect("list body");
+    let key = serde_json::from_slice::<serde_json::Value>(&body).expect("list json")["entries"][0]
+        ["target_key"]
+        .as_str()
+        .expect("target key")
+        .to_string();
+    let build_request = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/admin/v1/target-capabilities/{key}/probe"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", "probe-idem")
+            .body(Body::from(json!({"probe_set":["http.basic"]}).to_string()))
+            .expect("probe request")
+    };
+    let first = router
+        .clone()
+        .oneshot(build_request())
+        .await
+        .expect("first");
+    let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+    let first_json: serde_json::Value = serde_json::from_slice(&first_body).expect("first json");
+    let second = router.oneshot(build_request()).await.expect("second");
+    assert_eq!(second.status(), StatusCode::ACCEPTED);
+    let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("second body");
+    let second_json: serde_json::Value = serde_json::from_slice(&second_body).expect("second json");
+    assert_eq!(first_json["id"], second_json["id"]);
+}
+
+#[tokio::test]
+async fn capability_settings_idempotency_replays_and_conflicts() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    let build_request = |value: &str| {
+        Request::builder()
+            .method("PUT")
+            .uri("/admin/v1/settings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", "settings-idem-1")
+            .body(Body::from(
+                json!({"settings":{"gateway.capabilities.probe_enabled":value}}).to_string(),
+            ))
+            .expect("request")
+    };
+    let first = router
+        .clone()
+        .oneshot(build_request("false"))
+        .await
+        .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+    let replay = router
+        .clone()
+        .oneshot(build_request("false"))
+        .await
+        .expect("replay response");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .expect("replay body");
+    assert_eq!(first_body, replay_body);
+    let conflict = router
+        .oneshot(build_request("true"))
+        .await
+        .expect("conflict response");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(conflict.into_body(), usize::MAX)
+        .await
+        .expect("conflict body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("conflict json");
+    assert_eq!(value["error"]["code"], "idempotency_conflict");
+}
+
+#[tokio::test]
+async fn route_capability_mode_idempotency_replays_without_duplicate_route_write() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    create_test_provider(&router, "route-idem-provider").await;
+    let body = json!({
+        "id": "route-idem",
+        "virtual_model": "route-idem-model",
+        "targets": [{"provider_id":"route-idem-provider","model_id":"gpt-4o"}],
+        "capability_routing_mode": "shadow",
+        "enabled": true
+    });
+    let build_request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/admin/v1/routes")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", "route-idem-1")
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    };
+    let first = router
+        .clone()
+        .oneshot(build_request())
+        .await
+        .expect("first route response");
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("first route body");
+    let replay = router
+        .clone()
+        .oneshot(build_request())
+        .await
+        .expect("replay route response");
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    let replay_body = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .expect("replay route body");
+    let first_json: serde_json::Value = serde_json::from_slice(&first_body).expect("first json");
+    let replay_json: serde_json::Value = serde_json::from_slice(&replay_body).expect("replay json");
+    assert_eq!(first_json, replay_json);
+}
+
+#[tokio::test]
+async fn route_view_does_not_echo_target_credentials_or_url_overrides() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    create_test_provider(&router, "redact-route-provider").await;
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/routes",
+            json!({
+                "id": "redact-route",
+                "virtual_model": "redact-model",
+                "targets": [{
+                    "provider_id": "redact-route-provider",
+                    "model_id": "gpt-4o",
+                    "api_key_override": "route-secret",
+                    "api_base_override": "https://override.example/v1"
+                }]
+            }),
+        ))
+        .await
+        .expect("route create response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("route body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("route json");
+    let target = &value["targets"][0];
+    assert!(target.get("api_key_override").is_none());
+    assert!(target.get("api_base_override").is_none());
+    assert_eq!(target["api_key_override_configured"], true);
+    assert_eq!(target["api_base_override_configured"], true);
+    assert_eq!(
+        target["egress_protocol"],
+        "openai-compatible/chat-completions/v1"
+    );
+    assert!(!body
+        .windows("route-secret".len())
+        .any(|window| window == b"route-secret"));
+}
+
+#[tokio::test]
+async fn route_rejects_unregistered_egress_dialect() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    create_test_provider(&router, "invalid-dialect-provider").await;
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/routes",
+            json!({
+                "id": "invalid-dialect-route",
+                "virtual_model": "invalid-dialect-model",
+                "targets": [{
+                    "provider_id": "invalid-dialect-provider",
+                    "model_id": "gpt-4o",
+                    "egress_dialect_id": "custom-dialect"
+                }]
+            }),
+        ))
+        .await
+        .expect("route create response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1167,6 +1832,89 @@ async fn config_import_inserts_and_returns_report() {
     let report: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(report["providers_imported"], 1);
     assert_eq!(report["providers_skipped"], 0);
+}
+
+#[tokio::test]
+async fn config_import_rejects_forbidden_capability_override() {
+    let (router, store, _pool) = boot_no_auth().await;
+    let import_body = json!({
+        "master_key": "",
+        "config": {
+            "schema_version": 2,
+            "exported_at": "2025-01-01T00:00:00Z",
+            "encrypted": false,
+            "providers": [{
+                "id": "p-import-capability",
+                "name": "Imported capability target",
+                "vendor": "unknown-compatible",
+                "api_base": "https://api.openai.com/v1",
+                "encrypted_api_key": "sk-imported-capability",
+                "auth_mode": "api_key",
+                "encrypted_oauth_meta": "",
+                "metadata_json": {},
+                "enabled": true,
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z"
+            }],
+            "routes": [{
+                "id": "r-import-capability",
+                "virtual_model": "v-import-capability",
+                "targets": [{
+                    "provider_id": "p-import-capability",
+                    "model_id": "gpt-4o",
+                    "weight": 1.0,
+                    "enabled": true
+                }],
+                "enabled": true,
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z"
+            }],
+            "api_keys": [],
+            "capability_overrides": [{
+                "selector": {
+                    "route_id": "r-import-capability",
+                    "target_index": 0,
+                    "provider_id": "p-import-capability",
+                    "model_id": "gpt-4o"
+                },
+                "capability_id": "tools.namespace",
+                "state": "supported",
+                "reason": "invalid cross-wire override",
+                "actor": "tester"
+            }]
+        },
+        "selection": {
+            "providers": ["p-import-capability"],
+            "routes": ["r-import-capability"],
+            "capability_overrides": ["r-import-capability#0#tools.namespace"]
+        }
+    });
+    let response = router
+        .oneshot(json_request("POST", "/admin/v1/config/import", import_body))
+        .await
+        .expect("capability import response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("capability import body");
+    let report: serde_json::Value = serde_json::from_slice(&body).expect("capability import json");
+    assert_eq!(report["routes_imported"], 1);
+    assert_eq!(report["capability_overrides_imported"], 0);
+    assert_eq!(report["capability_overrides_skipped"], 1);
+    let target = store
+        .config_store()
+        .routing_table
+        .resolve("v-import-capability")
+        .expect("imported target")
+        .into_iter()
+        .next()
+        .expect("target");
+    let key = store.target_key_for(&target).expect("target key").0;
+    assert!(store
+        .list_capability_overrides(&key)
+        .await
+        .expect("override list")
+        .is_empty());
 }
 
 #[tokio::test]

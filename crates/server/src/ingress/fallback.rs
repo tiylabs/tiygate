@@ -111,7 +111,6 @@ where
     let mut hop = 0usize;
     let mut target_index = 0usize;
     let mut last_error: Option<AppError> = None;
-    let bytes_emitted: u64 = 0;
     let mut oauth_recovered = HashSet::new();
 
     // Strategy ordering — per-route override takes precedence over the
@@ -154,8 +153,9 @@ where
         let target = ordered_targets[target_index];
 
         // Check health — skip circuit-broken targets
-        let health_key = target.health_key();
-        if !state.health.is_healthy(&health_key) {
+        let health_id = target.health_instance_id();
+        let health_key = health_id.as_str().to_string();
+        if !state.health.is_healthy_id(&health_id) {
             hop += 1;
             let current_hop = hop;
             state
@@ -240,8 +240,10 @@ where
         match execution {
             Ok((response, ttfb_ms)) => {
                 let hop_elapsed_ms = (Utc::now() - hop_started).num_milliseconds().max(0) as u64;
-                state.health.record_success(&health_key);
-                state.health.record_latency_ms(&health_key, hop_elapsed_ms);
+                state.health.record_success_id(&health_id);
+                state
+                    .health
+                    .record_latency_ms_id(&health_id, hop_elapsed_ms);
                 // Telemetry: HopSuccess
                 state
                     .telemetry
@@ -263,13 +265,40 @@ where
             }
             Err(app_err) => {
                 let hop_elapsed_ms = (Utc::now() - hop_started).num_milliseconds().max(0) as u64;
-                state.health.record_failure(&health_key);
-                state.health.record_latency_ms(&health_key, hop_elapsed_ms);
+                let bytes_emitted = app_err.client_bytes_emitted();
+                let capability_error = app_err.is_target_capability_error();
+                if capability_error {
+                    // Capability evidence invalidation is deliberately off
+                    // the request hot path.  Enqueue it onto the owned
+                    // feedback worker so graceful shutdown and restart do
+                    // not leave a detached task behind.
+                    if let Some(dispatcher) = state.capability_feedback.as_ref() {
+                        if !dispatcher.enqueue(target.clone(), "capability_rejection") {
+                            tracing::warn!(
+                                target = %health_key,
+                                "capability feedback worker is unavailable"
+                            );
+                        }
+                    }
+                }
+                if !capability_error {
+                    state.health.record_failure_id(&health_id);
+                    state
+                        .health
+                        .record_latency_ms_id(&health_id, hop_elapsed_ms);
+                }
 
                 // Classify the error — prefer structured fields when
                 // available (HTTP status + error code from upstream),
                 // fall back to substring matching on the message.
-                let classification = if app_err.upstream_status.is_some()
+                let classification = if app_err.is_target_capability_error() {
+                    tiygate_core::ErrorClassification {
+                        class: RequestErrorClass::LossyOrCapability,
+                        fallback_class: ErrorClass::LossyOrCapability,
+                        retry_after: None,
+                        http_status: app_err.upstream_status,
+                    }
+                } else if app_err.upstream_status.is_some()
                     || app_err.upstream_error_code().is_some()
                 {
                     tiygate_core::classify_structured(
@@ -319,8 +348,15 @@ where
 
                 // Decide next action
                 let core_err = tiygate_core::Error::Routing(app_err.message.clone());
-                let decision =
-                    fallback.classify(&core_err, target, attempt, max_attempts, bytes_emitted);
+                let decision = if capability_error {
+                    if bytes_emitted == 0 && attempt < max_attempts {
+                        FallbackDecision::TryNext
+                    } else {
+                        FallbackDecision::Fail
+                    }
+                } else {
+                    fallback.classify(&core_err, target, attempt, max_attempts, bytes_emitted)
+                };
 
                 match decision {
                     FallbackDecision::TryNext => {

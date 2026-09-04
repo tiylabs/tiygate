@@ -19,6 +19,15 @@ let portResolved = false;
  */
 let currentInstanceKey = "";
 
+/** Generate a client mutation key so a retry after a lost response can be
+ * replayed safely by the Admin API instead of applying the write twice. */
+export function newIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 async function ensureApiBase(): Promise<void> {
   if (portResolved) return;
   const tauriInternals =
@@ -77,12 +86,14 @@ export function resetApiBase(): void {
 export class ApiError extends Error {
   status: number;
   type?: string;
+  code?: string;
 
-  constructor(status: number, message: string, type?: string) {
+  constructor(status: number, message: string, type?: string, code?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.type = type;
+    this.code = code;
   }
 }
 
@@ -96,6 +107,7 @@ export function setUnauthorizedHandler(fn: UnauthorizedHandler | null): void {
 async function parseError(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`;
   let type: string | undefined;
+  let code: string | undefined;
   try {
     const body = await res.json();
     const err = (body as Record<string, unknown>)?.error;
@@ -105,17 +117,19 @@ async function parseError(res: Response): Promise<ApiError> {
       const obj = err as Record<string, unknown>;
       if (typeof obj.message === "string") message = obj.message;
       if (typeof obj.type === "string") type = obj.type;
+      if (typeof obj.code === "string") code = obj.code;
     }
   } catch {
     // Non-JSON body; keep the status line as the message.
   }
-  return new ApiError(res.status, message, type);
+  return new ApiError(res.status, message, type, code);
 }
 
 interface RequestOptions {
   method?: string;
   body?: unknown;
   query?: Record<string, string | number | boolean | undefined | null>;
+  headers?: Record<string, string>;
   /** Set to true for endpoints that may return 204 No Content. */
   allowEmpty?: boolean;
 }
@@ -142,6 +156,7 @@ export async function apiRequest<T>(
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+  Object.assign(headers, opts.headers);
 
   const res = await fetch(buildUrl(path, opts.query), {
     method: opts.method ?? "GET",

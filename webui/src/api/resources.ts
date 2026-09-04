@@ -1,8 +1,19 @@
-import { apiRequest } from "./client";
+import { apiRequest, newIdempotencyKey } from "./client";
 import type {
   ApiKey,
   ApiKeyDetail,
   AuditListResponse,
+  CapabilityListResponse,
+  CapabilityRouteAdmission,
+  CapabilityRouteAdmissionListResponse,
+  CapabilityMetricsResponse,
+  CapabilityProfileResponse,
+  CapabilityProbeJobListResponse,
+  CapabilityProbeRunDetail,
+  CapabilityProbeRunListResponse,
+  CapabilityRequirement,
+  CapabilityRegistryEntry,
+  CapabilityState,
   CircuitBreakersResponse,
   ConfigExport,
   CreateApiKeyResponse,
@@ -95,11 +106,229 @@ export const routesApi = {
     }),
   get: (id: string) => apiRequest<Route>(`/routes/${id}`),
   create: (body: RouteInput) =>
-    apiRequest<Route>("/routes", { method: "POST", body }),
+    apiRequest<Route>("/routes", {
+      method: "POST",
+      body,
+      headers: { "Idempotency-Key": newIdempotencyKey() },
+    }),
   update: (id: string, body: RouteInput) =>
-    apiRequest<Route>(`/routes/${id}`, { method: "PUT", body }),
+    apiRequest<Route>(`/routes/${id}`, {
+      method: "PUT",
+      body,
+      headers: { "Idempotency-Key": newIdempotencyKey() },
+    }),
   remove: (id: string) =>
-    apiRequest<void>(`/routes/${id}`, { method: "DELETE", allowEmpty: true }),
+    apiRequest<void>(`/routes/${id}`, {
+      method: "DELETE",
+      allowEmpty: true,
+      headers: { "Idempotency-Key": newIdempotencyKey() },
+    }),
+  listAll: async () => {
+    const entries: Route[] = [];
+    let offset = 0;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await routesApi.list({ limit: 500, offset });
+      entries.push(...(response.entries ?? response.items ?? []));
+      if (!response.next_cursor) break;
+      const next = Number(response.next_cursor);
+      if (!Number.isSafeInteger(next) || next <= offset) break;
+      offset = next;
+    }
+    return { total: entries.length, limit: 500, offset: 0, entries, items: entries };
+  },
+};
+
+// ---- target capabilities ----
+export const capabilitiesApi = {
+  list: (filter: { limit?: number; offset?: number } = {}) =>
+    apiRequest<CapabilityListResponse>("/target-capabilities", {
+      query: filter as Record<string, string | number | boolean | undefined>,
+    }),
+  listAll: async () => {
+    const entries: import("./types").CapabilityProfileSummary[] = [];
+    let offset = 0;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await capabilitiesApi.list({ limit: 500, offset });
+      entries.push(...(response.entries ?? response.items ?? []));
+      if (!response.next_cursor) break;
+      const next = Number(response.next_cursor);
+      if (!Number.isSafeInteger(next) || next <= offset) break;
+      offset = next;
+    }
+    return { total: entries.length, limit: 500, offset: 0, entries, items: entries };
+  },
+  get: (targetKey: string) =>
+    apiRequest<CapabilityProfileResponse>(`/target-capabilities/${targetKey}`),
+  probe: (targetKey: string, probeSet?: string[]) =>
+    apiRequest<import("./types").ProbeJob>(
+      `/target-capabilities/${targetKey}/probe`,
+      {
+        method: "POST",
+        body: probeSet ? { probe_set: probeSet } : {},
+        headers: { "Idempotency-Key": newIdempotencyKey() },
+      },
+    ),
+  override: (
+    targetKey: string,
+    input: {
+      capability_id: string;
+      state: CapabilityState;
+      value?: unknown;
+      reason: string;
+      expires_at?: string | null;
+    },
+  ) =>
+    apiRequest<import("./types").CapabilityOverride>(
+      `/target-capabilities/${targetKey}/overrides`,
+      {
+        method: "PUT",
+        body: input,
+        headers: { "Idempotency-Key": newIdempotencyKey() },
+      },
+    ),
+  removeOverride: (targetKey: string, capabilityId: string) =>
+    apiRequest<void>(
+      `/target-capabilities/${targetKey}/overrides/${encodeURIComponent(capabilityId)}`,
+      {
+        method: "DELETE",
+        allowEmpty: true,
+        headers: { "Idempotency-Key": newIdempotencyKey() },
+      },
+    ),
+  registry: (filter: { limit?: number; offset?: number } = {}) =>
+    apiRequest<{
+      total: number;
+      limit: number;
+      offset: number;
+      next_cursor?: string | null;
+      contract_schema_version?: number;
+      contract_summary?: Array<[string, number]>;
+      items?: CapabilityRegistryEntry[];
+      entries: CapabilityRegistryEntry[];
+    }>("/capability-registry", {
+      query: filter as Record<string, string | number | boolean | undefined>,
+    }),
+  registryAll: async () => {
+    const entries: CapabilityRegistryEntry[] = [];
+    let offset = 0;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await capabilitiesApi.registry({ limit: 500, offset });
+      entries.push(...(response.entries ?? response.items ?? []));
+      if (!response.next_cursor) break;
+      const next = Number(response.next_cursor);
+      if (!Number.isSafeInteger(next) || next <= offset) break;
+      offset = next;
+    }
+    return { total: entries.length, limit: 500, offset: 0, entries, items: entries };
+  },
+  job: (jobId: string) =>
+    apiRequest<import("./types").ProbeJob>(`/probe-jobs/${jobId}`),
+  probeRuns: (targetKey: string, filter: { limit?: number; offset?: number } = {}) =>
+    apiRequest<CapabilityProbeRunListResponse>(`/target-capabilities/${encodeURIComponent(targetKey)}/probe-runs`, {
+      query: filter as Record<string, string | number | boolean | undefined>,
+    }),
+  probeJobs: (targetKey: string, filter: { limit?: number; offset?: number } = {}) =>
+    apiRequest<CapabilityProbeJobListResponse>(
+      `/target-capabilities/${encodeURIComponent(targetKey)}/probe-jobs`,
+      { query: filter as Record<string, string | number | boolean | undefined> },
+    ),
+  probeJobRuns: (
+    targetKey: string,
+    jobId: string,
+    filter: { limit?: number; offset?: number } = {},
+  ) =>
+    apiRequest<CapabilityProbeRunListResponse>(
+      `/target-capabilities/${encodeURIComponent(targetKey)}/probe-jobs/${encodeURIComponent(jobId)}/runs`,
+      { query: filter as Record<string, string | number | boolean | undefined> },
+    ),
+  probeRun: (targetKey: string, runId: string) =>
+    apiRequest<CapabilityProbeRunDetail>(
+      `/target-capabilities/${encodeURIComponent(targetKey)}/probe-runs/${encodeURIComponent(runId)}`,
+    ),
+  admissions: (routeId: string, filter: { limit?: number; offset?: number } = {}) =>
+    apiRequest<CapabilityRouteAdmissionListResponse>(
+      `/routes/${encodeURIComponent(routeId)}/capability-admissions`,
+      { query: filter as Record<string, string | number | boolean | undefined> },
+    ),
+  admissionsAll: async (routeId: string) => {
+    const entries: CapabilityRouteAdmission[] = [];
+    let offset = 0;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await capabilitiesApi.admissions(routeId, { limit: 500, offset });
+      entries.push(...(response.entries ?? response.items ?? []));
+      if (!response.next_cursor) break;
+      const next = Number(response.next_cursor);
+      if (!Number.isSafeInteger(next) || next <= offset) break;
+      offset = next;
+    }
+    return { route_id: routeId, total: entries.length, limit: 500, offset: 0, entries, items: entries };
+  },
+  upsertAdmission: (
+    routeId: string,
+    input: {
+      shape_hash?: string;
+      required_capabilities: string[];
+      required_requirements?: CapabilityRequirement[];
+      mode: "shadow" | "enforce";
+      expected_revision?: number;
+      expires_at?: string | null;
+      low_traffic_exception?: boolean;
+      reason: string;
+    },
+  ) =>
+    apiRequest<CapabilityRouteAdmission>(
+      `/routes/${encodeURIComponent(routeId)}/capability-admissions`,
+      {
+        method: "POST",
+        body: input,
+        headers: { "Idempotency-Key": newIdempotencyKey() },
+      },
+    ),
+  removeAdmission: (routeId: string, shapeHash: string, expectedRevision?: number) =>
+    apiRequest<void>(
+      `/routes/${encodeURIComponent(routeId)}/capability-admissions/${encodeURIComponent(shapeHash)}`,
+      {
+        method: "DELETE",
+        allowEmpty: true,
+        headers: { "Idempotency-Key": newIdempotencyKey() },
+        query: { expected_revision: expectedRevision },
+      },
+    ),
+  metrics: (filter: {
+    route_id?: string;
+    shape_hash?: string;
+    since?: string;
+    until?: string;
+    limit?: number;
+    offset?: number;
+  } = {}) =>
+    apiRequest<CapabilityMetricsResponse>("/capability-metrics", {
+      query: filter as Record<string, string | number | boolean | undefined>,
+    }),
+  metricsAll: async (filter: {
+    route_id?: string;
+    shape_hash?: string;
+    since?: string;
+    until?: string;
+  } = {}) => {
+    const entries: import("./types").CapabilityShadowMetric[] = [];
+    let offset = 0;
+    for (let page = 0; page < 100; page += 1) {
+      const response = await capabilitiesApi.metrics({ ...filter, limit: 500, offset });
+      entries.push(...response.entries);
+      if (!response.next_cursor) break;
+      const next = Number(response.next_cursor);
+      if (!Number.isSafeInteger(next) || next <= offset) break;
+      offset = next;
+    }
+    return { total: entries.length, limit: 500, offset: 0, entries, items: entries };
+  },
+  setProbeWorker: (enabled: boolean, reason: string) =>
+    apiRequest<{ enabled: boolean }>("/capability-probes", {
+      method: "PUT",
+      body: { enabled, reason },
+      headers: { "Idempotency-Key": newIdempotencyKey() },
+    }),
 };
 
 // ---- api keys ----
@@ -223,6 +452,7 @@ export const configApi = {
     apiRequest<ImportReport>("/config/import", {
       method: "POST",
       body: { master_key: masterKey, config, selection },
+      headers: { "Idempotency-Key": newIdempotencyKey() },
     }),
 };
 
@@ -233,5 +463,6 @@ export const settingsApi = {
     apiRequest<SettingsResponse>("/settings", {
       method: "PUT",
       body: { settings },
+      headers: { "Idempotency-Key": newIdempotencyKey() },
     }),
 };

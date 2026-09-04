@@ -99,6 +99,25 @@ pub fn spawn(pool: Arc<DbPool>, store: Arc<DbConfigStore>) -> RetentionHandle {
             if let Err(e) = cleanup_once(pool.as_ref(), retention_days).await {
                 warn!(error = %e, "log retention cleanup failed");
             }
+            match store
+                .cleanup_orphaned_capability_state(retention_days)
+                .await
+            {
+                Ok(report)
+                    if report.profiles_deleted > 0
+                        || report.overrides_deleted > 0
+                        || report.jobs_deleted > 0 =>
+                {
+                    info!(
+                        profiles_deleted = report.profiles_deleted,
+                        overrides_deleted = report.overrides_deleted,
+                        jobs_deleted = report.jobs_deleted,
+                        "capability retention cleanup pass"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "capability retention cleanup failed"),
+            }
             tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
         }
     });
@@ -137,18 +156,48 @@ pub async fn cleanup_once(pool: &DbPool, retention_days: u32) -> Result<u64, sql
         .bind(&cutoff_str)
         .execute(&mut *tx)
         .await?;
+    let capability_plan_res = sqlx::query("DELETE FROM request_capability_plans WHERE ts < $1")
+        .bind(&cutoff_str)
+        .execute(&mut *tx)
+        .await?;
+    let capability_feedback_res =
+        sqlx::query("DELETE FROM request_capability_feedback WHERE ts < $1")
+            .bind(&cutoff_str)
+            .execute(&mut *tx)
+            .await?;
+    let capability_gap_res =
+        sqlx::query("DELETE FROM request_capability_telemetry_gaps WHERE last_ts < $1")
+            .bind(&cutoff_str)
+            .execute(&mut *tx)
+            .await?;
+    let capability_probe_res = sqlx::query("DELETE FROM capability_probe_runs WHERE ts < $1")
+        .bind(&cutoff_str)
+        .execute(&mut *tx)
+        .await?;
+    // Capability-control idempotency reservations have their own short TTL;
+    // clean them independently of request-log retention so retries remain
+    // bounded without retaining mutation payload hashes forever.
+    let _ = sqlx::query("DELETE FROM capability_mutation_idempotency WHERE expires_at < $1")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
 
     let deleted_attempts = attempt_res.rows_affected();
     let deleted_payloads = payload_res.rows_affected();
     let deleted_logs = log_res.rows_affected();
-    let deleted = deleted_attempts + deleted_payloads + deleted_logs;
+    let deleted_capability = capability_plan_res.rows_affected()
+        + capability_feedback_res.rows_affected()
+        + capability_gap_res.rows_affected()
+        + capability_probe_res.rows_affected();
+    let deleted = deleted_attempts + deleted_payloads + deleted_logs + deleted_capability;
     if deleted > 0 {
         info!(
             deleted,
             deleted_logs,
             deleted_payloads,
             deleted_attempts,
+            deleted_capability,
             retention_days,
             "log retention cleanup pass"
         );
@@ -205,6 +254,49 @@ mod tests {
         .expect("insert attempt");
     }
 
+    async fn insert_capability_rows(pool: &DbPool, request_id: &str, ts: &str) {
+        sqlx::query(
+            "INSERT INTO request_capability_plans
+             (request_id, route_id, target, ts, mode, shape_hash, status, requirements_json, missing_json, unknown_json, evidence_json)
+             VALUES ($1, 'route', 'target', $2, 'shadow', 'shape/v1:test', 'compatible', '[]', '[]', '[]', '[]')",
+        )
+        .bind(request_id)
+        .bind(ts)
+        .execute(pool.any())
+        .await
+        .expect("insert capability plan");
+        sqlx::query(
+            "INSERT INTO request_capability_feedback
+             (request_id, route_id, shape_hash, target, capability, outcome, ts)
+             VALUES ($1, 'route', 'shape/v1:test', 'target', 'tools.function', 'success', $2)",
+        )
+        .bind(request_id)
+        .bind(ts)
+        .execute(pool.any())
+        .await
+        .expect("insert capability feedback");
+        sqlx::query(
+            "INSERT INTO request_capability_telemetry_gaps
+             (request_id, route_id, shape_hash, target, reason, dropped_count, first_ts, last_ts)
+             VALUES ($1, 'route', 'shape/v1:test', 'target', 'backpressure', 1, $2, $2)",
+        )
+        .bind(request_id)
+        .bind(ts)
+        .execute(pool.any())
+        .await
+        .expect("insert capability telemetry gap");
+        sqlx::query(
+            "INSERT INTO capability_probe_runs
+             (run_id, target, probe_id, outcome, duration_micros, budget_weight, error_class, ts)
+             VALUES ($1, 'target', 'http.basic', 'positive', 1, 1, NULL, $2)",
+        )
+        .bind(format!("probe-run-{request_id}"))
+        .bind(ts)
+        .execute(pool.any())
+        .await
+        .expect("insert capability probe run");
+    }
+
     async fn log_count(pool: &DbPool, request_id: &str) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE request_id = $1")
             .bind(request_id)
@@ -237,6 +329,7 @@ mod tests {
         insert_log(pool.as_ref(), "old", &old_ts).await;
         insert_payload(pool.as_ref(), "old", &new_ts).await;
         insert_attempt(pool.as_ref(), "old", &new_ts).await;
+        insert_capability_rows(pool.as_ref(), "old", &old_ts).await;
         insert_log(pool.as_ref(), "new", &new_ts).await;
         insert_payload(pool.as_ref(), "new", &new_ts).await;
         insert_attempt(pool.as_ref(), "new", &new_ts).await;
@@ -247,13 +340,41 @@ mod tests {
 
         let deleted = cleanup_once(pool.as_ref(), 30).await.expect("cleanup");
         assert_eq!(
-            deleted, 5,
-            "old log, old payload, old attempt, and old orphans must be deleted"
+            deleted, 9,
+            "old log, payload, attempt, capability plan/feedback/gap/probe, and old orphans must be deleted"
         );
 
         assert_eq!(log_count(pool.as_ref(), "old").await, 0);
         assert_eq!(payload_count(pool.as_ref(), "old").await, 0);
         assert_eq!(attempt_count(pool.as_ref(), "old").await, 0);
+        let plan_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_capability_plans WHERE request_id = 'old'",
+        )
+        .fetch_one(pool.any())
+        .await
+        .expect("capability plan count");
+        let feedback_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_capability_feedback WHERE request_id = 'old'",
+        )
+        .fetch_one(pool.any())
+        .await
+        .expect("capability feedback count");
+        let gap_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_capability_telemetry_gaps WHERE request_id = 'old'",
+        )
+        .fetch_one(pool.any())
+        .await
+        .expect("capability gap count");
+        assert_eq!(plan_count, 0);
+        assert_eq!(feedback_count, 0);
+        assert_eq!(gap_count, 0);
+        let probe_run_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM capability_probe_runs WHERE run_id = 'probe-run-old'",
+        )
+        .fetch_one(pool.any())
+        .await
+        .expect("capability probe run count");
+        assert_eq!(probe_run_count, 0);
         assert_eq!(log_count(pool.as_ref(), "new").await, 1);
         assert_eq!(payload_count(pool.as_ref(), "new").await, 1);
         assert_eq!(attempt_count(pool.as_ref(), "new").await, 1);

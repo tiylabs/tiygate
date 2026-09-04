@@ -1,0 +1,40 @@
+# Machine-readable mapping from conversion-relevant capabilities to the
+# human-maintained protocol capability matrix. The build script validates that
+# every routing-relevant descriptor has an explicit documentation reference.
+schema_version = 1
+
+[[mapping]]
+id = "transport.http"
+matrix_ref = "docs/protocol-capability-matrix.md"
+
+[[mapping]]
+id = "transport.sse"
+matrix_ref = "docs/protocol-capability-matrix.md"
+
+[[mapping]]
+id = "tools.function"
+matrix_ref = "docs/protocol-capability-matrix.md"
+
+[[mapping]]
+id = "tools.function.continuation"
+matrix_ref = "docs/protocol-capability-matrix.md"
+
+[[mapping]]
+id = "tools.choice.required"
+matrix_ref = "docs/protocol-capability-matrix.md"
+
+[[mapping]]
+id = "tools.choice.specific"
+matrix_ref = "docs/protocol-capability-matrix.md"
+
+[[mapping]]
+id = "tools.namespace"
+matrix_ref = "docs/protocol-capability-matrix.md"
+
+[[mapping]]
+id = "tools.custom"
+matrix_ref = "docs/protocol-capability-matrix.md"
+
+[[mapping]]
+id = "tools.crl.additional_tools"
+matrix_ref = "docs/target-capability-discovery-implementation-plan.md"

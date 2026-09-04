@@ -52,6 +52,7 @@ fn build_test_app(upstream_url: String, model: &str) -> axum::Router {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
             weight: 1.0,
             oauth: None,
         }],

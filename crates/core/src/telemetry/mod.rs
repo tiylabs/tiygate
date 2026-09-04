@@ -230,6 +230,65 @@ pub enum EventPayload {
         targets: Vec<String>,
         strategy: String,
     },
+    /// Capability planner result. This is intentionally a separate event so
+    /// it can be sampled or persisted without changing the request log schema.
+    CapabilityPlan {
+        mode: String,
+        #[serde(default)]
+        route_id: String,
+        #[serde(default)]
+        shape_hash: String,
+        #[serde(default)]
+        planning_micros: u64,
+        requirements: Vec<String>,
+        target: String,
+        status: String,
+        missing: Vec<String>,
+        unknown: Vec<String>,
+        transform: Option<String>,
+        #[serde(default)]
+        evidence: Vec<String>,
+    },
+    /// Semantically verified capability result observed on real business
+    /// traffic. A successful tool call is positive evidence; absence of a
+    /// call is never emitted as a negative conclusion.
+    CapabilityFeedback {
+        route_id: String,
+        shape_hash: String,
+        target: String,
+        capability: String,
+        outcome: String,
+    },
+    /// A capability-plan or feedback event could not be accepted by the
+    /// normal telemetry queue.  The server emits this through a reserved
+    /// gap path so the affected Route × capability shape cannot be admitted
+    /// until the missing observation window is repaired.
+    CapabilityTelemetryGap {
+        route_id: String,
+        shape_hash: String,
+        #[serde(default)]
+        target: String,
+        reason: String,
+        dropped_count: u64,
+    },
+    /// Audit/metrics record for one active capability probe.  Probe events
+    /// are kept separate from business request attempts and may include a
+    /// weighted cost without exposing request bodies or credentials.
+    CapabilityProbe {
+        run_id: String,
+        target: String,
+        probe_id: String,
+        outcome: String,
+        duration_micros: u64,
+        budget_weight: u32,
+        #[serde(default)]
+        error_class: Option<String>,
+        /// Bounded, redacted request/response exchanges and the deterministic
+        /// probe judgment. Kept as JSON so future probe types can add fields
+        /// without changing the core event enum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+    },
     /// Execution attempt against a target.
     HopStart {
         target: String,

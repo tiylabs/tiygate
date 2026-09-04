@@ -3,11 +3,12 @@
 
 use http::HeaderMap;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use tiygate_core::{
-    Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
-    Message, PromptCacheBreakpoint, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role,
+    CapabilityRequirement, CapabilityValue, Content, EndpointCapabilities, EndpointCodec,
+    ErrorClass, FinishReason, IrRequest, IrResponse, Message, PromptCacheBreakpoint,
+    ProtocolEndpoint, ProtocolSuite, RawEnvelope, RequirementExpr, RequirementStrength, Role,
     StreamDecoder, StreamEncoder, StreamPart, Tool, ToolCaller, Usage, Verbosity,
 };
 
@@ -111,6 +112,336 @@ fn decode_prompt_cache_breakpoint(part: &Value) -> Option<PromptCacheBreakpoint>
             mode: tiygate_core::PromptCacheBreakpointMode::Explicit,
         },
     )
+}
+
+/// Return the capability IDs required by CRL's `additional_tools` carrier.
+/// This inspects only the wire item and is intentionally independent from the
+/// IR so unknown/private fields remain available for same-protocol replay.
+pub fn crl_required_capability_ids(body: &Value) -> BTreeSet<String> {
+    crl_required_capability_requirements(body)
+        .into_iter()
+        .filter_map(|requirement| match requirement {
+            RequirementExpr::Capability(requirement) => Some(requirement.id.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Return typed requirements for CRL additional_tools carriers. Namespace
+/// requirements carry the complete namespace path, preventing a probe that
+/// only verified crm from authorizing a request for billing/admin.
+pub fn crl_required_capability_requirements(body: &Value) -> Vec<RequirementExpr> {
+    let mut requirements = BTreeMap::<String, Option<CapabilityValue>>::new();
+    let Some(input) = body.get("input").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    for item in input {
+        if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+            continue;
+        }
+        requirements.insert("tools.crl.additional_tools".to_string(), None);
+        if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+            collect_crl_tool_requirements(tools, &mut requirements, &[]);
+        }
+    }
+    requirements
+        .into_iter()
+        .map(|(id, value)| match value {
+            Some(value) => RequirementExpr::Capability(CapabilityRequirement::with_value(
+                id,
+                RequirementStrength::Required,
+                value,
+            )),
+            None => RequirementExpr::required(id),
+        })
+        .collect()
+}
+
+/// Validate the structural contract of every CRL `additional_tools` carrier.
+///
+/// A carrier is an opaque extension for same-dialect passthrough, but malformed
+/// JSON must still be rejected at ingress instead of being turned into an empty
+/// message or a misleading `no_compatible_target` result. Unknown tool types
+/// are intentionally accepted here (a native CRL target may understand them);
+/// the promotion transform performs a stricter allow-list check before moving a
+/// carrier into the standard Responses `tools` field.
+pub fn validate_crl_additional_tools(body: &Value) -> Result<(), String> {
+    let Some(input) = body.get("input") else {
+        return Ok(());
+    };
+    let Some(items) = input.as_array() else {
+        // Responses also permits a string shorthand for `input`.
+        return Ok(());
+    };
+    for item in items {
+        let object = item
+            .as_object()
+            .ok_or_else(|| "Responses input items must be objects".to_string())?;
+        if object.get("type").and_then(Value::as_str) != Some("additional_tools") {
+            continue;
+        }
+        let tools = object
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "additional_tools.tools must be an array".to_string())?;
+        for tool in tools {
+            validate_crl_tool_shape(tool, &[])?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_crl_tool_shape(tool: &Value, namespace_path: &[String]) -> Result<(), String> {
+    let object = tool
+        .as_object()
+        .ok_or_else(|| "CRL tool definition must be an object".to_string())?;
+    let tool_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "CRL tool definition requires a string type".to_string())?;
+    match tool_type {
+        "namespace" => {
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| "CRL namespace requires a non-empty name".to_string())?;
+            let children = object
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "CRL namespace.tools must be an array".to_string())?;
+            let mut next_path = namespace_path.to_vec();
+            next_path.push(name.to_string());
+            for child in children {
+                validate_crl_tool_shape(child, &next_path)?;
+            }
+        }
+        "function" | "custom" => {
+            if object
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err(format!("CRL {tool_type} tool requires a non-empty name"));
+            }
+        }
+        // Preserve unknown extension types for native passthrough. They are
+        // not safe to promote and are rejected by `append_crl_tool` instead.
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_crl_tool_requirements(
+    tools: &[Value],
+    required: &mut BTreeMap<String, Option<CapabilityValue>>,
+    namespace_path: &[String],
+) {
+    for tool in tools {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("namespace") => {
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let mut next_path = namespace_path.to_vec();
+                next_path.push(name.to_string());
+                let path = next_path.join("/");
+                let mut paths = required
+                    .remove("tools.namespace")
+                    .flatten()
+                    .and_then(|value| match value {
+                        CapabilityValue::EnumSet(paths) => Some(paths),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                paths.insert(path);
+                required.insert(
+                    "tools.namespace".to_string(),
+                    Some(CapabilityValue::EnumSet(paths)),
+                );
+                if let Some(children) = tool.get("tools").and_then(Value::as_array) {
+                    collect_crl_tool_requirements(children, required, &next_path);
+                }
+            }
+            Some("custom") => {
+                required.insert("tools.custom".to_string(), None);
+            }
+            Some("function") | None => {
+                required.insert("tools.function".to_string(), None);
+            }
+            Some(_) => {
+                // Carrier support proven with a function probe says nothing
+                // about a private embedded tool kind. Keep the opaque item
+                // replayable, but add an intentionally unregistered leaf so
+                // capability Enforce remains fail-closed until that kind gets
+                // its own descriptor and semantic evidence.
+                required.insert("tools.crl.unknown_tool_type".to_string(), None);
+            }
+        }
+    }
+}
+
+/// Promote CRL `input[].additional_tools` into the standard Responses
+/// top-level `tools` carrier. Existing top-level definitions stay first;
+/// carrier definitions follow their original order. Conflicting definitions
+/// with the same identity are rejected instead of silently changing a tool.
+pub fn promote_crl_additional_tools(body: &Value) -> Result<Value, String> {
+    let Some(input) = body.get("input").and_then(Value::as_array) else {
+        return Ok(body.clone());
+    };
+    if !input
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+    {
+        return Ok(body.clone());
+    }
+
+    let mut promoted = body.clone();
+    let tools_value = promoted
+        .get("tools")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let mut merged = match tools_value {
+        Value::Array(items) => items,
+        Value::Null => Vec::new(),
+        _ => return Err("tools must be an array when promoting additional_tools".to_string()),
+    };
+    let mut identities: HashMap<String, Value> = HashMap::new();
+    for tool in &merged {
+        if let Some(identity) = crl_tool_identity(tool, &[]) {
+            if let Some(existing) = identities.get(&identity) {
+                if !json_semantically_equal(existing, tool) {
+                    return Err(format!(
+                        "conflicting tool definition for identity {identity}"
+                    ));
+                }
+            } else {
+                identities.insert(identity, tool.clone());
+            }
+        }
+    }
+
+    let mut filtered_input = Vec::with_capacity(input.len());
+    for item in input {
+        if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+            filtered_input.push(item.clone());
+            continue;
+        }
+        let Some(tools) = item.get("tools").and_then(Value::as_array) else {
+            return Err("additional_tools.tools must be an array".to_string());
+        };
+        for tool in tools {
+            append_crl_tool(tool, &mut merged, &mut identities, &[])?;
+        }
+    }
+    promoted["tools"] = Value::Array(merged);
+    promoted["input"] = Value::Array(filtered_input);
+    Ok(promoted)
+}
+
+fn append_crl_tool(
+    tool: &Value,
+    merged: &mut Vec<Value>,
+    identities: &mut HashMap<String, Value>,
+    namespace_path: &[String],
+) -> Result<(), String> {
+    validate_promotable_crl_tool(tool, namespace_path)?;
+    let identity = crl_tool_identity(tool, namespace_path).ok_or_else(|| {
+        "CRL tool definition must be an object with a stable type/name".to_string()
+    })?;
+    if let Some(existing) = identities.get(&identity) {
+        if !json_semantically_equal(existing, tool) {
+            return Err(format!(
+                "conflicting tool definition for identity {identity}"
+            ));
+        }
+        return Ok(());
+    }
+    identities.insert(identity, tool.clone());
+    merged.push(tool.clone());
+    Ok(())
+}
+
+/// Compare JSON tool definitions without treating object-key insertion order
+/// as a semantic difference. Arrays remain ordered because tool/namespace
+/// ordering is part of the wire contract and can affect model behavior.
+fn json_semantically_equal(left: &Value, right: &Value) -> bool {
+    canonical_json(left) == canonical_json(right)
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        scalar => scalar.clone(),
+    }
+}
+
+fn validate_promotable_crl_tool(tool: &Value, namespace_path: &[String]) -> Result<(), String> {
+    let object = tool
+        .as_object()
+        .ok_or_else(|| "CRL tool definition must be an object".to_string())?;
+    let tool_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "CRL tool definition requires a string type".to_string())?;
+    match tool_type {
+        "function" | "custom" => {
+            if object
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err(format!(
+                    "CRL {tool_type} tool cannot be promoted without a stable name"
+                ));
+            }
+        }
+        "namespace" => {
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    "CRL namespace cannot be promoted without a stable name".to_string()
+                })?;
+            let children = object
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "CRL namespace.tools must be an array".to_string())?;
+            let mut child_path = namespace_path.to_vec();
+            child_path.push(name.to_string());
+            for child in children {
+                validate_promotable_crl_tool(child, &child_path)?;
+            }
+        }
+        other => {
+            return Err(format!(
+                "CRL tool type {other} is not safe to promote to standard Responses tools"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn crl_tool_identity(tool: &Value, namespace_path: &[String]) -> Option<String> {
+    let ty = tool.get("type")?.as_str()?;
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+    if ty != "namespace" && name.is_empty() {
+        return None;
+    }
+    let path = if namespace_path.is_empty() {
+        String::new()
+    } else {
+        format!("{}:", namespace_path.join("/"))
+    };
+    Some(format!("{path}{ty}:{name}"))
 }
 
 /// Chat Completions labels custom calls as `custom`, while Responses uses
@@ -401,6 +732,7 @@ impl EndpointCodec for ResponsesCodec {
         body: Value,
         _env: &RawEnvelope,
     ) -> Result<IrRequest, tiygate_core::Error> {
+        validate_crl_additional_tools(&body).map_err(tiygate_core::Error::Codec)?;
         let model = body["model"].as_str().unwrap_or("unknown").to_string();
         let stream = body["stream"].as_bool().unwrap_or(false);
         let system = body["instructions"].as_str().map(String::from);
@@ -429,6 +761,7 @@ impl EndpointCodec for ResponsesCodec {
                         | Some("compaction")
                         | Some("compaction_trigger")
                         | Some("context_compaction")
+                        | Some("additional_tools")
                         | Some("multi_agent_call")
                         | Some("multi_agent_call_output")
                 )
@@ -471,6 +804,7 @@ impl EndpointCodec for ResponsesCodec {
                         | Some("compaction")
                         | Some("compaction_trigger")
                         | Some("context_compaction")
+                        | Some("additional_tools")
                 ) {
                     // Known Codex opaque item types: preserve the raw JSON
                     // with its original input index for same-protocol replay.
@@ -966,6 +1300,17 @@ impl EndpointCodec for ResponsesCodec {
             extensions.insert(
                 "responses_opaque_input_items".to_string(),
                 json!(opaque_input_items),
+            );
+        }
+        let crl_requirements = crl_required_capability_ids(&body);
+        if !crl_requirements.is_empty() {
+            extensions.insert(
+                "responses_wire_requirements".to_string(),
+                json!(crl_requirements.into_iter().collect::<Vec<_>>()),
+            );
+            extensions.insert(
+                "responses_wire_requirement_exprs".to_string(),
+                json!(crl_required_capability_requirements(&body)),
             );
         }
         // Backward-compatible Codex bag (content only, no indices). Prefer the
@@ -5618,6 +5963,149 @@ mod tests {
         assert_eq!(chat_encoded["tools"][0]["type"], "custom");
         assert_eq!(chat_encoded["tools"][0]["name"], "code_exec");
         assert_eq!(chat_encoded["tools"][0]["format"]["type"], "text");
+    }
+
+    #[test]
+    fn test_crl_additional_tools_is_opaque_and_promotable() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "run it"},
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "tools": [
+                            {"type": "custom", "name": "exec", "format": {"type": "text"}},
+                            {"type": "function", "name": "wait", "parameters": {"type": "object"}}
+                        ]
+                    }]
+                }
+            ],
+            "tool_choice": "auto"
+        });
+
+        let required = crl_required_capability_ids(&body);
+        assert!(required.contains("tools.crl.additional_tools"));
+        assert!(required.contains("tools.namespace"));
+        assert!(required.contains("tools.custom"));
+        assert!(required.contains("tools.function"));
+        let typed_requirements = crl_required_capability_requirements(&body);
+        let namespace_requirement = typed_requirements.iter().find(|requirement| {
+            requirement.contains_required(&tiygate_core::CapabilityId::from("tools.namespace"))
+        });
+        assert!(matches!(
+            namespace_requirement,
+            Some(RequirementExpr::Capability(CapabilityRequirement {
+                value: Some(CapabilityValue::EnumSet(paths)),
+                ..
+            })) if paths.contains("functions")
+        ));
+
+        let ir = codec.decode_request(body.clone(), &env).expect("decode");
+        assert_eq!(
+            ir.messages.len(),
+            1,
+            "opaque carrier must not become an empty message"
+        );
+        assert_eq!(
+            ir.extensions["responses_wire_requirements"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            ir.extensions["responses_wire_requirement_exprs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        let (round_trip, _) = codec.encode_request(&ir).expect("encode");
+        assert_eq!(round_trip["input"][1]["type"], "additional_tools");
+        assert_eq!(round_trip["input"][1]["tools"], body["input"][1]["tools"]);
+
+        let promoted = promote_crl_additional_tools(&body).expect("promotion");
+        assert!(promoted["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| { item.get("type").and_then(Value::as_str) != Some("additional_tools") }));
+        assert_eq!(promoted["tools"][0]["type"], "namespace");
+        assert_eq!(promoted["tools"][0]["name"], "functions");
+    }
+
+    #[test]
+    fn test_crl_promotion_rejects_conflicting_definition() {
+        let body = json!({
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{"type": "function", "name": "wait", "parameters": {"type": "object"}}]
+            }],
+            "tools": [{"type": "function", "name": "wait", "parameters": {"type": "string"}}]
+        });
+        let error = promote_crl_additional_tools(&body).expect_err("conflict");
+        assert!(error.contains("conflicting tool definition"));
+    }
+
+    #[test]
+    fn test_crl_malformed_carrier_is_rejected_at_decode() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [{"type": "additional_tools", "tools": {"type": "function"}}]
+        });
+        let error = codec
+            .decode_request(body, &env)
+            .expect_err("malformed additional_tools must fail closed");
+        assert!(error.to_string().contains("additional_tools.tools"));
+        let malformed_item = json!({
+            "model": "gpt-5.6",
+            "input": ["not-an-input-item"]
+        });
+        assert!(codec.decode_request(malformed_item, &env).is_err());
+    }
+
+    #[test]
+    fn test_crl_unknown_tool_type_is_not_promoted() {
+        let body = json!({
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{"type": "computer", "name": "use_computer"}]
+            }]
+        });
+        let required = crl_required_capability_ids(&body);
+        assert!(required.contains("tools.crl.additional_tools"));
+        assert!(required.contains("tools.crl.unknown_tool_type"));
+        let error = promote_crl_additional_tools(&body).expect_err("unknown CRL type");
+        assert!(error.contains("not safe to promote"));
+    }
+
+    #[test]
+    fn test_crl_equivalent_object_key_order_is_deduplicated() {
+        let body = json!({
+            "tools": [{
+                "type": "function",
+                "name": "wait",
+                "parameters": {"type": "object", "properties": {"x": {"type": "string"}}}
+            }],
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{
+                    "name": "wait",
+                    "parameters": {"properties": {"x": {"type": "string"}}, "type": "object"},
+                    "type": "function"
+                }]
+            }]
+        });
+        let promoted = promote_crl_additional_tools(&body).expect("equivalent definition");
+        assert_eq!(promoted["tools"].as_array().expect("tools").len(), 1);
     }
 
     #[test]

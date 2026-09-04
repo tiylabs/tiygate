@@ -12,7 +12,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use base64::Engine;
 use parking_lot::RwLock;
+use rand::RngCore;
 use serde::Serialize;
 use sqlx::{Any, Row, Transaction};
 use thiserror::Error;
@@ -25,14 +27,16 @@ use tiygate_core::provider::oauth::{
     OAuthEgressProfile, OAuthTargetConfig, TokenRequestStyle, UpstreamTransport,
 };
 use tiygate_core::routing::{RouteEntry, RoutingTable, RoutingTarget};
+use tiygate_core::{CapabilityId, CapabilityState, CapabilityValue};
 
 use crate::db::DbPool;
 use crate::encryption::KeyEncryption;
 use crate::keys;
 use crate::model_catalog::ModelMetadata;
 use crate::models::{
-    ApiKey, ApiKeyStatus, AuthMode, ConfigEpoch, ConfigExport, ConfigSnapshot, ExportSetting,
-    ImportReport, ImportSelection, OAuthCredentialStatus, Provider, Route, RouteTarget,
+    ApiKey, ApiKeyStatus, AuthMode, ConfigEpoch, ConfigExport, ConfigSnapshot,
+    ExportCapabilityOverride, ExportSetting, ExportTargetSelector, ImportReport, ImportSelection,
+    OAuthCredentialStatus, Provider, Route, RouteTarget,
 };
 use crate::settings_keys::is_encrypted_key;
 
@@ -51,6 +55,51 @@ const OPENAI_CODEX_DESKTOP_USER_AGENT: &str =
 /// first-party OAuth egress contract. xAI providers must use an API key.
 pub const XAI_API_KEY_ONLY_ERROR: &str =
     "xAI OAuth is temporarily disabled; configure xAI with auth_mode 'api_key'";
+
+/// The dialect IDs understood by the capability registry. `auto` is the
+/// normal route configuration and is persisted as `None`; the explicit
+/// values remain available for provider integrations that need a fixed wire
+/// contract, but they are not free-form user metadata.
+pub const BUILTIN_EGRESS_DIALECTS: &[&str] = &[
+    "openai-chat-standard",
+    "anthropic-messages-standard",
+    "openai-responses-standard",
+    "openai-responses-codex-lite",
+    "gemini-generate-content-standard",
+    "openai-embeddings-standard",
+];
+
+/// Normalize and validate the optional route-target dialect.
+///
+/// Empty values and `auto` deliberately collapse to `None`, so all callers
+/// share one persisted representation of the Provider-default behavior.
+fn normalize_egress_dialect(value: Option<&str>) -> Result<Option<String>, StoreError> {
+    let Some(value) = value.map(str::trim) else {
+        return Ok(None);
+    };
+    if value.is_empty() || value == "auto" {
+        return Ok(None);
+    }
+    if BUILTIN_EGRESS_DIALECTS.contains(&value) {
+        return Ok(Some(value.to_string()));
+    }
+    Err(StoreError::Invalid(format!(
+        "unsupported egress dialect '{value}'; use auto or one of: {}",
+        BUILTIN_EGRESS_DIALECTS.join(", ")
+    )))
+}
+
+fn normalize_route_targets(targets: &[RouteTarget]) -> Result<Vec<RouteTarget>, StoreError> {
+    targets
+        .iter()
+        .map(|target| {
+            let mut normalized = target.clone();
+            normalized.egress_dialect_id =
+                normalize_egress_dialect(target.egress_dialect_id.as_deref())?;
+            Ok(normalized)
+        })
+        .collect()
+}
 
 /// Validate provider authentication modes that are constrained by a built-in
 /// provider integration. Keeping this beside persistence ensures Admin API,
@@ -73,11 +122,26 @@ pub enum StoreError {
     Decrypt(String),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("audit error: {0}")]
+    Audit(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("invalid input: {0}")]
     Invalid(String),
 }
+
+/// Optional protocol-layer validation hook for capability overrides during a
+/// configuration import.  The store remains independent from concrete
+/// protocol registries; callers such as the Admin layer inject the current
+/// descriptor/baseline validator when they need strict validation.
+pub type CapabilityOverrideValidator = dyn Fn(
+        &RoutingTarget,
+        &CapabilityId,
+        CapabilityState,
+        Option<&CapabilityValue>,
+    ) -> Result<(), String>
+    + Send
+    + Sync;
 
 // ---------------------------------------------------------------------
 // Legacy in-memory store
@@ -131,6 +195,7 @@ impl ConfigStore {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             }];
@@ -162,6 +227,7 @@ impl ConfigStore {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
                 weight: 1.0,
                 oauth: None,
             }];
@@ -301,8 +367,22 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
             } else {
                 raw_base
             };
-            let (api_protocol, api_base) =
+            let (mut api_protocol, api_base) =
                 provider_egress_for_target(provider, &t.model_id, &raw_base);
+            // A generic OpenAI-compatible provider normally defaults to Chat
+            // Completions, but an explicit Responses dialect is a target-level
+            // contract. This lets a non-OpenAI vendor expose `/responses`
+            // without pretending that the Provider identity determines the
+            // wire protocol. The dialect remains part of TargetKey/profile
+            // identity and must be probed independently.
+            if api_protocol.suite == ProtocolSuite::OpenAiCompatible
+                && matches!(
+                    t.egress_dialect_id.as_deref(),
+                    Some("openai-responses-standard") | Some("openai-responses-codex-lite")
+                )
+            {
+                api_protocol = ProtocolSuite::OpenAiResponses.default_endpoint();
+            }
             targets.push(RoutingTarget {
                 provider_id: provider.id.clone(),
                 model_id: t.model_id.clone(),
@@ -312,6 +392,7 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
                 account_label: t.account_label.clone(),
                 api_key_override: t.api_key_override.clone(),
                 api_base_override: t.api_base_override.clone(),
+                egress_dialect_id: t.egress_dialect_id.clone(),
                 weight: t.weight,
                 oauth: oauth_config,
             });
@@ -320,8 +401,10 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
             table.insert_entry(
                 virtual_model.clone(),
                 RouteEntry {
+                    route_id: Some(route.id.clone()),
                     targets,
                     strategy: route.routing_strategy,
+                    capability_routing_mode: route.capability_routing_mode,
                 },
             );
         }
@@ -635,12 +718,34 @@ pub struct ProviderDeleteOutcome {
     pub route_cleanups: Vec<ProviderRouteCleanup>,
 }
 
+/// Parameters for a route write, grouped so route updates can carry the
+/// optional capability-routing override without creating a wide function
+/// signature.
+pub struct RouteUpsert<'a> {
+    pub id: &'a str,
+    pub virtual_model: &'a str,
+    pub targets: &'a [RouteTarget],
+    pub routing_strategy: Option<tiygate_core::routing::RoutingStrategyName>,
+    pub capability_routing_mode: Option<tiygate_core::CapabilityRoutingMode>,
+    pub model_metadata: Option<&'a ModelMetadata>,
+    pub enabled: bool,
+}
+
 /// DB-backed configuration store. Owns the DB pool and the master
 /// encryption key; the data plane sees a `ConfigStore` rebuilt from
 /// [`Self::snapshot`] on every epoch tick.
 pub struct DbConfigStore {
     pub(crate) pool: DbPool,
     pub(crate) encryption: Option<Arc<KeyEncryption>>,
+    /// Installation-scoped HMAC key used to derive stable credential-scope
+    /// fingerprints. It is loaded from the encrypted installation secret
+    /// row during async startup; the random in-memory value is only a safe
+    /// fallback for legacy/test stores that have not been initialized yet.
+    pub(crate) fingerprint_secret: arc_swap::ArcSwap<zeroize::Zeroizing<[u8; 32]>>,
+    /// Serializes profile read-modify-write cycles for SQLite and for callers
+    /// sharing this store instance. PostgreSQL additionally takes a row lock so
+    /// independent gateway replicas cannot overwrite each other's evidence.
+    pub(crate) capability_profile_write_lock: tokio::sync::Mutex<()>,
     /// In-memory copy of the latest snapshot, used by readers that
     /// want a `ConfigStore` view. Held in an `ArcSwap` so the data
     /// plane can read the latest snapshot lock-free (a single
@@ -652,11 +757,124 @@ pub struct DbConfigStore {
 impl DbConfigStore {
     pub fn new(pool: DbPool, encryption: Option<Arc<KeyEncryption>>) -> Self {
         let inner = arc_swap::ArcSwap::from_pointee(ConfigStore::new());
+        let mut secret = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut secret);
         Self {
             pool,
             encryption,
+            fingerprint_secret: arc_swap::ArcSwap::from_pointee(zeroize::Zeroizing::new(secret)),
+            capability_profile_write_lock: tokio::sync::Mutex::new(()),
             inner,
         }
+    }
+
+    /// Load or create the installation-scoped HMAC secret. The secret is
+    /// encrypted at rest with a dedicated purpose when a master key is
+    /// configured. In the explicitly insecure no-master-key mode a random
+    /// base64 value is persisted with a warning so TargetKey remains stable
+    /// across process restarts; production deployments must configure a
+    /// master key to protect this value.
+    pub async fn ensure_fingerprint_secret(&self) -> Result<(), StoreError> {
+        const SECRET_NAME: &str = "target-key-hmac/v1";
+        let Some(encryption) = self.encryption.as_ref() else {
+            let existing = sqlx::query_scalar::<_, String>(
+                "SELECT encrypted_value FROM installation_secrets WHERE name = $1",
+            )
+            .bind(SECRET_NAME)
+            .fetch_optional(self.pool.any())
+            .await?;
+            let encoded = if let Some(value) = existing {
+                value
+            } else {
+                let mut secret = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut secret);
+                let encoded = base64::engine::general_purpose::STANDARD.encode(secret);
+                let now = chrono::Utc::now().to_rfc3339();
+                sqlx::query(
+                    "INSERT INTO installation_secrets (name, version, encrypted_value, created_at, updated_at)
+                     VALUES ($1, 1, $2, $3, $3) ON CONFLICT(name) DO NOTHING",
+                )
+                .bind(SECRET_NAME)
+                .bind(&encoded)
+                .bind(&now)
+                .execute(self.pool.any())
+                .await?;
+                sqlx::query_scalar::<_, String>(
+                    "SELECT encrypted_value FROM installation_secrets WHERE name = $1",
+                )
+                .bind(SECRET_NAME)
+                .fetch_one(self.pool.any())
+                .await?
+            };
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| {
+                    StoreError::Decrypt(format!("fingerprint secret base64: {error}"))
+                })?;
+            let secret: [u8; 32] = raw.try_into().map_err(|value: Vec<u8>| {
+                StoreError::Invalid(format!(
+                    "fingerprint secret must be 32 bytes (got {})",
+                    value.len()
+                ))
+            })?;
+            self.fingerprint_secret
+                .store(Arc::new(zeroize::Zeroizing::new(secret)));
+            warn!(
+                "TIYGATE_MASTER_KEY not set; installation fingerprint secret is stored without encryption (NOT FOR PRODUCTION)"
+            );
+            return Ok(());
+        };
+
+        let existing = sqlx::query_scalar::<_, String>(
+            "SELECT encrypted_value FROM installation_secrets WHERE name = $1",
+        )
+        .bind(SECRET_NAME)
+        .fetch_optional(self.pool.any())
+        .await?;
+
+        let encoded = if let Some(value) = existing {
+            value
+        } else {
+            let mut secret = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut secret);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(secret);
+            let encrypted = encryption
+                .encrypt("target-key-hmac-v1", &encoded)
+                .map_err(|error| StoreError::Decrypt(error.to_string()))?;
+            let now = chrono::Utc::now().to_rfc3339();
+            sqlx::query(
+                "INSERT INTO installation_secrets (name, version, encrypted_value, created_at, updated_at)
+                 VALUES ($1, 1, $2, $3, $3) ON CONFLICT(name) DO NOTHING",
+            )
+            .bind(SECRET_NAME)
+            .bind(&encrypted)
+            .bind(&now)
+            .execute(self.pool.any())
+            .await?;
+            // Another replica may have won the insert race. Always read the
+            // durable value after the conditional insert.
+            sqlx::query_scalar::<_, String>(
+                "SELECT encrypted_value FROM installation_secrets WHERE name = $1",
+            )
+            .bind(SECRET_NAME)
+            .fetch_one(self.pool.any())
+            .await?
+        };
+        let decoded = encryption
+            .decrypt("target-key-hmac-v1", &encoded)
+            .map_err(|error| StoreError::Decrypt(error.to_string()))?;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(decoded)
+            .map_err(|error| StoreError::Decrypt(format!("fingerprint secret base64: {error}")))?;
+        let secret: [u8; 32] = raw.try_into().map_err(|value: Vec<u8>| {
+            StoreError::Invalid(format!(
+                "fingerprint secret must be 32 bytes (got {})",
+                value.len()
+            ))
+        })?;
+        self.fingerprint_secret
+            .store(Arc::new(zeroize::Zeroizing::new(secret)));
+        Ok(())
     }
 
     /// Open from a `database_url` and load (or initialise) the
@@ -668,6 +886,7 @@ impl DbConfigStore {
         let pool = crate::db::open_pool(database_url).await?;
         crate::db::run_migrations(&pool).await?;
         let store = Arc::new(Self::new(pool, encryption));
+        store.ensure_fingerprint_secret().await?;
         store.refresh().await?;
         Ok(store)
     }
@@ -676,6 +895,13 @@ impl DbConfigStore {
     /// plane uses this in `App::new()`.
     pub fn config_store(&self) -> ConfigStore {
         (*self.inner.load_full()).clone()
+    }
+
+    /// Borrow the underlying pool for read-only aggregate queries used by
+    /// server-side control-plane workers. Request handlers must continue to
+    /// use the published in-memory snapshots instead of this accessor.
+    pub fn pool(&self) -> &DbPool {
+        &self.pool
     }
 
     /// Returns the latest config snapshot as a shared `Arc`. This is
@@ -698,6 +924,7 @@ impl DbConfigStore {
     /// Re-read providers + routes from the DB and update the
     /// in-memory snapshot. Increments the epoch.
     pub async fn refresh(&self) -> Result<(), StoreError> {
+        self.ensure_fingerprint_secret().await?;
         let mut providers = self.load_providers().await?;
         // Decrypt the cleartext API key for each provider so the
         // data plane can forward credentials without re-running
@@ -775,11 +1002,30 @@ impl DbConfigStore {
         Ok(row.get::<i64, _>(0))
     }
 
+    async fn bump_epoch_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<i64, StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO config_epoch (id, epoch, updated_at) VALUES (1, 1, $1)
+             ON CONFLICT(id) DO UPDATE SET epoch = config_epoch.epoch + 1, updated_at = excluded.updated_at",
+        )
+        .bind(&now)
+        .execute(&mut **tx)
+        .await?;
+        let row = sqlx::query("SELECT epoch FROM config_epoch WHERE id = 1")
+            .fetch_one(&mut **tx)
+            .await?;
+        Ok(row.get::<i64, _>(0))
+    }
+
     // --- Provider CRUD ---
 
     pub async fn list_providers(&self) -> Result<Vec<Provider>, StoreError> {
         let mut providers = self.load_providers().await?;
         for provider in &mut providers {
+            populate_provider_api_key_cleartext(self.encryption.as_ref(), provider);
             populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
         }
         Ok(providers)
@@ -796,6 +1042,7 @@ impl DbConfigStore {
         .await?;
         let mut provider = rows.map(row_to_provider).transpose()?;
         if let Some(provider) = provider.as_mut() {
+            populate_provider_api_key_cleartext(self.encryption.as_ref(), provider);
             populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
             populate_provider_usage_management_key_cleartext(self.encryption.as_ref(), provider);
         }
@@ -820,6 +1067,7 @@ impl DbConfigStore {
         .await?;
         let mut provider = row.map(row_to_provider).transpose()?;
         if let Some(provider) = provider.as_mut() {
+            populate_provider_api_key_cleartext(self.encryption.as_ref(), provider);
             populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
             populate_provider_usage_management_key_cleartext(self.encryption.as_ref(), provider);
         }
@@ -877,6 +1125,7 @@ impl DbConfigStore {
     ) -> Result<Provider, StoreError> {
         validate_provider_auth_mode(vendor, auth_mode)
             .map_err(|message| StoreError::Invalid(message.to_string()))?;
+        self.ensure_fingerprint_secret().await?;
         let now = chrono::Utc::now().to_rfc3339();
         let existing = self.get_provider(id).await?;
         let encrypted_api_key = match (api_key_plain, self.encryption.as_ref()) {
@@ -934,6 +1183,84 @@ impl DbConfigStore {
             .map(|p| p.created_at.to_rfc3339())
             .unwrap_or_else(|| now.clone());
 
+        // Build the prospective runtime view before opening the write
+        // transaction. Provider changes can alter every route target that
+        // references this provider; enqueue those new TargetKeys in the same
+        // transaction as the provider row so a committed credential/base
+        // change can never become visible without a durable probe job.
+        let now_dt = chrono::DateTime::parse_from_rfc3339(&now)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .map_err(|error| StoreError::Invalid(format!("invalid provider timestamp: {error}")))?;
+        let prospective_provider = Provider {
+            id: id.to_string(),
+            name: name.to_string(),
+            vendor: vendor.to_string(),
+            api_base: api_base.to_string(),
+            models_endpoint: models_endpoint.to_string(),
+            encrypted_api_key: encrypted_api_key.clone(),
+            auth_mode,
+            encrypted_usage_management_key: encrypted_usage_management_key.clone(),
+            encrypted_oauth_meta: encrypted_oauth_meta.clone(),
+            metadata_json: metadata_json.clone(),
+            enabled,
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .map_err(|error| {
+                    StoreError::Invalid(format!("invalid provider creation timestamp: {error}"))
+                })?,
+            updated_at: now_dt,
+            api_key_cleartext: if auth_mode == AuthMode::ApiKey {
+                api_key_plain
+                    .map(str::to_string)
+                    .or_else(|| existing.as_ref().and_then(|p| p.api_key_cleartext.clone()))
+            } else {
+                None
+            },
+            oauth_meta_cleartext: if auth_mode == AuthMode::OAuth {
+                oauth_meta_plain.map(str::to_string).or_else(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|p| p.oauth_meta_cleartext.clone())
+                })
+            } else {
+                None
+            },
+            usage_management_key_cleartext: None,
+        };
+        let mut prospective_providers = self.list_providers().await?;
+        if let Some(provider) = prospective_providers
+            .iter_mut()
+            .find(|provider| provider.id == id)
+        {
+            *provider = prospective_provider;
+        } else {
+            prospective_providers.push(prospective_provider);
+        }
+        let prospective_routes = self.load_routes().await?;
+        let impacted_route_ids = prospective_routes
+            .iter()
+            .filter(|route| route.targets.iter().any(|target| target.provider_id == id))
+            .map(|route| route.id.clone())
+            .collect::<Vec<_>>();
+        let prospective_snapshot = ConfigSnapshot {
+            epoch: 0,
+            providers: prospective_providers
+                .into_iter()
+                .map(|provider| (provider.id.clone(), provider))
+                .collect(),
+            routes: prospective_routes
+                .into_iter()
+                .map(|route| (route.virtual_model.clone(), route))
+                .collect(),
+        };
+        let prospective_targets = snapshot_to_routing_table(&prospective_snapshot)
+            .routes
+            .into_values()
+            .flat_map(|entry| entry.targets)
+            .filter(|target| target.provider_id == id)
+            .collect::<Vec<_>>();
+
+        let mut tx = self.pool.any().begin().await?;
         sqlx::query(
             "INSERT INTO providers (id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
              encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
@@ -959,8 +1286,26 @@ impl DbConfigStore {
         .bind(enabled_int)
         .bind(&created_at)
         .bind(&now)
-        .execute(self.pool.any())
+        .execute(&mut *tx)
         .await?;
+
+        let mut capability_changed = false;
+        for target in &prospective_targets {
+            let probe_set = crate::capabilities::default_probe_set_for_target(target);
+            capability_changed |= self
+                .ensure_target_capability_tx(&mut tx, target, &probe_set)
+                .await?;
+        }
+        let mut admissions_changed = false;
+        for route_id in &impacted_route_ids {
+            admissions_changed |= self
+                .mark_route_admissions_stale_tx(&mut tx, route_id, "provider_target_changed")
+                .await?;
+        }
+        if capability_changed || admissions_changed {
+            self.bump_capability_epoch_tx(&mut tx).await?;
+        }
+        tx.commit().await?;
 
         self.refresh().await?;
         self.get_provider(id)
@@ -993,7 +1338,7 @@ impl DbConfigStore {
         }
 
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, capability_routing_mode, model_metadata_json, enabled, created_at, updated_at \
              FROM routes",
         )
         .fetch_all(&mut *tx)
@@ -1004,12 +1349,14 @@ impl DbConfigStore {
             .collect::<Result<_, _>>()?;
         let impact = ProviderRouteImpact::for_routes(id, &routes);
         let mut route_cleanups = Vec::new();
+        let mut impacted_route_ids = Vec::new();
         let now = chrono::Utc::now().to_rfc3339();
 
         for route in routes {
             if !route.targets.iter().any(|target| target.provider_id == id) {
                 continue;
             }
+            impacted_route_ids.push(route.id.clone());
             let before = route.clone();
             let remaining_targets: Vec<RouteTarget> = route
                 .targets
@@ -1051,12 +1398,21 @@ impl DbConfigStore {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        let mut admissions_changed = false;
+        for route_id in &impacted_route_ids {
+            admissions_changed |= self
+                .mark_route_admissions_stale_tx(&mut tx, route_id, "provider_deleted")
+                .await?;
+        }
         let res = sqlx::query("DELETE FROM providers WHERE id = $1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("provider {id}")));
+        }
+        if admissions_changed {
+            self.bump_capability_epoch_tx(&mut tx).await?;
         }
         tx.commit().await?;
         self.refresh().await?;
@@ -1092,6 +1448,10 @@ impl DbConfigStore {
         id: &str,
         meta_plain: &str,
     ) -> Result<(), StoreError> {
+        let existing_provider = self
+            .get_provider(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("provider {id}")))?;
         // Encrypt the meta blob with the OAuth-purpose subkey
         // so the API-key subkey cannot decrypt it (defence in
         // depth). When encryption is not configured (legacy /
@@ -1103,20 +1463,80 @@ impl DbConfigStore {
             None => meta_plain.to_string(),
         };
         let now = chrono::Utc::now().to_rfc3339();
+        let impacted_route_ids = self
+            .load_routes()
+            .await?
+            .into_iter()
+            .filter(|route| route.targets.iter().any(|target| target.provider_id == id))
+            .map(|route| route.id)
+            .collect::<Vec<_>>();
+        // Build the prospective runtime targets with the newly exchanged OAuth
+        // metadata before opening the transaction. This lets the provider row,
+        // its new TargetKey profile/job pair, and admission invalidation commit
+        // together even when an OAuth callback changes account/scope identity.
+        let mut prospective_providers = self.list_providers().await?;
+        let mut prospective_provider = existing_provider.clone();
+        prospective_provider.encrypted_oauth_meta = encrypted.clone();
+        prospective_provider.oauth_meta_cleartext = Some(meta_plain.to_string());
+        prospective_provider.updated_at = chrono::Utc::now();
+        if let Some(provider) = prospective_providers
+            .iter_mut()
+            .find(|provider| provider.id == id)
+        {
+            *provider = prospective_provider;
+        }
+        let prospective_routes = self.load_routes().await?;
+        let prospective_snapshot = ConfigSnapshot {
+            epoch: 0,
+            providers: prospective_providers
+                .into_iter()
+                .map(|provider| (provider.id.clone(), provider))
+                .collect(),
+            routes: prospective_routes
+                .into_iter()
+                .map(|route| (route.virtual_model.clone(), route))
+                .collect(),
+        };
+        let prospective_targets = snapshot_to_routing_table(&prospective_snapshot)
+            .routes
+            .into_values()
+            .flat_map(|entry| entry.targets)
+            .filter(|target| target.provider_id == id)
+            .collect::<Vec<_>>();
+        let mut tx = self.pool.any().begin().await?;
         let res = sqlx::query(
             "UPDATE providers SET encrypted_oauth_meta = $1, updated_at = $2 WHERE id = $3",
         )
         .bind(&encrypted)
         .bind(&now)
         .bind(id)
-        .execute(self.pool.any())
+        .execute(&mut *tx)
         .await?;
         if res.rows_affected() == 0 {
+            tx.rollback().await?;
             return Err(StoreError::NotFound(format!("provider {id}")));
         }
+        let mut capability_changed = false;
+        for target in &prospective_targets {
+            let probe_set = crate::capabilities::default_probe_set_for_target(target);
+            capability_changed |= self
+                .ensure_target_capability_tx(&mut tx, target, &probe_set)
+                .await?;
+        }
+        let mut admissions_changed = false;
+        for route_id in &impacted_route_ids {
+            admissions_changed |= self
+                .mark_route_admissions_stale_tx(&mut tx, route_id, "oauth_scope_changed")
+                .await?;
+        }
+        if capability_changed || admissions_changed {
+            self.bump_capability_epoch_tx(&mut tx).await?;
+        }
+        tx.commit().await?;
         // Refresh the in-memory snapshot so subsequent reads
         // from the data plane see the new metadata.
         self.refresh().await?;
+        self.ensure_provider_target_capabilities(id).await?;
         Ok(())
     }
 
@@ -1234,7 +1654,7 @@ impl DbConfigStore {
             .fetch_one(self.pool.any())
             .await?;
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, capability_routing_mode, model_metadata_json, enabled, created_at, updated_at \
              FROM routes ORDER BY created_at DESC LIMIT $1 OFFSET $2",
         )
         .bind(limit as i64)
@@ -1250,7 +1670,7 @@ impl DbConfigStore {
 
     pub async fn get_route(&self, id: &str) -> Result<Option<Route>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, capability_routing_mode, model_metadata_json, enabled, created_at, updated_at \
              FROM routes WHERE id = $1",
         )
         .bind(id)
@@ -1268,28 +1688,140 @@ impl DbConfigStore {
         model_metadata: Option<&ModelMetadata>,
         enabled: bool,
     ) -> Result<Route, StoreError> {
+        self.upsert_route_with_mode(RouteUpsert {
+            id,
+            virtual_model,
+            targets,
+            routing_strategy,
+            capability_routing_mode: None,
+            model_metadata,
+            enabled,
+        })
+        .await
+    }
+
+    pub async fn upsert_route_with_mode(
+        &self,
+        input: RouteUpsert<'_>,
+    ) -> Result<Route, StoreError> {
+        self.upsert_route_with_mode_inner(input, None).await
+    }
+
+    /// Upsert a route and append its audit record in the same transaction.
+    /// Capability routing settings are security-sensitive: a successful
+    /// response must never leave the route/profile/job state without a
+    /// corresponding audit entry.
+    pub async fn upsert_route_with_mode_with_audit(
+        &self,
+        input: RouteUpsert<'_>,
+        actor: &str,
+        action: &str,
+        audit_target_id: &str,
+        audit_details: &serde_json::Value,
+    ) -> Result<Route, StoreError> {
+        self.upsert_route_with_mode_inner(
+            input,
+            Some((actor, action, audit_target_id, audit_details)),
+        )
+        .await
+    }
+
+    async fn upsert_route_with_mode_inner(
+        &self,
+        input: RouteUpsert<'_>,
+        audit: Option<(&str, &str, &str, &serde_json::Value)>,
+    ) -> Result<Route, StoreError> {
+        let RouteUpsert {
+            id,
+            virtual_model,
+            targets,
+            routing_strategy,
+            capability_routing_mode,
+            model_metadata,
+            enabled,
+        } = input;
         if targets.is_empty() {
             return Err(StoreError::Invalid(
                 "route must have at least one target".into(),
             ));
         }
+        // Keep auto/blank target settings canonical while rejecting unknown
+        // dialect IDs before they can create an unresolvable capability
+        // profile or a stale TargetKey.
+        let targets = normalize_route_targets(targets)?;
+        // Ensure the installation-scoped fingerprint key is loaded before
+        // deriving prospective Target identities. This is a no-op after the
+        // first startup initialization and keeps route/profile keys stable.
+        self.ensure_fingerprint_secret().await?;
         let now = chrono::Utc::now().to_rfc3339();
         let existing = self.get_route(id).await?;
         let created_at = existing
             .as_ref()
             .map(|r| r.created_at.to_rfc3339())
             .unwrap_or_else(|| now.clone());
-        let targets_json = serde_json::to_string(targets)?;
+        let targets_json = serde_json::to_string(&targets)?;
         let strategy_str = routing_strategy.map(|s| s.as_str());
         let model_metadata_json = serialize_model_metadata(model_metadata)?;
         let enabled_int: i32 = if enabled { 1 } else { 0 };
 
+        // Build the prospective runtime targets before opening the write
+        // transaction. Provider credentials and endpoint selection come from
+        // the current immutable snapshot; the route row and the resulting
+        // pending capability jobs are committed together below.
+        let prospective_route = Route {
+            id: id.to_string(),
+            virtual_model: virtual_model.to_string(),
+            targets: targets.to_vec(),
+            routing_strategy,
+            capability_routing_mode,
+            model_metadata: model_metadata.cloned(),
+            enabled,
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&now)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+        };
+        // Route mode is only an upper bound and must not invalidate a shape
+        // admission when the actual target identities are unchanged.  A
+        // target membership/identity or virtual-model change does invalidate
+        // the route's reports because the set of egress capabilities may
+        // have changed.  Weight, order and enabled flags are intentionally
+        // excluded from identity comparison.
+        let previous_runtime_targets = existing
+            .as_ref()
+            .and_then(|route| {
+                self.config_store()
+                    .routing_table
+                    .resolve(&route.virtual_model)
+            })
+            .unwrap_or_default();
+        let probe_targets = self.prospective_runtime_targets(&prospective_route);
+        let target_identity_set = |targets: &[RoutingTarget]| {
+            let mut keys = targets
+                .iter()
+                .filter_map(|target| self.target_key_for(target).ok().map(|(key, _)| key))
+                .collect::<Vec<_>>();
+            keys.sort();
+            keys.dedup();
+            keys
+        };
+        let invalidate_admissions = existing.is_none()
+            || existing
+                .as_ref()
+                .is_some_and(|route| route.virtual_model != virtual_model)
+            || target_identity_set(&previous_runtime_targets)
+                != target_identity_set(&probe_targets);
+        let mut tx = self.pool.any().begin().await?;
+
         sqlx::query(
-            "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+            "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, capability_routing_mode, model_metadata_json, enabled, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              ON CONFLICT(id) DO UPDATE SET \
                 virtual_model=excluded.virtual_model, targets_json=excluded.targets_json, \
                 routing_strategy=excluded.routing_strategy, \
+                capability_routing_mode=excluded.capability_routing_mode, \
                 model_metadata_json=excluded.model_metadata_json, \
                 enabled=excluded.enabled, updated_at=excluded.updated_at",
         )
@@ -1297,12 +1829,36 @@ impl DbConfigStore {
         .bind(virtual_model)
         .bind(&targets_json)
         .bind(strategy_str)
+        .bind(capability_routing_mode.map(|mode| mode.as_str()))
         .bind(&model_metadata_json)
         .bind(enabled_int)
         .bind(&created_at)
         .bind(&now)
-        .execute(self.pool.any())
+        .execute(&mut *tx)
         .await?;
+
+        let mut capability_changed = false;
+        for target in &probe_targets {
+            let probe_set = crate::capabilities::default_probe_set_for_target(target);
+            capability_changed |= self
+                .ensure_target_capability_tx(&mut tx, target, &probe_set)
+                .await?;
+        }
+        let admissions_changed = if invalidate_admissions {
+            self.mark_route_admissions_stale_tx(&mut tx, id, "route_target_or_mode_changed")
+                .await?
+        } else {
+            false
+        };
+        if capability_changed || admissions_changed {
+            self.bump_capability_epoch_tx(&mut tx).await?;
+        }
+        if let Some((actor, action, target_id, details)) = audit {
+            crate::audit::record_tx(&mut tx, actor, action, "route", target_id, details)
+                .await
+                .map_err(|error| StoreError::Audit(error.to_string()))?;
+        }
+        tx.commit().await?;
 
         self.refresh().await?;
         self.get_route(id)
@@ -1310,21 +1866,66 @@ impl DbConfigStore {
             .ok_or_else(|| StoreError::NotFound(format!("route {id} disappeared post-upsert")))
     }
 
+    fn prospective_runtime_targets(&self, route: &Route) -> Vec<RoutingTarget> {
+        let Some(mut snapshot) = self.config_store().snapshot() else {
+            return Vec::new();
+        };
+        snapshot
+            .routes
+            .insert(route.virtual_model.clone(), route.clone());
+        snapshot_to_routing_table(&snapshot)
+            .resolve(&route.virtual_model)
+            .unwrap_or_default()
+    }
+
     pub async fn delete_route(&self, id: &str) -> Result<(), StoreError> {
+        self.delete_route_inner(id, None).await
+    }
+
+    /// Delete a route and append its audit record atomically.
+    pub async fn delete_route_with_audit(
+        &self,
+        id: &str,
+        actor: &str,
+        audit_details: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.delete_route_inner(id, Some((actor, audit_details)))
+            .await
+    }
+
+    async fn delete_route_inner(
+        &self,
+        id: &str,
+        audit: Option<(&str, &serde_json::Value)>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.any().begin().await?;
         let res = sqlx::query("DELETE FROM routes WHERE id = $1")
             .bind(id)
-            .execute(self.pool.any())
+            .execute(&mut *tx)
             .await?;
         if res.rows_affected() == 0 {
+            tx.rollback().await?;
             return Err(StoreError::NotFound(format!("route {id}")));
         }
+        if self
+            .mark_route_admissions_stale_tx(&mut tx, id, "route_deleted")
+            .await?
+        {
+            self.bump_capability_epoch_tx(&mut tx).await?;
+        }
+        if let Some((actor, details)) = audit {
+            crate::audit::record_tx(&mut tx, actor, "delete", "route", id, details)
+                .await
+                .map_err(|error| StoreError::Audit(error.to_string()))?;
+        }
+        tx.commit().await?;
         self.refresh().await?;
         Ok(())
     }
 
     async fn load_routes(&self) -> Result<Vec<Route>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, created_at, updated_at \
+            "SELECT id, virtual_model, targets_json, routing_strategy, capability_routing_mode, model_metadata_json, enabled, created_at, updated_at \
              FROM routes",
         )
         .fetch_all(self.pool.any())
@@ -1503,6 +2104,7 @@ impl DbConfigStore {
         }
         let routes = self.load_routes().await?;
         let api_keys = self.list_api_keys().await?;
+        let capability_overrides = self.export_capability_overrides(&routes).await?;
         // Read the settings table. Each row is tagged with whether it
         // is an encrypted key so the importer knows whether the value
         // is a ciphertext blob that needs the source master key.
@@ -1526,7 +2128,68 @@ impl DbConfigStore {
             api_keys,
             settings,
             token_daily_stats,
+            capability_overrides,
         })
+    }
+
+    /// Convert stored capability overrides into non-secret route/target
+    /// selectors for a portable config bundle. TargetKey contains an
+    /// installation-scoped credential fingerprint and therefore cannot be
+    /// copied to another installation verbatim.
+    async fn export_capability_overrides(
+        &self,
+        routes: &[Route],
+    ) -> Result<Vec<ExportCapabilityOverride>, StoreError> {
+        let overrides = self.list_all_capability_overrides().await?;
+        if overrides.is_empty() || routes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runtime = self.config_store();
+        let mut exported = Vec::new();
+        for record in overrides {
+            let mut matched = false;
+            for route in routes {
+                for (target_index, persisted_target) in route.targets.iter().enumerate() {
+                    let Some(target) =
+                        runtime_target_for_route_index(&runtime, route, target_index)
+                    else {
+                        continue;
+                    };
+                    let Ok((target_key, _)) = self.target_key_for(target) else {
+                        continue;
+                    };
+                    if target_key != record.target_key {
+                        continue;
+                    }
+                    let state = serde_json::to_value(record.state)?
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string();
+                    exported.push(ExportCapabilityOverride {
+                        selector: ExportTargetSelector {
+                            route_id: route.id.clone(),
+                            target_index,
+                            provider_id: persisted_target.provider_id.clone(),
+                            model_id: persisted_target.model_id.clone(),
+                            egress_dialect_id: persisted_target.egress_dialect_id.clone(),
+                            account_label: persisted_target.account_label.clone(),
+                        },
+                        capability_id: record.capability_id.to_string(),
+                        state,
+                        value: record.value.clone().map(serde_json::to_value).transpose()?,
+                        reason: record.reason.clone(),
+                        actor: record.actor.clone(),
+                        expires_at: record.expires_at,
+                    });
+                    matched = true;
+                    break;
+                }
+                if matched {
+                    break;
+                }
+            }
+        }
+        Ok(exported)
     }
 
     /// Import a config bundle produced by [`Self::export_config`].
@@ -1547,6 +2210,22 @@ impl DbConfigStore {
         master_key: &str,
         selection: &ImportSelection,
     ) -> Result<ImportReport, StoreError> {
+        self.import_config_with_capability_validator(data, master_key, selection, None)
+            .await
+    }
+
+    /// Import a config bundle while applying an optional protocol-layer
+    /// capability override validator.  Keeping the validator injected avoids
+    /// a store → protocols dependency while still making Admin imports obey
+    /// the current registry and wire baseline.
+    pub async fn import_config_with_capability_validator(
+        &self,
+        data: &ConfigExport,
+        master_key: &str,
+        selection: &ImportSelection,
+        capability_validator: Option<&CapabilityOverrideValidator>,
+    ) -> Result<ImportReport, StoreError> {
+        self.ensure_fingerprint_secret().await?;
         // Version 1 predates per-key model access. It remains importable and
         // treats every API key as unrestricted. Version 2 preserves the
         // access policy so older importers reject it instead of silently
@@ -1585,6 +2264,11 @@ impl DbConfigStore {
             selection.settings.iter().map(String::as_str).collect();
         let sel_token_stats: std::collections::HashSet<&str> =
             selection.token_stats.iter().map(String::as_str).collect();
+        let sel_capability_overrides: std::collections::HashSet<&str> = selection
+            .capability_overrides
+            .iter()
+            .map(String::as_str)
+            .collect();
 
         let mut tx = self.pool.any().begin().await?;
         let mut report = ImportReport {
@@ -1598,6 +2282,8 @@ impl DbConfigStore {
             settings_skipped: 0,
             token_stats_imported: 0,
             token_stats_skipped: 0,
+            capability_overrides_imported: 0,
+            capability_overrides_skipped: 0,
         };
 
         for p in &data.providers {
@@ -1702,15 +2388,27 @@ impl DbConfigStore {
             let strategy_str = r.routing_strategy.map(|s| s.as_str());
             let model_metadata_json = serialize_model_metadata(r.model_metadata.as_ref())?;
             let enabled_int: i32 = if r.enabled { 1 } else { 0 };
+            // Admissions are intentionally not portable in config exports.
+            // Never import an active route-level enforce flag without a new
+            // local Route × shape approval; an explicit Shadow value is the
+            // safe equivalent even when the destination global mode is
+            // enforce.
+            let imported_capability_mode = match r.capability_routing_mode {
+                Some(tiygate_core::CapabilityRoutingMode::Enforce) => {
+                    Some(tiygate_core::CapabilityRoutingMode::Shadow)
+                }
+                other => other,
+            };
             let created_at = r.created_at.to_rfc3339();
             let updated_at = chrono::Utc::now().to_rfc3339();
             sqlx::query(
-                "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, model_metadata_json, enabled, \
+                "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, capability_routing_mode, model_metadata_json, enabled, \
                  created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT(id) DO UPDATE SET \
                     virtual_model=excluded.virtual_model, targets_json=excluded.targets_json, \
                     routing_strategy=excluded.routing_strategy, \
+                    capability_routing_mode=excluded.capability_routing_mode, \
                     model_metadata_json=excluded.model_metadata_json, \
                     enabled=excluded.enabled, updated_at=excluded.updated_at",
             )
@@ -1718,6 +2416,7 @@ impl DbConfigStore {
             .bind(&r.virtual_model)
             .bind(&targets_json)
             .bind(strategy_str)
+            .bind(imported_capability_mode.map(|m| m.as_str()))
             .bind(&model_metadata_json)
             .bind(enabled_int)
             .bind(&created_at)
@@ -1725,6 +2424,193 @@ impl DbConfigStore {
             .execute(&mut *tx)
             .await?;
             report.routes_imported += 1;
+        }
+
+        // Import is a route/provider write as well. Read the just-written
+        // rows through the same transaction and enqueue/reconcile capability
+        // state before committing, so an imported target can never become
+        // visible without its durable profile/job pair.
+        let mut imported_providers = sqlx::query(
+            "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode,
+                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled,
+                    created_at, updated_at
+             FROM providers",
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(row_to_provider)
+        .collect::<Result<Vec<_>, _>>()?;
+        for provider in &mut imported_providers {
+            populate_provider_api_key_cleartext(self.encryption.as_ref(), provider);
+            populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
+        }
+        let imported_routes = sqlx::query(
+            "SELECT id, virtual_model, targets_json, routing_strategy, capability_routing_mode,
+                    model_metadata_json, enabled, created_at, updated_at FROM routes",
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(row_to_route)
+        .collect::<Result<Vec<_>, _>>()?;
+        let imported_snapshot = ConfigSnapshot {
+            epoch: 0,
+            providers: imported_providers
+                .into_iter()
+                .map(|provider| (provider.id.clone(), provider))
+                .collect(),
+            routes: imported_routes
+                .into_iter()
+                .map(|route| (route.virtual_model.clone(), route))
+                .collect(),
+        };
+        let imported_runtime = snapshot_to_routing_table(&imported_snapshot);
+        let mut capability_changed = false;
+        for entry in imported_runtime.routes.values() {
+            for target in &entry.targets {
+                let probe_set = crate::capabilities::default_probe_set_for_target(target);
+                capability_changed |= self
+                    .ensure_target_capability_tx(&mut tx, target, &probe_set)
+                    .await?;
+            }
+        }
+        let imported_config = ConfigStore::with_routing_table(imported_runtime.clone());
+        for exported in &data.capability_overrides {
+            let selector_key =
+                capability_override_selector_key(&exported.selector, &exported.capability_id);
+            if !sel_capability_overrides.contains(selector_key.as_str())
+                || !sel_routes.contains(exported.selector.route_id.as_str())
+            {
+                report.capability_overrides_skipped += 1;
+                continue;
+            }
+            let Some(source_route) = data
+                .routes
+                .iter()
+                .find(|route| route.id == exported.selector.route_id)
+            else {
+                report.capability_overrides_skipped += 1;
+                continue;
+            };
+            let Some(source_target) = source_route.targets.get(exported.selector.target_index)
+            else {
+                report.capability_overrides_skipped += 1;
+                continue;
+            };
+            if source_target.provider_id != exported.selector.provider_id
+                || source_target.model_id != exported.selector.model_id
+                || source_target.egress_dialect_id != exported.selector.egress_dialect_id
+                || source_target.account_label != exported.selector.account_label
+            {
+                report.capability_overrides_skipped += 1;
+                continue;
+            }
+            let Some(target) = runtime_target_for_route_index(
+                &imported_config,
+                source_route,
+                exported.selector.target_index,
+            ) else {
+                report.capability_overrides_skipped += 1;
+                continue;
+            };
+            if target.provider_id != exported.selector.provider_id
+                || target.model_id != exported.selector.model_id
+                || target.effective_egress_dialect_id()
+                    != exported
+                        .selector
+                        .egress_dialect_id
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or("auto")
+                || target.account_label != exported.selector.account_label
+            {
+                report.capability_overrides_skipped += 1;
+                continue;
+            }
+            let now = chrono::Utc::now();
+            if exported.expires_at.is_some_and(|expires_at| {
+                expires_at <= now || expires_at > now + chrono::Duration::days(30)
+            }) || exported.reason.trim().is_empty()
+                || exported.reason.len() > 2048
+                || exported.actor.trim().is_empty()
+                || exported.actor.len() > 256
+                || exported.capability_id.len() > 256
+            {
+                report.capability_overrides_skipped += 1;
+                continue;
+            }
+            let state = match exported.state.as_str() {
+                "supported" => tiygate_core::CapabilityState::Supported,
+                "unsupported" => tiygate_core::CapabilityState::Unsupported,
+                "constrained" => tiygate_core::CapabilityState::Constrained,
+                "unknown" => {
+                    report.capability_overrides_skipped += 1;
+                    continue;
+                }
+                _ => {
+                    report.capability_overrides_skipped += 1;
+                    continue;
+                }
+            };
+            let capability_id = CapabilityId::from(exported.capability_id.clone());
+            if capability_id.as_str().is_empty() {
+                report.capability_overrides_skipped += 1;
+                continue;
+            }
+            let value = match exported
+                .value
+                .clone()
+                .map(serde_json::from_value::<tiygate_core::CapabilityValue>)
+                .transpose()
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    report.capability_overrides_skipped += 1;
+                    continue;
+                }
+            };
+            let shape_valid = match state {
+                CapabilityState::Unknown => value.is_none(),
+                CapabilityState::Constrained => value
+                    .as_ref()
+                    .is_some_and(|candidate| !candidate.is_empty()),
+                CapabilityState::Supported | CapabilityState::Unsupported => true,
+            };
+            if !shape_valid {
+                report.capability_overrides_skipped += 1;
+                continue;
+            }
+            if let Some(validator) = capability_validator {
+                if validator(target, &capability_id, state, value.as_ref()).is_err() {
+                    report.capability_overrides_skipped += 1;
+                    continue;
+                }
+            }
+            let target_key = match self.target_key_for(target) {
+                Ok((key, _)) => key,
+                Err(_) => {
+                    report.capability_overrides_skipped += 1;
+                    continue;
+                }
+            };
+            let record = crate::capabilities::TargetCapabilityOverride {
+                target_key,
+                capability_id,
+                state,
+                value,
+                reason: exported.reason.clone(),
+                actor: exported.actor.clone(),
+                expires_at: exported.expires_at,
+                created_at: now,
+                updated_at: now,
+            };
+            self.upsert_capability_override_tx(&mut tx, &record).await?;
+            report.capability_overrides_imported += 1;
+            capability_changed = true;
+        }
+        if capability_changed {
+            self.bump_capability_epoch_tx(&mut tx).await?;
         }
 
         // The api_keys table has a UNIQUE constraint on key_hash in
@@ -1875,6 +2761,17 @@ impl DbConfigStore {
             report.token_stats_imported += 1;
         }
 
+        let mut admissions_changed = false;
+        for route in &data.routes {
+            if sel_routes.contains(route.id.as_str()) {
+                admissions_changed |= self
+                    .mark_route_admissions_stale_tx(&mut tx, &route.id, "config_import")
+                    .await?;
+            }
+        }
+        if admissions_changed && !capability_changed {
+            self.bump_capability_epoch_tx(&mut tx).await?;
+        }
         tx.commit().await?;
         // Recompute the token_summary from the merged daily stats so
         // lifetime/peak/streaks reflect the combined data. This runs
@@ -1921,6 +2818,7 @@ impl DbConfigStore {
     /// races.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let now = chrono::Utc::now().to_rfc3339();
+        let mut tx = self.pool.any().begin().await?;
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -1928,7 +2826,7 @@ impl DbConfigStore {
         .bind(key)
         .bind(value)
         .bind(&now)
-        .execute(self.pool.any())
+        .execute(&mut *tx)
         .await?;
         // Notify the data plane + background tasks that a setting
         // changed. We intentionally do NOT call `refresh()` here:
@@ -1936,8 +2834,89 @@ impl DbConfigStore {
         // reload of providers/routes on every settings write would
         // be wasteful. The epoch bump is enough for the epoch-poll
         // task to wake and reload the runtime tunables.
-        if let Err(e) = self.bump_epoch().await {
-            tracing::warn!(error = %e, key, "failed to bump epoch after settings update");
+        self.bump_epoch_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically upsert a batch of settings and advance the configuration
+    /// epoch once. The boolean marks values that must be encrypted with the
+    /// settings purpose before persistence.
+    pub async fn set_settings_batch(
+        &self,
+        updates: &[(String, String, bool)],
+    ) -> Result<(), StoreError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.any().begin().await?;
+        self.set_settings_batch_tx(&mut tx, updates).await?;
+        self.bump_epoch_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Persist a settings batch, append an audit record and advance the config
+    /// epoch atomically.  Capability routing settings use this variant so a
+    /// successful response cannot be returned without an audit trail.
+    pub async fn set_settings_batch_with_audit(
+        &self,
+        updates: &[(String, String, bool)],
+        actor: &str,
+        target_id: &str,
+        audit_details: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.any().begin().await?;
+        self.set_settings_batch_tx(&mut tx, updates).await?;
+        self.bump_epoch_tx(&mut tx).await?;
+        crate::audit::record_tx(
+            &mut tx,
+            actor,
+            "upsert",
+            "settings",
+            target_id,
+            audit_details,
+        )
+        .await
+        .map_err(|error| StoreError::Audit(error.to_string()))?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn set_settings_batch_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        updates: &[(String, String, bool)],
+    ) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        for (key, value, encrypted) in updates {
+            let stored = if *encrypted {
+                match self.encryption.as_ref() {
+                    Some(enc) => crate::keys::encrypt_settings(enc, value)
+                        .map_err(|error| StoreError::Decrypt(error.to_string()))?,
+                    None => {
+                        warn!(
+                            key,
+                            "TIYGATE_MASTER_KEY not set; storing setting in cleartext (NOT FOR PRODUCTION)"
+                        );
+                        value.clone()
+                    }
+                }
+            } else {
+                value.clone()
+            };
+            sqlx::query(
+                "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            )
+            .bind(key)
+            .bind(stored)
+            .bind(&now)
+            .execute(&mut **tx)
+            .await?;
         }
         Ok(())
     }
@@ -1996,6 +2975,39 @@ impl DbConfigStore {
 
 // ---------- row → model helpers ----------
 
+/// Resolve one persisted route-target index to its runtime target. Disabled
+/// persisted targets are omitted from the routing table, so the runtime
+/// cursor must advance independently of the original index.
+fn runtime_target_for_route_index<'a>(
+    runtime: &'a ConfigStore,
+    route: &Route,
+    target_index: usize,
+) -> Option<&'a RoutingTarget> {
+    let entry = runtime.routing_table.routes.get(&route.virtual_model)?;
+    let mut runtime_index = 0usize;
+    for (index, persisted_target) in route.targets.iter().enumerate() {
+        if !persisted_target.enabled {
+            continue;
+        }
+        let target = entry.targets.get(runtime_index)?;
+        runtime_index = runtime_index.saturating_add(1);
+        if index == target_index {
+            return Some(target);
+        }
+    }
+    None
+}
+
+fn capability_override_selector_key(
+    selector: &ExportTargetSelector,
+    capability_id: &str,
+) -> String {
+    format!(
+        "{}#{}#{}",
+        selector.route_id, selector.target_index, capability_id
+    )
+}
+
 fn row_to_provider(row: sqlx::any::AnyRow) -> Result<Provider, StoreError> {
     let auth_mode_str: String = row.get("auth_mode");
     let auth_mode = AuthMode::parse(&auth_mode_str)
@@ -2053,6 +3065,31 @@ fn populate_provider_oauth_cleartext(
     } else {
         // No master key: column holds cleartext.
         provider.oauth_meta_cleartext = Some(provider.encrypted_oauth_meta.clone());
+    }
+}
+
+fn populate_provider_api_key_cleartext(
+    encryption: Option<&Arc<KeyEncryption>>,
+    provider: &mut Provider,
+) {
+    if provider.encrypted_api_key.is_empty() {
+        provider.api_key_cleartext = Some(String::new());
+        return;
+    }
+    if let Some(enc) = encryption {
+        match keys::decrypt_api_key(enc, &provider.encrypted_api_key) {
+            Ok(plain) => provider.api_key_cleartext = Some(plain),
+            Err(error) => {
+                tracing::warn!(
+                    provider = %provider.id,
+                    error = %error,
+                    "decrypting provider api key failed; data plane will skip the auth header"
+                );
+                provider.api_key_cleartext = None;
+            }
+        }
+    } else {
+        provider.api_key_cleartext = Some(provider.encrypted_api_key.clone());
     }
 }
 
@@ -2115,11 +3152,16 @@ fn row_to_route(row: sqlx::any::AnyRow) -> Result<Route, StoreError> {
     let routing_strategy = routing_strategy
         .as_deref()
         .and_then(tiygate_core::routing::RoutingStrategyName::parse);
+    let capability_routing_mode: Option<String> = row.get("capability_routing_mode");
+    let capability_routing_mode = capability_routing_mode
+        .as_deref()
+        .and_then(tiygate_core::CapabilityRoutingMode::parse);
     Ok(Route {
         id: row.get("id"),
         virtual_model: row.get("virtual_model"),
         targets,
         routing_strategy,
+        capability_routing_mode,
         model_metadata,
         enabled: enabled_int != 0,
         created_at: parse_dt(row.get("created_at"))?,
@@ -2201,6 +3243,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn route_target_dialect_is_canonical_and_validated() {
+        assert_eq!(normalize_egress_dialect(None).unwrap(), None);
+        assert_eq!(normalize_egress_dialect(Some("  ")).unwrap(), None);
+        assert_eq!(normalize_egress_dialect(Some("auto")).unwrap(), None);
+        assert_eq!(normalize_egress_dialect(Some(" auto ")).unwrap(), None);
+        assert_eq!(
+            normalize_egress_dialect(Some("openai-responses-standard")).unwrap(),
+            Some("openai-responses-standard".to_string())
+        );
+        assert!(normalize_egress_dialect(Some("custom-dialect")).is_err());
+    }
+
+    #[test]
     fn hash_api_key_is_deterministic() {
         assert_eq!(hash_api_key("a"), hash_api_key("a"));
         assert_ne!(hash_api_key("a"), hash_api_key("b"));
@@ -2241,8 +3296,10 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
             }],
             routing_strategy: None,
+            capability_routing_mode: None,
             model_metadata: None,
             enabled: true,
             created_at: now,
@@ -2262,6 +3319,63 @@ mod tests {
         let target = &table.routes.get("vm").unwrap().targets[0];
         assert_eq!(target.api_protocol.suite, ProtocolSuite::OpenAiCompatible);
         assert_eq!(target.api_base, "https://example.test/root");
+    }
+
+    #[test]
+    fn explicit_responses_dialect_selects_responses_egress_for_compatible_provider() {
+        use crate::models::{ConfigSnapshot, Provider, Route, RouteTarget};
+        use std::collections::HashMap;
+
+        let now = chrono::Utc::now();
+        let provider = Provider {
+            id: "prov-responses-compatible".to_string(),
+            name: "Responses Compatible".to_string(),
+            vendor: "unregistered-openai-compatible".to_string(),
+            api_base: "https://example.test/v1".to_string(),
+            models_endpoint: String::new(),
+            encrypted_api_key: "sk-test".to_string(),
+            auth_mode: AuthMode::ApiKey,
+            encrypted_usage_management_key: String::new(),
+            encrypted_oauth_meta: String::new(),
+            metadata_json: serde_json::json!({}),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            api_key_cleartext: Some("sk-test".to_string()),
+            usage_management_key_cleartext: None,
+            oauth_meta_cleartext: None,
+        };
+        let route = Route {
+            id: "route-responses-compatible".to_string(),
+            virtual_model: "responses-compatible-model".to_string(),
+            targets: vec![RouteTarget {
+                provider_id: provider.id.clone(),
+                model_id: "vendor-model".to_string(),
+                weight: 1.0,
+                enabled: true,
+                account_label: None,
+                api_key_override: None,
+                api_base_override: None,
+                egress_dialect_id: Some("openai-responses-standard".to_string()),
+            }],
+            routing_strategy: None,
+            capability_routing_mode: None,
+            model_metadata: None,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let snapshot = ConfigSnapshot {
+            epoch: 1,
+            providers: HashMap::from([(provider.id.clone(), provider)]),
+            routes: HashMap::from([(route.virtual_model.clone(), route)]),
+        };
+        let target = snapshot_to_routing_table(&snapshot)
+            .resolve("responses-compatible-model")
+            .expect("target")
+            .remove(0);
+        assert_eq!(target.api_protocol.suite, ProtocolSuite::OpenAiResponses);
+        assert_eq!(target.api_protocol.name, "responses");
     }
 
     #[test]
@@ -2297,6 +3411,7 @@ mod tests {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
         };
         let target_disabled = RouteTarget {
             provider_id: "prov-x".to_string(),
@@ -2306,12 +3421,14 @@ mod tests {
             account_label: None,
             api_key_override: None,
             api_base_override: None,
+            egress_dialect_id: None,
         };
         let route = Route {
             id: "route-1".to_string(),
             virtual_model: "vm".to_string(),
             targets: vec![target_disabled, target_enabled],
             routing_strategy: None,
+            capability_routing_mode: None,
             model_metadata: None,
             enabled: true,
             created_at: now,
@@ -2371,8 +3488,10 @@ mod tests {
                 account_label: None,
                 api_key_override: None,
                 api_base_override: None,
+                egress_dialect_id: None,
             }],
             routing_strategy: None,
+            capability_routing_mode: None,
             model_metadata: None,
             enabled: true,
             created_at: now,
@@ -2808,6 +3927,219 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn provider_update_enqueues_capability_jobs_atomically() {
+        let store = boot_store(None).await;
+        store
+            .upsert_provider(
+                "p-capability",
+                "Capability Provider",
+                "openai",
+                "https://first.example/v1",
+                "",
+                Some("sk-first"),
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("provider");
+        store
+            .upsert_route(
+                "r-capability",
+                "virtual-capability",
+                &[RouteTarget {
+                    provider_id: "p-capability".to_string(),
+                    model_id: "gpt-test".to_string(),
+                    weight: 1.0,
+                    enabled: true,
+                    account_label: None,
+                    api_key_override: None,
+                    api_base_override: None,
+                    egress_dialect_id: None,
+                }],
+                None,
+                None,
+                true,
+            )
+            .await
+            .expect("route");
+        let first_target = store
+            .config_store()
+            .routing_table
+            .resolve("virtual-capability")
+            .expect("first target")
+            .remove(0);
+        let first_key = store.target_key_for(&first_target).expect("first key").0;
+
+        store
+            .upsert_provider(
+                "p-capability",
+                "Capability Provider",
+                "openai",
+                "https://second.example/v1",
+                "",
+                Some("sk-second"),
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("provider update");
+        let second_target = store
+            .config_store()
+            .routing_table
+            .resolve("virtual-capability")
+            .expect("second target")
+            .remove(0);
+        let second_key = store.target_key_for(&second_target).expect("second key").0;
+        assert_ne!(first_key, second_key);
+        assert!(store
+            .get_capability_profile(&second_key)
+            .await
+            .expect("new profile")
+            .is_some());
+        let jobs = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM target_probe_jobs WHERE target_key = $1 AND status = 'pending'",
+        )
+        .bind(second_key.as_str())
+        .fetch_one(store.pool.any())
+        .await
+        .expect("pending job");
+        assert!(jobs > 0);
+    }
+
+    #[tokio::test]
+    async fn route_mode_change_keeps_admission_for_unchanged_target_identity() {
+        let store = boot_store(None).await;
+        store
+            .upsert_provider(
+                "p-admission-mode",
+                "Admission Mode Provider",
+                "openai",
+                "https://mode.example/v1",
+                "",
+                Some("sk-mode"),
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("provider");
+        let target = RouteTarget {
+            provider_id: "p-admission-mode".to_string(),
+            model_id: "gpt-mode".to_string(),
+            weight: 1.0,
+            enabled: true,
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            egress_dialect_id: Some("openai-responses-standard".to_string()),
+        };
+        store
+            .upsert_route_with_mode(RouteUpsert {
+                id: "r-admission-mode",
+                virtual_model: "vm-admission-mode",
+                targets: std::slice::from_ref(&target),
+                routing_strategy: None,
+                capability_routing_mode: Some(tiygate_core::CapabilityRoutingMode::Shadow),
+                model_metadata: None,
+                enabled: true,
+            })
+            .await
+            .expect("route");
+        let shape_hash =
+            tiygate_core::capability_shape_hash_from_ids(&[tiygate_core::CapabilityId::from(
+                "tools.function",
+            )]);
+        let now = chrono::Utc::now();
+        store
+            .upsert_capability_route_admission(
+                &crate::capabilities::CapabilityRouteAdmission {
+                    route_id: "r-admission-mode".to_string(),
+                    capability_shape_hash: shape_hash.clone(),
+                    required_capabilities: vec![tiygate_core::CapabilityId::from("tools.function")],
+                    required_requirements: Vec::new(),
+                    mode: tiygate_core::CapabilityRoutingMode::Enforce,
+                    gate_policy_version: 1,
+                    report: serde_json::json!({"gate_passed": true}),
+                    approved_by: Some("test".to_string()),
+                    approved_at: Some(now),
+                    expires_at: Some(now + chrono::Duration::hours(1)),
+                    revision: 0,
+                    created_at: now,
+                    updated_at: now,
+                },
+                None,
+            )
+            .await
+            .expect("admission");
+        store
+            .upsert_route_with_mode(RouteUpsert {
+                id: "r-admission-mode",
+                virtual_model: "vm-admission-mode",
+                targets: std::slice::from_ref(&target),
+                routing_strategy: None,
+                capability_routing_mode: Some(tiygate_core::CapabilityRoutingMode::Enforce),
+                model_metadata: None,
+                enabled: true,
+            })
+            .await
+            .expect("mode update");
+        let admission = store
+            .get_capability_route_admission("r-admission-mode", &shape_hash)
+            .await
+            .expect("read admission")
+            .expect("admission retained");
+        assert_eq!(admission.mode, tiygate_core::CapabilityRoutingMode::Enforce);
+        assert_eq!(admission.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn route_audit_failure_rolls_back_route_and_capability_state() {
+        let store = boot_store(None).await;
+        sqlx::query("DROP TABLE audit_log")
+            .execute(store.pool.any())
+            .await
+            .expect("drop audit table");
+        let target = RouteTarget {
+            provider_id: "missing-provider".to_string(),
+            model_id: "model".to_string(),
+            weight: 1.0,
+            enabled: true,
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            egress_dialect_id: None,
+        };
+        let result = store
+            .upsert_route_with_mode_with_audit(
+                RouteUpsert {
+                    id: "route-audit-rollback",
+                    virtual_model: "model-audit-rollback",
+                    targets: std::slice::from_ref(&target),
+                    routing_strategy: None,
+                    capability_routing_mode: Some(tiygate_core::CapabilityRoutingMode::Shadow),
+                    model_metadata: None,
+                    enabled: true,
+                },
+                "admin",
+                "upsert",
+                "route-audit-rollback",
+                &serde_json::json!({"reason": "audit failure fixture"}),
+            )
+            .await;
+        assert!(matches!(result, Err(StoreError::Audit(_))));
+        assert!(store
+            .get_route("route-audit-rollback")
+            .await
+            .expect("route lookup")
+            .is_none());
+    }
+
     fn test_model_metadata(id: &str) -> ModelMetadata {
         ModelMetadata {
             id: id.to_string(),
@@ -2855,6 +4187,7 @@ mod tests {
                     account_label: None,
                     api_key_override: None,
                     api_base_override: None,
+                    egress_dialect_id: None,
                 }],
                 None,
                 Some(&metadata),
@@ -2892,6 +4225,134 @@ mod tests {
             imported.model_metadata.as_ref().unwrap().context_window,
             Some(12345)
         );
+        let imported_target = target
+            .config_store()
+            .routing_table
+            .resolve("virtual/meta")
+            .expect("imported runtime target")
+            .into_iter()
+            .next()
+            .expect("target");
+        let (imported_key, _) = target
+            .target_key_for(&imported_target)
+            .expect("imported target key");
+        let imported_jobs = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM target_probe_jobs WHERE target_key = $1",
+        )
+        .bind(imported_key.as_str())
+        .fetch_one(target.pool.any())
+        .await
+        .expect("imported capability job");
+        assert!(imported_jobs > 0);
+    }
+
+    #[tokio::test]
+    async fn capability_override_export_import_rebinds_by_route_target_selector() {
+        let source = boot_store(None).await;
+        source
+            .upsert_provider(
+                "p-override",
+                "Override Provider",
+                "openai",
+                "https://override.example/v1",
+                "",
+                None,
+                AuthMode::None,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("provider");
+        source
+            .upsert_route(
+                "r-override",
+                "virtual/override",
+                &[RouteTarget {
+                    provider_id: "p-override".to_string(),
+                    model_id: "upstream-override".to_string(),
+                    weight: 1.0,
+                    enabled: true,
+                    account_label: Some("account-a".to_string()),
+                    api_key_override: None,
+                    api_base_override: None,
+                    egress_dialect_id: Some("openai-responses-standard".to_string()),
+                }],
+                None,
+                None,
+                true,
+            )
+            .await
+            .expect("route");
+        let target = source
+            .config_store()
+            .routing_table
+            .resolve("virtual/override")
+            .expect("runtime target")
+            .into_iter()
+            .next()
+            .expect("target");
+        let target_key = source.target_key_for(&target).expect("target key").0;
+        let now = chrono::Utc::now();
+        source
+            .upsert_capability_override(&crate::capabilities::TargetCapabilityOverride {
+                target_key,
+                capability_id: tiygate_core::CapabilityId::from("unknown.future.capability"),
+                state: tiygate_core::CapabilityState::Supported,
+                value: None,
+                reason: "carry unknown capability through export".to_string(),
+                actor: "test".to_string(),
+                expires_at: Some(now + chrono::Duration::hours(1)),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("override");
+
+        let bundle = source.export_config().await.expect("export");
+        assert_eq!(bundle.capability_overrides.len(), 1);
+        let exported = &bundle.capability_overrides[0];
+        let selector_key =
+            capability_override_selector_key(&exported.selector, &exported.capability_id);
+
+        let target_store = boot_store(None).await;
+        let imported = target_store
+            .import_config(
+                &bundle,
+                "",
+                &ImportSelection {
+                    providers: vec!["p-override".to_string()],
+                    routes: vec!["r-override".to_string()],
+                    capability_overrides: vec![selector_key],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("import");
+        assert_eq!(imported.capability_overrides_imported, 1);
+        assert_eq!(imported.capability_overrides_skipped, 0);
+        let imported_target = target_store
+            .config_store()
+            .routing_table
+            .resolve("virtual/override")
+            .expect("imported runtime target")
+            .into_iter()
+            .next()
+            .expect("imported target");
+        let imported_key = target_store
+            .target_key_for(&imported_target)
+            .expect("imported target key")
+            .0;
+        let overrides = target_store
+            .list_capability_overrides(&imported_key)
+            .await
+            .expect("imported overrides");
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(
+            overrides[0].capability_id.as_str(),
+            "unknown.future.capability"
+        );
+        assert_eq!(overrides[0].state, tiygate_core::CapabilityState::Supported);
     }
 
     #[tokio::test]
@@ -2924,6 +4385,7 @@ mod tests {
                     account_label: None,
                     api_key_override: None,
                     api_base_override: None,
+                    egress_dialect_id: None,
                 }],
                 None,
                 None,
@@ -3048,6 +4510,7 @@ mod tests {
             }],
             settings: vec![],
             token_daily_stats: vec![],
+            capability_overrides: vec![],
         };
         target
             .import_config(
@@ -3135,6 +4598,7 @@ mod tests {
             api_keys: vec![],
             settings: vec![],
             token_daily_stats: vec![],
+            capability_overrides: vec![],
         };
 
         // Select only the new provider; the existing one stays
@@ -3244,6 +4708,7 @@ mod tests {
             api_keys: vec![],
             settings: vec![],
             token_daily_stats: vec![],
+            capability_overrides: vec![],
         };
         let err = store
             .import_config(&bundle, "", &ImportSelection::default())
@@ -3283,6 +4748,7 @@ mod tests {
             }],
             settings: vec![],
             token_daily_stats: vec![],
+            capability_overrides: vec![],
         };
 
         let selection = ImportSelection {
@@ -3329,6 +4795,7 @@ mod tests {
             }],
             settings: vec![],
             token_daily_stats: vec![],
+            capability_overrides: vec![],
         };
         let report = store
             .import_config(
@@ -3407,6 +4874,7 @@ mod tests {
             api_keys: vec![],
             settings: vec![],
             token_daily_stats: vec![],
+            capability_overrides: vec![],
         };
 
         // Explicitly select the existing id → upsert overwrites it.
@@ -3459,6 +4927,7 @@ mod tests {
             api_keys: vec![],
             settings: vec![],
             token_daily_stats: vec![],
+            capability_overrides: vec![],
         };
 
         let report = store
@@ -3738,6 +5207,7 @@ mod tests {
                 peak_single_request: 150,
                 longest_task_ms: 5000,
             }],
+            capability_overrides: vec![],
         };
         let selection = ImportSelection {
             token_stats: vec![day_str.clone()],
@@ -3816,6 +5286,7 @@ mod tests {
                     longest_task_ms: 6000,
                 },
             ],
+            capability_overrides: vec![],
         };
         let selection = ImportSelection {
             token_stats: vec![yesterday_str.clone(), today_str.clone()],
@@ -3858,6 +5329,7 @@ mod tests {
             api_keys: vec![],
             settings: vec![],
             token_daily_stats: vec![],
+            capability_overrides: vec![],
         };
         let report = store
             .import_config(&bundle, "", &ImportSelection::default())

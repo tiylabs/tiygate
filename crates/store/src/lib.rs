@@ -16,6 +16,7 @@
 
 pub mod archive;
 pub mod audit;
+pub mod capabilities;
 pub mod config_store;
 pub mod db;
 pub mod encryption;

@@ -8,12 +8,16 @@
 //! - Error source distinction (gateway vs upstream)
 //! - UsageAccumulator for disconnected streaming billing
 
+pub(crate) mod capabilities;
+pub(crate) mod capability_planner;
 mod executors;
 mod fallback;
 mod handlers;
 mod headers;
 pub(crate) mod observability;
+pub(crate) mod probe;
 mod response_model;
+pub(crate) mod shadow;
 mod streaming;
 
 use handlers::{
@@ -32,6 +36,7 @@ use axum::{
     Json, Router,
 };
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use tiygate_core::{HealthRegistry, TelemetryBus};
@@ -80,6 +85,10 @@ use tiygate_store::config::ConfigStore;
 pub struct RuntimeTunables {
     /// Routing strategy selector (default `Weighted`, per §3.4).
     pub routing_strategy: crate::config::RoutingStrategyName,
+    /// Capability-aware routing rollout mode.
+    pub capability_routing_mode: tiygate_core::CapabilityRoutingMode,
+    /// Allow the CRL additional-tools → top-level tools transform.
+    pub crl_tool_promotion_enabled: bool,
     /// Whether to capture inline base64 media in raw envelopes.
     pub raw_envelope_capture_media: bool,
     /// Whether to require a valid API key on every data-plane
@@ -163,6 +172,45 @@ pub struct AppState {
     /// OAuth token manager. Handles OAuth token refresh and
     /// injection for providers configured with `AuthMode::OAuth`.
     pub oauth_manager: Arc<crate::oauth_manager::OAuthTokenManager>,
+    /// Atomically published target capability profiles. The request path
+    /// reads this snapshot without querying the database.
+    pub capabilities: Arc<capabilities::CapabilitySnapshotStore>,
+    /// Non-blocking invalidation queue for target-specific capability
+    /// re-probes. Store I/O is owned by the ingress background handles.
+    pub capability_feedback: Option<Arc<capabilities::CapabilityFeedbackDispatcher>>,
+}
+
+/// Background tasks owned by the production ingress router. The public test
+/// constructor keeps the historical detached watcher behavior, while the
+/// `App` path retains this handle so graceful shutdown can stop all capability
+/// tasks explicitly.
+pub(crate) struct IngressBackgroundHandles {
+    capability_reloader: Option<capabilities::CapabilityReloaderHandle>,
+    capability_admission_guard: Option<capabilities::CapabilityAdmissionGuardHandle>,
+    probe_worker: Option<probe::ProbeWorkerHandle>,
+    capability_feedback: Option<capabilities::CapabilityFeedbackHandle>,
+    tunables_reloader: Option<JoinHandle<()>>,
+}
+
+impl IngressBackgroundHandles {
+    pub(crate) async fn stop(self) {
+        if let Some(worker) = self.probe_worker {
+            worker.stop().await;
+        }
+        if let Some(feedback) = self.capability_feedback {
+            feedback.stop().await;
+        }
+        if let Some(reloader) = self.capability_reloader {
+            reloader.stop().await;
+        }
+        if let Some(guard) = self.capability_admission_guard {
+            guard.stop().await;
+        }
+        if let Some(join) = self.tunables_reloader {
+            join.abort();
+            let _ = join.await;
+        }
+    }
 }
 
 impl AppState {
@@ -290,6 +338,41 @@ pub(crate) fn router_with_telemetry_full_and_oauth(
     model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
     oauth_manager: Arc<crate::oauth_manager::OAuthTokenManager>,
 ) -> Router {
+    let (router, _background) = build_data_plane_router(
+        config,
+        health,
+        server_config,
+        telemetry,
+        quota,
+        embedding_cache,
+        db_store,
+        model_catalog,
+        oauth_manager,
+        Arc::new(arc_swap::ArcSwap::from_pointee(
+            capabilities::CapabilitySnapshot::default(),
+        )),
+        true,
+    );
+    router
+}
+
+/// Production variant which returns owned background-task handles and uses a
+/// startup-loaded capability snapshot. The ordinary router shim preserves its
+/// historical background watcher behavior for integration callers; the App
+/// path owns the returned handles and stops them during shutdown.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn router_with_telemetry_full_and_oauth_with_background(
+    config: ConfigStore,
+    health: Arc<HealthRegistry>,
+    server_config: &ServerConfig,
+    telemetry: Arc<dyn TelemetryBus>,
+    quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>>,
+    embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
+    db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
+    model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
+    oauth_manager: Arc<crate::oauth_manager::OAuthTokenManager>,
+    capability_snapshot: Arc<capabilities::CapabilitySnapshotStore>,
+) -> (Router, IngressBackgroundHandles) {
     build_data_plane_router(
         config,
         health,
@@ -300,6 +383,8 @@ pub(crate) fn router_with_telemetry_full_and_oauth(
         db_store,
         model_catalog,
         oauth_manager,
+        capability_snapshot,
+        true,
     )
 }
 
@@ -405,13 +490,25 @@ fn build_data_plane_router(
     db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
     model_catalog: Option<Arc<tiygate_store::model_catalog::ModelCatalogStore>>,
     oauth_manager: Arc<crate::oauth_manager::OAuthTokenManager>,
-) -> Router {
+    capability_snapshot: Arc<capabilities::CapabilitySnapshotStore>,
+    start_background: bool,
+) -> (Router, IngressBackgroundHandles) {
     let semaphore = Arc::new(Semaphore::new(server_config.max_inflight_requests));
     // Clone the db_store before it is moved into AppState so we can
     // spawn the tunables reloader after state construction.
     let db_store_for_reloader = db_store.clone();
+    let capability_feedback_worker = if start_background {
+        db_store.clone().map(capabilities::spawn_feedback_worker)
+    } else {
+        None
+    };
+    let capability_feedback = capability_feedback_worker
+        .as_ref()
+        .map(|worker| worker.dispatcher.clone());
     let tunables = RuntimeTunables {
         routing_strategy: server_config.routing_strategy,
+        capability_routing_mode: server_config.capability_routing_mode,
+        crl_tool_promotion_enabled: server_config.crl_tool_promotion_enabled,
         raw_envelope_capture_media: server_config.raw_envelope_capture_media,
         require_api_key: server_config.require_api_key,
         header_policy: Arc::new(
@@ -443,9 +540,32 @@ fn build_data_plane_router(
         model_catalog,
         tunables: Arc::new(arc_swap::ArcSwap::from_pointee(tunables)),
         oauth_manager,
+        capabilities: capability_snapshot,
+        capability_feedback,
     };
 
-    Router::new()
+    let capability_reloader = if start_background {
+        capabilities::install_reloader(db_store.clone(), &state)
+    } else {
+        None
+    };
+    let capability_admission_guard = if start_background {
+        db_store.clone().map(capabilities::spawn_admission_guard)
+    } else {
+        None
+    };
+    let probe_worker = if start_background {
+        probe::spawn_worker(state.clone())
+    } else {
+        None
+    };
+    let tunables_reloader = if start_background {
+        db_store_for_reloader.map(|db| spawn_tunables_reloader(db, state.clone()))
+    } else {
+        None
+    };
+
+    let router = Router::new()
         .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/v1/messages", post(handle_messages))
         .route("/v1/embeddings", post(handle_embeddings))
@@ -503,15 +623,17 @@ fn build_data_plane_router(
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             server_config.max_multimodal_body_bytes as usize,
         ))
-        .with_state({
-            // Spawn the tunables reloader when a DB store is
-            // available so runtime settings changes propagate to
-            // the data plane without a restart.
-            if let Some(ref db) = db_store_for_reloader {
-                spawn_tunables_reloader(db.clone(), state.clone());
-            }
-            state
-        })
+        .with_state(state);
+    (
+        router,
+        IngressBackgroundHandles {
+            capability_reloader,
+            capability_admission_guard,
+            probe_worker,
+            capability_feedback: capability_feedback_worker,
+            tunables_reloader,
+        },
+    )
 }
 
 /// Spawn a background task that watches the config epoch and
@@ -545,6 +667,22 @@ pub(crate) fn spawn_tunables_reloader(
                 sk::get_string(store.as_ref(), sk::ROUTING_DEFAULT_STRATEGY, "weighted").await;
             let routing_strategy =
                 crate::config::RoutingStrategyName::parse(&routing_strategy).unwrap_or_default();
+            let current_t = state.tunables();
+            let capability_routing_mode = tiygate_core::CapabilityRoutingMode::parse(
+                &sk::get_string(
+                    store.as_ref(),
+                    sk::CAPABILITY_ROUTING_MODE,
+                    current_t.capability_routing_mode.as_str(),
+                )
+                .await,
+            )
+            .unwrap_or(current_t.capability_routing_mode);
+            let crl_tool_promotion_enabled = tiygate_store::settings_keys::get_bool(
+                store.as_ref(),
+                tiygate_store::settings_keys::RESPONSES_CRL_TOOL_PROMOTION_ENABLED,
+                current_t.crl_tool_promotion_enabled,
+            )
+            .await;
             let raw_envelope_capture_media = sk::get_bool(
                 store.as_ref(),
                 sk::INGRESS_RAW_ENVELOPE_CAPTURE_MEDIA,
@@ -553,7 +691,6 @@ pub(crate) fn spawn_tunables_reloader(
             .await;
             let require_api_key =
                 sk::get_bool(store.as_ref(), sk::INGRESS_REQUIRE_API_KEY, true).await;
-            let current_t = state.tunables();
             let max_request_body_bytes = sk::get_u64(
                 store.as_ref(),
                 sk::INGRESS_MAX_BODY_BYTES,
@@ -641,6 +778,8 @@ pub(crate) fn spawn_tunables_reloader(
             drop(current_t);
             state.reload_tunables(RuntimeTunables {
                 routing_strategy,
+                capability_routing_mode,
+                crl_tool_promotion_enabled,
                 raw_envelope_capture_media,
                 require_api_key,
                 header_policy,
@@ -672,6 +811,8 @@ mod tests {
     ) -> AppState {
         let tunables = RuntimeTunables {
             routing_strategy: config.routing_strategy,
+            capability_routing_mode: config.capability_routing_mode,
+            crl_tool_promotion_enabled: config.crl_tool_promotion_enabled,
             raw_envelope_capture_media: config.raw_envelope_capture_media,
             require_api_key: config.require_api_key,
             header_policy: Arc::new(
@@ -711,6 +852,10 @@ mod tests {
                 Some(store),
                 build_http_client(config),
             )),
+            capabilities: Arc::new(arc_swap::ArcSwap::from_pointee(
+                capabilities::CapabilitySnapshot::default(),
+            )),
+            capability_feedback: None,
         }
     }
 
@@ -756,6 +901,39 @@ mod tests {
         reloader.abort();
 
         assert!(reloaded.is_ok(), "runtime timeout setting did not reload");
+    }
+
+    #[tokio::test]
+    async fn capability_background_handles_stop_without_detached_tasks() {
+        use tiygate_store::{db, settings_keys};
+        let pool = Arc::new(db::open_pool("sqlite::memory:").await.expect("pool"));
+        db::run_migrations(&pool).await.expect("migrations");
+        let store = Arc::new(tiygate_store::config_store::DbConfigStore::new(
+            (*pool).clone(),
+            None,
+        ));
+        store.refresh().await.expect("refresh");
+        store
+            .set_setting(settings_keys::CAPABILITY_PROBE_ENABLED, "false")
+            .await
+            .expect("disable probes");
+        let config = ServerConfig::default();
+        let state = test_state(store.clone(), &config);
+        let reloader = capabilities::spawn_reloader(store.clone(), state.capabilities.clone());
+        let worker = probe::spawn_worker(state).expect("probe worker");
+        let guard = capabilities::spawn_admission_guard(store);
+        let feedback = capabilities::spawn_feedback_worker(Arc::new(
+            tiygate_store::config_store::DbConfigStore::new((*pool).clone(), None),
+        ));
+        IngressBackgroundHandles {
+            capability_reloader: Some(reloader),
+            capability_admission_guard: Some(guard),
+            probe_worker: Some(worker),
+            capability_feedback: Some(feedback),
+            tunables_reloader: None,
+        }
+        .stop()
+        .await;
     }
 }
 
@@ -1234,7 +1412,18 @@ pub struct AppError {
     /// `error.code` in protocols that support it.
     upstream_error_code: Option<String>,
     /// Upstream RateLimit-* headers to passthrough on the error response.
-    rate_limit_headers: Vec<(&'static str, String)>,
+    rate_limit_headers: Arc<Vec<(&'static str, String)>>,
+    /// Small, already-redacted gateway diagnostic details.
+    details: Option<Box<serde_json::Value>>,
+    /// True when an upstream rejection is specific to the requested
+    /// capability and can safely transfer to the next target before any
+    /// client bytes are emitted.
+    target_capability_error: bool,
+    /// Number of downstream bytes already committed when an error is
+    /// returned to the fallback loop.  Errors produced before a response is
+    /// returned remain zero; streaming errors are finalized by the stream
+    /// driver and never re-enter this loop.
+    client_bytes_emitted: u64,
 }
 
 impl AppError {
@@ -1247,7 +1436,10 @@ impl AppError {
             retry_after_header: None,
             upstream_status: None,
             upstream_error_code: None,
-            rate_limit_headers: Vec::new(),
+            rate_limit_headers: Arc::new(Vec::new()),
+            details: None,
+            target_capability_error: false,
+            client_bytes_emitted: 0,
         }
     }
 
@@ -1256,6 +1448,38 @@ impl AppError {
     /// response body and the fallback classifier's retry/stop decision.
     pub(crate) fn with_class(mut self, class: tiygate_core::ErrorClass) -> Self {
         self.error_class = class;
+        self
+    }
+
+    /// Attach a bounded, redacted diagnostic object for protocol-native error
+    /// encoders. Callers must not put Target credentials or topology here.
+    pub(crate) fn with_details(mut self, details: serde_json::Value) -> Self {
+        const MAX_DETAILS_BYTES: usize = 16 * 1024;
+        let bounded = match serde_json::to_vec(&details) {
+            Ok(encoded) if encoded.len() <= MAX_DETAILS_BYTES => details,
+            _ => serde_json::json!({"code": "details_truncated"}),
+        };
+        self.details = Some(Box::new(bounded));
+        self
+    }
+
+    pub(crate) fn with_target_capability_error(mut self) -> Self {
+        self.target_capability_error = true;
+        self.error_class = tiygate_core::ErrorClass::LossyOrCapability;
+        self
+    }
+
+    pub(crate) fn is_target_capability_error(&self) -> bool {
+        self.target_capability_error
+    }
+
+    pub(crate) fn client_bytes_emitted(&self) -> u64 {
+        self.client_bytes_emitted
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_client_bytes_emitted(mut self, bytes: u64) -> Self {
+        self.client_bytes_emitted = bytes;
         self
     }
 
@@ -1282,6 +1506,25 @@ impl AppError {
         self.upstream_error_code.as_deref()
     }
 
+    fn public_message(&self) -> String {
+        if self.target_capability_error {
+            "upstream target does not support the requested capability".to_string()
+        } else if let Some(status) = self.upstream_status {
+            format!("upstream request failed (HTTP {status})")
+        } else {
+            const MAX_PUBLIC_ERROR_BYTES: usize = 1024;
+            if self.message.len() <= MAX_PUBLIC_ERROR_BYTES {
+                self.message.clone()
+            } else {
+                let mut end = MAX_PUBLIC_ERROR_BYTES;
+                while !self.message.is_char_boundary(end) {
+                    end = end.saturating_sub(1);
+                }
+                format!("{}…", &self.message[..end])
+            }
+        }
+    }
+
     /// Attach a Retry-After value (seconds).
     fn with_retry_after(mut self, seconds: u64) -> Self {
         self.retry_after_header = Some(seconds.to_string());
@@ -1304,25 +1547,30 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let public_message = self.public_message();
         // Generate protocol-native error body when the protocol suite
         // is known; otherwise fall back to a generic OpenAI-style body.
         let body = if let Some(suite) = self.protocol_suite {
-            tiygate_protocols::error_body::encode_error_body_for_suite(
+            tiygate_protocols::error_body::encode_error_body_for_suite_with_details(
                 suite,
-                &self.message,
+                &public_message,
                 self.error_class,
                 self.status.as_u16(),
                 self.upstream_error_code.as_deref(),
+                self.details.as_deref(),
             )
         } else {
             // Fallback: generic OpenAI-style error body.
             let mut err = serde_json::json!({
-                "message": self.message,
+                "message": public_message,
                 "type": "server_error",
                 "param": null,
             });
             if let Some(ref code) = self.upstream_error_code {
                 err["code"] = serde_json::json!(code);
+            }
+            if let Some(details) = self.details {
+                err["details"] = *details;
             }
             serde_json::json!({"error": err})
         };
@@ -1339,7 +1587,7 @@ impl IntoResponse for AppError {
         }
 
         // Passthrough upstream RateLimit-* headers (they appear on 429/503)
-        for (name, value) in &self.rate_limit_headers {
+        for (name, value) in self.rate_limit_headers.iter() {
             if let Ok(hv) = http::HeaderValue::from_str(value) {
                 if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
                     response.headers_mut().insert(hn, hv);

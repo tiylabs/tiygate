@@ -20,6 +20,7 @@ import {
 import { isTauri } from "@/auth/setup";
 import type {
   ConfigExport,
+  ExportCapabilityOverride,
   ExportSetting,
   ExportTokenDailyStat,
   ImportReport,
@@ -39,7 +40,13 @@ import {
 } from "@/components/ui";
 import { PageHeader } from "@/components/PageHeader";
 
-type ScopeKey = "providers" | "routes" | "api_keys" | "settings" | "token_stats";
+type ScopeKey =
+  | "providers"
+  | "routes"
+  | "api_keys"
+  | "settings"
+  | "token_stats"
+  | "capability_overrides";
 
 const ALL_SCOPES: ScopeKey[] = [
   "providers",
@@ -47,6 +54,7 @@ const ALL_SCOPES: ScopeKey[] = [
   "api_keys",
   "settings",
   "token_stats",
+  "capability_overrides",
 ];
 
 /** A single item shown in the restore preview list. */
@@ -74,6 +82,7 @@ export default function ConfigManagement() {
     api_keys: true,
     settings: true,
     token_stats: true,
+    capability_overrides: false,
   });
 
   const exportMutation = useMutation({
@@ -88,6 +97,9 @@ export default function ConfigManagement() {
         settings: exportScope.settings ? (bundle.settings ?? []) : [],
         token_daily_stats: exportScope.token_stats
           ? (bundle.token_daily_stats ?? [])
+          : [],
+        capability_overrides: exportScope.capability_overrides
+          ? (bundle.capability_overrides ?? [])
           : [],
       };
       const json = JSON.stringify(filtered, null, 2);
@@ -144,7 +156,7 @@ export default function ConfigManagement() {
       const [providers, routesResp, apiKeys, settingsResp, tokenActivity] =
         await Promise.all([
           providersApi.list(),
-          routesApi.list({ limit: 500 }),
+          routesApi.listAll(),
           apiKeysApi.list(),
           settingsApi.list(),
           statsApi.tokenActivity(730),
@@ -228,6 +240,16 @@ export default function ConfigManagement() {
         ),
         existing?.tokenStatsDays,
       ),
+      capability_overrides: buildItems(
+        (parsedBackup.capability_overrides ?? []).map(
+          (override: ExportCapabilityOverride) => ({
+            id: `${override.selector.route_id}#${override.selector.target_index}#${override.capability_id}`,
+            label: override.capability_id,
+            sub: `${override.selector.route_id} · ${override.selector.provider_id}/${override.selector.model_id}`,
+          }),
+        ),
+        undefined,
+      ),
     };
   }, [parsedBackup, existingQuery.data, t]);
 
@@ -247,6 +269,11 @@ export default function ConfigManagement() {
         // than overwrites.
         if (scope === "token_stats") {
           next[`${scope}:${item.id}`] = true;
+        } else if (scope === "capability_overrides") {
+          // An override may replace a local operator decision. Require an
+          // explicit checkbox selection because the preview query does not
+          // eagerly enumerate every target's override set.
+          next[`${scope}:${item.id}`] = false;
         } else {
           next[`${scope}:${item.id}`] = !item.exists;
         }
@@ -308,6 +335,9 @@ export default function ConfigManagement() {
         if (!Array.isArray(parsed.token_daily_stats)) {
           parsed.token_daily_stats = [];
         }
+        if (!Array.isArray(parsed.capability_overrides)) {
+          parsed.capability_overrides = [];
+        }
         setParsedBackup(parsed);
       } catch {
         setParseError(t("backup.invalidFormat"));
@@ -329,6 +359,7 @@ export default function ConfigManagement() {
         api_keys: [],
         settings: [],
         token_stats: [],
+        capability_overrides: [],
       };
     }
     const sel: ImportSelection = {
@@ -337,6 +368,7 @@ export default function ConfigManagement() {
       api_keys: [],
       settings: [],
       token_stats: [],
+      capability_overrides: [],
     };
     for (const scope of ALL_SCOPES) {
       for (const item of preview[scope]) {
@@ -542,6 +574,7 @@ export default function ConfigManagement() {
                   apiKeys: parsedBackup.api_keys.length,
                   settings: parsedBackup.settings?.length ?? 0,
                   tokenStats: parsedBackup.token_daily_stats?.length ?? 0,
+                  capabilityOverrides: parsedBackup.capability_overrides?.length ?? 0,
                   encrypted: parsedBackup.encrypted
                     ? t("common.yes")
                     : t("common.no"),
@@ -604,6 +637,11 @@ export default function ConfigManagement() {
                   "token_stats",
                   t("backup.scope.token_stats"),
                   preview.token_stats,
+                )}
+                {renderPreviewGroup(
+                  "capability_overrides",
+                  t("backup.scope.capability_overrides"),
+                  preview.capability_overrides,
                 )}
               </div>
             )}
@@ -674,6 +712,12 @@ export default function ConfigManagement() {
                     {t("backup.tokenStatsResult", {
                       imported: restoreResult.token_stats_imported,
                       skipped: restoreResult.token_stats_skipped,
+                    })}
+                  </li>
+                  <li>
+                    {t("backup.capabilityOverridesResult", {
+                      imported: restoreResult.capability_overrides_imported,
+                      skipped: restoreResult.capability_overrides_skipped,
                     })}
                   </li>
                 </ul>
