@@ -10,7 +10,7 @@
 //!   stashed in `AdminState::oauth_pending` so the callback can
 //!   validate the round-trip.
 //!
-//! * `GET /admin/v1/oauth/callback` — receive the provider's
+//! * `POST /admin/v1/oauth/callback` — receive the provider's
 //!   redirect (with `code` + `state` query params), look up the
 //!   pending flow, exchange the code for tokens via the
 //!   provider-specific token endpoint (form or JSON body), persist
@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use tiygate_auth::provider_oauth::{
@@ -47,6 +48,8 @@ use tiygate_store::config_store::validate_provider_auth_mode;
 use tiygate_store::models::{AuthMode, OAuthCredentialStatus};
 
 use crate::state::{AdminState, OAuthPendingFlow};
+
+const OAUTH_PENDING_FLOW_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub fn router() -> Router<AdminState> {
     Router::new()
@@ -107,12 +110,17 @@ async fn start_oauth(
     // Build the authorization URL.
     let url = build_authorize_url(&preset, &csrf_state, &challenge);
 
-    // Stash the pending flow (provider_id + PKCE verifier).
-    state.oauth_pending.lock().await.insert(
+    // Stash the pending flow (provider_id + PKCE verifier). Prune abandoned
+    // flows while holding the same lock so a browser that is closed midway
+    // cannot grow this in-memory secret store without bound.
+    let mut pending_flows = state.oauth_pending.lock().await;
+    pending_flows.retain(|_, flow| flow.created_at.elapsed() <= OAUTH_PENDING_FLOW_TTL);
+    pending_flows.insert(
         csrf_state.clone(),
         OAuthPendingFlow {
             provider_id: req.provider_id.clone(),
             verifier,
+            created_at: Instant::now(),
         },
     );
 
@@ -137,13 +145,13 @@ struct StartOauthResponse {
 /// the user manually pastes the authorization code from the
 /// provider's redirect URL.
 ///
-/// The provider redirects the user's browser to the `redirect_url`
-/// registered in the preset (e.g.
-/// `http://localhost:1455/auth/callback?code=…&state=…`). Because
-/// TiyGate does not serve that callback URL, the page will 404 —
-/// the user copies the `code` (and `state`) query parameters from
-/// the address bar and pastes them into the Admin Console, which
-/// then calls this endpoint via the normal admin-API auth path.
+/// The provider redirects the user's browser to the provider-owned
+/// callback URL registered for the Claude Code subscription client
+/// (for example `https://platform.claude.com/oauth/code/callback`).
+/// TiyGate does not own that callback, so the user copies the `code`
+/// and `state` query parameters from the address bar and pastes them
+/// into the Admin Console, which then calls this endpoint through the
+/// normal Admin API auth path.
 async fn callback_oauth(
     State(state): State<AdminState>,
     Json(req): Json<OauthCallbackRequest>,
@@ -181,6 +189,12 @@ async fn callback_oauth_inner(
         StatusCode::BAD_REQUEST,
         "invalid or expired `state`".to_string(),
     ))?;
+    if pending.created_at.elapsed() > OAUTH_PENDING_FLOW_TTL {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid or expired `state`".to_string(),
+        ));
+    }
 
     // Look up the provider and its OAuth preset.
     let provider = state

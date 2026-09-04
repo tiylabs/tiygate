@@ -126,12 +126,11 @@ fn egress_http_client(state: &AppState, anthropic_oauth_profile: bool) -> reqwes
 }
 
 fn apply_anthropic_oauth_egress_headers(
-    target: &tiygate_core::RoutingTarget,
     upstream_headers: &mut http::HeaderMap,
     is_stream: bool,
     request_id: &str,
 ) -> Result<(), AppError> {
-    crate::anthropic_oauth::apply_headers(target, upstream_headers, is_stream, request_id).map_err(
+    crate::anthropic_oauth::apply_headers(upstream_headers, is_stream, request_id).map_err(
         |error| {
             AppError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -591,7 +590,7 @@ pub(super) async fn execute_upstream(
         );
     }
     if anthropic_oauth_profile {
-        apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
+        apply_anthropic_oauth_egress_headers(&mut upstream_headers, is_stream, request_id)?;
     }
 
     // Capture the egress request (headers + body) for the request-log
@@ -1183,7 +1182,7 @@ pub(super) async fn execute_messages_upstream(
         );
     }
     if anthropic_oauth_profile {
-        apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
+        apply_anthropic_oauth_egress_headers(&mut upstream_headers, is_stream, request_id)?;
     }
 
     // Capture egress request (headers + body) for the detail view.
@@ -2012,7 +2011,7 @@ pub(super) async fn execute_responses_upstream(
         );
     }
     if anthropic_oauth_profile {
-        apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
+        apply_anthropic_oauth_egress_headers(&mut upstream_headers, is_stream, request_id)?;
     }
 
     let mut egress_body_capture = if pass_through_verbatim {
@@ -2844,7 +2843,7 @@ pub(super) async fn execute_gemini_upstream(
         );
     }
     if anthropic_oauth_profile {
-        apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
+        apply_anthropic_oauth_egress_headers(&mut upstream_headers, is_stream, request_id)?;
     }
 
     let mut egress_body_capture = if pass_through_verbatim {

@@ -31,18 +31,27 @@
 |------|:---:|:---:|:---:|:---:|:---:|
 | `multimodal` | ✅ | ✅ | ✅ | ✅ | N/A |
 | inline base64 | ✅（image） | ✅（image, document） | ✅ | ✅（image, audio, video, pdf） | N/A |
-| URL 引用 | ✅ | ⚠️ → 需要先下载转 inline | ✅ | ✅ | N/A |
-| file_id 引用 | ❌ | ❌ | ✅ | ❌ | N/A |
+| URL 引用 | ✅ | ✅（image/document） | ✅ | ✅ | N/A |
+| file_id 引用 | ❌ | ✅¹（仅原生 Anthropic workspace 文件的 PassThrough） | ✅ | ❌ | N/A |
 | audio inline | ❌ | ❌ | ✅ | ✅ | N/A |
 | video inline | ❌ | ❌ | ❌ | ✅ | N/A |
 | `image_url.detail` | ✅ | ❌（lossy：字段丢弃） | ✅ | ❌（lossy：字段丢弃） | N/A |
 
+Anthropic Messages 的媒体编码按官方 source/MIME 组合校验：图片仅允许
+`image/jpeg`、`image/png`、`image/gif`、`image/webp`，文档允许
+`application/pdf` 和 `text/plain`；audio、video、`application/octet-stream`
+及其它 MIME 在转换到 Messages 时明确拒绝。
+
 **有损组合（阶段 1-3 已知）**：
-- URL 承载 → `messages`（Anthropic 需要 inline base64，无法传递 URL）→ **拒绝**
+- 跨 provider 的 `file_id` → `messages` → **拒绝**（文件 ID 绑定上游 workspace；原生 Anthropic Messages 的文件 ID 可透传）
 - inline audio → `chat_completions`/`messages` → **拒绝**
 - inline video → 任何非 Gemini → **拒绝**
-- file_id → 非 `responses` → **拒绝**
+- file_id → 非 `responses`/原生 `messages` → **拒绝**
 - `image_url.detail` → `messages`/`gemini` → **有损**（该字段在 IR `Content::Media.metadata` 中保留，但 messages/gemini 编解码器不读取，静默丢弃）
+
+> ¹ Anthropic Files API 的 `file_id` 绑定 workspace；TiyGate 仅在原生
+> Messages PassThrough 中保留它，跨协议转换一律拒绝，避免把其他上游的
+> file ID 发到错误 workspace。
 
 ## 3. Reasoning / 结构化输出
 
@@ -103,6 +112,10 @@
 
 **跨协议策略**：普通 thinking 配置跨协议时映射或丢弃，不拒绝（thinking 配置不影响语义正确性，只影响模型行为质量）。`mode` / `context` 是 Responses-only 的持久化推理控制；向其他协议转换会以 `LossyDimension::ExtendedReasoning` 明确拒绝，避免静默改变请求行为。
 
+Anthropic `redacted_thinking.data` 与 OpenAI Responses
+`reasoning.encrypted_content` 均为 provider-specific opaque payload，只能回放到
+签发它的协议；跨两者转换会明确拒绝。
+
 **effort 级别映射**：IR 使用 7 级枚举（None/Minimal/Low/Medium/High/XHigh/Max）。各协议支持级别不同：
 - OpenAI Chat/Responses: none/minimal/low/medium/high/xhigh/**max**；server 按真实 upstream model 判定，仅 GPT-5.6 系列保留 max，旧模型降为 xhigh。
 - Anthropic: low/medium/high/xhigh/max；None 不下发 thinking，Minimal → low。
@@ -118,7 +131,7 @@
 |------|:---:|:---:|:---:|:---:|:---:|
 | function tools | ✅ | ✅ | ✅ | ✅ | N/A |
 | custom tools (`type: "custom"`) | ✅ | ❌ 跨协议拒绝 (`CustomTools`) | ✅ | ❌ 跨协议拒绝 (`CustomTools`) | N/A |
-| hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅（`Tool.tool_type` + `config` 往返） | ❌ 跨协议拒绝 | N/A |
+| hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅（仅 Responses→Responses；`Tool.tool_type` + `config` 往返） | ❌ 跨协议拒绝 | N/A |
 | Programmatic Tool Calling (`programmatic_tool_calling` / `allowed_callers` / `program` / `caller` / `program_output`) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ 稳定版有序往返 | ❌ 跨协议拒绝 | N/A |
 
 **跨协议策略**：Responses 保留 hosted/function tool 的完整配置，并建模 PTC 的 program、caller 与 program_output 关系。目标协议不能表达 hosted tool 或 PTC 时由 lossy guard 明确拒绝，不再静默过滤。Hosted tool 的 provider-specific 输出 item（`web_search_call` / `file_search_call` / `code_interpreter_call` / `computer_call` 等）在同协议 Convert/re-encode 路径通过有序 `extensions["responses_opaque_output_items"]` 保活；跨协议仍丢弃（客户端不会消费这些 wire item）。raw PassThrough 路径始终字节级无损。
@@ -130,8 +143,11 @@
 | `prompt_cache_key` | ✅（`openai_extra` 透传） | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
 | `prompt_cache_retention` | ✅（`openai_extra` 透传） | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
 | `prompt_cache_options` | ✅（Chat ↔ Responses 重放） | N/A | ✅（Chat ↔ Responses 重放） | N/A | N/A |
-| per-item `prompt_cache_breakpoint` | ✅（有序 content block） | ❌ 跨协议拒绝 | ✅（有序 input content block） | ❌ 跨协议拒绝 | N/A |
+| per-item `prompt_cache_breakpoint` | ✅（有序 content block） | ✅（`cache_control`，含 `ttl`） | ✅（有序 input content block） | ❌ 跨协议拒绝 | N/A |
 | `cache_write_tokens` usage | ✅（non-stream/stream） | ✅（`cache_creation_input_tokens`） | ✅（non-stream/stream） | N/A | N/A |
+
+Anthropic `cache_control` 的 `ttl`（`5m` / `1h`）在 canonical breakpoint 中保留，
+重新编码到 Messages 时原样恢复；未指定 TTL 时使用 Anthropic 默认值。
 
 **跨协议策略**：Chat 与 Responses 通过 canonical content block 保持显式 breakpoint 的精确位置，顶层 options 使用统一 OpenAI extension 重放；目标协议无等价 carrier 时明确拒绝。
 

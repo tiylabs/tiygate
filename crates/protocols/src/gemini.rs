@@ -381,6 +381,7 @@ impl EndpointCodec for GeminiCodec {
                                     signature: None,
                                     id: None,
                                     encrypted_content: None,
+                                    encrypted_content_source: None,
                                 });
                             }
                         } else if let Some(text) = part["text"].as_str() {
@@ -1031,6 +1032,7 @@ impl EndpointCodec for GeminiCodec {
                                         signature: None,
                                         id: None,
                                         encrypted_content: None,
+                                        encrypted_content_source: None,
                                     });
                                 }
                             } else if let Some(text) = part["text"].as_str() {
@@ -1045,6 +1047,7 @@ impl EndpointCodec for GeminiCodec {
                                     signature: None,
                                     id: None,
                                     encrypted_content: None,
+                                    encrypted_content_source: None,
                                 });
                             } else if let Some(t) = part["thought"]["text"].as_str() {
                                 content.push(Content::Reasoning {
@@ -1052,6 +1055,7 @@ impl EndpointCodec for GeminiCodec {
                                     signature: None,
                                     id: None,
                                     encrypted_content: None,
+                                    encrypted_content_source: None,
                                 });
                             } else if let Some(fc) = part.get("functionCall") {
                                 let name = fc["name"].as_str().unwrap_or("").to_string();
@@ -1426,6 +1430,7 @@ impl StreamDecoder for GeminiStreamDecoder {
                                     text: text.to_string(),
                                     id: None,
                                     encrypted_content: None,
+                                    encrypted_content_source: None,
                                 });
                             }
                         } else {
@@ -1442,6 +1447,7 @@ impl StreamDecoder for GeminiStreamDecoder {
                                     text: t.to_string(),
                                     id: None,
                                     encrypted_content: None,
+                                    encrypted_content_source: None,
                                 });
                             }
                         }
@@ -1653,6 +1659,7 @@ mod tests {
                 text: "think".to_string(),
                 id: None,
                 encrypted_content: None,
+                encrypted_content_source: None,
             },
             StreamPart::ToolCallDelta {
                 id: "t1".to_string(),
@@ -1795,6 +1802,7 @@ mod tests {
                     signature: None,
                     id: None,
                     encrypted_content: None,
+                    encrypted_content_source: None,
                 },
                 Content::Text {
                     text: "answer".to_string(),

@@ -23,7 +23,7 @@
 //! Per §3.2 the gateway deliberately does **not** ship a per-route `allow_lossy`
 //! escape hatch: a lossy combination is rejected outright, full stop.
 
-use crate::ir::{Content, IrRequest, MediaSource, ResponseFormat};
+use crate::ir::{Content, EncryptedReasoningSource, IrRequest, MediaSource, ResponseFormat};
 use crate::protocol::structured_output::validate_response_format_for_target;
 use crate::protocol::{EndpointCapabilities, Error, ProtocolEndpoint};
 
@@ -42,7 +42,7 @@ pub enum LossyDimension {
     /// protocol can only express it as `auto`/`any`/`required`.
     ToolChoiceSpecific,
     /// Request contains a media part whose `MediaSource` kind is not expressible
-    /// on the egress protocol (e.g. URL → Anthropic, file_id → non-Responses).
+    /// on the egress protocol (e.g. provider-scoped file_id crossings).
     MediaSourceUnsupported,
     /// Request has `response_format` constraints but the egress protocol does
     /// not support structured output.
@@ -172,8 +172,21 @@ pub fn check_lossy_conversion(
     // kind is not expressible on the egress protocol.
     for msg in &request.messages {
         for content in &msg.content {
-            if let Content::Media { source, .. } = content {
-                if let Some(dim) = media_source_dimension(source, egress, egress_caps) {
+            if let Content::Media {
+                source,
+                mime_type,
+                metadata,
+                ..
+            } = content
+            {
+                if let Some(dim) = media_source_dimension(
+                    source,
+                    mime_type,
+                    metadata,
+                    request.ingress_protocol.suite,
+                    egress,
+                    egress_caps,
+                ) {
                     let hint = format!("media part with kind {:?}", media_kind(source));
                     return Err((dim, lossy_error(dim, egress, &hint)));
                 }
@@ -214,7 +227,12 @@ pub fn check_lossy_conversion(
         crate::protocol::ProtocolSuite::OpenAiCompatible
             | crate::protocol::ProtocolSuite::OpenAiResponses
     );
-    if request.tools.iter().any(|tool| tool.is_hosted()) && !egress_caps.hosted_tools {
+    let hosted_tools_are_portable = request.ingress_protocol.suite
+        == crate::protocol::ProtocolSuite::OpenAiResponses
+        && egress.suite == crate::protocol::ProtocolSuite::OpenAiResponses;
+    if request.tools.iter().any(|tool| tool.is_hosted())
+        && (!egress_caps.hosted_tools || !hosted_tools_are_portable)
+    {
         return Err((
             LossyDimension::HostedTools,
             lossy_error(
@@ -224,7 +242,12 @@ pub fn check_lossy_conversion(
             ),
         ));
     }
-    if request.tools.iter().any(|tool| tool.is_custom()) && !openai_egress {
+    let custom_tools_are_portable = matches!(
+        request.ingress_protocol.suite,
+        crate::protocol::ProtocolSuite::OpenAiCompatible
+            | crate::protocol::ProtocolSuite::OpenAiResponses
+    ) && openai_egress;
+    if request.tools.iter().any(|tool| tool.is_custom()) && !custom_tools_are_portable {
         return Err((
             LossyDimension::CustomTools,
             lossy_error(
@@ -300,7 +323,10 @@ pub fn check_lossy_conversion(
                 }
             )
         });
-    if has_breakpoint && !openai_egress {
+    if has_breakpoint
+        && !openai_egress
+        && egress.suite != crate::protocol::ProtocolSuite::AnthropicMessages
+    {
         return Err((
             LossyDimension::PromptCacheBreakpoint,
             lossy_error(
@@ -318,6 +344,43 @@ pub fn check_lossy_conversion(
         .iter()
         .flat_map(|m| m.content.iter())
         .any(|c| matches!(c, Content::Reasoning { .. }));
+    let has_incompatible_encrypted_reasoning = request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .any(|content| {
+            let Content::Reasoning {
+                encrypted_content: Some(_),
+                encrypted_content_source,
+                ..
+            } = content
+            else {
+                return false;
+            };
+            let source = (*encrypted_content_source).or(match request.ingress_protocol.suite {
+                crate::protocol::ProtocolSuite::AnthropicMessages => {
+                    Some(EncryptedReasoningSource::AnthropicRedactedThinking)
+                }
+                crate::protocol::ProtocolSuite::OpenAiResponses => {
+                    Some(EncryptedReasoningSource::OpenAiResponses)
+                }
+                _ => None,
+            });
+            (source == Some(EncryptedReasoningSource::OpenAiResponses)
+                && egress.suite == crate::protocol::ProtocolSuite::AnthropicMessages)
+                || (source == Some(EncryptedReasoningSource::AnthropicRedactedThinking)
+                    && egress.suite == crate::protocol::ProtocolSuite::OpenAiResponses)
+        });
+    if has_incompatible_encrypted_reasoning {
+        return Err((
+            LossyDimension::ExtendedReasoning,
+            lossy_error(
+                LossyDimension::ExtendedReasoning,
+                egress,
+                "provider-specific encrypted reasoning payload",
+            ),
+        ));
+    }
     if has_reasoning && !egress_caps.extended_reasoning {
         return Err((
             LossyDimension::ExtendedReasoning,
@@ -389,11 +452,16 @@ pub fn check_lossy_conversion(
 ///
 /// We follow `protocol-capability-matrix.md` §2:
 /// - `chat_completions`: inline image only; URL is fine; no audio/video; no file_id.
-/// - `messages` (Anthropic): inline image/document; URL is lossy; no audio/video/file_id.
+/// - `messages` (Anthropic): inline/URL/file media for its image/document
+///   sources; provider-scoped file IDs are preserved by native PassThrough,
+///   but cannot cross a conversion boundary.
 /// - `responses`: inline image/audio; URL; file_id; no video.
 /// - `gemini`: inline image/audio/video/pdf; URL; no file_id.
 fn media_source_dimension(
     source: &MediaSource,
+    mime_type: &str,
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+    ingress_suite: crate::protocol::ProtocolSuite,
     egress: &ProtocolEndpoint,
     caps: &EndpointCapabilities,
 ) -> Option<LossyDimension> {
@@ -401,17 +469,66 @@ fn media_source_dimension(
         // Egress protocol cannot carry media at all — every media part is lossy.
         return Some(LossyDimension::MediaSourceUnsupported);
     }
+    if egress.suite == crate::protocol::ProtocolSuite::AnthropicMessages
+        && !anthropic_media_supported(source, mime_type, metadata)
+    {
+        return Some(LossyDimension::MediaSourceUnsupported);
+    }
     match (source, egress.suite) {
         (MediaSource::Inline { .. }, _) => None, // always expressible when caps.multimodal
-        (MediaSource::Url { .. }, crate::protocol::ProtocolSuite::AnthropicMessages) => {
-            // Anthropic requires pre-downloaded inline base64; URL would be silently dropped.
+        // The current Messages API accepts URL sources for both image and
+        // document blocks. The codec chooses the block type from mime_type.
+        (MediaSource::Url { .. }, crate::protocol::ProtocolSuite::AnthropicMessages) => None,
+        (MediaSource::Url { .. }, _) => None,
+        (MediaSource::FileId { .. }, suite) if suite == ingress_suite => {
+            if matches!(
+                suite,
+                crate::protocol::ProtocolSuite::AnthropicMessages
+                    | crate::protocol::ProtocolSuite::OpenAiResponses
+            ) {
+                None
+            } else {
+                Some(LossyDimension::MediaSourceUnsupported)
+            }
+        }
+        (MediaSource::FileId { .. }, _) => {
+            // File IDs are scoped to the provider workspace. The native
+            // Anthropic Messages pass-through path can preserve them, but a
+            // conversion path cannot prove that the destination workspace
+            // owns the source ID.
             Some(LossyDimension::MediaSourceUnsupported)
         }
-        (MediaSource::Url { .. }, _) => None,
-        (MediaSource::FileId { .. }, crate::protocol::ProtocolSuite::OpenAiResponses) => None,
-        (MediaSource::FileId { .. }, _) => {
-            // file_id is a Responses-only construct; other suites have no equivalent.
-            Some(LossyDimension::MediaSourceUnsupported)
+    }
+}
+
+fn anthropic_media_supported(
+    source: &MediaSource,
+    mime_type: &str,
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> bool {
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+    let image = matches!(
+        mime_type.as_str(),
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    );
+    match source {
+        MediaSource::Inline { .. } => {
+            image
+                || mime_type == "application/pdf"
+                || (mime_type == "text/plain"
+                    && metadata
+                        .get("anthropic_source_type")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("text"))
+        }
+        MediaSource::Url { .. } => {
+            image || mime_type == "image/*" || mime_type == "application/pdf"
+        }
+        MediaSource::FileId { .. } => {
+            image
+                || mime_type == "image/*"
+                || mime_type == "application/pdf"
+                || mime_type == "text/plain"
         }
     }
 }

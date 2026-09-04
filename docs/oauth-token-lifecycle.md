@@ -46,6 +46,36 @@ all protocols. Before refreshing, TiyGate checks whether the local cache or
 shared database already contains an access token different from the rejected
 one. The original upstream request is retried once with the resulting token.
 
+## Anthropic OAuth scope
+
+The built-in Anthropic provider is the Claude Code subscription OAuth
+compatibility flow. Its current browser authorization and token exchange
+surfaces are `https://claude.com/cai/oauth/authorize` and
+`https://platform.claude.com/v1/oauth/token`, with the callback completed at
+`https://platform.claude.com/oauth/code/callback`. These are the current
+Claude Code client surfaces used by the reference implementation; Anthropic
+does not publish them as the public Claude API OAuth contract.
+
+The [public Claude API authentication
+standard](https://platform.claude.com/docs/en/manage-claude/authentication)
+documents API keys, Workload Identity Federation, and App Attest. In
+particular, [public WIF](https://platform.claude.com/docs/en/manage-claude/wif-reference)
+uses `POST /v1/oauth/token` with an RFC 7523 JWT-bearer grant and an IdP
+assertion, which is a different flow from the subscription authorization-code
+flow above. The [Claude Code authentication
+guide](https://code.claude.com/docs/en/authentication) documents subscription
+OAuth and `claude setup-token`, but not the private exchange wire contract.
+TiyGate must not describe the subscription flow as generic or officially
+supported API OAuth. Deployments that require the public API contract should
+use an API key or implement WIF with an organization/service-account
+configuration; that WIF flow is not implicitly enabled by the built-in
+provider preset.
+
+The subscription token endpoint receives the requested scope during browser
+authorization. TiyGate therefore omits `scope` from the JSON authorization-code
+and refresh grants, preserving the current client behavior and avoiding a
+second, potentially broader scope declaration.
+
 ## Provider egress profiles
 
 OAuth providers use their built-in authorization and API endpoints. Provider
@@ -68,10 +98,11 @@ The provider vendor selects an immutable `OAuthEgressProfile`:
   transport, rejects tool names over Codex's 64-byte limit with a capability
   error, and does not impersonate a browser TLS fingerprint.
 - Anthropic OAuth uses `anthropic_oauth` only for Anthropic Messages egress.
-  The profile owns OAuth beta and client headers, summarized-thinking defaults,
-  re-signing of an existing billing header, and a dedicated verified-Rustls
-  HTTP/2 pool. It does not synthesize prompts, rewrite tools, or impersonate a
-  browser TLS fingerprint.
+  The profile is a compatibility boundary for the subscription token, not a
+  public API standard. It owns the currently required OAuth beta/client
+  headers, summarized-thinking defaults, re-signing of an existing billing
+  header, and a dedicated verified-Rustls HTTP/2 pool. It does not synthesize
+  prompts, rewrite tools, or impersonate a browser TLS fingerprint.
 - Other OAuth providers use `standard` egress behavior.
 
 OAuth egress profiles never apply to API-key credentials or unrelated egress
