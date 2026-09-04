@@ -205,6 +205,8 @@ pub enum CapabilityMutationIdempotency {
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilityProfileSummary {
     pub target_key: TargetKey,
+    pub provider_id: String,
+    pub model_id: String,
     pub profile_status: ProfileStatus,
     pub dialect_id: String,
     pub supported: usize,
@@ -236,6 +238,8 @@ impl From<&TargetCapabilityProfile> for CapabilityProfileSummary {
         };
         let mut summary = Self {
             target_key: profile.target_key.clone(),
+            provider_id: profile.provider_id.clone(),
+            model_id: profile.model_id.clone(),
             profile_status,
             dialect_id: profile.dialect_id.clone(),
             supported: 0,
@@ -1139,6 +1143,41 @@ impl DbConfigStore {
         .fetch_optional(self.pool.any())
         .await?;
         row.map(parse_job).transpose()
+    }
+
+    /// Return a bounded history of probe jobs for one target. Jobs are kept
+    /// even after completion so operators can correlate retries and probe
+    /// runs with the profile version they produced.
+    pub async fn list_probe_jobs_for_target(
+        &self,
+        target_key: &TargetKey,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ProbeJob>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, target_key, probe_set_json, probe_set_hash, status, priority, attempt_count,
+             max_attempts, next_probe_index, next_attempt_at, lease_owner, lease_until, last_error_class,
+             last_error_redacted, created_at, updated_at FROM target_probe_jobs
+             WHERE target_key = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(target_key.as_str())
+        .bind(i64::from(limit.clamp(1, 500)))
+        .bind(i64::from(offset))
+        .fetch_all(self.pool.any())
+        .await?;
+        rows.into_iter().map(parse_job).collect()
+    }
+
+    pub async fn count_probe_jobs_for_target(
+        &self,
+        target_key: &TargetKey,
+    ) -> Result<u64, StoreError> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM target_probe_jobs WHERE target_key = $1")
+                .bind(target_key.as_str())
+                .fetch_one(self.pool.any())
+                .await?;
+        Ok(count.max(0) as u64)
     }
 
     async fn get_probe_job_by_target_and_hash(
@@ -2634,6 +2673,8 @@ mod tests {
         );
         profile.resolved_capabilities = ResolvedTargetCapabilities { capabilities };
         let summary = CapabilityProfileSummary::from(&profile);
+        assert_eq!(summary.provider_id, "p");
+        assert_eq!(summary.model_id, "m");
         assert_eq!(summary.supported, 1);
         assert_eq!(summary.unknown, 0);
     }

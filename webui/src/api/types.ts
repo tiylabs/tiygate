@@ -162,6 +162,8 @@ export interface RouteTarget {
   provider_id: string;
   model_id: string;
   egress_dialect_id?: string | null;
+  /** Resolved target-side protocol, e.g. openai-responses/responses/v1. */
+  egress_protocol?: string | null;
   // Backend persists only `weight`. The `priority` strategy reuses this same
   // value (sorted descending), so the UI just relabels the column per strategy.
   //
@@ -219,6 +221,8 @@ export type CapabilityProfileStatus =
 
 export interface CapabilityProfileSummary {
   target_key: string;
+  provider_id: string;
+  model_id: string;
   profile_status: CapabilityProfileStatus;
   dialect_id: string;
   supported: number;
@@ -378,6 +382,7 @@ export interface ProbeJob {
 
 export interface CapabilityProbeRun {
   run_id: string;
+  job_id?: string | null;
   target: string;
   probe_id: string;
   outcome: string;
@@ -385,6 +390,57 @@ export interface CapabilityProbeRun {
   budget_weight: number;
   error_class?: string | null;
   ts: string;
+}
+
+export interface CapabilityProbeExchange {
+  request_path: string;
+  request_headers?: Record<string, string>;
+  request_body: unknown;
+  response_status?: number | null;
+  response_content_type?: string | null;
+  response_body?: string | null;
+  error?: string | null;
+}
+
+export interface CapabilityProbeJudgment {
+  classification: string;
+  capability_id?: string | null;
+  state?: CapabilityState | null;
+  value?: unknown;
+  source?: string | null;
+  reason_code?: string | null;
+  reason?: string | null;
+  error_class?: string | null;
+  detail?: string | null;
+}
+
+export interface CapabilityProbeDetails {
+  schema_version: number;
+  exchanges: CapabilityProbeExchange[];
+  judgment: CapabilityProbeJudgment;
+  truncated?: boolean;
+}
+
+export interface CapabilityProbeRunDetail extends CapabilityProbeRun {
+  details?: CapabilityProbeDetails | null;
+}
+
+export interface CapabilityProbeJobListResponse {
+  total: number;
+  limit: number;
+  offset: number;
+  next_cursor?: string | null;
+  items?: ProbeJob[];
+  entries: ProbeJob[];
+}
+
+export interface CapabilityProbeRunListResponse {
+  total: number;
+  limit: number;
+  offset: number;
+  next_cursor?: string | null;
+  items?: CapabilityProbeRun[];
+  entries: CapabilityProbeRun[];
 }
 
 export interface CapabilityListResponse {

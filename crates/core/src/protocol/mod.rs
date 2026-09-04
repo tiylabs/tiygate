@@ -107,9 +107,7 @@ impl ProtocolEndpoint {
 
     /// The canonical string form: `suite/name/version`.
     pub fn canonical(&self) -> String {
-        format!("{:?}/{}", self.suite, self.name)
-            .to_lowercase()
-            .replace('_', "-")
+        format!("{}/{}", self.suite.label(), self.name)
     }
 
     /// The full identifier with version.

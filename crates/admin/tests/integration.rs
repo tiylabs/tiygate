@@ -188,7 +188,45 @@ async fn target_capability_routes_create_profile_and_probe_job() {
         .as_str()
         .expect("target key")
         .to_string();
+    assert_eq!(value["entries"][0]["provider_id"], "capability-provider");
+    assert_eq!(value["entries"][0]["model_id"], "gpt-4o");
     assert_eq!(value["entries"][0]["profile_status"], "pending");
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/admin/v1/target-capabilities/{target_key}/probe-jobs?limit=10"),
+            json!({}),
+        ))
+        .await
+        .expect("probe job list response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let jobs = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("probe job list body");
+    let jobs: serde_json::Value = serde_json::from_slice(&jobs).expect("probe job list json");
+    assert_eq!(jobs["total"], 1);
+    let job_id = jobs["entries"][0]["id"].as_str().expect("probe job id");
+
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!(
+                "/admin/v1/target-capabilities/{target_key}/probe-jobs/{job_id}/runs?limit=10"
+            ),
+            json!({}),
+        ))
+        .await
+        .expect("probe job runs response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let job_runs = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("probe job runs body");
+    let job_runs: serde_json::Value =
+        serde_json::from_slice(&job_runs).expect("probe job runs json");
+    assert_eq!(job_runs["total"], 0);
 
     let response = router
         .clone()
@@ -747,9 +785,37 @@ async fn route_view_does_not_echo_target_credentials_or_url_overrides() {
     assert!(target.get("api_base_override").is_none());
     assert_eq!(target["api_key_override_configured"], true);
     assert_eq!(target["api_base_override_configured"], true);
+    assert_eq!(
+        target["egress_protocol"],
+        "openai-compatible/chat-completions/v1"
+    );
     assert!(!body
         .windows("route-secret".len())
         .any(|window| window == b"route-secret"));
+}
+
+#[tokio::test]
+async fn route_rejects_unregistered_egress_dialect() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    create_test_provider(&router, "invalid-dialect-provider").await;
+    let response = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/routes",
+            json!({
+                "id": "invalid-dialect-route",
+                "virtual_model": "invalid-dialect-model",
+                "targets": [{
+                    "provider_id": "invalid-dialect-provider",
+                    "model_id": "gpt-4o",
+                    "egress_dialect_id": "custom-dialect"
+                }]
+            }),
+        ))
+        .await
+        .expect("route create response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

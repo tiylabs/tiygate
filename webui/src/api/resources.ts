@@ -8,6 +8,9 @@ import type {
   CapabilityRouteAdmissionListResponse,
   CapabilityMetricsResponse,
   CapabilityProfileResponse,
+  CapabilityProbeJobListResponse,
+  CapabilityProbeRunDetail,
+  CapabilityProbeRunListResponse,
   CapabilityRequirement,
   CapabilityRegistryEntry,
   CapabilityState,
@@ -221,16 +224,27 @@ export const capabilitiesApi = {
   job: (jobId: string) =>
     apiRequest<import("./types").ProbeJob>(`/probe-jobs/${jobId}`),
   probeRuns: (targetKey: string, filter: { limit?: number; offset?: number } = {}) =>
-    apiRequest<{
-      total: number;
-      limit: number;
-      offset: number;
-      next_cursor?: string | null;
-      items?: import("./types").CapabilityProbeRun[];
-      entries: import("./types").CapabilityProbeRun[];
-    }>(`/target-capabilities/${encodeURIComponent(targetKey)}/probe-runs`, {
+    apiRequest<CapabilityProbeRunListResponse>(`/target-capabilities/${encodeURIComponent(targetKey)}/probe-runs`, {
       query: filter as Record<string, string | number | boolean | undefined>,
     }),
+  probeJobs: (targetKey: string, filter: { limit?: number; offset?: number } = {}) =>
+    apiRequest<CapabilityProbeJobListResponse>(
+      `/target-capabilities/${encodeURIComponent(targetKey)}/probe-jobs`,
+      { query: filter as Record<string, string | number | boolean | undefined> },
+    ),
+  probeJobRuns: (
+    targetKey: string,
+    jobId: string,
+    filter: { limit?: number; offset?: number } = {},
+  ) =>
+    apiRequest<CapabilityProbeRunListResponse>(
+      `/target-capabilities/${encodeURIComponent(targetKey)}/probe-jobs/${encodeURIComponent(jobId)}/runs`,
+      { query: filter as Record<string, string | number | boolean | undefined> },
+    ),
+  probeRun: (targetKey: string, runId: string) =>
+    apiRequest<CapabilityProbeRunDetail>(
+      `/target-capabilities/${encodeURIComponent(targetKey)}/probe-runs/${encodeURIComponent(runId)}`,
+    ),
   admissions: (routeId: string, filter: { limit?: number; offset?: number } = {}) =>
     apiRequest<CapabilityRouteAdmissionListResponse>(
       `/routes/${encodeURIComponent(routeId)}/capability-admissions`,

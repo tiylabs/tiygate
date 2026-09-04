@@ -283,6 +283,11 @@ pub enum EventPayload {
         budget_weight: u32,
         #[serde(default)]
         error_class: Option<String>,
+        /// Bounded, redacted request/response exchanges and the deterministic
+        /// probe judgment. Kept as JSON so future probe types can add fields
+        /// without changing the core event enum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     /// Execution attempt against a target.
     HopStart {

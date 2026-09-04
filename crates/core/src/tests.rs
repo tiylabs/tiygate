@@ -506,6 +506,7 @@ mod tests {
     fn test_protocol_endpoint_identity() {
         let ep = ProtocolEndpoint::new(ProtocolSuite::OpenAiCompatible, "chat-completions", "v1");
         assert_eq!(ep.suite, ProtocolSuite::OpenAiCompatible);
+        assert_eq!(ep.full_id(), "openai-compatible/chat-completions/v1");
         assert!(ep.full_id().contains("chat-completions"));
         assert!(ep.full_id().contains("v1"));
     }

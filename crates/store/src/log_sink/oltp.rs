@@ -830,28 +830,42 @@ impl OltpSink {
             duration_micros,
             budget_weight,
             error_class,
+            details,
         } = payload
         else {
             return Ok(());
         };
         let run_id = bounded_text(run_id, 128);
+        let job_id =
+            (!event.request_id.trim().is_empty()).then(|| bounded_text(&event.request_id, 128));
         let target = bounded_text(target, 256);
         let probe_id = bounded_text(probe_id, 256);
         let outcome = bounded_text(outcome, 64);
         let error_class = error_class.as_deref().map(|value| bounded_text(value, 64));
+        const MAX_PROBE_DETAILS_BYTES: usize = 256 * 1024;
+        let details_json = details.as_ref().and_then(|details| {
+            let encoded = serde_json::to_string(details).ok()?;
+            if encoded.len() <= MAX_PROBE_DETAILS_BYTES {
+                Some(encoded)
+            } else {
+                Some(r#"{"truncated":true}"#.to_string())
+            }
+        });
         sqlx::query(
             "INSERT INTO capability_probe_runs
-             (run_id, target, probe_id, outcome, duration_micros, budget_weight, error_class, ts)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             (run_id, job_id, target, probe_id, outcome, duration_micros, budget_weight, error_class, details_json, ts)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
              ON CONFLICT(run_id) DO NOTHING",
         )
         .bind(run_id)
+        .bind(job_id)
         .bind(target)
         .bind(probe_id)
         .bind(outcome)
         .bind(i64::try_from(*duration_micros).unwrap_or(i64::MAX))
         .bind(i64::from((*budget_weight).max(1)))
         .bind(error_class)
+        .bind(details_json)
         .bind(event.timestamp.to_rfc3339())
         .execute(self.pool.any())
         .await?;
@@ -3450,6 +3464,7 @@ pub struct RequestCapabilityPlanEntry {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct CapabilityProbeRunEntry {
     pub run_id: String,
+    pub job_id: Option<String>,
     pub target: String,
     pub probe_id: String,
     pub outcome: String,
@@ -3457,6 +3472,23 @@ pub struct CapabilityProbeRunEntry {
     pub budget_weight: u32,
     pub error_class: Option<String>,
     pub ts: String,
+}
+
+/// Full, redacted details for one capability probe run. The opaque `details`
+/// value is versioned by the producer so new probe shapes remain readable by
+/// older Admin clients.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct CapabilityProbeRunDetail {
+    pub run_id: String,
+    pub job_id: Option<String>,
+    pub target: String,
+    pub probe_id: String,
+    pub outcome: String,
+    pub duration_micros: u64,
+    pub budget_weight: u32,
+    pub error_class: Option<String>,
+    pub ts: String,
+    pub details: Option<serde_json::Value>,
 }
 
 /// List bounded probe-run audit records for one TargetKey.
@@ -3472,7 +3504,7 @@ pub async fn list_capability_probe_runs(
             .fetch_one(pool.any())
             .await?;
     let rows = sqlx::query(
-        "SELECT run_id, target, probe_id, outcome, duration_micros, budget_weight, error_class, ts
+        "SELECT run_id, job_id, target, probe_id, outcome, duration_micros, budget_weight, error_class, ts
          FROM capability_probe_runs WHERE target = $1 ORDER BY ts DESC LIMIT $2 OFFSET $3",
     )
     .bind(target)
@@ -3484,6 +3516,7 @@ pub async fn list_capability_probe_runs(
         .into_iter()
         .map(|row| CapabilityProbeRunEntry {
             run_id: row.get("run_id"),
+            job_id: row.get("job_id"),
             target: row.get("target"),
             probe_id: row.get("probe_id"),
             outcome: row.get("outcome"),
@@ -3494,6 +3527,80 @@ pub async fn list_capability_probe_runs(
         })
         .collect();
     Ok((entries, total.max(0) as u64))
+}
+
+/// List probe runs belonging to one durable probe job.
+pub async fn list_capability_probe_runs_for_job(
+    pool: &DbPool,
+    target: &str,
+    job_id: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<CapabilityProbeRunEntry>, u64), sqlx::Error> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM capability_probe_runs WHERE target = $1 AND job_id = $2",
+    )
+    .bind(target)
+    .bind(job_id)
+    .fetch_one(pool.any())
+    .await?;
+    let rows = sqlx::query(
+        "SELECT run_id, job_id, target, probe_id, outcome, duration_micros, budget_weight, error_class, ts
+         FROM capability_probe_runs WHERE target = $1 AND job_id = $2
+         ORDER BY ts DESC LIMIT $3 OFFSET $4",
+    )
+    .bind(target)
+    .bind(job_id)
+    .bind(i64::from(limit.clamp(1, 500)))
+    .bind(i64::from(offset))
+    .fetch_all(pool.any())
+    .await?;
+    let entries = rows
+        .into_iter()
+        .map(|row| CapabilityProbeRunEntry {
+            run_id: row.get("run_id"),
+            job_id: row.get("job_id"),
+            target: row.get("target"),
+            probe_id: row.get("probe_id"),
+            outcome: row.get("outcome"),
+            duration_micros: row.get::<i64, _>("duration_micros").max(0) as u64,
+            budget_weight: row.get::<i64, _>("budget_weight").max(0) as u32,
+            error_class: row.get("error_class"),
+            ts: row.get("ts"),
+        })
+        .collect();
+    Ok((entries, total.max(0) as u64))
+}
+
+/// Read one probe run's redacted exchanges and judge result.
+pub async fn get_capability_probe_run(
+    pool: &DbPool,
+    target: &str,
+    run_id: &str,
+) -> Result<Option<CapabilityProbeRunDetail>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT run_id, job_id, target, probe_id, outcome, duration_micros, budget_weight,
+         error_class, ts, details_json FROM capability_probe_runs
+         WHERE target = $1 AND run_id = $2 LIMIT 1",
+    )
+    .bind(target)
+    .bind(run_id)
+    .fetch_optional(pool.any())
+    .await?;
+    Ok(row.map(|row| CapabilityProbeRunDetail {
+        run_id: row.get("run_id"),
+        job_id: row.get("job_id"),
+        target: row.get("target"),
+        probe_id: row.get("probe_id"),
+        outcome: row.get("outcome"),
+        duration_micros: row.get::<i64, _>("duration_micros").max(0) as u64,
+        budget_weight: row.get::<i64, _>("budget_weight").max(0) as u32,
+        error_class: row.get("error_class"),
+        ts: row.get("ts"),
+        details: row
+            .get::<Option<String>, _>("details_json")
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
+    }))
 }
 
 fn row_to_capability_plan(
@@ -4331,6 +4438,16 @@ mod tests {
                 duration_micros: 42,
                 budget_weight: 2,
                 error_class: None,
+                details: Some(serde_json::json!({
+                    "schema_version": 1,
+                    "exchanges": [{
+                        "request_path": "/chat/completions",
+                        "request_body": {"model": "gpt-4o"},
+                        "response_status": 200,
+                        "response_body": "{}"
+                    }],
+                    "judgment": {"classification": "positive", "state": "supported"}
+                })),
             },
         })
         .await
@@ -4342,6 +4459,18 @@ mod tests {
         .await
         .expect("read capability probe run");
         assert_eq!(probe_runs, 1);
+        let probe_detail = get_capability_probe_run(&pool, "target:key", "probe-run-1")
+            .await
+            .expect("read probe detail")
+            .expect("probe detail");
+        assert_eq!(probe_detail.job_id.as_deref(), Some("probe-job-1"));
+        assert_eq!(probe_detail.details.as_ref().unwrap()["schema_version"], 1);
+        let (job_runs, job_run_total) =
+            list_capability_probe_runs_for_job(&pool, "target:key", "probe-job-1", 10, 0)
+                .await
+                .expect("list probe job runs");
+        assert_eq!(job_run_total, 1);
+        assert_eq!(job_runs[0].run_id, "probe-run-1");
         let plans = list_request_capability_plans(&pool, "req-capability")
             .await
             .expect("list capability plans");

@@ -1197,6 +1197,9 @@ GET  /admin/v1/target-capabilities
 GET  /admin/v1/target-capabilities/:target_key
 POST /admin/v1/target-capabilities/:target_key/probe
 GET  /admin/v1/target-capabilities/:target_key/probe-runs
+GET  /admin/v1/target-capabilities/:target_key/probe-jobs
+GET  /admin/v1/target-capabilities/:target_key/probe-jobs/:job_id/runs
+GET  /admin/v1/target-capabilities/:target_key/probe-runs/:run_id
 PUT  /admin/v1/target-capabilities/:target_key/overrides
 DELETE /admin/v1/target-capabilities/:target_key/overrides/:capability_id
 GET  /admin/v1/capability-registry
@@ -1209,6 +1212,8 @@ DELETE /admin/v1/routes/:route_id/capability-admissions/:shape_hash
 ```
 
 现有 request attempt 详情增加内部 `CompatibilityReport`，不新增面向普通客户端的逐 Target 诊断接口。profile、job、metrics、admission 和 report 列表必须分页；registry 是编译期的有界静态集合（超过上限时也按相同分页契约返回），并返回 `contract_schema_version` 与 registry/baseline/matrix/probe 数量摘要。所有错误和 observation detail 必须脱敏、限长。
+
+`probe-jobs` 返回目标的持久化任务历史；任务下的 `probe-jobs/:job_id/runs` 返回每次运行摘要，`probe-runs/:run_id` 返回版本化的详情对象。详情可包含多条有序 exchange（请求路径、脱敏请求头/请求体、HTTP 响应状态/类型/响应体）及结构化 judge 结果；不包含 API Base、认证凭证或账户标识，单次响应和详情总大小均受限，历史记录缺失详情时返回 `null`。
 
 Admin mutation 的统一响应契约：
 
@@ -1363,7 +1368,7 @@ worker 启动、Shadow 采样、准入计算或 Enforce 流量都必须等待对
 | capability shape hash | `shape/v1` | admission 立即变为 shadow，必须重新计算 hash 和报告 | `V-SHADOW` |
 | gate policy | `1` | admission 不得 enforce，等待新的准入报告 | `V-SHADOW`、`V-ADMIN-UI` |
 | config export | `2` | 旧 bundle 可导入；未知主版本返回稳定的 unsupported-version 错误 | `V-IDENTITY`、`V-ADMIN-UI` |
-| capability telemetry/migration | `20260829000001`–`20260829000004`（log）及对应 config profile/job/admission versions `20260829000006`–`20260829000008` | sink 不得静默丢弃事件；迁移未完成时保持 off-only | `V-TELEMETRY-GAP`、`V-DB-RECOVERY` |
+| capability telemetry/migration | `20260829000001`–`20260829000004`、`20260904000001`（log）及对应 config profile/job/admission versions `20260829000006`–`20260829000008` | sink 不得静默丢弃事件；迁移未完成时保持 off-only | `V-TELEMETRY-GAP`、`V-DB-RECOVERY` |
 
 启动和热路径都遵循 fail-closed：未知主版本、迁移缺失、registry 校验失败、shape hash 或 gate policy 失配，只能保留诊断和历史数据，不能生成 Supported、compatible 或 enforce 结论。版本失配、TTL 过期和 Target 身份变化不得删除原始 observation；清理只在诊断保留期之后执行。
 

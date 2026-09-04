@@ -160,6 +160,18 @@ pub fn router() -> Router<AdminState> {
             get(list_target_capability_probe_runs),
         )
         .route(
+            "/admin/v1/target-capabilities/:target_key/probe-jobs",
+            get(list_target_capability_probe_jobs),
+        )
+        .route(
+            "/admin/v1/target-capabilities/:target_key/probe-jobs/:job_id/runs",
+            get(list_target_capability_probe_job_runs),
+        )
+        .route(
+            "/admin/v1/target-capabilities/:target_key/probe-runs/:run_id",
+            get(get_target_capability_probe_run),
+        )
+        .route(
             "/admin/v1/target-capabilities/:target_key/overrides",
             put(upsert_target_capability_override),
         )
@@ -340,7 +352,7 @@ async fn ensure_capability_store_available(state: &AdminState) -> Result<(), Adm
         }
     }
     let required_migrations = [
-        ("config", 20260829000001_i64),
+        ("config", 20260828000001_i64),
         ("config", 20260829000002_i64),
         ("config", 20260829000003_i64),
         ("config", 20260829000005_i64),
@@ -351,6 +363,7 @@ async fn ensure_capability_store_available(state: &AdminState) -> Result<(), Adm
         ("log", 20260829000002_i64),
         ("log", 20260829000003_i64),
         ("log", 20260829000004_i64),
+        ("log", 20260904000001_i64),
     ];
     for (sequence, version) in required_migrations {
         let present: Option<i64> = sqlx::query_scalar(
@@ -461,6 +474,102 @@ async fn list_target_capability_probe_runs(
         "entries": items
     }))
     .into_response())
+}
+
+async fn list_target_capability_probe_jobs(
+    State(state): State<AdminState>,
+    Path(target_key): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<CapabilityListQuery>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let key = tiygate_core::TargetKey(target_key);
+    if state.store.get_capability_profile(&key).await?.is_none() {
+        return Err(AdminError::NotFound(
+            "target capability profile".to_string(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0);
+    let items = state
+        .store
+        .list_probe_jobs_for_target(&key, limit, offset)
+        .await?;
+    let total = state.store.count_probe_jobs_for_target(&key).await?;
+    let next_cursor = (offset.saturating_add(items.len() as u32) < total as u32)
+        .then(|| offset.saturating_add(items.len() as u32).to_string());
+    Ok(Json(json!({
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "next_cursor": next_cursor,
+        "items": items,
+        "entries": items
+    }))
+    .into_response())
+}
+
+async fn list_target_capability_probe_job_runs(
+    State(state): State<AdminState>,
+    Path((target_key, job_id)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<CapabilityListQuery>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let key = tiygate_core::TargetKey(target_key.clone());
+    if state.store.get_capability_profile(&key).await?.is_none() {
+        return Err(AdminError::NotFound(
+            "target capability profile".to_string(),
+        ));
+    }
+    let Some(job) = state.store.get_probe_job(&job_id).await? else {
+        return Err(AdminError::NotFound(format!("probe job {job_id}")));
+    };
+    if job.target_key != key {
+        return Err(AdminError::NotFound(format!("probe job {job_id}")));
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0);
+    let (items, total) = tiygate_store::log_sink::oltp::list_capability_probe_runs_for_job(
+        state.pool.as_ref(),
+        &target_key,
+        &job_id,
+        limit,
+        offset,
+    )
+    .await
+    .map_err(AdminError::Db)?;
+    let next_cursor = (offset.saturating_add(items.len() as u32) < total as u32)
+        .then(|| offset.saturating_add(items.len() as u32).to_string());
+    Ok(Json(json!({
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "next_cursor": next_cursor,
+        "items": items,
+        "entries": items
+    }))
+    .into_response())
+}
+
+async fn get_target_capability_probe_run(
+    State(state): State<AdminState>,
+    Path((target_key, run_id)): Path<(String, String)>,
+) -> Result<Response, AdminError> {
+    ensure_capability_store_available(&state).await?;
+    let key = tiygate_core::TargetKey(target_key.clone());
+    if state.store.get_capability_profile(&key).await?.is_none() {
+        return Err(AdminError::NotFound(
+            "target capability profile".to_string(),
+        ));
+    }
+    let detail = tiygate_store::log_sink::oltp::get_capability_probe_run(
+        state.pool.as_ref(),
+        &target_key,
+        &run_id,
+    )
+    .await
+    .map_err(AdminError::Db)?
+    .ok_or_else(|| AdminError::NotFound(format!("probe run {run_id}")))?;
+    Ok(Json(detail).into_response())
 }
 
 /// Build the capability detail payload exposed to Admin callers. TargetKey is
@@ -4095,6 +4204,8 @@ struct RouteTargetView {
     api_base_override_configured: bool,
     egress_dialect_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    egress_protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     target_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile_status: Option<tiygate_store::capabilities::ProfileStatus>,
@@ -4121,6 +4232,7 @@ impl From<Route> for RouteView {
                     api_key_override_configured: target.api_key_override.is_some(),
                     api_base_override_configured: target.api_base_override.is_some(),
                     egress_dialect_id: target.egress_dialect_id,
+                    egress_protocol: None,
                     target_key: None,
                     profile_status: None,
                     probe_job_status: None,
@@ -4161,6 +4273,7 @@ async fn enrich_route_view(state: &AdminState, route: &Route, view: &mut RouteVi
             continue;
         };
         used_runtime_targets.insert(runtime_index);
+        target_view.egress_protocol = Some(target.api_protocol.full_id());
         let Ok((key, _)) = state.store.target_key_for(target) else {
             continue;
         };

@@ -56,6 +56,51 @@ const OPENAI_CODEX_DESKTOP_USER_AGENT: &str =
 pub const XAI_API_KEY_ONLY_ERROR: &str =
     "xAI OAuth is temporarily disabled; configure xAI with auth_mode 'api_key'";
 
+/// The dialect IDs understood by the capability registry. `auto` is the
+/// normal route configuration and is persisted as `None`; the explicit
+/// values remain available for provider integrations that need a fixed wire
+/// contract, but they are not free-form user metadata.
+pub const BUILTIN_EGRESS_DIALECTS: &[&str] = &[
+    "openai-chat-standard",
+    "anthropic-messages-standard",
+    "openai-responses-standard",
+    "openai-responses-codex-lite",
+    "gemini-generate-content-standard",
+    "openai-embeddings-standard",
+];
+
+/// Normalize and validate the optional route-target dialect.
+///
+/// Empty values and `auto` deliberately collapse to `None`, so all callers
+/// share one persisted representation of the Provider-default behavior.
+fn normalize_egress_dialect(value: Option<&str>) -> Result<Option<String>, StoreError> {
+    let Some(value) = value.map(str::trim) else {
+        return Ok(None);
+    };
+    if value.is_empty() || value == "auto" {
+        return Ok(None);
+    }
+    if BUILTIN_EGRESS_DIALECTS.contains(&value) {
+        return Ok(Some(value.to_string()));
+    }
+    Err(StoreError::Invalid(format!(
+        "unsupported egress dialect '{value}'; use auto or one of: {}",
+        BUILTIN_EGRESS_DIALECTS.join(", ")
+    )))
+}
+
+fn normalize_route_targets(targets: &[RouteTarget]) -> Result<Vec<RouteTarget>, StoreError> {
+    targets
+        .iter()
+        .map(|target| {
+            let mut normalized = target.clone();
+            normalized.egress_dialect_id =
+                normalize_egress_dialect(target.egress_dialect_id.as_deref())?;
+            Ok(normalized)
+        })
+        .collect()
+}
+
 /// Validate provider authentication modes that are constrained by a built-in
 /// provider integration. Keeping this beside persistence ensures Admin API,
 /// config imports, and internal callers follow the same policy.
@@ -1635,6 +1680,10 @@ impl DbConfigStore {
                 "route must have at least one target".into(),
             ));
         }
+        // Keep auto/blank target settings canonical while rejecting unknown
+        // dialect IDs before they can create an unresolvable capability
+        // profile or a stale TargetKey.
+        let targets = normalize_route_targets(targets)?;
         // Ensure the installation-scoped fingerprint key is loaded before
         // deriving prospective Target identities. This is a no-op after the
         // first startup initialization and keeps route/profile keys stable.
@@ -1645,7 +1694,7 @@ impl DbConfigStore {
             .as_ref()
             .map(|r| r.created_at.to_rfc3339())
             .unwrap_or_else(|| now.clone());
-        let targets_json = serde_json::to_string(targets)?;
+        let targets_json = serde_json::to_string(&targets)?;
         let strategy_str = routing_strategy.map(|s| s.as_str());
         let model_metadata_json = serialize_model_metadata(model_metadata)?;
         let enabled_int: i32 = if enabled { 1 } else { 0 };
@@ -3078,6 +3127,19 @@ use tracing::info as _info;
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_target_dialect_is_canonical_and_validated() {
+        assert_eq!(normalize_egress_dialect(None).unwrap(), None);
+        assert_eq!(normalize_egress_dialect(Some("  ")).unwrap(), None);
+        assert_eq!(normalize_egress_dialect(Some("auto")).unwrap(), None);
+        assert_eq!(normalize_egress_dialect(Some(" auto ")).unwrap(), None);
+        assert_eq!(
+            normalize_egress_dialect(Some("openai-responses-standard")).unwrap(),
+            Some("openai-responses-standard".to_string())
+        );
+        assert!(normalize_egress_dialect(Some("custom-dialect")).is_err());
+    }
 
     #[test]
     fn hash_api_key_is_deterministic() {

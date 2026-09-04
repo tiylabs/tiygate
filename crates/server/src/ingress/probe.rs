@@ -228,6 +228,46 @@ enum ProbeOutcome {
     },
 }
 
+/// Redacted wire exchange retained with a probe audit record. Request paths
+/// intentionally omit the target's API base and credentials.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProbeExchange {
+    request_path: String,
+    request_headers: Value,
+    request_body: Value,
+    response_status: Option<u16>,
+    response_content_type: Option<String>,
+    response_body: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ProbeTrace {
+    exchanges: Vec<ProbeExchange>,
+}
+
+fn record_probe_error(
+    trace: &mut ProbeTrace,
+    request_path: &str,
+    request_headers: &Value,
+    request_body: &Value,
+    target: &tiygate_core::RoutingTarget,
+    error: &ProbeRequestError,
+) {
+    let detail = match error {
+        ProbeRequestError::Auth(detail) | ProbeRequestError::Transient(detail) => detail,
+    };
+    trace.exchanges.push(ProbeExchange {
+        request_path: request_path.to_string(),
+        request_headers: request_headers.clone(),
+        request_body: request_body.clone(),
+        response_status: None,
+        response_content_type: None,
+        response_body: None,
+        error: Some(redact_target_error(target, detail)),
+    });
+}
+
 #[derive(Debug, Clone)]
 enum ProbeRequestError {
     Auth(String),
@@ -293,14 +333,25 @@ async fn run_worker(
     mut stop_rx: watch::Receiver<bool>,
 ) {
     // Backfill targets that predate capability discovery or were restored from
-    // an older config export.  This runs once in the background; each store
-    // operation is idempotent and the request path is never involved.
-    if let Err(error) = bootstrap_missing_targets(&state, &store).await {
-        tracing::warn!(error = %error, "capability probe bootstrap failed");
-    }
+    // an older config export. SQLite startup tasks can briefly contend for the
+    // writer lock, so retry the idempotent bootstrap until it succeeds instead
+    // of permanently skipping every pre-existing target after one busy error.
+    let mut bootstrap_complete = false;
     loop {
         if *stop_rx.borrow() {
             break;
+        }
+        if !bootstrap_complete {
+            match bootstrap_missing_targets(&state, &store).await {
+                Ok(()) => bootstrap_complete = true,
+                Err(error) => {
+                    tracing::warn!(error = %error, "capability probe bootstrap failed; retrying");
+                    if wait_or_stop(&mut stop_rx, Duration::from_secs(PROBE_POLL_SECS)).await {
+                        break;
+                    }
+                    continue;
+                }
+            }
         }
         let enabled = tiygate_store::settings_keys::get_bool(
             store.as_ref(),
@@ -503,7 +554,8 @@ async fn execute_job(
                 Err(error) => return Err(error),
             };
         let probe_started = std::time::Instant::now();
-        let outcome = run_probe(state, &target, probe_id).await;
+        let mut trace = ProbeTrace::default();
+        let outcome = run_probe(state, &target, probe_id, &mut trace).await;
         let (outcome_name, error_class) = probe_outcome_summary(&outcome);
         state
             .telemetry
@@ -519,6 +571,7 @@ async fn execute_job(
                     duration_micros: probe_started.elapsed().as_micros() as u64,
                     budget_weight: u32::try_from(budget_weight).unwrap_or(u32::MAX),
                     error_class: error_class.map(str::to_string),
+                    details: Some(probe_details(&trace, &outcome)),
                 },
             })
             .await;
@@ -612,6 +665,46 @@ fn probe_outcome_summary(outcome: &ProbeOutcome) -> (&'static str, Option<&str>)
     }
 }
 
+fn probe_details(trace: &ProbeTrace, outcome: &ProbeOutcome) -> Value {
+    let judgment = match outcome {
+        ProbeOutcome::Positive(observation) => json!({
+            "classification": "positive",
+            "capability_id": observation.capability_id,
+            "state": observation.state,
+            "value": observation.value,
+            "source": observation.source,
+            "reason_code": observation.reason_code,
+        }),
+        ProbeOutcome::ExplicitNegative(observation) => json!({
+            "classification": "explicit_negative",
+            "capability_id": observation.capability_id,
+            "state": observation.state,
+            "value": observation.value,
+            "source": observation.source,
+            "reason_code": observation.reason_code,
+        }),
+        ProbeOutcome::Inconclusive {
+            capability_id,
+            reason,
+        } => json!({
+            "classification": "inconclusive",
+            "capability_id": capability_id,
+            "state": "unknown",
+            "reason": reason,
+        }),
+        ProbeOutcome::Error { class, detail } => json!({
+            "classification": "error",
+            "error_class": class,
+            "detail": detail,
+        }),
+    };
+    json!({
+        "schema_version": 1,
+        "exchanges": trace.exchanges,
+        "judgment": judgment,
+    })
+}
+
 fn probe_run_id(job: &ProbeJob, probe_id: &str) -> String {
     let material = format!(
         "probe-run/v1\0{}\0{}\0{}\0{}",
@@ -646,6 +739,7 @@ async fn run_probe(
     state: &AppState,
     target: &tiygate_core::RoutingTarget,
     probe_id: &str,
+    trace: &mut ProbeTrace,
 ) -> ProbeOutcome {
     if !is_allowed_probe_id(probe_id) {
         return ProbeOutcome::Error {
@@ -667,13 +761,13 @@ async fn run_probe(
     }
     let nonce = format!("{NONCE_PREFIX}-{}", uuid::Uuid::now_v7());
     if probe_id == "tools.function.continuation" {
-        return run_continuation_probe(state, target, &nonce).await;
+        return run_continuation_probe(state, target, &nonce, trace).await;
     }
     if probe_id == "tools.crl.additional_tools" {
-        return run_crl_probe(state, target, &nonce).await;
+        return run_crl_probe(state, target, &nonce, trace).await;
     }
     let (body, capability_id, stream) = probe_body(target, probe_id, &nonce);
-    let response = send_probe(state, target, body, stream, probe_timeout(probe_id)).await;
+    let response = send_probe(state, target, body, stream, probe_timeout(probe_id), trace).await;
     match response {
         Ok((status, content_type, body_text)) => {
             if !(200..300).contains(&status) {
@@ -913,6 +1007,7 @@ async fn run_crl_probe(
     state: &AppState,
     target: &tiygate_core::RoutingTarget,
     nonce: &str,
+    trace: &mut ProbeTrace,
 ) -> ProbeOutcome {
     let (control_body, capability_id, _) = probe_body(target, "tools.function", nonce);
     let control = match send_probe(
@@ -921,6 +1016,7 @@ async fn run_crl_probe(
         control_body,
         false,
         probe_timeout("tools.crl.additional_tools"),
+        trace,
     )
     .await
     {
@@ -947,6 +1043,7 @@ async fn run_crl_probe(
         carrier_body,
         false,
         probe_timeout("tools.crl.additional_tools"),
+        trace,
     )
     .await
     {
@@ -980,6 +1077,7 @@ async fn run_crl_probe(
         second_body,
         false,
         probe_timeout("tools.crl.additional_tools"),
+        trace,
     )
     .await
     {
@@ -1011,6 +1109,7 @@ async fn run_continuation_probe(
     state: &AppState,
     target: &tiygate_core::RoutingTarget,
     nonce: &str,
+    trace: &mut ProbeTrace,
 ) -> ProbeOutcome {
     let (first_body, capability_id, _) = probe_body(target, "tools.function", nonce);
     let first = match send_probe(
@@ -1019,6 +1118,7 @@ async fn run_continuation_probe(
         first_body,
         false,
         probe_timeout("tools.function.continuation"),
+        trace,
     )
     .await
     {
@@ -1087,6 +1187,7 @@ async fn run_continuation_probe(
         continuation_body,
         false,
         probe_timeout("tools.function.continuation"),
+        trace,
     )
     .await
     {
@@ -1374,9 +1475,14 @@ async fn send_probe(
     body: Value,
     stream: bool,
     timeout: Duration,
+    trace: &mut ProbeTrace,
 ) -> Result<(u16, Option<String>, String), ProbeRequestError> {
     let mut body = body;
     let suite = target.api_protocol.suite;
+    let request_path = probe_request_path(target, suite, stream);
+    let mut request_headers = json!({});
+    let mut request_body = body.clone();
+    state.redactor.redact_value(&mut request_body);
     let url = match suite {
         tiygate_core::ProtocolSuite::GoogleGemini => format!(
             "{}/v1beta/models/{}:{}",
@@ -1399,7 +1505,7 @@ async fn send_probe(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
-    super::apply_provider_auth(target, &mut headers, &state.oauth_manager)
+    let auth_result = super::apply_provider_auth(target, &mut headers, &state.oauth_manager)
         .await
         .map_err(|error| {
             let detail = format!("provider auth failed with HTTP {}", error.http_status());
@@ -1410,39 +1516,128 @@ async fn send_probe(
             } else {
                 ProbeRequestError::Transient(detail)
             }
-        })?;
+        });
+    if let Err(error) = auth_result {
+        record_probe_error(
+            trace,
+            &request_path,
+            &request_headers,
+            &request_body,
+            target,
+            &error,
+        );
+        return Err(error);
+    }
+    request_headers = redacted_probe_headers(state, &headers);
     let request_id = format!("capability-probe-{}", uuid::Uuid::now_v7());
     let codex_profile =
-        prepare_probe_egress_profile(target, &mut body, &mut headers, stream, &request_id)?;
+        match prepare_probe_egress_profile(target, &mut body, &mut headers, stream, &request_id) {
+            Ok(profile) => profile,
+            Err(error) => {
+                record_probe_error(
+                    trace,
+                    &request_path,
+                    &request_headers,
+                    &request_body,
+                    target,
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+    request_body = body.clone();
+    state.redactor.redact_value(&mut request_body);
     let anthropic_oauth_profile = crate::anthropic_oauth::is_enabled(target, suite);
     let client = if anthropic_oauth_profile {
         state.tunables().anthropic_oauth_http_client.clone()
     } else {
         state.tunables().http_client.clone()
     };
-    let mut request = client.post(url).headers(headers);
     if stream {
-        request = request.header(http::header::ACCEPT, "text/event-stream");
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
     }
+    request_headers = redacted_probe_headers(state, &headers);
+    let request = client.post(url).headers(headers);
     let request = request.json(&body);
-    let response = tokio::time::timeout(timeout, request.send())
-        .await
-        .map_err(|_| ProbeRequestError::Transient("probe request timed out".to_string()))?
-        .map_err(|error| ProbeRequestError::Transient(error.to_string()))?;
+    let response = match tokio::time::timeout(timeout, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let error = ProbeRequestError::Transient(error.to_string());
+            record_probe_error(
+                trace,
+                &request_path,
+                &request_headers,
+                &request_body,
+                target,
+                &error,
+            );
+            return Err(error);
+        }
+        Err(_) => {
+            let error = ProbeRequestError::Transient("probe request timed out".to_string());
+            record_probe_error(
+                trace,
+                &request_path,
+                &request_headers,
+                &request_body,
+                target,
+                &error,
+            );
+            return Err(error);
+        }
+    };
     let status = response.status().as_u16();
     let content_type = response
         .headers()
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let text = tokio::time::timeout(timeout, read_limited_body(response))
-        .await
-        .map_err(|_| ProbeRequestError::Transient("probe response body timed out".to_string()))?
-        .map_err(ProbeRequestError::Transient)?;
+    let text = match tokio::time::timeout(timeout, read_limited_body(response)).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(detail)) => {
+            let error = ProbeRequestError::Transient(detail);
+            record_probe_error(
+                trace,
+                &request_path,
+                &request_headers,
+                &request_body,
+                target,
+                &error,
+            );
+            return Err(error);
+        }
+        Err(_) => {
+            let error = ProbeRequestError::Transient("probe response body timed out".to_string());
+            record_probe_error(
+                trace,
+                &request_path,
+                &request_headers,
+                &request_body,
+                target,
+                &error,
+            );
+            return Err(error);
+        }
+    };
     let text = if codex_profile && !stream && (200..300).contains(&status) {
-        crate::openai_codex_oauth::parse_http_response(&text)
-            .map(|value| value.to_string())
-            .map_err(|error| ProbeRequestError::Transient(error.message))?
+        match crate::openai_codex_oauth::parse_http_response(&text) {
+            Ok(value) => value.to_string(),
+            Err(error) => {
+                let error = ProbeRequestError::Transient(error.message);
+                record_probe_error(
+                    trace,
+                    &request_path,
+                    &request_headers,
+                    &request_body,
+                    target,
+                    &error,
+                );
+                return Err(error);
+            }
+        }
     } else {
         text
     };
@@ -1451,11 +1646,57 @@ async fn send_probe(
     // pass also removes API keys, API-base strings and URL-like tokens from
     // plain-text upstream errors before they reach profile diagnostics.
     let redacted = redact_target_error(target, &redacted);
-    Ok((
-        status,
-        content_type,
-        truncate(&redacted, MAX_PROBE_RESPONSE_BYTES),
-    ))
+    let redacted = truncate(&redacted, MAX_PROBE_RESPONSE_BYTES);
+    trace.exchanges.push(ProbeExchange {
+        request_path,
+        request_headers,
+        request_body,
+        response_status: Some(status),
+        response_content_type: content_type.clone(),
+        response_body: Some(redacted.clone()),
+        error: None,
+    });
+    Ok((status, content_type, redacted))
+}
+
+fn probe_request_path(
+    target: &tiygate_core::RoutingTarget,
+    suite: tiygate_core::ProtocolSuite,
+    stream: bool,
+) -> String {
+    match suite {
+        tiygate_core::ProtocolSuite::GoogleGemini => format!(
+            "/v1beta/models/{}:{}",
+            target.model_id,
+            if stream {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            }
+        ),
+        _ => probe_path_suffix(target, suite).to_string(),
+    }
+}
+
+fn redacted_probe_headers(state: &AppState, headers: &http::HeaderMap) -> Value {
+    let mut redacted = serde_json::Map::new();
+    for (name, value) in headers {
+        let lower_name = name.as_str().to_ascii_lowercase();
+        let value = if state.redactor.should_redact_header(name.as_str())
+            || lower_name == "api-key"
+            || lower_name.ends_with("-api-key")
+            || lower_name == "chatgpt-account-id"
+        {
+            tiygate_core::redaction::REDACTED.to_string()
+        } else {
+            value
+                .to_str()
+                .unwrap_or("[invalid header value]")
+                .to_string()
+        };
+        redacted.insert(name.to_string(), Value::String(value));
+    }
+    Value::Object(redacted)
 }
 
 fn probe_timeout(probe_id: &str) -> Duration {

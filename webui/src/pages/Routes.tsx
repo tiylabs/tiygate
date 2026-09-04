@@ -16,6 +16,7 @@ import {
   Copy,
   GripVertical,
   IdCard,
+  Info,
   Pencil,
   Plus,
   Trash2,
@@ -99,6 +100,7 @@ function createFormTarget(target: Partial<RouteTarget> = {}): FormTarget {
     provider_id: target.provider_id ?? "",
     model_id: target.model_id ?? "",
     egress_dialect_id: target.egress_dialect_id ?? null,
+    egress_protocol: target.egress_protocol,
     enabled: target.enabled ?? true,
     ...(target.weight !== undefined ? { weight: target.weight } : {}),
   };
@@ -299,10 +301,10 @@ export default function RoutesPage() {
       const body: RouteInput = {
         virtual_model: `${r.virtual_model}-${suffix}`,
         targets: r.targets.map((tg) => ({
-              provider_id: tg.provider_id,
-              model_id: tg.model_id,
-              egress_dialect_id: tg.egress_dialect_id ?? null,
-              enabled: tg.enabled ?? true,
+          provider_id: tg.provider_id,
+          model_id: tg.model_id,
+          egress_dialect_id: tg.egress_dialect_id ?? null,
+          enabled: tg.enabled ?? true,
         })),
         routing_strategy: r.routing_strategy ?? undefined,
         capability_routing_mode: r.capability_routing_mode ?? undefined,
@@ -345,6 +347,7 @@ export default function RoutesPage() {
               provider_id: tg.provider_id,
               model_id: tg.model_id,
               egress_dialect_id: tg.egress_dialect_id ?? null,
+              egress_protocol: tg.egress_protocol ?? null,
               enabled: tg.enabled ?? true,
             }),
           )
@@ -1232,13 +1235,12 @@ export default function RoutesPage() {
                 {reorderMessage}
               </span>
               <div
-                className="hidden border-b border-border bg-surface-muted/50 px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.04em] text-text-subtle sm:grid sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,0.9fr)_36px_28px] sm:gap-2"
+                className="hidden border-b border-border bg-surface-muted/50 px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.04em] text-text-subtle sm:grid sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_36px_28px] sm:gap-2"
                 aria-hidden="true"
               >
                 <span />
                 <span>{t("routes.provider")}</span>
                 <span>{t("routes.model")}</span>
-                <span>{t("routes.dialect")}</span>
                 <span className="text-center">
                   {t("routes.targetEnabledHeader")}
                 </span>
@@ -1269,7 +1271,7 @@ export default function RoutesPage() {
                         : undefined
                     }
                     className={cn(
-                      "relative grid grid-cols-[18px_minmax(0,1fr)_28px] gap-2 px-3 py-2 sm:items-center sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,0.9fr)_36px_28px]",
+                      "relative grid grid-cols-[18px_minmax(0,1fr)_28px] gap-2 px-3 py-2 sm:items-center sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_36px_28px]",
                       idx > 0 && "border-t border-border",
                       !enabled && !isDragging && "opacity-50",
                       isDragging &&
@@ -1303,7 +1305,11 @@ export default function RoutesPage() {
                       <Select
                         value={tg.provider_id}
                         onValueChange={(v) =>
-                          updateTarget(idx, { provider_id: v })
+                          updateTarget(idx, {
+                            provider_id: v,
+                            egress_dialect_id: null,
+                            egress_protocol: null,
+                          })
                         }
                         ariaLabel={t("routes.provider")}
                         options={providerOptions}
@@ -1314,31 +1320,33 @@ export default function RoutesPage() {
                             : undefined
                         }
                       />
-                      <Combobox
-                        value={tg.model_id}
-                        placeholder={t("routes.model")}
-                        aria-label={
-                          loadingModelsFor === tg.provider_id
-                            ? t("routes.modelLoading")
-                            : t("routes.model")
-                        }
-                        options={getModelOptions(tg.provider_id)}
-                        loading={loadingModelsFor === tg.provider_id}
-                        onChange={(v) => updateTarget(idx, { model_id: v })}
-                        onFocus={() => {
-                          if (tg.provider_id) void fetchModels(tg.provider_id);
-                        }}
-                      />
-                      <Input
-                        value={tg.egress_dialect_id ?? ""}
-                        placeholder="auto"
-                        aria-label={t("routes.dialect")}
-                        onChange={(event) =>
-                          updateTarget(idx, {
-                            egress_dialect_id: event.target.value.trim() || null,
-                          })
-                        }
-                      />
+                      <div className="flex min-w-0 items-center gap-1">
+                        <div className="min-w-0 flex-1">
+                          <Combobox
+                            value={tg.model_id}
+                            placeholder={t("routes.model")}
+                            aria-label={
+                              loadingModelsFor === tg.provider_id
+                                ? t("routes.modelLoading")
+                                : t("routes.model")
+                            }
+                            options={getModelOptions(tg.provider_id)}
+                            loading={loadingModelsFor === tg.provider_id}
+                            onChange={(v) =>
+                              updateTarget(idx, {
+                                model_id: v,
+                                egress_dialect_id: null,
+                                egress_protocol: null,
+                              })
+                            }
+                            onFocus={() => {
+                              if (tg.provider_id)
+                                void fetchModels(tg.provider_id);
+                            }}
+                          />
+                        </div>
+                        <EgressProtocolInfo target={tg} />
+                      </div>
                       <div className="flex items-center justify-center">
                         <Switch
                           checked={enabled}
@@ -1408,6 +1416,42 @@ export default function RoutesPage() {
         }
       />
     </div>
+  );
+}
+
+function EgressProtocolInfo({ target }: { target: RouteTarget }) {
+  const { t } = useTranslation();
+  const dialect = target.egress_dialect_id?.trim() || "auto";
+  const protocol =
+    target.egress_protocol?.trim() || t("routes.egressProtocolPending");
+
+  return (
+    <Tooltip
+      content={
+        <div className="space-y-1 leading-4">
+          <div>
+            {t("routes.egressProtocol")}: {" "}
+            <span className="font-mono text-[10px]">{protocol}</span>
+          </div>
+          <div>
+            {t("routes.egressDialect")}: {" "}
+            <span className="font-mono text-[10px]">{dialect}</span>
+          </div>
+          <div className="text-text-subtle">
+            {t("routes.egressProtocolHint")}
+          </div>
+        </div>
+      }
+      side="top"
+    >
+      <button
+        type="button"
+        className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-text-subtle transition-colors hover:bg-surface-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+        aria-label={t("routes.egressProtocolInfo")}
+      >
+        <Info size={13} />
+      </button>
+    </Tooltip>
   );
 }
 

@@ -1,19 +1,30 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { capabilitiesApi, routesApi, settingsApi } from "@/api/resources";
-import type { CapabilityRequirement, CapabilityState } from "@/api/types";
+import {
+  capabilitiesApi,
+  providersApi,
+  routesApi,
+  settingsApi,
+} from "@/api/resources";
+import type {
+  CapabilityProbeRunDetail,
+  CapabilityRequirement,
+  CapabilityState,
+} from "@/api/types";
 import {
   Badge,
   Button,
   Card,
   CardBody,
   CardHeader,
+  Drawer,
   ErrorBox,
   Field,
   Input,
+  JsonViewer,
   Metric,
   Select,
   Table,
@@ -25,6 +36,14 @@ import {
   useToast,
 } from "@/components/ui";
 import { PageHeader, fmtTime } from "@/components/PageHeader";
+import { Pagination } from "@/components/Pagination";
+
+const DEFAULT_TARGET_PAGE_SIZE = 10;
+const TARGET_PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
+const DEFAULT_PROBE_JOB_PAGE_SIZE = 10;
+const PROBE_JOB_PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
+const PROFILE_PANEL_CLASS =
+  "flex min-h-0 flex-col overflow-hidden xl:max-h-[calc(100vh-10rem)]";
 
 const stateOptions = [
   { value: "supported", label: "Supported" },
@@ -77,11 +96,21 @@ function constrainedOverrideValue(
 }
 
 function statusTone(status: string): "success" | "warning" | "danger" | "neutral" {
-  if (status === "ready") return "success";
+  if (status === "ready" || status === "complete") return "success";
   if (status === "stale" || status === "partial" || status === "pending") {
     return "warning";
   }
-  if (status === "error") return "danger";
+  if (status === "running") return "warning";
+  if (status === "error" || status === "failed") return "danger";
+  return "neutral";
+}
+
+function probeStatusTone(status: string): "success" | "warning" | "danger" | "neutral" {
+  if (status === "complete") return "success";
+  if (status === "failed") return "danger";
+  if (status === "pending" || status === "running" || status === "partial") {
+    return "warning";
+  }
   return "neutral";
 }
 
@@ -92,11 +121,88 @@ function capabilityTone(state: string): "success" | "danger" | "warning" | "neut
   return "neutral";
 }
 
+function jsonText(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function ProbeRunDetailView({ detail }: { detail: CapabilityProbeRunDetail }) {
+  const { t, i18n } = useTranslation();
+  const exchanges = detail.details?.exchanges ?? [];
+  const judgment = detail.details?.judgment;
+  const probeLabel = (group: string, value: string) => {
+    const key = `capabilities.${group}.${value}`;
+    return i18n.exists(key) ? t(key) : value;
+  };
+  return (
+    <div className="mt-2 space-y-2 rounded border border-primary/30 bg-primary-soft/20 p-2">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-text-muted">
+        <span className="font-medium text-text">{t("capabilities.probeRunDetail")}</span>
+        <span>{t("capabilities.probeRunOutcome")}: {probeLabel("probeOutcomes", detail.outcome)}</span>
+        <span>{t("capabilities.probeRunTime")}: {fmtTime(detail.ts)}</span>
+      </div>
+      {judgment ? (
+        <section>
+          <div className="mb-1 font-medium text-text">{t("capabilities.probeJudgment")}</div>
+          <JsonViewer value={jsonText(judgment)} className="max-h-80" />
+        </section>
+      ) : null}
+      {exchanges.length === 0 ? (
+        <div className="text-text-muted">{t("capabilities.probeExchangesEmpty")}</div>
+      ) : (
+        <section className="space-y-2">
+          <div className="font-medium text-text">{t("capabilities.probeExchanges")}</div>
+          {exchanges.map((exchange, index) => (
+            <div key={`${exchange.request_path}:${index}`} className="rounded border border-border bg-surface px-2 py-2">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-text-muted">
+                <span className="font-medium text-text">{t("capabilities.probeExchange", { index: index + 1 })}</span>
+                <code>{exchange.request_path}</code>
+                {exchange.response_status !== undefined && exchange.response_status !== null ? (
+                  <span>{t("capabilities.probeResponseStatus")}: {exchange.response_status}</span>
+                ) : null}
+                {exchange.response_content_type ? <span>{exchange.response_content_type}</span> : null}
+              </div>
+              <div className="mt-2 text-text-subtle">{t("capabilities.probeRequestHeaders")}</div>
+              <JsonViewer value={jsonText(exchange.request_headers)} className="mt-1" />
+              <div className="mt-2 text-text-subtle">{t("capabilities.probeRequest")}</div>
+              <JsonViewer value={jsonText(exchange.request_body)} className="mt-1" />
+              {exchange.response_body ? (
+                <>
+                  <div className="mt-2 text-text-subtle">{t("capabilities.probeResponse")}</div>
+                  <JsonViewer value={exchange.response_body} className="mt-1" />
+                </>
+              ) : null}
+              {exchange.error ? (
+                <div className="mt-2 rounded border border-danger/30 bg-danger/5 px-2 py-1 text-danger">
+                  {t("capabilities.probeExchangeError")}: {exchange.error}
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </section>
+      )}
+      {detail.details?.truncated ? (
+        <div className="text-warning">{t("capabilities.probeDetailTruncated")}</div>
+      ) : null}
+    </div>
+  );
+}
+
 export default function CapabilitiesPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const toast = useToast();
   const qc = useQueryClient();
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [targetPageSize, setTargetPageSize] = useState(DEFAULT_TARGET_PAGE_SIZE);
+  const [targetOffset, setTargetOffset] = useState(0);
+  const [probeJobPageSize, setProbeJobPageSize] = useState(DEFAULT_PROBE_JOB_PAGE_SIZE);
+  const [probeJobOffset, setProbeJobOffset] = useState(0);
+  const [expandedProbeJobId, setExpandedProbeJobId] = useState<string | null>(null);
+  const [selectedProbeRunId, setSelectedProbeRunId] = useState<string | null>(null);
   const [overrideCapability, setOverrideCapability] = useState("");
   const [overrideState, setOverrideState] = useState<CapabilityState>("supported");
   const [overrideReason, setOverrideReason] = useState("");
@@ -116,8 +222,9 @@ export default function CapabilitiesPage() {
   const [lowTrafficException, setLowTrafficException] = useState(false);
 
   const profilesQuery = useQuery({
-    queryKey: ["target-capabilities"],
-    queryFn: () => capabilitiesApi.listAll(),
+    queryKey: ["target-capabilities", targetPageSize, targetOffset],
+    queryFn: () =>
+      capabilitiesApi.list({ limit: targetPageSize, offset: targetOffset }),
   });
   const detailQuery = useQuery({
     queryKey: ["target-capability", selectedKey],
@@ -125,11 +232,29 @@ export default function CapabilitiesPage() {
     enabled: selectedKey !== null,
     refetchInterval: selectedKey !== null ? 3000 : false,
   });
-  const probeRunsQuery = useQuery({
-    queryKey: ["target-capability-probe-runs", selectedKey],
-    queryFn: () => capabilitiesApi.probeRuns(selectedKey ?? "", { limit: 20 }),
+  const probeJobsQuery = useQuery({
+    queryKey: ["target-capability-probe-jobs", selectedKey, probeJobPageSize, probeJobOffset],
+    queryFn: () =>
+      capabilitiesApi.probeJobs(selectedKey ?? "", {
+        limit: probeJobPageSize,
+        offset: probeJobOffset,
+      }),
     enabled: selectedKey !== null,
-    refetchInterval: selectedKey !== null ? 5000 : false,
+    refetchInterval: selectedKey !== null ? 3000 : false,
+  });
+  const probeJobRunsQuery = useQuery({
+    queryKey: ["target-capability-probe-job-runs", selectedKey, expandedProbeJobId],
+    queryFn: () =>
+      capabilitiesApi.probeJobRuns(selectedKey ?? "", expandedProbeJobId ?? "", {
+        limit: 50,
+      }),
+    enabled: selectedKey !== null && expandedProbeJobId !== null,
+    refetchInterval: selectedKey !== null && expandedProbeJobId !== null ? 3000 : false,
+  });
+  const probeRunDetailQuery = useQuery({
+    queryKey: ["target-capability-probe-run", selectedKey, selectedProbeRunId],
+    queryFn: () => capabilitiesApi.probeRun(selectedKey ?? "", selectedProbeRunId ?? ""),
+    enabled: selectedKey !== null && selectedProbeRunId !== null,
   });
   const registryQuery = useQuery({
     queryKey: ["capability-registry"],
@@ -138,6 +263,10 @@ export default function CapabilitiesPage() {
   const routesQuery = useQuery({
     queryKey: ["routes", "capability-admissions"],
     queryFn: () => routesApi.listAll(),
+  });
+  const providersQuery = useQuery({
+    queryKey: ["providers"],
+    queryFn: providersApi.list,
   });
   const settingsQuery = useQuery({
     queryKey: ["settings", "capability-probes"],
@@ -162,6 +291,7 @@ export default function CapabilitiesPage() {
       toast.success(t("capabilities.probeQueued"));
       void qc.invalidateQueries({ queryKey: ["target-capabilities"] });
       void qc.invalidateQueries({ queryKey: ["target-capability", targetKey] });
+      void qc.invalidateQueries({ queryKey: ["target-capability-probe-jobs", targetKey] });
     },
     onError: (error: Error) => toast.error(t("capabilities.probeFailed"), error.message),
   });
@@ -298,7 +428,25 @@ export default function CapabilitiesPage() {
   });
 
   const profiles = profilesQuery.data?.entries ?? [];
+  const targetTotal = profilesQuery.data?.total ?? 0;
+  const targetPage = Math.floor(targetOffset / targetPageSize) + 1;
+  const targetPageCount =
+    targetTotal === 0 ? 1 : Math.ceil(targetTotal / targetPageSize);
+  const probeJobTotal = probeJobsQuery.data?.total ?? 0;
+  const probeJobPage = Math.floor(probeJobOffset / probeJobPageSize) + 1;
+  const probeJobPageCount =
+    probeJobTotal === 0 ? 1 : Math.ceil(probeJobTotal / probeJobPageSize);
   const routes = routesQuery.data?.entries ?? [];
+  const providerNameById = useMemo(
+    () =>
+      new Map(
+        (providersQuery.data ?? []).map((provider) => [provider.id, provider.name]),
+      ),
+    [providersQuery.data],
+  );
+  const selectedSummary = profiles.find(
+    (profile) => profile.target_key === selectedKey,
+  );
   const registryEntries = registryQuery.data?.entries ?? registryQuery.data?.items ?? [];
   const overrideDescriptor = registryEntries.find(
     (descriptor) => descriptor.id === overrideCapability.trim(),
@@ -308,7 +456,10 @@ export default function CapabilitiesPage() {
   const probeWorkerEnabled =
     settingsQuery.data?.settings["gateway.capabilities.probe_enabled"] !== "false";
   const detail = detailQuery.data;
-  const probeRuns = probeRunsQuery.data?.entries ?? probeRunsQuery.data?.items ?? [];
+  const probeJobs = probeJobsQuery.data?.entries ?? probeJobsQuery.data?.items ?? [];
+  const probeJobRuns =
+    probeJobRunsQuery.data?.entries ?? probeJobRunsQuery.data?.items ?? [];
+  const probeRunDetail = probeRunDetailQuery.data;
   const entries = useMemo(
     () => Object.entries(detail?.profile.resolved_capabilities ?? {}),
     [detail],
@@ -320,6 +471,52 @@ export default function CapabilitiesPage() {
       ),
     [detail],
   );
+
+  function providerName(providerId: string) {
+    return providerNameById.get(providerId) ?? providerId;
+  }
+
+  useEffect(() => {
+    setExpandedProbeJobId(null);
+    setSelectedProbeRunId(null);
+    setProbeJobOffset(0);
+  }, [selectedKey]);
+
+  function registryLabel(group: string, value: string) {
+    const key = `capabilities.registry.${group}.${value.replace(/\./g, "__")}`;
+    return i18n.exists(key) ? t(key) : value;
+  }
+
+  function probeLabel(group: string, value: string) {
+    const key = `capabilities.${group}.${value}`;
+    return i18n.exists(key) ? t(key) : value;
+  }
+
+  function changeTargetPage(next: number) {
+    const clamped = Math.max(1, Math.min(targetPageCount, next));
+    setTargetOffset((clamped - 1) * targetPageSize);
+    setSelectedKey(null);
+  }
+
+  function changeTargetPageSize(next: number) {
+    setTargetPageSize(next);
+    setTargetOffset(0);
+    setSelectedKey(null);
+  }
+
+  function changeProbeJobPage(next: number) {
+    const clamped = Math.max(1, Math.min(probeJobPageCount, next));
+    setProbeJobOffset((clamped - 1) * probeJobPageSize);
+    setExpandedProbeJobId(null);
+    setSelectedProbeRunId(null);
+  }
+
+  function changeProbeJobPageSize(next: number) {
+    setProbeJobPageSize(next);
+    setProbeJobOffset(0);
+    setExpandedProbeJobId(null);
+    setSelectedProbeRunId(null);
+  }
 
   return (
     <div>
@@ -334,10 +531,10 @@ export default function CapabilitiesPage() {
           retryLabel={t("common.retry")}
         />
       ) : (
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,32rem)]">
-          <Card>
+        <div>
+          <Card className={PROFILE_PANEL_CLASS}>
             <CardHeader
-            title={t("capabilities.targets")}
+              title={t("capabilities.targets")}
               description={probeWorkerEnabled ? t("capabilities.probeWorkerRunning") : t("capabilities.probeWorkerPaused")}
               action={
                 <div className="flex items-center gap-2">
@@ -371,7 +568,7 @@ export default function CapabilitiesPage() {
                 {t("capabilities.empty")}
               </CardBody>
             ) : (
-              <Table tableClassName="min-w-max">
+              <Table className="min-h-0 flex-1" tableClassName="min-w-max">
                 <thead>
                   <tr>
                     <Th>{t("capabilities.target")}</Th>
@@ -382,53 +579,107 @@ export default function CapabilitiesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {profiles.map((profile) => (
-                    <Tr
-                      key={profile.target_key}
-                      className={selectedKey === profile.target_key ? "bg-primary-soft/40" : undefined}
-                    >
-                      <Td>
-                        <button
-                          type="button"
-                          className="max-w-48 truncate font-mono text-xs text-primary hover:underline"
-                          onClick={() => setSelectedKey(profile.target_key)}
-                          title={profile.target_key}
-                        >
-                          {profile.target_key}
-                        </button>
-                      </Td>
-                      <Td className="text-xs text-text-muted">{profile.dialect_id}</Td>
-                      <Td>
-                        <Badge tone={statusTone(profile.profile_status)}>
-                          {profile.profile_status}
-                        </Badge>
-                      </Td>
-                      <Td className="text-xs text-text-muted">
-                        {profile.supported}/{profile.constrained}/{profile.unsupported}/{profile.unknown}
-                      </Td>
-                      <Td>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          loading={probeMutation.isPending && probeMutation.variables === profile.target_key}
-                          icon={<RefreshCw size={14} />}
-                          onClick={() => probeMutation.mutate(profile.target_key)}
-                        >
-                          {t("capabilities.probe")}
-                        </Button>
-                      </Td>
-                    </Tr>
-                  ))}
+                  {profiles.map((profile) => {
+                    const displayProvider = providerName(profile.provider_id);
+                    const displayTarget = `${displayProvider} / ${profile.model_id}`;
+                    return (
+                      <Tr
+                        key={profile.target_key}
+                        className={selectedKey === profile.target_key ? "bg-primary-soft/40" : undefined}
+                      >
+                        <Td>
+                          <button
+                            type="button"
+                            className="block max-w-64 text-left text-primary hover:underline"
+                            aria-haspopup="dialog"
+                            onClick={() => setSelectedKey(profile.target_key)}
+                            title={`${displayTarget}\nTarget Key: ${profile.target_key}`}
+                          >
+                            <span className="block truncate text-sm font-medium">
+                              {displayProvider}
+                            </span>
+                            <span className="block truncate text-xs text-text-muted">
+                              {profile.model_id}
+                            </span>
+                          </button>
+                        </Td>
+                        <Td className="text-xs text-text-muted">{profile.dialect_id}</Td>
+                        <Td>
+                          <Badge tone={statusTone(profile.profile_status)}>
+                            {profile.profile_status}
+                          </Badge>
+                        </Td>
+                        <Td className="text-xs text-text-muted">
+                          {profile.supported}/{profile.constrained}/{profile.unsupported}/{profile.unknown}
+                        </Td>
+                        <Td>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            loading={probeMutation.isPending && probeMutation.variables === profile.target_key}
+                            icon={<RefreshCw size={14} />}
+                            onClick={() => probeMutation.mutate(profile.target_key)}
+                          >
+                            {t("capabilities.probe")}
+                          </Button>
+                        </Td>
+                      </Tr>
+                    );
+                  })}
                 </tbody>
               </Table>
             )}
+            {targetTotal > 0 ? (
+              <Pagination
+                page={targetPage}
+                pageCount={targetPageCount}
+                total={targetTotal}
+                limit={targetPageSize}
+                offset={targetOffset}
+                pageSizeOptions={TARGET_PAGE_SIZE_OPTIONS}
+                onPageChange={changeTargetPage}
+                onPageSizeChange={changeTargetPageSize}
+                labels={{
+                  pageSizeLabel: t("capabilities.pageSizeLabel"),
+                  pageSizeOption: t("capabilities.pageSizeOption"),
+                  total: t("capabilities.total"),
+                  range: t("capabilities.range"),
+                  pageOf: t("capabilities.pageOf"),
+                  first: t("capabilities.firstPage"),
+                  prev: t("capabilities.prevPage"),
+                  next: t("capabilities.nextPage"),
+                  last: t("capabilities.lastPage"),
+                  goTo: t("capabilities.goToPage"),
+                  go: t("capabilities.go"),
+                }}
+              />
+            ) : null}
           </Card>
 
-          <Card>
-            <CardHeader
-              title={t("capabilities.details")}
-              description={selectedKey ?? t("capabilities.selectTarget")}
-            />
+          <Drawer
+            open={selectedKey !== null}
+            onOpenChange={(open) => {
+              if (!open) {
+                setSelectedKey(null);
+                setExpandedProbeJobId(null);
+                setSelectedProbeRunId(null);
+              }
+            }}
+            title={t("capabilities.details")}
+            description={
+              selectedSummary
+                ? `${providerName(selectedSummary.provider_id)} / ${selectedSummary.model_id}`
+                : detail
+                  ? `${providerName(detail.profile.provider_id)} / ${detail.profile.model_id}`
+                  : t("capabilities.selectTarget")
+            }
+            closeLabel={t("common.close")}
+            footer={
+              <Button variant="secondary" onClick={() => setSelectedKey(null)}>
+                {t("common.close")}
+              </Button>
+            }
+          >
             {!selectedKey ? (
               <CardBody className="text-sm text-text-muted">{t("capabilities.selectTarget")}</CardBody>
             ) : detailQuery.isLoading ? (
@@ -440,7 +691,7 @@ export default function CapabilitiesPage() {
             ) : detail ? (
               <CardBody className="space-y-4">
                 <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div><span className="text-text-subtle">{t("capabilities.provider")}</span><div className="font-medium">{detail.profile.provider_id}</div></div>
+                  <div><span className="text-text-subtle">{t("capabilities.provider")}</span><div className="truncate font-medium" title={detail.profile.provider_id}>{providerName(detail.profile.provider_id)}</div></div>
                   <div><span className="text-text-subtle">{t("capabilities.model")}</span><div className="font-medium">{detail.profile.model_id}</div></div>
                   <div><span className="text-text-subtle">{t("capabilities.dialect")}</span><div className="font-medium">{detail.profile.dialect_id}</div></div>
                   <div><span className="text-text-subtle">{t("capabilities.status")}</span><div><Badge tone={statusTone(detail.profile.profile_status)}>{detail.profile.profile_status}</Badge></div></div>
@@ -458,20 +709,112 @@ export default function CapabilitiesPage() {
                     {detail.probe_job.lease_until ? ` · ${t("capabilities.leaseUntil")}: ${fmtTime(detail.probe_job.lease_until)}` : ""}
                   </div>
                 ) : null}
-                {probeRunsQuery.error ? (
-                  <div className="text-xs text-danger">{(probeRunsQuery.error as Error).message}</div>
-                ) : probeRuns.length > 0 ? (
-                  <div className="rounded border border-border px-2.5 py-2 text-xs text-text-muted">
-                    <div className="font-medium text-text">{t("capabilities.probeRuns")}</div>
-                    <div className="mt-1 space-y-1">
-                      {probeRuns.slice(0, 20).map((run) => (
-                        <div key={run.run_id} className="flex items-center justify-between gap-2">
-                          <span className="truncate font-mono">{run.probe_id}</span>
-                          <span>{run.outcome} · {run.budget_weight}u · {Math.round(run.duration_micros / 1000)}ms</span>
-                        </div>
-                      ))}
+                <div className="rounded border border-border px-2.5 py-2 text-xs">
+                  <div className="font-medium text-text">{t("capabilities.probeJobsTitle")}</div>
+                  {probeJobsQuery.error ? (
+                    <div className="mt-1 text-danger">{(probeJobsQuery.error as Error).message}</div>
+                  ) : probeJobsQuery.isLoading ? (
+                    <div className="mt-1 text-text-muted">{t("common.loading")}</div>
+                  ) : probeJobs.length === 0 ? (
+                    <div className="mt-1 text-text-muted">{t("capabilities.probeJobsEmpty")}</div>
+                  ) : (
+                    <div className="mt-1 space-y-1.5">
+                      {probeJobs.map((job) => {
+                        const expanded = expandedProbeJobId === job.id;
+                        return (
+                          <div key={job.id} className="rounded border border-border/70">
+                            <button
+                              type="button"
+                              className="flex min-h-11 w-full items-center justify-between gap-2 px-2 py-1.5 text-left hover:bg-surface-muted"
+                              aria-expanded={expanded}
+                              onClick={() => {
+                                setExpandedProbeJobId(expanded ? null : job.id);
+                                setSelectedProbeRunId(null);
+                              }}
+                            >
+                              <span className="min-w-0">
+                                <span className="block truncate font-mono text-text" title={job.probe_set.join(", ")}>
+                                  {job.probe_set.join(", ")}
+                                </span>
+                                <span className="block truncate text-text-subtle">
+                                  {t("capabilities.probeJobAttempts")}: {job.attempt_count}/{job.max_attempts} · {t("capabilities.probeJobProgress")}: {job.next_probe_index}/{job.probe_set.length}
+                                </span>
+                              </span>
+                              <Badge tone={probeStatusTone(job.status)}>{probeLabel("probeStatuses", job.status)}</Badge>
+                            </button>
+                            {expanded ? (
+                              <div className="border-t border-border/70 px-2 py-2">
+                                {probeJobRunsQuery.error ? (
+                                  <div className="text-danger">{(probeJobRunsQuery.error as Error).message}</div>
+                                ) : probeJobRunsQuery.isLoading ? (
+                                  <div className="text-text-muted">{t("common.loading")}</div>
+                                ) : probeJobRuns.length === 0 ? (
+                                  <div className="text-text-muted">{t("capabilities.probeJobRunsEmpty")}</div>
+                                ) : (
+                                  <div className="space-y-1">
+                                    <div className="text-text-subtle">{t("capabilities.probeJobRuns")}</div>
+                                    {probeJobRuns.map((run) => (
+                                      <button
+                                        key={run.run_id}
+                                        type="button"
+                                        className="flex min-h-10 w-full items-center justify-between gap-2 rounded px-1.5 py-1 text-left hover:bg-surface-muted"
+                                        aria-expanded={selectedProbeRunId === run.run_id}
+                                        onClick={() => setSelectedProbeRunId(
+                                          selectedProbeRunId === run.run_id ? null : run.run_id,
+                                        )}
+                                      >
+                                        <span className="min-w-0 truncate">
+                                          <span className="font-mono text-text">{run.probe_id}</span>
+                                          <span className="ml-2 text-text-subtle">{fmtTime(run.ts)}</span>
+                                        </span>
+                                        <span className="shrink-0 text-text-muted">
+                                          {probeLabel("probeOutcomes", run.outcome)} · {Math.round(run.duration_micros / 1000)}ms
+                                        </span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                                {selectedProbeRunId && probeRunDetail ? (
+                                  <ProbeRunDetailView
+                                    detail={probeRunDetail}
+                                  />
+                                ) : selectedProbeRunId && probeRunDetailQuery.isLoading ? (
+                                  <div className="mt-2 text-text-muted">{t("common.loading")}</div>
+                                ) : selectedProbeRunId && probeRunDetailQuery.error ? (
+                                  <div className="mt-2 text-danger">{(probeRunDetailQuery.error as Error).message}</div>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
                     </div>
-                  </div>
+                  )}
+                </div>
+                {probeJobTotal > 0 ? (
+                  <Pagination
+                    page={probeJobPage}
+                    pageCount={probeJobPageCount}
+                    total={probeJobTotal}
+                    limit={probeJobPageSize}
+                    offset={probeJobOffset}
+                    pageSizeOptions={PROBE_JOB_PAGE_SIZE_OPTIONS}
+                    onPageChange={changeProbeJobPage}
+                    onPageSizeChange={changeProbeJobPageSize}
+                    labels={{
+                      pageSizeLabel: t("capabilities.pageSizeLabel"),
+                      pageSizeOption: t("capabilities.pageSizeOption"),
+                      total: t("capabilities.probeJobsTotal"),
+                      range: t("capabilities.range"),
+                      pageOf: t("capabilities.pageOf"),
+                      first: t("capabilities.firstPage"),
+                      prev: t("capabilities.prevPage"),
+                      next: t("capabilities.nextPage"),
+                      last: t("capabilities.lastPage"),
+                      goTo: t("capabilities.goToPage"),
+                      go: t("capabilities.go"),
+                    }}
+                  />
                 ) : null}
                 {detail.profile.last_probe_error_class ? (
                   <div className="rounded border border-danger/30 bg-danger/5 px-2.5 py-2 text-xs text-danger">
@@ -664,7 +1007,7 @@ export default function CapabilitiesPage() {
                 </div>
               </CardBody>
             ) : null}
-          </Card>
+          </Drawer>
         </div>
       )}
       <Card className="mt-4">
@@ -867,22 +1210,54 @@ export default function CapabilitiesPage() {
         <Card className="mt-4">
           <CardHeader
             title={t("capabilities.registryTitle")}
-            description={`${registryEntries.length} capability descriptors`}
+            description={t("capabilities.registryDescription", {
+              count: registryEntries.length,
+            })}
           />
           <CardBody className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-            {registryEntries.map((descriptor) => (
-              <div key={descriptor.id} className="rounded border border-border px-2.5 py-2 text-xs">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate font-mono" title={descriptor.id}>{descriptor.id}</span>
-                  <Badge tone={descriptor.routing_eligibility === "enforce_eligible" ? "success" : "neutral"}>
-                    {descriptor.routing_eligibility}
-                  </Badge>
+            {registryEntries.map((descriptor) => {
+              const capabilityName = registryLabel("capabilityNames", descriptor.id);
+              return (
+                <div key={descriptor.id} className="rounded border border-border px-2.5 py-2 text-xs">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      {capabilityName !== descriptor.id ? (
+                        <div className="truncate font-medium text-text" title={capabilityName}>
+                          {capabilityName}
+                        </div>
+                      ) : null}
+                      <div className="truncate font-mono text-text-muted" title={descriptor.id}>
+                        {descriptor.id}
+                      </div>
+                    </div>
+                    <Badge
+                      tone={descriptor.routing_eligibility === "enforce_eligible" ? "success" : "neutral"}
+                      title={descriptor.routing_eligibility}
+                    >
+                      {registryLabel("routingEligibility", descriptor.routing_eligibility)}
+                    </Badge>
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-text-subtle">
+                    <span>
+                      {t("capabilities.registryValueKind")}:{" "}
+                      <code className="text-text">{descriptor.value_kind}</code>
+                    </span>
+                    <span>
+                      {t("capabilities.registryMatcher")}:{" "}
+                      <span className="text-text" title={descriptor.matcher}>
+                        {registryLabel("matcher", descriptor.matcher)}
+                      </span>
+                    </span>
+                    <span>
+                      {t("capabilities.registryImplementationStatus")}:{" "}
+                      <span className="text-text" title={descriptor.implementation_status}>
+                        {registryLabel("implementationStatus", descriptor.implementation_status)}
+                      </span>
+                    </span>
+                  </div>
                 </div>
-                <div className="mt-1 text-text-subtle">
-                  {descriptor.value_kind} · {descriptor.matcher} · {descriptor.implementation_status}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </CardBody>
         </Card>
       ) : null}
