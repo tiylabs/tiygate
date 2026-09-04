@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { ChevronDown, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -188,6 +188,37 @@ function ProbeRunDetailView({ detail }: { detail: CapabilityProbeRunDetail }) {
       {detail.details?.truncated ? (
         <div className="text-warning">{t("capabilities.probeDetailTruncated")}</div>
       ) : null}
+    </div>
+  );
+}
+
+function DrawerSection({
+  title,
+  description,
+  children,
+}: {
+  title: ReactNode;
+  description?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="space-y-2">
+      <div>
+        <h3 className="text-sm font-semibold text-text">{title}</h3>
+        {description ? <p className="mt-0.5 text-xs text-text-subtle">{description}</p> : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function DrawerMeta({ label, value }: { label: ReactNode; value: ReactNode }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[11px] font-medium uppercase tracking-[0.04em] text-text-subtle">{label}</div>
+      <div className="mt-0.5 min-w-0 truncate text-xs font-medium text-text" title={typeof value === "string" ? value : undefined}>
+        {value}
+      </div>
     </div>
   );
 }
@@ -689,28 +720,54 @@ export default function CapabilitiesPage() {
                 <ErrorBox message={(detailQuery.error as Error).message} onRetry={() => void detailQuery.refetch()} retryLabel={t("common.retry")} />
               </CardBody>
             ) : detail ? (
-              <CardBody className="space-y-4">
-                <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div><span className="text-text-subtle">{t("capabilities.provider")}</span><div className="truncate font-medium" title={detail.profile.provider_id}>{providerName(detail.profile.provider_id)}</div></div>
-                  <div><span className="text-text-subtle">{t("capabilities.model")}</span><div className="font-medium">{detail.profile.model_id}</div></div>
-                  <div><span className="text-text-subtle">{t("capabilities.dialect")}</span><div className="font-medium">{detail.profile.dialect_id}</div></div>
-                  <div><span className="text-text-subtle">{t("capabilities.status")}</span><div><Badge tone={statusTone(detail.profile.profile_status)}>{detail.profile.profile_status}</Badge></div></div>
-                  <div><span className="text-text-subtle">{t("capabilities.probeJob")}</span><div>{detail.probe_job ? <Badge tone={statusTone(detail.probe_job.status)}>{detail.probe_job.status}</Badge> : "—"}</div></div>
-                  <div><span className="text-text-subtle">{t("capabilities.probeAttempts")}</span><div>{detail.probe_job ? `${detail.probe_job.attempt_count}/${detail.probe_job.max_attempts}` : "—"}</div></div>
-                  <div><span className="text-text-subtle">probe progress</span><div>{detail.probe_job ? `${detail.probe_job.next_probe_index}/${detail.probe_job.probe_set.length}` : "—"}</div></div>
-                  <div><span className="text-text-subtle">{t("capabilities.freshUntil")}</span><div>{fmtTime(detail.profile.fresh_until)}</div></div>
-                  <div><span className="text-text-subtle">{t("capabilities.staleUntil")}</span><div>{fmtTime(detail.profile.stale_until)}</div></div>
-                  <div><span className="text-text-subtle">registry/baseline</span><div>{detail.profile.registry_version}/{detail.profile.baseline_version}</div></div>
-                  <div><span className="text-text-subtle">probe suite/judge</span><div>{detail.profile.last_probe_suite_version ?? "—"}/{detail.profile.last_probe_judge_version ?? "—"}</div></div>
-                </div>
+              <div className="space-y-5">
+                <section className="rounded-lg border border-border bg-surface-muted/40 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-base font-semibold text-text">
+                        {providerName(detail.profile.provider_id)}
+                      </div>
+                      <div className="mt-0.5 truncate text-sm text-text-muted" title={detail.profile.model_id}>
+                        {detail.profile.model_id}
+                      </div>
+                      <div className="mt-2 truncate font-mono text-[11px] text-text-subtle" title={detail.profile.dialect_id}>
+                        {detail.profile.dialect_id}
+                      </div>
+                    </div>
+                    <Badge tone={statusTone(detail.profile.profile_status)}>
+                      {detail.profile.profile_status}
+                    </Badge>
+                  </div>
+                  <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-3 sm:grid-cols-3">
+                    <DrawerMeta
+                      label={t("capabilities.probeJob")}
+                      value={detail.probe_job ? <Badge tone={statusTone(detail.probe_job.status)}>{detail.probe_job.status}</Badge> : "—"}
+                    />
+                    <DrawerMeta
+                      label={t("capabilities.probeAttempts")}
+                      value={detail.probe_job ? `${detail.probe_job.attempt_count}/${detail.probe_job.max_attempts}` : "—"}
+                    />
+                    <DrawerMeta
+                      label={t("capabilities.probeJobProgress")}
+                      value={detail.probe_job ? `${detail.probe_job.next_probe_index}/${detail.probe_job.probe_set.length}` : "—"}
+                    />
+                    <DrawerMeta label={t("capabilities.freshUntil")} value={fmtTime(detail.profile.fresh_until)} />
+                    <DrawerMeta label={t("capabilities.staleUntil")} value={fmtTime(detail.profile.stale_until)} />
+                    <DrawerMeta label={t("capabilities.registryBaseline")} value={`${detail.profile.registry_version}/${detail.profile.baseline_version}`} />
+                    <DrawerMeta label={t("capabilities.probeSuiteJudge")} value={`${detail.profile.last_probe_suite_version ?? "—"}/${detail.profile.last_probe_judge_version ?? "—"}`} />
+                  </div>
+                </section>
                 {detail.probe_job ? (
                   <div className="rounded border border-border px-2.5 py-2 text-xs text-text-muted">
                     {t("capabilities.nextProbe")}: {fmtTime(detail.probe_job.next_attempt_at)}
                     {detail.probe_job.lease_until ? ` · ${t("capabilities.leaseUntil")}: ${fmtTime(detail.probe_job.lease_until)}` : ""}
                   </div>
                 ) : null}
+                <DrawerSection
+                  title={t("capabilities.probeJobsTitle")}
+                  description={t("capabilities.probeJobsDescription")}
+                >
                 <div className="rounded border border-border px-2.5 py-2 text-xs">
-                  <div className="font-medium text-text">{t("capabilities.probeJobsTitle")}</div>
                   {probeJobsQuery.error ? (
                     <div className="mt-1 text-danger">{(probeJobsQuery.error as Error).message}</div>
                   ) : probeJobsQuery.isLoading ? (
@@ -816,14 +873,15 @@ export default function CapabilitiesPage() {
                     }}
                   />
                 ) : null}
+                </DrawerSection>
                 {detail.profile.last_probe_error_class ? (
-                  <div className="rounded border border-danger/30 bg-danger/5 px-2.5 py-2 text-xs text-danger">
+                  <div role="alert" className="rounded-lg border border-danger/30 bg-danger/5 px-3 py-2.5 text-xs text-danger">
                     {detail.profile.last_probe_error_class}: {detail.profile.last_probe_error_redacted ?? ""}
                   </div>
                 ) : null}
                 {inconclusiveObservations.length > 0 ? (
-                  <div className="rounded border border-warning/30 bg-warning/5 px-2.5 py-2 text-xs text-text-muted">
-                    <div className="font-medium text-warning">{t("capabilities.inconclusiveTitle")}</div>
+                  <DrawerSection title={t("capabilities.inconclusiveTitle")}>
+                  <div className="rounded-lg border border-warning/30 bg-warning/5 px-3 py-2.5 text-xs text-text-muted">
                     <div className="mt-1 space-y-1">
                       {inconclusiveObservations.map((observation) => (
                         <div key={`${observation.capability_id}:${observation.observed_at}`} className="truncate" title={observation.redacted_detail ?? undefined}>
@@ -832,8 +890,13 @@ export default function CapabilitiesPage() {
                       ))}
                     </div>
                   </div>
+                  </DrawerSection>
                 ) : null}
-                <div className="space-y-1.5">
+                <DrawerSection
+                  title={t("capabilities.resolvedCapabilities")}
+                  description={t("capabilities.resolvedCapabilitiesDescription")}
+                >
+                <div className="grid gap-2 sm:grid-cols-2">
                   {entries.length === 0 ? <p className="text-sm text-text-muted">{t("capabilities.noObservations")}</p> : entries.map(([id, value]) => (
                     <div key={id} className="rounded border border-border px-2.5 py-1.5 text-xs">
                       <div className="flex items-center justify-between gap-2">
@@ -855,8 +918,13 @@ export default function CapabilitiesPage() {
                     </div>
                   ))}
                 </div>
-                <div className="space-y-2 border-t border-border pt-3">
-                  <div className="flex items-center gap-2 text-xs font-medium"><ShieldCheck size={14} />{t("capabilities.overrideTitle")}</div>
+                </DrawerSection>
+                <details className="group rounded-lg border border-border">
+                  <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 text-sm font-semibold text-text select-none [&::-webkit-details-marker]:hidden">
+                    <span className="flex items-center gap-2"><ShieldCheck size={14} />{t("capabilities.overrideTitle")}</span>
+                    <ChevronDown size={15} aria-hidden="true" className="text-text-subtle transition-transform group-open:rotate-180" />
+                  </summary>
+                  <div className="space-y-2 border-t border-border px-3 py-3">
                   <Field label={t("capabilities.capabilityId")} controlId="override-capability-id">
                     <Input
                       id="override-capability-id"
@@ -1004,8 +1072,9 @@ export default function CapabilitiesPage() {
                       ))}
                     </div>
                   ) : null}
-                </div>
-              </CardBody>
+                  </div>
+                </details>
+              </div>
             ) : null}
           </Drawer>
         </div>
