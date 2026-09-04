@@ -372,6 +372,13 @@ fn parse_reset_credit_list(value: &Value) -> Vec<ProviderResetCredit> {
         .collect()
 }
 
+fn reconcile_reset_credit_count(explicit_count: Option<usize>, observed_count: usize) -> usize {
+    // A returned credit record is direct evidence that the credit is
+    // available. Keep a larger explicit count when the endpoint returns only
+    // partial details, but never let a stale summary hide returned credits.
+    explicit_count.map_or(observed_count, |count| count.max(observed_count))
+}
+
 fn parse_reset_credits(value: &Value) -> Option<ProviderResetCredits> {
     if value.is_array() {
         let credits = parse_reset_credit_list(value);
@@ -386,20 +393,27 @@ fn parse_reset_credits(value: &Value) -> Option<ProviderResetCredits> {
         .get("available_count")
         .or_else(|| object.get("availableCount"))
         .and_then(|value| parse_non_negative_count(Some(value)));
-    let credit_payload = ["credits", "items", "data"]
-        .into_iter()
-        .find_map(|key| object.get(key));
-    if let Some(credit_payload) = credit_payload {
-        let credits = parse_reset_credit_list(credit_payload);
-        return Some(ProviderResetCredits {
-            available_count: available_count.unwrap_or(credits.len()),
-            credits,
-        });
+
+    // The detail endpoint has returned both flat arrays and wrapper objects
+    // (for example {"data": {"credits": [...]}}). Walk each supported
+    // container instead of treating a non-array container as an empty list.
+    for key in ["credits", "items", "data"] {
+        let Some(credit_payload) = object.get(key) else {
+            continue;
+        };
+        let Some(mut parsed) = parse_reset_credits(credit_payload) else {
+            continue;
+        };
+        parsed.available_count =
+            reconcile_reset_credit_count(available_count, parsed.available_count);
+        return Some(parsed);
     }
 
     for key in ["rate_limit_reset_credits", "rateLimitResetCredits"] {
         if let Some(nested) = object.get(key) {
-            if let Some(parsed) = parse_reset_credits(nested) {
+            if let Some(mut parsed) = parse_reset_credits(nested) {
+                parsed.available_count =
+                    reconcile_reset_credit_count(available_count, parsed.available_count);
                 return Some(parsed);
             }
         }
@@ -4061,6 +4075,39 @@ mod tests {
         let empty = parse_reset_credits(&json!([])).expect("empty reset credits JSON");
         assert_eq!(empty.available_count, 0);
         assert!(empty.credits.is_empty());
+    }
+
+    #[test]
+    fn does_not_underreport_credits_when_explicit_count_is_smaller() {
+        let body = json!({
+            "available_count": 1,
+            "credits": [
+                {"status": "available", "expires_at": "2026-08-30T00:00:00Z"},
+                {"status": "available", "expires_at": "2026-09-01T00:00:00Z"},
+                {"status": "available", "expires_at": "2026-09-03T00:00:00Z"}
+            ]
+        });
+
+        let parsed = parse_reset_credits(&body).expect("reset credits JSON");
+        assert_eq!(parsed.available_count, 3);
+        assert_eq!(parsed.credits.len(), 3);
+    }
+
+    #[test]
+    fn parses_reset_credits_from_nested_data_object() {
+        let body = json!({
+            "available_count": 1,
+            "data": {
+                "credits": [
+                    {"status": "available", "expires_at": "2026-08-30T00:00:00Z"},
+                    {"status": "available", "expires_at": "2026-09-01T00:00:00Z"}
+                ]
+            }
+        });
+
+        let parsed = parse_reset_credits(&body).expect("nested reset credits JSON");
+        assert_eq!(parsed.available_count, 2);
+        assert_eq!(parsed.credits.len(), 2);
     }
 
     #[test]
