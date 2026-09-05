@@ -161,7 +161,7 @@ pub(super) fn spawn_capture(state: &AppState, capture: tiygate_core::ExchangeCap
 pub(super) fn maybe_inject_prompt_cache_key(
     body: &mut serde_json::Value,
     egress_suite: &tiygate_core::ProtocolSuite,
-    api_key_id: &str,
+    caller_key_id: &str,
 ) -> bool {
     let dominated_by_openai = matches!(
         egress_suite,
@@ -176,10 +176,10 @@ pub(super) fn maybe_inject_prompt_cache_key(
         return false;
     }
     // "anonymous" callers have no stable identity → skip injection.
-    if api_key_id == "anonymous" {
+    if caller_key_id == "anonymous" {
         return false;
     }
-    body["prompt_cache_key"] = serde_json::Value::String(api_key_id.to_string());
+    body["prompt_cache_key"] = serde_json::Value::String(caller_key_id.to_string());
     true
 }
 
