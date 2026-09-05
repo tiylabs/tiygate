@@ -234,6 +234,7 @@ mod tests {
     fn target(profile: OAuthEgressProfile) -> RoutingTarget {
         RoutingTarget {
             provider_id: "anthropic-oauth".to_string(),
+            vendor: None,
             model_id: "claude-test".to_string(),
             api_base: "https://api.anthropic.com/v1".to_string(),
             api_key: String::new(),

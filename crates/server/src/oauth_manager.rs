@@ -1106,6 +1106,7 @@ mod tests {
     fn make_target(oauth: Option<OAuthTargetConfig>) -> RoutingTarget {
         RoutingTarget {
             provider_id: "test-prov".to_string(),
+            vendor: None,
             model_id: "test-model".to_string(),
             api_base: String::new(),
             api_key: String::new(),
@@ -1272,6 +1273,7 @@ mod tests {
         let oauth = build_oauth_target_config(&provider).unwrap();
         let target = RoutingTarget {
             provider_id: provider_id.to_string(),
+            vendor: None,
             model_id: "model".to_string(),
             api_base: String::new(),
             api_key: String::new(),
@@ -2009,6 +2011,7 @@ mod tests {
         let provider = store_a.get_provider(&provider_id).await.unwrap().unwrap();
         let target = RoutingTarget {
             provider_id: provider_id.clone(),
+            vendor: None,
             model_id: "model".to_string(),
             api_base: String::new(),
             api_key: String::new(),

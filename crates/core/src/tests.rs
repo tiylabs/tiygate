@@ -18,6 +18,7 @@ mod tests {
         let mut table = RoutingTable::new();
         let targets = vec![RoutingTarget {
             provider_id: "openai".to_string(),
+            vendor: None,
             model_id: "gpt-4o".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             api_key: "sk-test".to_string(),

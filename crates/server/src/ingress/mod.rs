@@ -811,6 +811,7 @@ pub async fn apply_provider_auth(
     target: &tiygate_core::RoutingTarget,
     upstream_headers: &mut http::HeaderMap,
     oauth_manager: &crate::oauth_manager::OAuthTokenManager,
+    caller_key_id: &str,
 ) -> Result<(), AppError> {
     // OAuth path: if the routing target carries an OAuth config,
     // use the OAuthTokenManager to refresh/inject the access token.
@@ -840,8 +841,9 @@ pub async fn apply_provider_auth(
         }
         // Inject provider-specific extra headers (e.g. x-opencode-session)
         // after auth so provider auth headers always win.
-        let api_key = target.effective_api_key().to_string();
-        inject_provider_extra_headers(&*provider, &api_key, upstream_headers);
+        // Use caller_key_id (TiYgate customer's key) so each customer
+        // gets a unique session identifier, not the shared upstream key.
+        inject_provider_extra_headers(&*provider, caller_key_id, upstream_headers);
         return Ok(());
     }
     // Protocol-aware fallback when no provider is registered for the

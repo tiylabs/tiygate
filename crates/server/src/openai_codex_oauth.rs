@@ -734,6 +734,7 @@ mod tests {
     fn target(profile: OAuthEgressProfile, transport: UpstreamTransport) -> RoutingTarget {
         RoutingTarget {
             provider_id: "openai-oauth".to_string(),
+            vendor: None,
             model_id: "gpt-test".to_string(),
             api_base: "https://chatgpt.com/backend-api/codex".to_string(),
             api_key: String::new(),

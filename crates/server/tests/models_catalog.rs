@@ -40,6 +40,7 @@ async fn models_endpoint_enriches_visible_routes_from_catalog() {
     routing_table.insert(
         "zai/glm-test".to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "zai".to_string(),
             model_id: "zai/glm-test".to_string(),
             api_base: "https://example.invalid/v1".to_string(),

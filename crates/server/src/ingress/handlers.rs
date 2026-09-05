@@ -773,6 +773,7 @@ pub(super) async fn handle_embeddings(
                 &request_id,
                 &headers,
                 cache_key,
+                &api_key.key_id,
             ))
         },
     )
