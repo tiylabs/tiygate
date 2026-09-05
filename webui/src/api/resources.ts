@@ -31,6 +31,7 @@ import type {
   Settings,
   SettingsResponse,
   StatsResponse,
+  TokenDashboardData,
   TokenActivityResponse,
   TokenSummaryData,
 } from "./types";
@@ -156,6 +157,10 @@ export const statsApi = {
     apiRequest<StatsResponse>("/stats/by-api-key", { query: range }),
   byTarget: (range: StatsRange = {}) =>
     apiRequest<StatsResponse>("/stats/by-target", { query: range }),
+  tokenDashboard: (days = 365) =>
+    apiRequest<TokenDashboardData>("/stats/token-dashboard", {
+      query: { days },
+    }),
   tokenActivity: (days = 365) =>
     apiRequest<TokenActivityResponse>("/stats/token-activity", {
       query: { days },

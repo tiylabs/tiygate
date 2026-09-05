@@ -1856,8 +1856,12 @@ impl DbConfigStore {
                     completion_tokens = token_daily_stats.completion_tokens + excluded.completion_tokens, \
                     reasoning_tokens = token_daily_stats.reasoning_tokens + excluded.reasoning_tokens, \
                     total_cost = token_daily_stats.total_cost + excluded.total_cost, \
-                    peak_single_request = MAX(token_daily_stats.peak_single_request, excluded.peak_single_request), \
-                    longest_task_ms = MAX(token_daily_stats.longest_task_ms, excluded.longest_task_ms), \
+                    peak_single_request = CASE \
+                        WHEN token_daily_stats.peak_single_request > excluded.peak_single_request \
+                        THEN token_daily_stats.peak_single_request ELSE excluded.peak_single_request END, \
+                    longest_task_ms = CASE \
+                        WHEN token_daily_stats.longest_task_ms > excluded.longest_task_ms \
+                        THEN token_daily_stats.longest_task_ms ELSE excluded.longest_task_ms END, \
                     updated_at = excluded.updated_at",
             )
             .bind(&s.day)
@@ -1875,14 +1879,13 @@ impl DbConfigStore {
             report.token_stats_imported += 1;
         }
 
-        tx.commit().await?;
-        // Recompute the token_summary from the merged daily stats so
-        // lifetime/peak/streaks reflect the combined data. This runs
-        // after commit because recompute_summary uses the pool
-        // directly (compute_streaks queries via pool.any()).
+        // Keep the merged daily rows and their derived summary in the same
+        // transaction. A failed summary recomputation now rolls back the
+        // imported token stats instead of exposing a partial state.
         if report.token_stats_imported > 0 {
-            crate::token_stats::recompute_summary(&self.pool).await?;
+            crate::token_stats::recompute_summary_in_tx(&mut tx).await?;
         }
+        tx.commit().await?;
         // Refresh the in-memory snapshot so the data plane picks up
         // the newly imported rows immediately.
         self.refresh().await?;
@@ -3841,6 +3844,54 @@ mod tests {
         // current streak = 2 (yesterday + today)
         assert_eq!(summary.current_streak, 2);
         assert_eq!(summary.longest_streak, 2);
+    }
+
+    #[tokio::test]
+    async fn import_token_stats_rolls_back_when_summary_update_fails() {
+        let store = boot_store(None).await;
+        let today_str = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        sqlx::query(
+            "CREATE TRIGGER fail_import_summary_update \
+             BEFORE UPDATE ON token_summary \
+             BEGIN SELECT RAISE(FAIL, 'forced summary failure'); END",
+        )
+        .execute(store.pool.any())
+        .await
+        .expect("create trigger");
+
+        let bundle = ConfigExport {
+            schema_version: 2,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            encrypted: false,
+            providers: vec![],
+            routes: vec![],
+            api_keys: vec![],
+            settings: vec![],
+            token_daily_stats: vec![ExportTokenDailyStat {
+                day: today_str.clone(),
+                request_count: 1,
+                total_tokens: 500,
+                prompt_tokens: 250,
+                completion_tokens: 250,
+                reasoning_tokens: 0,
+                total_cost: 10_000,
+                peak_single_request: 500,
+                longest_task_ms: 1000,
+            }],
+        };
+        let selection = ImportSelection {
+            token_stats: vec![today_str],
+            ..Default::default()
+        };
+
+        assert!(store.import_config(&bundle, "", &selection).await.is_err());
+        let activity = crate::token_stats::get_token_activity(&store.pool, 365)
+            .await
+            .expect("activity after rollback");
+        assert!(activity.is_empty(), "imported daily row must roll back");
     }
 
     #[tokio::test]

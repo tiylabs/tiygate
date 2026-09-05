@@ -15,12 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{NaiveDate, Utc};
-use sqlx::Row;
+use sqlx::{Any, Row, Transaction};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::config_store::DbConfigStore;
-use crate::db::DbPool;
+use crate::db::{DbKind, DbPool};
 use crate::models::ExportTokenDailyStat;
 use crate::settings_keys;
 
@@ -114,26 +114,17 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
     let today = now.date_naive();
     let since = today - chrono::Duration::days(lookback_days as i64);
     let since_str = since.format("%Y-%m-%d").to_string();
+    let mut tx = pool.any().begin().await?;
 
     // Step 1: Aggregate per-day stats from request_logs.
-    let rows = sqlx::query(
-        "SELECT CAST(DATE(ts) AS TEXT) AS day, \
-                COUNT(*) AS cnt, \
-                COALESCE(SUM(total_tokens), 0) AS tt, \
-                COALESCE(SUM(prompt_tokens), 0) AS pt, \
-                COALESCE(SUM(completion_tokens), 0) AS ct, \
-                COALESCE(SUM(reasoning_tokens), 0) AS rt, \
-                COALESCE(SUM(cost), 0) AS tc, \
-                COALESCE(MAX(total_tokens), 0) AS peak_req, \
-                COALESCE(MAX(total_latency_ms), 0) AS longest_ms \
-         FROM request_logs \
-         WHERE ts >= $1 \
-         GROUP BY DATE(ts) \
-         ORDER BY day",
-    )
-    .bind(&since_str)
-    .fetch_all(pool.any())
-    .await?;
+    // `ts` is deliberately stored as TEXT for SQLite/PostgreSQL parity, but
+    // DATE(text) is not a valid PostgreSQL function call. Keep the two SQL
+    // dialects explicit so the worker does not fail every pass on PG.
+    let aggregation_sql = aggregation_sql(pool.kind());
+    let rows = sqlx::query(aggregation_sql)
+        .bind(&since_str)
+        .fetch_all(&mut *tx)
+        .await?;
 
     let updated_at = now.to_rfc3339();
 
@@ -175,12 +166,15 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
         .bind(peak_single_request)
         .bind(longest_task_ms)
         .bind(&updated_at)
-        .execute(pool.any())
+        .execute(&mut *tx)
         .await?;
     }
 
-    // Step 3: Recompute summary from token_daily_stats.
-    recompute_summary(pool).await?;
+    // Step 3: Recompute the summary in the same transaction as the daily
+    // rows. Readers therefore see either the complete old snapshot or the
+    // complete new snapshot, never fresh daily rows with a stale summary.
+    recompute_summary_in_tx(&mut tx).await?;
+    tx.commit().await?;
 
     debug!(
         days_aggregated = rows.len(),
@@ -190,42 +184,97 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
     Ok(())
 }
 
+/// SQL used to aggregate request logs by UTC calendar day. PostgreSQL and
+/// SQLite expose different date functions because `request_logs.ts` is TEXT
+/// on both backends.
+fn aggregation_sql(kind: DbKind) -> &'static str {
+    match kind {
+        DbKind::Sqlite => {
+            "SELECT CAST(DATE(ts) AS TEXT) AS day, \
+                    COUNT(*) AS cnt, \
+                    CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS tt, \
+                    CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS pt, \
+                    CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS ct, \
+                    CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) AS rt, \
+                    CAST(COALESCE(SUM(cost), 0) AS BIGINT) AS tc, \
+                    COALESCE(MAX(total_tokens), 0) AS peak_req, \
+                    COALESCE(MAX(total_latency_ms), 0) AS longest_ms \
+             FROM request_logs \
+             WHERE ts >= $1 \
+             GROUP BY DATE(ts) \
+             ORDER BY day"
+        }
+        DbKind::Postgres => {
+            // `ts` is written as UTC RFC-3339 text by the sink, so the
+            // lower-bound comparison can use the indexed TEXT column while
+            // the grouping expression performs the explicit UTC conversion.
+            "SELECT TO_CHAR((ts::timestamptz AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, \
+                    COUNT(*) AS cnt, \
+                    CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS tt, \
+                    CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS pt, \
+                    CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS ct, \
+                    CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) AS rt, \
+                    CAST(COALESCE(SUM(cost), 0) AS BIGINT) AS tc, \
+                    COALESCE(MAX(total_tokens), 0) AS peak_req, \
+                    COALESCE(MAX(total_latency_ms), 0) AS longest_ms \
+             FROM request_logs \
+             WHERE ts >= $1 \
+             GROUP BY (ts::timestamptz AT TIME ZONE 'UTC')::date \
+             ORDER BY day"
+        }
+    }
+}
+
 /// Recompute the single-row `token_summary` table from the current
 /// contents of `token_daily_stats`. Computes `lifetime_tokens`
 /// (SUM), `peak_day_tokens` (MAX), `longest_task_ms` (MAX), and
 /// streaks (via `compute_streaks`). Public so the config import
 /// path can call it after merging imported daily stats.
 pub async fn recompute_summary(pool: &DbPool) -> Result<(), sqlx::Error> {
+    let mut tx = pool.any().begin().await?;
+    recompute_summary_in_tx(&mut tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Recompute `token_summary` using the caller's transaction. Kept
+/// crate-visible so config import can include the merged daily rows and the
+/// derived summary in one atomic commit.
+pub(crate) async fn recompute_summary_in_tx(
+    tx: &mut Transaction<'_, Any>,
+) -> Result<(), sqlx::Error> {
     let now = Utc::now();
     let today = now.date_naive();
     let updated_at = now.to_rfc3339();
 
-    let lifetime_tokens: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(total_tokens), 0) FROM token_daily_stats")
-            .fetch_one(pool.any())
-            .await?;
+    let lifetime_tokens: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) FROM token_daily_stats",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
 
     let peak_day_tokens: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(total_tokens), 0) FROM token_daily_stats")
-            .fetch_one(pool.any())
+            .fetch_one(&mut **tx)
             .await?;
 
     let longest_task_ms: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(longest_task_ms), 0) FROM token_daily_stats")
-            .fetch_one(pool.any())
+            .fetch_one(&mut **tx)
             .await?;
 
-    let lifetime_cost: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(total_cost), 0) FROM token_daily_stats")
-            .fetch_one(pool.any())
-            .await?;
+    let lifetime_cost: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(total_cost), 0) AS BIGINT) FROM token_daily_stats",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
 
     let peak_day_cost: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(total_cost), 0) FROM token_daily_stats")
-            .fetch_one(pool.any())
+            .fetch_one(&mut **tx)
             .await?;
 
-    let (current_streak, longest_streak) = compute_streaks(pool, today).await?;
+    let (current_streak, longest_streak) = compute_streaks_in_tx(tx, today).await?;
 
     sqlx::query(
         "UPDATE token_summary SET \
@@ -247,7 +296,7 @@ pub async fn recompute_summary(pool: &DbPool) -> Result<(), sqlx::Error> {
     .bind(current_streak)
     .bind(longest_streak)
     .bind(&updated_at)
-    .execute(pool.any())
+    .execute(&mut **tx)
     .await?;
 
     debug!(
@@ -260,12 +309,15 @@ pub async fn recompute_summary(pool: &DbPool) -> Result<(), sqlx::Error> {
 
 /// Compute the current streak (consecutive days ending at `today`) and
 /// the longest streak ever from `token_daily_stats`.
-async fn compute_streaks(pool: &DbPool, today: NaiveDate) -> Result<(i64, i64), sqlx::Error> {
+async fn compute_streaks_in_tx(
+    tx: &mut Transaction<'_, Any>,
+    today: NaiveDate,
+) -> Result<(i64, i64), sqlx::Error> {
     // Fetch all active days (those with at least 1 token) ordered descending.
     let days: Vec<String> = sqlx::query_scalar(
         "SELECT day FROM token_daily_stats WHERE total_tokens > 0 ORDER BY day DESC",
     )
-    .fetch_all(pool.any())
+    .fetch_all(&mut **tx)
     .await?;
 
     if days.is_empty() {
@@ -373,6 +425,72 @@ pub struct TokenSummaryData {
     pub current_streak: i64,
     pub longest_streak: i64,
     pub updated_at: String,
+}
+
+/// Atomic dashboard payload: daily activity and its derived summary are read
+/// from one database snapshot and returned by one Admin API request.
+#[derive(Debug, serde::Serialize)]
+pub struct TokenDashboardData {
+    pub days: Vec<TokenDayActivity>,
+    pub summary: TokenSummaryData,
+}
+
+/// Fetch the complete Token Activity dashboard snapshot. PostgreSQL defaults
+/// to READ COMMITTED (a new snapshot per statement), so explicitly promote
+/// this short read transaction to REPEATABLE READ. SQLite already pins the
+/// snapshot on the first read in a transaction.
+pub async fn get_token_dashboard(
+    pool: &DbPool,
+    days: u32,
+) -> Result<TokenDashboardData, sqlx::Error> {
+    let mut tx = pool.any().begin().await?;
+    if pool.kind() == crate::db::DbKind::Postgres {
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    let summary_row = sqlx::query(
+        "SELECT lifetime_tokens, peak_day_tokens, lifetime_cost, peak_day_cost, \
+                longest_task_ms, current_streak, longest_streak, updated_at \
+         FROM token_summary WHERE id = 1",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let summary = TokenSummaryData {
+        lifetime_tokens: summary_row.get("lifetime_tokens"),
+        peak_day_tokens: summary_row.get("peak_day_tokens"),
+        lifetime_cost: summary_row.get("lifetime_cost"),
+        peak_day_cost: summary_row.get("peak_day_cost"),
+        longest_task_ms: summary_row.get("longest_task_ms"),
+        current_streak: summary_row.get("current_streak"),
+        longest_streak: summary_row.get("longest_streak"),
+        updated_at: summary_row.get("updated_at"),
+    };
+
+    let rows = sqlx::query(
+        "SELECT day, total_tokens, total_cost, request_count \
+         FROM token_daily_stats ORDER BY day DESC LIMIT $1",
+    )
+    .bind(days as i64)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut activity = Vec::with_capacity(rows.len());
+    for row in rows {
+        activity.push(TokenDayActivity {
+            day: row.get("day"),
+            total_tokens: row.get("total_tokens"),
+            total_cost: row.get("total_cost"),
+            request_count: row.get("request_count"),
+        });
+    }
+    activity.reverse();
+    tx.commit().await?;
+
+    Ok(TokenDashboardData {
+        days: activity,
+        summary,
+    })
 }
 
 /// Fetch the pre-computed summary from the single-row table.
@@ -516,6 +634,46 @@ mod tests {
         assert_eq!(summary.longest_task_ms, 8000);
         assert_eq!(summary.current_streak, 2);
         assert_eq!(summary.longest_streak, 2);
+
+        let dashboard = get_token_dashboard(pool.as_ref(), 365)
+            .await
+            .expect("dashboard");
+        assert_eq!(dashboard.days.len(), 2);
+        assert_eq!(dashboard.days[1].total_tokens, 300);
+        assert_eq!(dashboard.summary.lifetime_tokens, 450);
+        assert_eq!(dashboard.summary.peak_day_tokens, 300);
+    }
+
+    #[tokio::test]
+    async fn aggregate_rolls_back_daily_rows_when_summary_update_fails() {
+        let pool = in_mem_pool().await;
+        let today = Utc::now().date_naive();
+        let today_ts = format!("{}T10:00:00Z", today);
+        insert_log(pool.as_ref(), "req-atomic", &today_ts, 100, 5000, None).await;
+
+        // Force the final step to fail. The daily upsert must be part of the
+        // same transaction and therefore must not leak out after rollback.
+        sqlx::query(
+            "CREATE TRIGGER fail_token_summary_update \
+             BEFORE UPDATE ON token_summary \
+             BEGIN SELECT RAISE(FAIL, 'forced summary failure'); END",
+        )
+        .execute(pool.any())
+        .await
+        .expect("create trigger");
+
+        assert!(aggregate_once(pool.as_ref(), 30).await.is_err());
+        let activity = get_token_activity(pool.as_ref(), 365)
+            .await
+            .expect("activity after rollback");
+        assert!(
+            activity.is_empty(),
+            "daily rows must roll back with summary"
+        );
+
+        let summary = get_token_summary(pool.as_ref()).await.expect("summary");
+        assert_eq!(summary.lifetime_tokens, 0);
+        assert_eq!(summary.peak_day_tokens, 0);
     }
 
     #[tokio::test]
@@ -532,5 +690,13 @@ mod tests {
         let summary = get_token_summary(pool.as_ref()).await.expect("summary");
         assert_eq!(summary.current_streak, 0);
         assert_eq!(summary.longest_streak, 1);
+    }
+
+    #[test]
+    fn postgres_aggregation_uses_utc_timestamptz_casts() {
+        let sql = aggregation_sql(DbKind::Postgres);
+        assert!(sql.contains("ts::timestamptz"));
+        assert!(sql.contains("AT TIME ZONE 'UTC'"));
+        assert!(!sql.contains("DATE(ts)"));
     }
 }

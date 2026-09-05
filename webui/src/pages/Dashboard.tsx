@@ -233,14 +233,9 @@ export default function Dashboard() {
     queryKey: ["circuit-breakers"],
     queryFn: healthApi.circuitBreakers,
   });
-  const tokenActivity = useQuery({
-    queryKey: ["stats", "token-activity"],
-    queryFn: () => statsApi.tokenActivity(365),
-    staleTime: 5 * 60_000,
-  });
-  const tokenSummary = useQuery({
-    queryKey: ["stats", "token-summary"],
-    queryFn: () => statsApi.tokenSummary(),
+  const tokenDashboard = useQuery({
+    queryKey: ["stats", "token-dashboard"],
+    queryFn: () => statsApi.tokenDashboard(365),
     staleTime: 5 * 60_000,
   });
   // Name directories for nicer labels in the stats tables. We keep these
@@ -312,8 +307,7 @@ export default function Dashboard() {
       byApiKey.refetch(),
       byTarget.refetch(),
       breakers.refetch(),
-      tokenActivity.refetch(),
-      tokenSummary.refetch(),
+      tokenDashboard.refetch(),
       providers.refetch(),
       apiKeys.refetch(),
     ]);
@@ -331,15 +325,14 @@ export default function Dashboard() {
       <div className="flex flex-col xl:flex-row gap-4 xl:items-stretch">
         {/* Left: heatmap — fixed intrinsic width */}
         <Card className="shrink-0 xl:w-fit">
-          {tokenActivity.error || tokenSummary.error ? (
+          {tokenDashboard.error ? (
             <div className="p-4">
               <ErrorBox
                 message={
-                  ((tokenActivity.error ?? tokenSummary.error) as Error).message
+                  (tokenDashboard.error as Error).message
                 }
                 onRetry={() => {
-                  tokenActivity.refetch();
-                  tokenSummary.refetch();
+                  tokenDashboard.refetch();
                 }}
                 retryLabel={t("common.retry")}
               />
@@ -347,8 +340,8 @@ export default function Dashboard() {
           ) : (
             <div className="p-4">
               <TokenHeatmap
-                data={tokenActivity.data?.days ?? []}
-                isLoading={tokenActivity.isLoading}
+                data={tokenDashboard.data?.days ?? []}
+                isLoading={tokenDashboard.isLoading}
               />
             </div>
           )}
@@ -357,8 +350,8 @@ export default function Dashboard() {
         {/* Non-ultrawide: only lifetime Token/cost stays beside the heatmap. */}
         <div className="min-w-0 xl:flex-1 2xl:hidden">
           <TokenSummaryBar
-            data={tokenSummary.data}
-            isLoading={tokenSummary.isLoading}
+            data={tokenDashboard.data?.summary}
+            isLoading={tokenDashboard.isLoading}
             group="lifetime"
           />
         </div>
@@ -366,16 +359,16 @@ export default function Dashboard() {
         {/* Ultrawide: keep the existing full six-card summary layout. */}
         <div className="hidden flex-1 min-w-0 2xl:block">
           <TokenSummaryBar
-            data={tokenSummary.data}
-            isLoading={tokenSummary.isLoading}
+            data={tokenDashboard.data?.summary}
+            isLoading={tokenDashboard.isLoading}
           />
         </div>
       </div>
 
       {/* Non-ultrawide: detail summary cards span the full row below token activity. */}
       <TokenSummaryBar
-        data={tokenSummary.data}
-        isLoading={tokenSummary.isLoading}
+        data={tokenDashboard.data?.summary}
+        isLoading={tokenDashboard.isLoading}
         group="details"
         className="2xl:hidden"
       />
