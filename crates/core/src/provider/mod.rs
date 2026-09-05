@@ -87,6 +87,19 @@ pub trait Provider: Send + Sync {
     fn egress_api_base(&self, raw_base: &str, _endpoint: &ProtocolEndpoint) -> String {
         raw_base.to_string()
     }
+
+    /// Extra headers to inject into the upstream request after auth is applied.
+    ///
+    /// This allows providers to require custom headers (e.g. session tracking)
+    /// without relying on the client to send them. The default returns an
+    /// empty list.
+    ///
+    /// `caller_key_id` is the caller's TiyGate API key ID (not the upstream
+    /// provider key). Providers can use it to derive stable per-customer
+    /// session identifiers.
+    fn extra_headers(&self, _caller_key_id: &str) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
 }
 
 /// Decentralized provider registration via `inventory`.

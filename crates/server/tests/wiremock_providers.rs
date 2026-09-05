@@ -53,6 +53,7 @@ fn build_test_app_with_config(
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "openai".to_string(),
             model_id: "gpt-4o".to_string(),
             api_base: upstream_url,
@@ -92,6 +93,7 @@ fn build_anthropic_test_app_with_config(
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "anthropic".to_string(),
             model_id: "claude-3-5-sonnet-20241022".to_string(),
             api_base: upstream_url,
@@ -126,6 +128,7 @@ fn build_anthropic_ingress_codex_egress_app(
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: provider_id.to_string(),
             model_id: model.to_string(),
             api_base: upstream_url,
@@ -169,6 +172,7 @@ fn build_openai_compatible_test_app(
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "openai-compatible".to_string(),
             model_id: model.to_string(),
             api_base: upstream_url,
@@ -809,7 +813,7 @@ async fn test_multi_target_fallback_5xx_transfers() {
         "gpt-4o".to_string(),
         vec![
             tiygate_core::RoutingTarget {
-                provider_id: "primary".to_string(),
+            vendor: None,                 provider_id: "primary".to_string(),
                 model_id: "gpt-4o".to_string(),
                 api_base: primary.uri(),
                 api_key: "sk-1".to_string(),
@@ -825,7 +829,7 @@ async fn test_multi_target_fallback_5xx_transfers() {
                 oauth: None,
             },
             tiygate_core::RoutingTarget {
-                provider_id: "secondary".to_string(),
+            vendor: None,                 provider_id: "secondary".to_string(),
                 model_id: "gpt-4o".to_string(),
                 api_base: secondary.uri(),
                 api_key: "sk-2".to_string(),
@@ -1245,6 +1249,7 @@ fn build_chat_ingress_anthropic_egress_app(upstream_url: String, model: &str) ->
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "anthropic".to_string(),
             model_id: "claude-3-5-sonnet-20241022".to_string(),
             api_base: upstream_url,
@@ -1277,6 +1282,7 @@ fn build_messages_ingress_openai_egress_app(upstream_url: String, model: &str) -
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "openai".to_string(),
             model_id: "gpt-4o".to_string(),
             api_base: upstream_url,
@@ -1554,6 +1560,7 @@ fn build_chat_ingress_anthropic_egress_app_with_config(
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "anthropic".to_string(),
             model_id: "claude-3-5-sonnet-20241022".to_string(),
             api_base: upstream_url,
@@ -1733,6 +1740,7 @@ fn build_responses_ingress_openai_egress_app_with_config(
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "openai".to_string(),
             model_id: "gpt-4o".to_string(),
             api_base: upstream_url,
@@ -1773,6 +1781,7 @@ fn build_gemini_ingress_openai_egress_app_with_config(
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "openai".to_string(),
             model_id: "gpt-4o".to_string(),
             api_base: upstream_url,
@@ -2010,6 +2019,7 @@ fn build_responses_same_protocol_app(upstream_url: String, model: &str) -> axum:
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "openai".to_string(),
             model_id: "gpt-4o".to_string(),
             api_base: upstream_url,
@@ -2037,6 +2047,7 @@ fn build_gemini_same_protocol_app(upstream_url: String, model: &str) -> axum::Ro
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "google".to_string(),
             model_id: "gemini-pro".to_string(),
             api_base: upstream_url,
@@ -2166,6 +2177,7 @@ fn build_app_with_require_api_key(
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "openai".to_string(),
             model_id: "gpt-4o".to_string(),
             api_base: upstream_url,

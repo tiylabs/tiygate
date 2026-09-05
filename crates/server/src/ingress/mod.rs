@@ -36,6 +36,8 @@ use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use tiygate_core::{HealthRegistry, TelemetryBus};
 
+use headers::inject_provider_extra_headers;
+
 /// Construct a `Strategy` from the `RoutingStrategyName` carried on
 /// `AppState`. §3.4 names `Weighted` as the document-level default; we honor
 /// that here. The `Latency` strategy needs the `HealthRegistry` handle, so it
@@ -805,10 +807,16 @@ pub fn compute_pass_through<C: tiygate_core::EndpointCodec>(
 /// a caller substitute a different upstream key than the one
 /// TiyGate routes traffic to, breaking per-account model routing
 /// and the audit trail.
+///
+/// `caller_key_id` is the caller's TiyGate API key ID. It is passed
+/// to provider `extra_headers()` so providers can derive stable
+/// per-customer session identifiers (e.g. OpenCode's
+/// `x-opencode-session`).
 pub async fn apply_provider_auth(
     target: &tiygate_core::RoutingTarget,
     upstream_headers: &mut http::HeaderMap,
     oauth_manager: &crate::oauth_manager::OAuthTokenManager,
+    caller_key_id: &str,
 ) -> Result<(), AppError> {
     // OAuth path: if the routing target carries an OAuth config,
     // use the OAuthTokenManager to refresh/inject the access token.
@@ -825,7 +833,10 @@ pub async fn apply_provider_auth(
         }
     }
 
-    if let Some(provider) = tiygate_core::provider::find_provider(&target.provider_id) {
+    // Use vendor (if available) for registered-provider lookup, falling back
+    // to provider_id for legacy targets that predate the vendor field.
+    let lookup_key = target.vendor.as_deref().unwrap_or(&target.provider_id);
+    if let Some(provider) = tiygate_core::provider::find_provider(lookup_key) {
         let auth = provider.auth();
         if let Err(e) = auth.apply(upstream_headers, target).await {
             return Err(AppError::new(
@@ -833,6 +844,11 @@ pub async fn apply_provider_auth(
                 format!("Provider auth applier failed: {e}"),
             ));
         }
+        // Inject provider-specific extra headers (e.g. x-opencode-session)
+        // after auth so provider auth headers always win.
+        // Use caller_key_id (TiYgate customer's key) so each customer
+        // gets a unique session identifier, not the shared upstream key.
+        inject_provider_extra_headers(&*provider, caller_key_id, upstream_headers);
         return Ok(());
     }
     // Protocol-aware fallback when no provider is registered for the

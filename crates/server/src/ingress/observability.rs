@@ -322,11 +322,11 @@ pub(super) struct RequestScope<'a> {
     resolved_model: Option<String>,
     trace: TraceContext,
     started: Instant,
-    /// Resolved api key id from `resolve_api_key` (`"anonymous"` when
-    /// no credential was supplied). Surface this on the terminal
+    /// Resolved caller key id from `resolve_api_key` (`"anonymous"`
+    /// when no credential was supplied). Surface this on the terminal
     /// `RequestEvent` so the OltpSink can attribute the row to a
     /// specific key — required for the per-key quota dashboard.
-    api_key_id: String,
+    caller_key_id: String,
     /// Optional `RawEnvelope` captured at the ingress. Set via
     /// `set_envelope` and persisted on the terminal `RequestEvent`
     /// so the OLTP log row carries the redacted envelope for
@@ -368,7 +368,7 @@ impl<'a> RequestScope<'a> {
             resolved_model: None,
             trace,
             started,
-            api_key_id: "anonymous".to_string(),
+            caller_key_id: "anonymous".to_string(),
             envelope: None,
             ttfb_ms: None,
             armed: true,
@@ -389,10 +389,10 @@ impl<'a> RequestScope<'a> {
         self.resolved_model = Some(model);
     }
 
-    /// Bind the resolved api key id. Call after `resolve_api_key` at
-    /// the top of the handler.
-    pub fn set_api_key_id(&mut self, key_id: String) {
-        self.api_key_id = key_id;
+    /// Bind the resolved caller key id. Call after `resolve_api_key`
+    /// at the top of the handler.
+    pub fn set_caller_key_id(&mut self, key_id: String) {
+        self.caller_key_id = key_id;
     }
 
     /// Bind the `RawEnvelope` so the terminal `RequestEvent`
@@ -502,7 +502,7 @@ impl<'a> RequestScope<'a> {
             },
             self.ttfb_ms,
             None,
-            Some(&self.api_key_id),
+            Some(&self.caller_key_id),
             &self.trace,
             envelope,
         );
@@ -560,7 +560,7 @@ impl<'a> Drop for RequestScope<'a> {
             latency_ms,
             self.ttfb_ms,
             None,
-            Some(&self.api_key_id),
+            Some(&self.caller_key_id),
             &self.trace,
             self.envelope.as_ref(),
         );
@@ -864,14 +864,14 @@ pub(super) fn finalize_egress(
 /// `1` for request-level counters.
 pub(super) async fn check_quota(
     state: &AppState,
-    api_key_id: &str,
+    caller_key_id: &str,
     spec: &QuotaSpec,
     tokens: u64,
 ) -> QuotaOutcome {
     let Some(q) = state.quota.as_ref() else {
         return QuotaOutcome::Allow;
     };
-    match q.check_and_consume(api_key_id, spec, tokens).await {
+    match q.check_and_consume(caller_key_id, spec, tokens).await {
         Ok(QuotaDecision::Allow { .. }) => QuotaOutcome::Allow,
         Ok(QuotaDecision::Deny {
             retry_after,
@@ -964,7 +964,7 @@ pub(super) fn emit_request_event(
     latency: LatencyBreakdown,
     ttfb_ms: Option<u64>,
     tokens: Option<Usage>,
-    api_key_id: Option<&str>,
+    caller_key_id: Option<&str>,
     trace: &TraceContext,
     envelope: Option<&RawEnvelope>,
 ) {
@@ -995,7 +995,7 @@ pub(super) fn emit_request_event(
         ttfb_ms,
         tokens: tokens.clone(),
         cost: None,
-        api_key_id: api_key_id.map(str::to_string),
+        api_key_id: caller_key_id.map(str::to_string),
         client_ip: None,
         user_agent: None,
         // Persist the redacted envelope alongside the
@@ -1021,7 +1021,7 @@ pub(super) fn emit_request_event(
             ttfb_ms,
             tokens,
             cost: None,
-            api_key_id: api_key_id.map(str::to_string),
+            api_key_id: caller_key_id.map(str::to_string),
             client_ip: None,
             user_agent: None,
             trace_id: Some(trace.trace_id.clone()),
@@ -1073,7 +1073,7 @@ pub(super) fn emit_completion(
     error_class: Option<RequestErrorClass>,
     http_status: Option<u16>,
     trace: &TraceContext,
-    api_key_id: Option<&str>,
+    caller_key_id: Option<&str>,
     started: Instant,
     envelope: Option<&RawEnvelope>,
 ) {
@@ -1099,7 +1099,7 @@ pub(super) fn emit_completion(
         latency_ms,
         None,
         None,
-        api_key_id,
+        caller_key_id,
         trace,
         envelope,
     );

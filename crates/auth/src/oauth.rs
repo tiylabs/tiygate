@@ -458,6 +458,7 @@ mod tests {
     fn dummy_target(label: Option<&str>) -> RoutingTarget {
         RoutingTarget {
             provider_id: "test".to_string(),
+            vendor: None,
             model_id: "test-model".to_string(),
             api_base: "https://example.com".to_string(),
             api_key: "placeholder".to_string(),

@@ -40,6 +40,7 @@ fn build_test_app(upstream_url: String, model: &str) -> axum::Router {
     routing_table.insert(
         model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "openai".to_string(),
             model_id: "gpt-4o".to_string(),
             api_base: upstream_url,

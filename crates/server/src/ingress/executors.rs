@@ -482,7 +482,7 @@ pub(super) async fn execute_upstream(
     trace: &TraceContext,
     request_id: &str,
     client_headers: &http::HeaderMap,
-    api_key_id: &str,
+    caller_key_id: &str,
 ) -> Result<(Response, Option<u64>), AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
@@ -536,7 +536,7 @@ pub(super) async fn execute_upstream(
     // requests from the same caller are routed to the same inference
     // machine, improving prompt-prefix cache hit rates.
     let mut body_mutated =
-        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, caller_key_id);
 
     // Replace the (possibly virtual) model name with the routing
     // target's real upstream model id before sending and before we
@@ -576,7 +576,7 @@ pub(super) async fn execute_upstream(
         &mut upstream_headers,
         &state.tunables().header_policy,
     );
-    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager, caller_key_id).await?;
     if openai_codex_profile {
         codex_oauth::apply_request_headers(
             &mut upstream_headers,
@@ -1086,7 +1086,7 @@ pub(super) async fn execute_messages_upstream(
     trace: &TraceContext,
     request_id: &str,
     client_headers: &http::HeaderMap,
-    api_key_id: &str,
+    caller_key_id: &str,
 ) -> Result<(Response, Option<u64>), AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
@@ -1133,7 +1133,7 @@ pub(super) async fn execute_messages_upstream(
     // target's real upstream model id.
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
     body_mutated |=
-        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, caller_key_id);
     body_mutated |= normalize_openai_reasoning_for_target(
         &mut upstream_body,
         &egress_protocol.suite,
@@ -1168,7 +1168,7 @@ pub(super) async fn execute_messages_upstream(
         &mut upstream_headers,
         &state.tunables().header_policy,
     );
-    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager, caller_key_id).await?;
     if openai_codex_profile {
         codex_oauth::apply_request_headers(
             &mut upstream_headers,
@@ -1751,6 +1751,7 @@ pub(super) async fn execute_embeddings_upstream(
     request_id: &str,
     client_headers: &http::HeaderMap,
     cache_key: tiygate_cache::embedding_cache::EmbeddingCacheKey,
+    caller_key_id: &str,
 ) -> Result<(Response, Option<u64>), AppError> {
     let (mut upstream_body, mut upstream_headers) =
         codec.encode_request(ir_request).map_err(|e| {
@@ -1766,7 +1767,7 @@ pub(super) async fn execute_embeddings_upstream(
         &mut upstream_headers,
         &state.tunables().header_policy,
     );
-    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager, caller_key_id).await?;
 
     let egress_body_capture = serde_json::to_string(&upstream_body).ok();
     let req_id_capture = request_id.to_string();
@@ -1929,7 +1930,7 @@ pub(super) async fn execute_responses_upstream(
     trace: &TraceContext,
     request_id: &str,
     client_headers: &http::HeaderMap,
-    api_key_id: &str,
+    caller_key_id: &str,
 ) -> Result<(Response, Option<u64>), AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
@@ -1971,7 +1972,7 @@ pub(super) async fn execute_responses_upstream(
 
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
     body_mutated |=
-        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, caller_key_id);
     body_mutated |= normalize_openai_reasoning_for_target(
         &mut upstream_body,
         &egress_protocol.suite,
@@ -1997,7 +1998,7 @@ pub(super) async fn execute_responses_upstream(
         &mut upstream_headers,
         &state.tunables().header_policy,
     );
-    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager, caller_key_id).await?;
     if openai_codex_profile {
         codex_oauth::apply_request_headers(
             &mut upstream_headers,
@@ -2750,7 +2751,7 @@ pub(super) async fn execute_gemini_upstream(
     trace: &TraceContext,
     request_id: &str,
     client_headers: &http::HeaderMap,
-    api_key_id: &str,
+    caller_key_id: &str,
 ) -> Result<(Response, Option<u64>), AppError> {
     // Delegate to the shared Responses executor — the only difference is
     // the codec type, and `execute_responses_upstream` already handles
@@ -2803,7 +2804,7 @@ pub(super) async fn execute_gemini_upstream(
 
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
     body_mutated |=
-        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, caller_key_id);
     body_mutated |= normalize_openai_reasoning_for_target(
         &mut upstream_body,
         &egress_protocol.suite,
@@ -2829,7 +2830,7 @@ pub(super) async fn execute_gemini_upstream(
         &mut upstream_headers,
         &state.tunables().header_policy,
     );
-    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager, caller_key_id).await?;
     if openai_codex_profile {
         codex_oauth::apply_request_headers(
             &mut upstream_headers,
@@ -3263,7 +3264,7 @@ pub(super) async fn execute_images_generations_upstream(
     trace: &TraceContext,
     request_id: &str,
     client_headers: &http::HeaderMap,
-    api_key_id: &str,
+    caller_key_id: &str,
 ) -> Result<(Response, Option<u64>), AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
@@ -3301,7 +3302,7 @@ pub(super) async fn execute_images_generations_upstream(
     };
 
     let cache_key_injected =
-        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, caller_key_id);
 
     let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
     let pass_through_verbatim = is_pass_through && !model_was_overridden && !cache_key_injected;
@@ -3311,7 +3312,7 @@ pub(super) async fn execute_images_generations_upstream(
         &mut upstream_headers,
         &state.tunables().header_policy,
     );
-    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager, caller_key_id).await?;
 
     let egress_body_capture = if pass_through_verbatim {
         raw_passthrough_body.map(|s| s.to_string())
@@ -3677,7 +3678,7 @@ pub(super) async fn execute_images_edits_upstream(
     trace: &TraceContext,
     request_id: &str,
     client_headers: &http::HeaderMap,
-    api_key_id: &str,
+    caller_key_id: &str,
 ) -> Result<(Response, Option<u64>), AppError> {
     let mut upstream_headers = http::HeaderMap::new();
     merge_client_headers(
@@ -3685,13 +3686,12 @@ pub(super) async fn execute_images_edits_upstream(
         &mut upstream_headers,
         &state.tunables().header_policy,
     );
-    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager).await?;
+    apply_provider_auth(target, &mut upstream_headers, &state.oauth_manager, caller_key_id).await?;
 
     // TODO(prompt-cache): multipart re-encoding is not implemented in
     // v1, so prompt_cache_key cannot be injected for edits requests.
     // The virtual→upstream model mapping is also effectively ignored
     // for /v1/images/edits (model override requires multipart parsing).
-    let _ = api_key_id;
 
     let upstream_url = format!("{}/images/edits", target.effective_api_base());
     let client = &state.tunables().http_client;
