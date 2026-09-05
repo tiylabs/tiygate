@@ -1,5 +1,6 @@
 //! Route handlers for each ingress protocol.
 
+use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::Instant;
 
 use axum::extract::State;
@@ -907,6 +908,7 @@ pub(super) async fn handle_responses(
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     let request_id = scope.request_id().to_string();
     scope.mark_waiting_upstream();
+    let adaptation_budget = Arc::new(AtomicUsize::new(0));
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
@@ -926,6 +928,7 @@ pub(super) async fn handle_responses(
                 &request_id,
                 &headers,
                 &api_key.key_id,
+                adaptation_budget.clone(),
             ))
         },
     )

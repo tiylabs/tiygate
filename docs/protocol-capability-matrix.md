@@ -123,6 +123,19 @@
 
 **跨协议策略**：Responses 保留 hosted/function tool 的完整配置，并建模 PTC 的 program、caller 与 program_output 关系。目标协议不能表达 hosted tool 或 PTC 时由 lossy guard 明确拒绝，不再静默过滤。Hosted tool 的 provider-specific 输出 item（`web_search_call` / `file_search_call` / `code_interpreter_call` / `computer_call` 等）在同协议 Convert/re-encode 路径通过有序 `extensions["responses_opaque_output_items"]` 保活；跨协议仍丢弃（客户端不会消费这些 wire item）。raw PassThrough 路径始终字节级无损。
 
+### 6.1.1 Namespace / tool-search target 方言
+
+Responses 的 `namespace`、`defer_loading` 和 hosted `tool_search` 是合法的
+Responses wire 能力，但不代表每个 OpenAI-compatible relay 都实现了同一层级的
+工具结构。TiyGate 不对 target 发主动探测请求，而是在真实请求收到明确的
+`unknown_parameter`/`unsupported_parameter` 等工具 schema rejection 后，对该具体
+target 做一次有界的 flat-tools retry：namespace child 会提升为顶层
+`function`（`namespace__tool`），并以 request-scoped reverse map 恢复非流式/SSE
+响应中的原始 namespace 与本地工具名。学习状态按 provider/account/API base/endpoint/
+exact model/transport 绑定并带 TTL；client-executed/dynamic tool search、冲突名称和
+不完整工具集合会 fail closed，不静默删除。普通 400/422、认证、限流、超时和 5xx
+不触发此转换。
+
 ## 6.2 Explicit Prompt Caching
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
