@@ -3692,7 +3692,6 @@ pub(super) async fn execute_images_edits_upstream(
     // v1, so prompt_cache_key cannot be injected for edits requests.
     // The virtual→upstream model mapping is also effectively ignored
     // for /v1/images/edits (model override requires multipart parsing).
-    let _ = caller_key_id;
 
     let upstream_url = format!("{}/images/edits", target.effective_api_base());
     let client = &state.tunables().http_client;

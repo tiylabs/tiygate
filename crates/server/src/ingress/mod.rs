@@ -807,6 +807,11 @@ pub fn compute_pass_through<C: tiygate_core::EndpointCodec>(
 /// a caller substitute a different upstream key than the one
 /// TiyGate routes traffic to, breaking per-account model routing
 /// and the audit trail.
+///
+/// `caller_key_id` is the caller's TiyGate API key ID. It is passed
+/// to provider `extra_headers()` so providers can derive stable
+/// per-customer session identifiers (e.g. OpenCode's
+/// `x-opencode-session`).
 pub async fn apply_provider_auth(
     target: &tiygate_core::RoutingTarget,
     upstream_headers: &mut http::HeaderMap,
