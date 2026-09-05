@@ -2601,14 +2601,14 @@ pub async fn aggregate_by_model(
 ) -> Result<Vec<StatsBucket>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT virtual_model, COUNT(*) AS c, \
-                SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS e, \
-                COALESCE(SUM(prompt_tokens), 0) AS pt, \
-                COALESCE(SUM(completion_tokens), 0) AS ct, \
-                COALESCE(SUM(reasoning_tokens), 0) AS rt, \
-                COALESCE(SUM(cache_read_tokens), 0) AS crt, \
-                COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
-                COALESCE(SUM(total_tokens), 0) AS tt, \
-                COALESCE(SUM(cost), 0) AS cost \
+                CAST(SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS BIGINT) AS e, \
+                CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS pt, \
+                CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS ct, \
+                CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) AS rt, \
+                CAST(COALESCE(SUM(cache_read_tokens), 0) AS BIGINT) AS crt, \
+                CAST(COALESCE(SUM(cache_write_tokens), 0) AS BIGINT) AS cwt, \
+                CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS tt, \
+                CAST(COALESCE(SUM(cost), 0) AS BIGINT) AS cost \
          FROM request_logs \
          WHERE ts >= $1 AND ts < $2 \
          GROUP BY virtual_model \
@@ -2645,14 +2645,14 @@ pub async fn aggregate_by_provider(
 ) -> Result<Vec<StatsBucket>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT COALESCE(resolved_provider, 'unknown') AS provider, COUNT(*) AS c, \
-                SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS e, \
-                COALESCE(SUM(prompt_tokens), 0) AS pt, \
-                COALESCE(SUM(completion_tokens), 0) AS ct, \
-                COALESCE(SUM(reasoning_tokens), 0) AS rt, \
-                COALESCE(SUM(cache_read_tokens), 0) AS crt, \
-                COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
-                COALESCE(SUM(total_tokens), 0) AS tt, \
-                COALESCE(SUM(cost), 0) AS cost \
+                CAST(SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS BIGINT) AS e, \
+                CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS pt, \
+                CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS ct, \
+                CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) AS rt, \
+                CAST(COALESCE(SUM(cache_read_tokens), 0) AS BIGINT) AS crt, \
+                CAST(COALESCE(SUM(cache_write_tokens), 0) AS BIGINT) AS cwt, \
+                CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS tt, \
+                CAST(COALESCE(SUM(cost), 0) AS BIGINT) AS cost \
          FROM request_logs \
          WHERE ts >= $1 AND ts < $2 \
          GROUP BY provider \
@@ -2689,14 +2689,14 @@ pub async fn aggregate_by_api_key(
 ) -> Result<Vec<StatsBucket>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT COALESCE(api_key_id, 'anonymous') AS api_key, COUNT(*) AS c, \
-                SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS e, \
-                COALESCE(SUM(prompt_tokens), 0) AS pt, \
-                COALESCE(SUM(completion_tokens), 0) AS ct, \
-                COALESCE(SUM(reasoning_tokens), 0) AS rt, \
-                COALESCE(SUM(cache_read_tokens), 0) AS crt, \
-                COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
-                COALESCE(SUM(total_tokens), 0) AS tt, \
-                COALESCE(SUM(cost), 0) AS cost \
+                CAST(SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS BIGINT) AS e, \
+                CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS pt, \
+                CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS ct, \
+                CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) AS rt, \
+                CAST(COALESCE(SUM(cache_read_tokens), 0) AS BIGINT) AS crt, \
+                CAST(COALESCE(SUM(cache_write_tokens), 0) AS BIGINT) AS cwt, \
+                CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS tt, \
+                CAST(COALESCE(SUM(cost), 0) AS BIGINT) AS cost \
          FROM request_logs \
          WHERE ts >= $1 AND ts < $2 \
          GROUP BY api_key \
@@ -2738,14 +2738,14 @@ pub async fn aggregate_by_target(
         "SELECT \
                 COALESCE(resolved_provider, 'unknown') || ' / ' || COALESCE(resolved_model, 'unknown') AS target, \
                 COUNT(*) AS c, \
-                SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS e, \
-                COALESCE(SUM(prompt_tokens), 0) AS pt, \
-                COALESCE(SUM(completion_tokens), 0) AS ct, \
-                COALESCE(SUM(reasoning_tokens), 0) AS rt, \
-                COALESCE(SUM(cache_read_tokens), 0) AS crt, \
-                COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
-                COALESCE(SUM(total_tokens), 0) AS tt, \
-                COALESCE(SUM(cost), 0) AS cost, \
+                CAST(SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS BIGINT) AS e, \
+                CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS pt, \
+                CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS ct, \
+                CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) AS rt, \
+                CAST(COALESCE(SUM(cache_read_tokens), 0) AS BIGINT) AS crt, \
+                CAST(COALESCE(SUM(cache_write_tokens), 0) AS BIGINT) AS cwt, \
+                CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS tt, \
+                CAST(COALESCE(SUM(cost), 0) AS BIGINT) AS cost, \
                 CAST(AVG(ttfb_ms) AS DOUBLE PRECISION) AS alat, \
                 CASE WHEN SUM(stream_duration_ms) > 0 \
                      THEN CAST(SUM(completion_tokens) * 1000.0 / SUM(stream_duration_ms) AS DOUBLE PRECISION) \

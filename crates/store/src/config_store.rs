@@ -1856,8 +1856,12 @@ impl DbConfigStore {
                     completion_tokens = token_daily_stats.completion_tokens + excluded.completion_tokens, \
                     reasoning_tokens = token_daily_stats.reasoning_tokens + excluded.reasoning_tokens, \
                     total_cost = token_daily_stats.total_cost + excluded.total_cost, \
-                    peak_single_request = MAX(token_daily_stats.peak_single_request, excluded.peak_single_request), \
-                    longest_task_ms = MAX(token_daily_stats.longest_task_ms, excluded.longest_task_ms), \
+                    peak_single_request = CASE \
+                        WHEN token_daily_stats.peak_single_request > excluded.peak_single_request \
+                        THEN token_daily_stats.peak_single_request ELSE excluded.peak_single_request END, \
+                    longest_task_ms = CASE \
+                        WHEN token_daily_stats.longest_task_ms > excluded.longest_task_ms \
+                        THEN token_daily_stats.longest_task_ms ELSE excluded.longest_task_ms END, \
                     updated_at = excluded.updated_at",
             )
             .bind(&s.day)

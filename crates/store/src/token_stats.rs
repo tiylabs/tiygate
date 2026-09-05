@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::config_store::DbConfigStore;
-use crate::db::DbPool;
+use crate::db::{DbKind, DbPool};
 use crate::models::ExportTokenDailyStat;
 use crate::settings_keys;
 
@@ -117,24 +117,14 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
     let mut tx = pool.any().begin().await?;
 
     // Step 1: Aggregate per-day stats from request_logs.
-    let rows = sqlx::query(
-        "SELECT CAST(DATE(ts) AS TEXT) AS day, \
-                COUNT(*) AS cnt, \
-                COALESCE(SUM(total_tokens), 0) AS tt, \
-                COALESCE(SUM(prompt_tokens), 0) AS pt, \
-                COALESCE(SUM(completion_tokens), 0) AS ct, \
-                COALESCE(SUM(reasoning_tokens), 0) AS rt, \
-                COALESCE(SUM(cost), 0) AS tc, \
-                COALESCE(MAX(total_tokens), 0) AS peak_req, \
-                COALESCE(MAX(total_latency_ms), 0) AS longest_ms \
-         FROM request_logs \
-         WHERE ts >= $1 \
-         GROUP BY DATE(ts) \
-         ORDER BY day",
-    )
-    .bind(&since_str)
-    .fetch_all(&mut *tx)
-    .await?;
+    // `ts` is deliberately stored as TEXT for SQLite/PostgreSQL parity, but
+    // DATE(text) is not a valid PostgreSQL function call. Keep the two SQL
+    // dialects explicit so the worker does not fail every pass on PG.
+    let aggregation_sql = aggregation_sql(pool.kind());
+    let rows = sqlx::query(aggregation_sql)
+        .bind(&since_str)
+        .fetch_all(&mut *tx)
+        .await?;
 
     let updated_at = now.to_rfc3339();
 
@@ -194,6 +184,47 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
     Ok(())
 }
 
+/// SQL used to aggregate request logs by UTC calendar day. PostgreSQL and
+/// SQLite expose different date functions because `request_logs.ts` is TEXT
+/// on both backends.
+fn aggregation_sql(kind: DbKind) -> &'static str {
+    match kind {
+        DbKind::Sqlite => {
+            "SELECT CAST(DATE(ts) AS TEXT) AS day, \
+                    COUNT(*) AS cnt, \
+                    CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS tt, \
+                    CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS pt, \
+                    CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS ct, \
+                    CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) AS rt, \
+                    CAST(COALESCE(SUM(cost), 0) AS BIGINT) AS tc, \
+                    COALESCE(MAX(total_tokens), 0) AS peak_req, \
+                    COALESCE(MAX(total_latency_ms), 0) AS longest_ms \
+             FROM request_logs \
+             WHERE ts >= $1 \
+             GROUP BY DATE(ts) \
+             ORDER BY day"
+        }
+        DbKind::Postgres => {
+            // `ts` is written as UTC RFC-3339 text by the sink, so the
+            // lower-bound comparison can use the indexed TEXT column while
+            // the grouping expression performs the explicit UTC conversion.
+            "SELECT TO_CHAR((ts::timestamptz AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day, \
+                    COUNT(*) AS cnt, \
+                    CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS tt, \
+                    CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS pt, \
+                    CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS ct, \
+                    CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) AS rt, \
+                    CAST(COALESCE(SUM(cost), 0) AS BIGINT) AS tc, \
+                    COALESCE(MAX(total_tokens), 0) AS peak_req, \
+                    COALESCE(MAX(total_latency_ms), 0) AS longest_ms \
+             FROM request_logs \
+             WHERE ts >= $1 \
+             GROUP BY (ts::timestamptz AT TIME ZONE 'UTC')::date \
+             ORDER BY day"
+        }
+    }
+}
+
 /// Recompute the single-row `token_summary` table from the current
 /// contents of `token_daily_stats`. Computes `lifetime_tokens`
 /// (SUM), `peak_day_tokens` (MAX), `longest_task_ms` (MAX), and
@@ -216,10 +247,11 @@ pub(crate) async fn recompute_summary_in_tx(
     let today = now.date_naive();
     let updated_at = now.to_rfc3339();
 
-    let lifetime_tokens: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(total_tokens), 0) FROM token_daily_stats")
-            .fetch_one(&mut **tx)
-            .await?;
+    let lifetime_tokens: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) FROM token_daily_stats",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
 
     let peak_day_tokens: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(total_tokens), 0) FROM token_daily_stats")
@@ -231,10 +263,11 @@ pub(crate) async fn recompute_summary_in_tx(
             .fetch_one(&mut **tx)
             .await?;
 
-    let lifetime_cost: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(total_cost), 0) FROM token_daily_stats")
-            .fetch_one(&mut **tx)
-            .await?;
+    let lifetime_cost: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(total_cost), 0) AS BIGINT) FROM token_daily_stats",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
 
     let peak_day_cost: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(total_cost), 0) FROM token_daily_stats")
@@ -657,5 +690,13 @@ mod tests {
         let summary = get_token_summary(pool.as_ref()).await.expect("summary");
         assert_eq!(summary.current_streak, 0);
         assert_eq!(summary.longest_streak, 1);
+    }
+
+    #[test]
+    fn postgres_aggregation_uses_utc_timestamptz_casts() {
+        let sql = aggregation_sql(DbKind::Postgres);
+        assert!(sql.contains("ts::timestamptz"));
+        assert!(sql.contains("AT TIME ZONE 'UTC'"));
+        assert!(!sql.contains("DATE(ts)"));
     }
 }
