@@ -14,6 +14,7 @@ mod handlers;
 mod headers;
 pub(crate) mod observability;
 mod response_model;
+mod responses_tool_adapter;
 mod streaming;
 
 use handlers::{
@@ -163,6 +164,10 @@ pub struct AppState {
     /// OAuth token manager. Handles OAuth token refresh and
     /// injection for providers configured with `AuthMode::OAuth`.
     pub oauth_manager: Arc<crate::oauth_manager::OAuthTokenManager>,
+    /// Target-local learned dialect for Responses namespace/tool-search
+    /// compatibility. This is process-local by design; target identity and
+    /// TTL prevent one relay/account from affecting another.
+    pub(crate) responses_tool_compat: Arc<responses_tool_adapter::ResponsesToolCompatibility>,
 }
 
 impl AppState {
@@ -443,6 +448,7 @@ fn build_data_plane_router(
         model_catalog,
         tunables: Arc::new(arc_swap::ArcSwap::from_pointee(tunables)),
         oauth_manager,
+        responses_tool_compat: Arc::new(responses_tool_adapter::ResponsesToolCompatibility::new()),
     };
 
     Router::new()
@@ -639,6 +645,11 @@ pub(crate) fn spawn_tunables_reloader(
                 pool_idle_timeout_secs,
             );
             drop(current_t);
+            // Route/provider snapshots and credentials may have changed at
+            // this epoch. Learned Responses dialects are deliberately
+            // short-lived and are cleared so a new target configuration
+            // always starts native-first.
+            state.responses_tool_compat.clear();
             state.reload_tunables(RuntimeTunables {
                 routing_strategy,
                 raw_envelope_capture_media,
@@ -711,6 +722,9 @@ mod tests {
                 Some(store),
                 build_http_client(config),
             )),
+            responses_tool_compat: Arc::new(
+                responses_tool_adapter::ResponsesToolCompatibility::new(),
+            ),
         }
     }
 
@@ -1235,6 +1249,10 @@ pub struct AppError {
     upstream_error_code: Option<String>,
     /// Upstream RateLimit-* headers to passthrough on the error response.
     rate_limit_headers: Vec<(&'static str, String)>,
+    /// True when the upstream rejected a valid Responses tool dialect that
+    /// can be retried as a target-local flat-tools request. This is kept
+    /// separate from ordinary 400/422 so fallback may try another target.
+    target_capability_mismatch: bool,
 }
 
 impl AppError {
@@ -1248,6 +1266,7 @@ impl AppError {
             upstream_status: None,
             upstream_error_code: None,
             rate_limit_headers: Vec::new(),
+            target_capability_mismatch: false,
         }
     }
 
@@ -1264,6 +1283,16 @@ impl AppError {
     pub(crate) fn with_protocol_suite(mut self, suite: tiygate_core::ProtocolSuite) -> Self {
         self.protocol_suite = Some(suite);
         self
+    }
+
+    pub(crate) fn with_target_capability_mismatch(mut self) -> Self {
+        self.target_capability_mismatch = true;
+        self.error_class = tiygate_core::ErrorClass::LossyOrCapability;
+        self
+    }
+
+    pub(crate) fn is_target_capability_mismatch(&self) -> bool {
+        self.target_capability_mismatch
     }
 
     /// Attach an upstream-native error code (e.g. `insufficient_quota`)

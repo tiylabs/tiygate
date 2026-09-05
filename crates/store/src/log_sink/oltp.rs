@@ -135,6 +135,7 @@ impl EventSink for OltpSink {
             }
             EventPayload::RequestStarted { .. }
             | EventPayload::RouteResolved { .. }
+            | EventPayload::ResponsesToolAdaptation { .. }
             | EventPayload::RequestCompleted { .. } => Ok(()),
         };
         if let Err(e) = res {

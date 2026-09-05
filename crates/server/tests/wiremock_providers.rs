@@ -2106,6 +2106,286 @@ async fn test_nonstream_responses_same_protocol_passthrough() {
 }
 
 #[tokio::test]
+async fn test_responses_namespace_adaptive_flat_retry_and_learning() {
+    let mock_server = wiremock::MockServer::start().await;
+    let native_body = json!({
+        "model": "gpt-4o",
+        "input": "Hi",
+        "tools": [{
+            "type": "namespace",
+            "namespace": "collaboration",
+            "tools": [{
+                "type": "function",
+                "name": "spawn_agent",
+                "parameters": {"type": "object"}
+            }]
+        }]
+    });
+
+    // The target rejects the native namespace declaration once. The gateway
+    // must classify this as a target capability mismatch, flatten and retry
+    // the same request, then remember the target-local flat dialect.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/responses"))
+        .and(wiremock::matchers::body_json(native_body.clone()))
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "unknown_parameter",
+                "param": "tools[0].type",
+                "message": "unknown parameter tools[0].type"
+            }
+        })))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/responses"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp-flat",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "collaboration__spawn_agent",
+                "arguments": "{}"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_responses_same_protocol_app(mock_server.uri(), "gpt-4o");
+    let request_body = serde_json::to_vec(&native_body).unwrap();
+    for _ in 0..2 {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body.clone()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["output"][0]["namespace"], "collaboration");
+        assert_eq!(value["output"][0]["name"], "spawn_agent");
+    }
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "one native rejection + two flat requests"
+    );
+    let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let third: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(first["tools"][0]["type"], "namespace");
+    assert_eq!(second["tools"][0]["name"], "collaboration__spawn_agent");
+    assert_eq!(third["tools"][0]["name"], "collaboration__spawn_agent");
+}
+
+#[tokio::test]
+async fn test_responses_ordinary_400_does_not_trigger_flat_retry() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/responses"))
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+                "param": "temperature",
+                "message": "temperature is not accepted"
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+    let app = build_responses_same_protocol_app(mock_server.uri(), "gpt-4o");
+    let body = json!({
+        "model": "gpt-4o",
+        "input": "Hi",
+        "temperature": 0.2,
+        "tools": [{
+            "type": "namespace",
+            "namespace": "collaboration",
+            "tools": [{"type": "function", "name": "spawn_agent"}]
+        }]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_responses_namespace_flat_sse_restores_namespace() {
+    let mock_server = wiremock::MockServer::start().await;
+    let native_body = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "input": "Hi",
+        "tools": [{
+            "type": "namespace",
+            "namespace": "collaboration",
+            "tools": [{"type": "function", "name": "spawn_agent"}]
+        }]
+    });
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/responses"))
+        .and(wiremock::matchers::body_json(native_body.clone()))
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "code": "unsupported_parameter",
+                "param": "tools[0].tools",
+                "message": "namespace tools are unsupported"
+            }
+        })))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"collaboration__spawn_agent\",\"call_id\":\"call-1\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"name\":\"collaboration__spawn_agent\",\"call_id\":\"call-1\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"name\":\"collaboration__spawn_agent\"}]}}\n\n"
+    );
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/responses"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .with_priority(10)
+        .mount(&mock_server)
+        .await;
+
+    let app = build_responses_same_protocol_app(mock_server.uri(), "gpt-4o");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&native_body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("\"namespace\":\"collaboration\""));
+    assert!(text.contains("\"name\":\"spawn_agent\""));
+    assert!(!text.contains("collaboration__spawn_agent"));
+}
+
+#[tokio::test]
+async fn test_responses_tool_mismatch_falls_back_to_next_target() {
+    let primary = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "code": "unsupported_parameter",
+                "param": "tools[0].type",
+                "message": "namespace tools unsupported"
+            }
+        })))
+        .mount(&primary)
+        .await;
+    let secondary = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp-secondary",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "secondary"}]
+            }]
+        })))
+        .mount(&secondary)
+        .await;
+
+    let mut routing_table = RoutingTable::new();
+    routing_table.insert(
+        "gpt-4o".to_string(),
+        vec![
+            tiygate_core::RoutingTarget {
+                provider_id: "primary".to_string(),
+                model_id: "gpt-4o".to_string(),
+                api_base: primary.uri(),
+                api_key: "sk-primary".to_string(),
+                api_protocol: ProtocolEndpoint::new(
+                    ProtocolSuite::OpenAiResponses,
+                    "responses",
+                    "v1",
+                ),
+                account_label: Some("primary".to_string()),
+                api_key_override: None,
+                api_base_override: None,
+                weight: 2.0,
+                oauth: None,
+            },
+            tiygate_core::RoutingTarget {
+                provider_id: "secondary".to_string(),
+                model_id: "gpt-4o".to_string(),
+                api_base: secondary.uri(),
+                api_key: "sk-secondary".to_string(),
+                api_protocol: ProtocolEndpoint::new(
+                    ProtocolSuite::OpenAiResponses,
+                    "responses",
+                    "v1",
+                ),
+                account_label: Some("secondary".to_string()),
+                api_key_override: None,
+                api_base_override: None,
+                weight: 1.0,
+                oauth: None,
+            },
+        ],
+    );
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    let mut cfg = ServerConfig::default();
+    cfg.require_api_key = false;
+    cfg.routing_strategy = tiygate_core::RoutingStrategyName::Priority;
+    let app = ingress::router(config_store, health, &cfg);
+    let body = json!({
+        "model": "gpt-4o",
+        "input": "Hi",
+        "tools": [{
+            "type": "namespace",
+            "namespace": "collaboration",
+            "tools": [{"type": "function", "name": "spawn_agent"}]
+        }]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body_bytes);
+    assert!(text.contains("secondary"));
+    assert_eq!(primary.received_requests().await.unwrap().len(), 2);
+    assert_eq!(secondary.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn test_nonstream_gemini_same_protocol_passthrough() {
     // Same-protocol Gemini→Gemini: the upstream body is forwarded verbatim.
     let mock_server = wiremock::MockServer::start().await;

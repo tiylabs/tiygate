@@ -269,7 +269,14 @@ where
                 // Classify the error — prefer structured fields when
                 // available (HTTP status + error code from upstream),
                 // fall back to substring matching on the message.
-                let classification = if app_err.upstream_status.is_some()
+                let classification = if app_err.is_target_capability_mismatch() {
+                    tiygate_core::ErrorClassification {
+                        class: RequestErrorClass::LossyOrCapability,
+                        fallback_class: ErrorClass::LossyOrCapability,
+                        retry_after: None,
+                        http_status: app_err.upstream_status,
+                    }
+                } else if app_err.upstream_status.is_some()
                     || app_err.upstream_error_code().is_some()
                 {
                     tiygate_core::classify_structured(
@@ -319,8 +326,15 @@ where
 
                 // Decide next action
                 let core_err = tiygate_core::Error::Routing(app_err.message.clone());
-                let decision =
-                    fallback.classify(&core_err, target, attempt, max_attempts, bytes_emitted);
+                let decision = if app_err.is_target_capability_mismatch() {
+                    // A valid Responses request was rejected because this
+                    // concrete target lacks the namespace/tool dialect. It
+                    // is safe to move to the next target, unlike an ordinary
+                    // client 400/422.
+                    FallbackDecision::TryNext
+                } else {
+                    fallback.classify(&core_err, target, attempt, max_attempts, bytes_emitted)
+                };
 
                 match decision {
                     FallbackDecision::TryNext => {
