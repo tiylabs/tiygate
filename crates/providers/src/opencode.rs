@@ -69,8 +69,8 @@ impl Provider for OpenCodeZenProvider {
         opencode_egress_protocol_for_model(model_id)
     }
 
-    fn extra_headers(&self, api_key: &str) -> Vec<(&'static str, String)> {
-        vec![("x-opencode-session", opencode_session_id(api_key))]
+    fn extra_headers(&self, caller_key_id: &str) -> Vec<(&'static str, String)> {
+        vec![("x-opencode-session", opencode_session_id(caller_key_id))]
     }
 }
 
@@ -95,20 +95,19 @@ impl Provider for OpenCodeGoProvider {
         opencode_egress_protocol_for_model(model_id)
     }
 
-    fn extra_headers(&self, api_key: &str) -> Vec<(&'static str, String)> {
-        vec![("x-opencode-session", opencode_session_id(api_key))]
+    fn extra_headers(&self, caller_key_id: &str) -> Vec<(&'static str, String)> {
+        vec![("x-opencode-session", opencode_session_id(caller_key_id))]
     }
 }
 
-/// Derive a stable session identifier from the upstream API key.
+/// Derive a stable session identifier from the caller's TiyGate key ID.
 ///
 /// OpenCode requires an `x-opencode-session` header to correlate requests
 /// into sessions for service optimization. We generate a stable SHA-256
-/// hex digest of the upstream API key so that all requests from the same
-/// key share a consistent session identifier, without requiring clients
-/// to send any custom headers.
-fn opencode_session_id(api_key: &str) -> String {
-    let digest = Sha256::digest(api_key.as_bytes());
+/// hex digest of the caller's TiyGate API key ID so that each customer
+/// gets a unique, consistent session identifier.
+fn opencode_session_id(caller_key_id: &str) -> String {
+    let digest = Sha256::digest(caller_key_id.as_bytes());
     hex::encode(digest)
 }
 

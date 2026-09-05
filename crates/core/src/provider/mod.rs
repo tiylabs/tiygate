@@ -94,10 +94,10 @@ pub trait Provider: Send + Sync {
     /// without relying on the client to send them. The default returns an
     /// empty list.
     ///
-    /// `api_key` is the upstream API key configured on the routing target
-    /// (not the caller's TiyGate API key). Providers can use it to derive
-    /// stable per-account session identifiers.
-    fn extra_headers(&self, _api_key: &str) -> Vec<(&'static str, String)> {
+    /// `caller_key_id` is the caller's TiyGate API key ID (not the upstream
+    /// provider key). Providers can use it to derive stable per-customer
+    /// session identifiers.
+    fn extra_headers(&self, _caller_key_id: &str) -> Vec<(&'static str, String)> {
         Vec::new()
     }
 }

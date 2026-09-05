@@ -254,15 +254,15 @@ pub(super) fn extract_rate_limit_headers(headers: &HeaderMap) -> Vec<(&'static s
 ///
 /// Some providers require custom headers (e.g. OpenCode requires
 /// `x-opencode-session`) that clients don't know about. The provider
-/// generates these based on the upstream API key. This function is
-/// called *after* `apply_provider_auth` so provider auth headers
+/// generates these based on the caller's TiyGate key ID. This function
+/// is called *after* `apply_provider_auth` so provider auth headers
 /// always win.
 pub(super) fn inject_provider_extra_headers(
     provider: &dyn tiygate_core::Provider,
-    api_key: &str,
+    caller_key_id: &str,
     upstream: &mut http::HeaderMap,
 ) {
-    for (name, value) in provider.extra_headers(api_key) {
+    for (name, value) in provider.extra_headers(caller_key_id) {
         if let (Ok(hn), Ok(hv)) = (
             http::HeaderName::from_bytes(name.as_bytes()),
             http::HeaderValue::from_str(&value),
@@ -329,8 +329,8 @@ mod tests {
             fn metadata(&self) -> &ProviderMetadata { unreachable!() }
             fn supported_protocols(&self) -> &[ProtocolEndpoint] { unreachable!() }
             fn auth(&self) -> Arc<dyn tiygate_core::AuthApplier> { unreachable!() }
-            fn extra_headers(&self, api_key: &str) -> Vec<(&'static str, String)> {
-                vec![("x-test-header", format!("session-{api_key}"))]
+            fn extra_headers(&self, caller_key_id: &str) -> Vec<(&'static str, String)> {
+                vec![("x-test-header", format!("session-{caller_key_id}"))]
             }
         }
 
