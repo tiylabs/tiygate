@@ -681,6 +681,45 @@ async fn acceptance_3_stats_by_provider_endpoint() {
     assert_eq!(buckets[0]["cost"], 42_000);
 }
 
+#[tokio::test]
+async fn token_dashboard_endpoint_returns_activity_and_summary_together() {
+    let (router, _store, pool) = boot_no_auth().await;
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO request_logs \
+            (request_id, ts, virtual_model, ingress_protocol, status, total_tokens) \
+         VALUES ($1, $2, 'gpt-4o', 'openai/chat-completions/v1', 'ok', $3)",
+    )
+    .bind("token-dashboard-request")
+    .bind(now.to_rfc3339())
+    .bind(1_400_000_000_i64)
+    .execute(pool.any())
+    .await
+    .expect("insert request log");
+    tiygate_store::token_stats::aggregate_once(pool.as_ref(), 30)
+        .await
+        .expect("aggregate token stats");
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/v1/stats/token-dashboard?days=365")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 8192)
+        .await
+        .expect("response body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("response JSON");
+    assert_eq!(body["days"][0]["total_tokens"], 1_400_000_000_i64);
+    assert_eq!(body["summary"]["lifetime_tokens"], 1_400_000_000_i64);
+    assert_eq!(body["summary"]["peak_day_tokens"], 1_400_000_000_i64);
+}
+
 // ---- Acceptance #4: config and log are separate tables ----
 
 #[tokio::test]

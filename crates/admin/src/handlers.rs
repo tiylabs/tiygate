@@ -115,6 +115,10 @@ pub fn router() -> Router<AdminState> {
         .route("/admin/v1/stats/by-provider", get(stats_by_provider))
         .route("/admin/v1/stats/by-api-key", get(stats_by_api_key))
         .route("/admin/v1/stats/by-target", get(stats_by_target))
+        .route(
+            "/admin/v1/stats/token-dashboard",
+            get(stats_token_dashboard),
+        )
         .route("/admin/v1/stats/token-activity", get(stats_token_activity))
         .route("/admin/v1/stats/token-summary", get(stats_token_summary))
         .route("/admin/v1/audit", get(list_audit))
@@ -3206,6 +3210,17 @@ async fn stats_token_activity(
             Err(e) => return Err(AdminError::Db(e)),
         };
     Ok(Json(json!({"days": activity})).into_response())
+}
+
+async fn stats_token_dashboard(
+    State(state): State<AdminState>,
+    axum::extract::Query(q): axum::extract::Query<TokenActivityQuery>,
+) -> Result<Response, AdminError> {
+    let days = q.days.unwrap_or(365).clamp(1, 730);
+    let dashboard = tiygate_store::token_stats::get_token_dashboard(state.pool.as_ref(), days)
+        .await
+        .map_err(AdminError::Db)?;
+    Ok(Json(dashboard).into_response())
 }
 
 async fn stats_token_summary(State(state): State<AdminState>) -> Result<Response, AdminError> {

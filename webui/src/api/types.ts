@@ -413,6 +413,11 @@ export interface TokenSummaryData {
   updated_at: string;
 }
 
+export interface TokenDashboardData {
+  days: TokenDayActivity[];
+  summary: TokenSummaryData;
+}
+
 // ---- server info ----
 export interface ServerInfo {
   name: string;
