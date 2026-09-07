@@ -79,6 +79,10 @@ pub enum StreamPart {
         /// turns; `None` for plain-text streaming reasoning.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
+        /// Identifies the provider contract for `encrypted_content`. The
+        /// payloads are opaque but are not interchangeable across providers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content_source: Option<EncryptedReasoningSource>,
     },
     /// A tool call being built incrementally.
     ToolCallDelta {
@@ -206,6 +210,10 @@ pub enum Content {
         /// encrypted data that must be replayed verbatim on subsequent turns.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
+        /// Identifies the provider contract for `encrypted_content`. The
+        /// payloads are opaque but are not interchangeable across providers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content_source: Option<EncryptedReasoningSource>,
     },
     /// A tool call issued by the model.
     ToolCall {
@@ -283,6 +291,19 @@ pub enum Content {
     },
 }
 
+/// Provider-specific contract for an encrypted reasoning payload.
+///
+/// Anthropic `redacted_thinking.data` and OpenAI Responses
+/// `reasoning.encrypted_content` must only be replayed to the provider that
+/// issued them. Keeping this provenance in the canonical IR prevents a
+/// cross-protocol encoder from mistaking one opaque payload for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptedReasoningSource {
+    AnthropicRedactedThinking,
+    OpenAiResponses,
+}
+
 /// The only currently supported explicit prompt-cache breakpoint mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -291,9 +312,13 @@ pub enum PromptCacheBreakpointMode {
 }
 
 /// Marks the exact end of a reusable OpenAI prompt prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptCacheBreakpoint {
     pub mode: PromptCacheBreakpointMode,
+    /// Optional Anthropic cache lifetime. The API currently accepts `5m` or
+    /// `1h`; `None` preserves the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
 }
 
 /// Execution context for a Responses function call or output.

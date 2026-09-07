@@ -69,6 +69,8 @@ pub struct OAuthPendingFlow {
     /// random string the client generated; we hold the original
     /// value in memory until the callback completes.
     pub verifier: String,
+    /// Absolute process-local expiry for abandoned authorization attempts.
+    pub created_at: std::time::Instant,
 }
 
 impl AdminState {

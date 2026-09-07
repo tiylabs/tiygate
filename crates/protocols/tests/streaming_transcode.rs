@@ -405,11 +405,13 @@ fn matrix_reasoning_delta_roundtrip_all_pairs() {
             text: "thinking ".to_string(),
             id: None,
             encrypted_content: None,
+            encrypted_content_source: None,
         },
         StreamPart::ReasoningDelta {
             text: "harder".to_string(),
             id: None,
             encrypted_content: None,
+            encrypted_content_source: None,
         },
         StreamPart::TextDelta {
             text: "answer".to_string(),

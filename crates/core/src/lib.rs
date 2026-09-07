@@ -27,10 +27,10 @@ pub mod tracing_ctx;
 // Re-export key types
 pub use header_forward::HeaderForwardPolicy;
 pub use ir::{
-    Annotation, AnnotationKind, Content, FinishReason, GenerationParams, IrRequest, IrResponse,
-    Message, PromptCacheBreakpoint, PromptCacheBreakpointMode, RawEnvelope, ResponseFormat, Role,
-    StreamPart, ThinkingConfig, ThinkingDisplay, ThinkingEffort, Tool, ToolCaller,
-    TruncationReason, UpstreamStreamError, Usage, UsageAccumulator, Verbosity,
+    Annotation, AnnotationKind, Content, EncryptedReasoningSource, FinishReason, GenerationParams,
+    IrRequest, IrResponse, Message, PromptCacheBreakpoint, PromptCacheBreakpointMode, RawEnvelope,
+    ResponseFormat, Role, StreamPart, ThinkingConfig, ThinkingDisplay, ThinkingEffort, Tool,
+    ToolCaller, TruncationReason, UpstreamStreamError, Usage, UsageAccumulator, Verbosity,
 };
 pub use pipeline::{
     ExecutionHook, HookDecision, ObserveHook, PipelineContext, PipelineStage, PreRequestHook,

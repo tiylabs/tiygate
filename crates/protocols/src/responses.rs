@@ -6,9 +6,10 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tiygate_core::{
-    Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
-    Message, PromptCacheBreakpoint, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role,
-    StreamDecoder, StreamEncoder, StreamPart, Tool, ToolCaller, Usage, Verbosity,
+    Content, EncryptedReasoningSource, EndpointCapabilities, EndpointCodec, ErrorClass,
+    FinishReason, IrRequest, IrResponse, Message, PromptCacheBreakpoint, ProtocolEndpoint,
+    ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder, StreamPart, Tool, ToolCaller,
+    Usage, Verbosity,
 };
 
 /// Map an `ErrorClass` to the OpenAI Responses-native `error.type` string.
@@ -34,6 +35,51 @@ fn error_type_for_class(class: ErrorClass) -> &'static str {
 pub struct ResponsesCodec {
     id: ProtocolEndpoint,
     capabilities: EndpointCapabilities,
+}
+
+fn validate_responses_request_reasoning(ir: &IrRequest) -> Result<(), tiygate_core::Error> {
+    for message in &ir.messages {
+        for content in &message.content {
+            let Content::Reasoning {
+                encrypted_content: Some(_),
+                encrypted_content_source,
+                ..
+            } = content
+            else {
+                continue;
+            };
+            let source = (*encrypted_content_source).or_else(|| {
+                (ir.ingress_protocol.suite == ProtocolSuite::OpenAiResponses)
+                    .then_some(EncryptedReasoningSource::OpenAiResponses)
+            });
+            if source != Some(EncryptedReasoningSource::OpenAiResponses) {
+                return Err(tiygate_core::Error::Codec(
+                    "Anthropic redacted thinking cannot be encoded as OpenAI Responses encrypted reasoning"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_responses_response_reasoning(ir: &IrResponse) -> Result<(), tiygate_core::Error> {
+    if ir.content.iter().any(|content| {
+        matches!(
+            content,
+            Content::Reasoning {
+                encrypted_content: Some(_),
+                encrypted_content_source: source,
+                ..
+            } if *source != Some(EncryptedReasoningSource::OpenAiResponses)
+        )
+    }) {
+        return Err(tiygate_core::Error::Codec(
+            "Anthropic redacted thinking cannot be encoded as OpenAI Responses encrypted reasoning"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl Default for ResponsesCodec {
@@ -109,6 +155,7 @@ fn decode_prompt_cache_breakpoint(part: &Value) -> Option<PromptCacheBreakpoint>
     (part["prompt_cache_breakpoint"]["mode"].as_str() == Some("explicit")).then_some(
         PromptCacheBreakpoint {
             mode: tiygate_core::PromptCacheBreakpointMode::Explicit,
+            ttl: None,
         },
     )
 }
@@ -643,6 +690,9 @@ impl EndpointCodec for ResponsesCodec {
                         encrypted_content: item["encrypted_content"]
                             .as_str()
                             .map(|s| s.to_string()),
+                        encrypted_content_source: item["encrypted_content"]
+                            .as_str()
+                            .map(|_| EncryptedReasoningSource::OpenAiResponses),
                     }]
                 } else if item["type"] == "local_shell_call" {
                     // Codex local_shell_call: map to a ToolCall so it
@@ -1019,6 +1069,7 @@ impl EndpointCodec for ResponsesCodec {
     }
 
     fn encode_response(&self, ir: &IrResponse) -> Result<Value, tiygate_core::Error> {
+        validate_responses_response_reasoning(ir)?;
         let mut response = json!({"object": "response", "model": ""});
         if let Some(id) = &ir.response_id {
             response["id"] = json!(id);
@@ -1046,6 +1097,7 @@ impl EndpointCodec for ResponsesCodec {
                     text,
                     id,
                     encrypted_content,
+                    encrypted_content_source: _,
                     ..
                 } => {
                     flush_text(&mut pending_text, &mut output_items);
@@ -1216,6 +1268,7 @@ impl EndpointCodec for ResponsesCodec {
     }
 
     fn encode_request(&self, ir: &IrRequest) -> Result<(Value, HeaderMap), tiygate_core::Error> {
+        validate_responses_request_reasoning(ir)?;
         tiygate_core::protocol::structured_output::validate_response_format_for_target(
             ir.response_format.as_ref(),
             self.id(),
@@ -1954,6 +2007,9 @@ impl EndpointCodec for ResponsesCodec {
                         let id = item["id"].as_str().map(|s| s.to_string());
                         let encrypted_content =
                             item["encrypted_content"].as_str().map(|s| s.to_string());
+                        let encrypted_content_source = encrypted_content
+                            .as_ref()
+                            .map(|_| EncryptedReasoningSource::OpenAiResponses);
                         // Keep the reasoning item only when it carries a
                         // replayable payload — summary text or encrypted
                         // content. When `include:
@@ -1972,6 +2028,7 @@ impl EndpointCodec for ResponsesCodec {
                                 signature: None,
                                 id,
                                 encrypted_content,
+                                encrypted_content_source,
                             });
                         }
                     }
@@ -2565,7 +2622,16 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 text,
                 id,
                 encrypted_content,
+                encrypted_content_source,
             } => {
+                if encrypted_content.is_some()
+                    && *encrypted_content_source != Some(EncryptedReasoningSource::OpenAiResponses)
+                {
+                    return Err(tiygate_core::Error::Codec(
+                        "Anthropic redacted thinking cannot be encoded as OpenAI Responses encrypted reasoning"
+                            .to_string(),
+                    ));
+                }
                 // Latch the provider reasoning id / encrypted content the first
                 // time each arrives so every lifecycle event (added → delta →
                 // done → completed) uses the same identity and the encrypted
@@ -2900,10 +2966,15 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     // Attach the reasoning id / encrypted content captured from
                     // the reasoning output item to the first delta, then clear
                     // it so it is not repeated on subsequent deltas.
+                    let id = self.pending_reasoning_id.take();
+                    let encrypted_content = self.pending_reasoning_encrypted.take();
                     parts.push(StreamPart::ReasoningDelta {
                         text: text.to_string(),
-                        id: self.pending_reasoning_id.take(),
-                        encrypted_content: self.pending_reasoning_encrypted.take(),
+                        id,
+                        encrypted_content_source: encrypted_content
+                            .as_ref()
+                            .map(|_| EncryptedReasoningSource::OpenAiResponses),
+                        encrypted_content,
                     });
                 }
             }
@@ -3098,10 +3169,15 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     if self.pending_reasoning_id.is_some()
                         || self.pending_reasoning_encrypted.is_some()
                     {
+                        let id = self.pending_reasoning_id.take();
+                        let encrypted_content = self.pending_reasoning_encrypted.take();
                         parts.push(StreamPart::ReasoningDelta {
                             text: String::new(),
-                            id: self.pending_reasoning_id.take(),
-                            encrypted_content: self.pending_reasoning_encrypted.take(),
+                            id,
+                            encrypted_content_source: encrypted_content
+                                .as_ref()
+                                .map(|_| EncryptedReasoningSource::OpenAiResponses),
+                            encrypted_content,
                         });
                     }
                 } else if item["type"] == "program" || item["type"] == "program_output" {
@@ -3987,6 +4063,36 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_request_marks_responses_encrypted_reasoning_source() {
+        let codec = ResponsesCodec::new();
+        let ir = codec
+            .decode_request(
+                json!({
+                    "model": "gpt-5",
+                    "input": [{
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [],
+                        "encrypted_content": "responses-encrypted"
+                    }]
+                }),
+                &make_raw_env(),
+            )
+            .unwrap();
+        assert!(ir.messages.iter().any(|message| {
+            message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    Content::Reasoning {
+                        encrypted_content_source: Some(EncryptedReasoningSource::OpenAiResponses),
+                        ..
+                    }
+                )
+            })
+        }));
+    }
+
+    #[test]
     fn test_stream_decoder_interleaved_function_calls_use_item_id_and_call_id() {
         let mut decoder = ResponsesStreamDecoder::new();
         let first = decoder
@@ -4330,6 +4436,7 @@ mod tests {
                 text: "thinking".to_string(),
                 id: None,
                 encrypted_content: None,
+                encrypted_content_source: None,
             })
             .unwrap();
         let s1 = String::from_utf8_lossy(&bytes1);
@@ -4360,6 +4467,7 @@ mod tests {
                 text: " harder".to_string(),
                 id: None,
                 encrypted_content: None,
+                encrypted_content_source: None,
             })
             .unwrap();
         let s2 = String::from_utf8_lossy(&bytes2);
@@ -4443,6 +4551,7 @@ mod tests {
                 text: String::new(),
                 id: Some("rs_enc1".to_string()),
                 encrypted_content: Some("enc-blob".to_string()),
+                encrypted_content_source: Some(EncryptedReasoningSource::OpenAiResponses),
             })
             .unwrap();
         let _ = enc
@@ -4685,6 +4794,7 @@ mod tests {
                             signature: None,
                             id: None,
                             encrypted_content: None,
+                            encrypted_content_source: None,
                         },
                         Content::ToolCall {
                             id: "call_1".to_string(),
@@ -4763,6 +4873,7 @@ mod tests {
                     signature: None,
                     id: None,
                     encrypted_content: None,
+                    encrypted_content_source: None,
                 }],
             }],
             tools: vec![],
@@ -5024,6 +5135,7 @@ mod tests {
                     signature: Some("sig_anthropic".to_string()),
                     id: None,
                     encrypted_content: None,
+                    encrypted_content_source: None,
                 }],
             }],
             tools: vec![],

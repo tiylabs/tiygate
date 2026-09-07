@@ -185,10 +185,12 @@ pub fn codex_preset() -> OAuthProviderPreset {
 pub fn claude_preset() -> OAuthProviderPreset {
     OAuthProviderPreset {
         vendor: "anthropic".to_string(),
-        auth_url: "https://claude.ai/oauth/authorize".to_string(),
-        token_url: "https://api.anthropic.com/v1/oauth/token".to_string(),
+        // Claude Code subscription OAuth is a separate compatibility flow;
+        // it is not the public API's WIF JWT-bearer grant.
+        auth_url: "https://claude.com/cai/oauth/authorize".to_string(),
+        token_url: "https://platform.claude.com/v1/oauth/token".to_string(),
         client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
-        redirect_url: "http://localhost:54545/callback".to_string(),
+        redirect_url: "https://platform.claude.com/oauth/code/callback".to_string(),
         scopes: vec![
             "user:profile".to_string(),
             "user:inference".to_string(),
@@ -198,7 +200,9 @@ pub fn claude_preset() -> OAuthProviderPreset {
         ],
         exchange_request_style: TokenRequestStyle::Json,
         refresh_request_style: TokenRequestStyle::Json,
-        send_scopes_in_exchange_request: true,
+        // The selected scope is carried by the authorization request. The
+        // current subscription token endpoint does not need it again.
+        send_scopes_in_exchange_request: false,
         send_state_in_exchange_request: true,
         refresh_scopes: vec![
             "user:profile".to_string(),
@@ -439,14 +443,15 @@ pub async fn do_refresh_token(
             parse_token_response(resp).await
         }
         TokenRequestStyle::Json => {
-            let mut body = serde_json::json!({
+            let body = serde_json::json!({
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
                 "client_id": client_id,
             });
-            if !scopes_str.is_empty() {
-                body["scope"] = serde_json::json!(scopes_str);
-            }
+            // Anthropic's Claude Code subscription refresh grant does not
+            // accept the scope list used during authorization. JSON is the
+            // Anthropic-specific style in this crate; form-based providers
+            // keep their existing scope behavior above.
             let resp = http_client
                 .post(token_url)
                 .header("Content-Type", "application/json")
@@ -466,7 +471,31 @@ async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResult, St
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("token endpoint returned {status}: {body}"));
+        // Do not expose an authorization-server response verbatim through
+        // Admin API errors or logs. Preserve only stable OAuth error codes so
+        // refresh classification can still identify invalid credentials.
+        let hint = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|error| {
+                matches!(
+                    error.as_str(),
+                    "invalid_grant"
+                        | "invalid_token"
+                        | "refresh_token_reused"
+                        | "token_revoked"
+                        | "expired_token"
+                )
+            });
+        return Err(match hint {
+            Some(hint) => format!("token endpoint returned {status}: {hint}"),
+            None => format!("token endpoint returned {status}"),
+        });
     }
     let raw: TokenResponseRaw = resp
         .json()
@@ -1016,10 +1045,13 @@ mod tests {
     fn claude_preset_values() {
         let p = claude_preset();
         assert_eq!(p.vendor, "anthropic");
-        assert_eq!(p.auth_url, "https://claude.ai/oauth/authorize");
-        assert_eq!(p.token_url, "https://api.anthropic.com/v1/oauth/token");
+        assert_eq!(p.auth_url, "https://claude.com/cai/oauth/authorize");
+        assert_eq!(p.token_url, "https://platform.claude.com/v1/oauth/token");
         assert_eq!(p.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
-        assert_eq!(p.redirect_url, "http://localhost:54545/callback");
+        assert_eq!(
+            p.redirect_url,
+            "https://platform.claude.com/oauth/code/callback"
+        );
         assert_eq!(
             p.scopes,
             vec![
@@ -1032,6 +1064,7 @@ mod tests {
         );
         assert_eq!(p.exchange_request_style, TokenRequestStyle::Json);
         assert_eq!(p.refresh_request_style, TokenRequestStyle::Json);
+        assert!(!p.send_scopes_in_exchange_request);
         assert!(p.send_state_in_exchange_request);
         assert!(p
             .extra_authorize_params
@@ -1059,6 +1092,17 @@ mod tests {
         assert!(url.contains("prompt=login"));
         assert!(!url.contains("originator="));
         assert!(!url.contains("api.connectors"));
+    }
+
+    #[test]
+    fn claude_authorize_url_uses_subscription_console_flow() {
+        let url = build_authorize_url(&claude_preset(), "state", "challenge");
+        assert!(url.starts_with("https://claude.com/cai/oauth/authorize?"));
+        assert!(url.contains("code=true"));
+        assert!(url
+            .contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"));
+        assert!(url.contains("scope=user%3Aprofile+user%3Ainference"));
+        assert!(!url.contains("org%3Aadmin"));
     }
 
     #[tokio::test]
@@ -1102,7 +1146,66 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["state"], "csrf-state");
+        assert!(body.get("scope").is_none());
         assert_eq!(requests[0].headers["accept"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn claude_refresh_uses_json_without_scope() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+
+        let result = do_refresh_token(
+            &format!("{}/oauth/token", server.uri()),
+            "client",
+            "refresh-token-old",
+            &["user:inference".to_string()],
+            &TokenRequestStyle::Json,
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.access_token, "access-token");
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert_eq!(body["refresh_token"], "refresh-token-old");
+        assert!(body.get("scope").is_none());
+    }
+
+    #[tokio::test]
+    async fn token_error_keeps_only_safe_oauth_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "refresh-secret-must-not-leak"
+            })))
+            .mount(&server)
+            .await;
+
+        let error = do_refresh_token(
+            &format!("{}/oauth/token", server.uri()),
+            "client",
+            "refresh-token",
+            &[],
+            &TokenRequestStyle::Json,
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("invalid_grant"));
+        assert!(!error.contains("refresh-secret-must-not-leak"));
     }
 
     #[test]

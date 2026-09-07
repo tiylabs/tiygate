@@ -195,6 +195,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 signature: None,
                                 id: None,
                                 encrypted_content: None,
+                                encrypted_content_source: None,
                             },
                         );
                     }
@@ -1183,6 +1184,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         signature: None,
                         id: None,
                         encrypted_content: None,
+                        encrypted_content_source: None,
                     });
                 }
 
@@ -1230,6 +1232,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 signature: None,
                                 id: None,
                                 encrypted_content: None,
+                                encrypted_content_source: None,
                             });
                         }
                     }
@@ -1701,6 +1704,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                     text: text.to_string(),
                                     id: None,
                                     encrypted_content: None,
+                                    encrypted_content_source: None,
                                 });
                             }
                         } else if let Some(reasoning) = delta.get("reasoning_details") {
@@ -1709,6 +1713,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                     text: text.to_string(),
                                     id: None,
                                     encrypted_content: None,
+                                    encrypted_content_source: None,
                                 });
                             }
                         }
@@ -1956,6 +1961,7 @@ fn decode_chat_prompt_cache_breakpoint(item: &Value) -> Option<PromptCacheBreakp
     (item["prompt_cache_breakpoint"]["mode"].as_str() == Some("explicit")).then_some(
         PromptCacheBreakpoint {
             mode: tiygate_core::PromptCacheBreakpointMode::Explicit,
+            ttl: None,
         },
     )
 }
@@ -2453,6 +2459,7 @@ mod tests {
                 text: "think".to_string(),
                 id: None,
                 encrypted_content: None,
+                encrypted_content_source: None,
             },
             StreamPart::ToolCallDelta {
                 id: "tc1".to_string(),
@@ -2781,6 +2788,7 @@ mod tests {
                             signature: None,
                             id: None,
                             encrypted_content: None,
+                            encrypted_content_source: None,
                         },
                         Content::ToolCall {
                             id: "call_1".to_string(),
@@ -2812,6 +2820,7 @@ mod tests {
                             signature: None,
                             id: None,
                             encrypted_content: None,
+                            encrypted_content_source: None,
                         },
                         Content::Text {
                             text: "杭州今天晴。".to_string(),
