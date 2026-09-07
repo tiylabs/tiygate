@@ -438,11 +438,7 @@ async fn restart_with_current_config(
             .path()
             .app_local_data_dir()
             .map_err(|e| format!("failed to resolve app_local_data_dir: {e}"))?;
-        let db_path = data_dir.join("tiygate.db");
-        let db_url = format!(
-            "sqlite://{}?mode=rwc",
-            db_path.to_string_lossy().replace('\\', "/")
-        );
+        let db_url = sidecar::sqlite_database_url(&data_dir);
         (
             port,
             cfg.admin_token.clone(),

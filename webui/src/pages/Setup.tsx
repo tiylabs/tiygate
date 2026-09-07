@@ -650,6 +650,7 @@ export default function Setup() {
           {mode === "show-master-key" && (
             <div className="space-y-4">
               <Alert tone="warning">{t("setup.masterKeyWarning")}</Alert>
+              {error ? <ErrorBox message={error} /> : null}
               <div>
                 <label className="mb-1 block text-sm font-medium text-text">
                   {t("setup.masterKeyLabel")}

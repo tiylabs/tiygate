@@ -45,6 +45,15 @@ pub fn run() {
     app_start_time();
 
     let app = match tauri::Builder::default()
+        // The desktop client owns one local SQLite database and one sidecar.
+        // A second launch must therefore wake the existing process instead of
+        // starting another sidecar against the same files on the next port.
+        // Register this first so it can intercept secondary launches before
+        // any other plugin performs initialization.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tracing::info!("secondary TiyGate launch requested; showing existing window");
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -82,16 +91,7 @@ pub fn run() {
             let port = sidecar::find_available_port(13000)
                 .ok_or_else(|| anyhow::anyhow!("no available port in range 13000-13099"))?;
 
-            let db_path = data_dir.join("tiygate.db");
-            // Use `sqlite:` (not `sqlite://`) so the URL parser does not
-            // treat a Windows drive letter (e.g. `C:`) as the host part
-            // of an authority. With `sqlite://C:/…` the `url` crate
-            // parses `C` as host and strips it, leaving a relative path
-            // that SQLite cannot open. `sqlite:` keeps the path verbatim.
-            let db_url = format!(
-                "sqlite:{}?mode=rwc",
-                db_path.to_string_lossy().replace('\\', "/")
-            );
+            let db_url = sidecar::sqlite_database_url(&data_dir);
 
             // Use the admin token already stored in the config (generated
             // during load_or_init when missing). The sidecar inherits it
@@ -293,6 +293,10 @@ fn show_main_window(app: &tauri::AppHandle) {
     if let Err(e) = window.show() {
         tracing::warn!("failed to show main window: {e}");
         return;
+    }
+
+    if let Err(e) = window.unminimize() {
+        tracing::warn!("failed to restore minimized main window: {e}");
     }
 
     if let Err(e) = window.set_focus() {

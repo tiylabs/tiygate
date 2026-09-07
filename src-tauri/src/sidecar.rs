@@ -10,6 +10,7 @@
 //! - Graceful shutdown: kill the child process and wait for exit.
 
 use std::net::TcpListener;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -23,6 +24,20 @@ const MAX_PORT_ATTEMPTS: u16 = 100;
 /// How long to wait for the sidecar health check to succeed.
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Build the SQLite URL shared by initial startup and every sidecar restart.
+///
+/// `sqlite:` is intentional: `sqlite://C:/...` treats the Windows drive
+/// letter as a URL authority and leaves SQLite with an invalid relative path.
+/// Keeping this in one helper prevents the startup and restart paths from
+/// drifting apart again.
+pub fn sqlite_database_url(data_dir: &Path) -> String {
+    let db_path = data_dir.join("tiygate.db");
+    format!(
+        "sqlite:{}?mode=rwc",
+        db_path.to_string_lossy().replace('\\', "/")
+    )
+}
 
 /// Wrapper around the spawned sidecar child process.
 pub struct SidecarManager {
@@ -84,7 +99,7 @@ pub fn find_available_port(start_port: u16) -> Option<u16> {
 /// * `port` - Port for the sidecar to listen on.
 /// * `admin_token` - Value for `TIYGATE_ADMIN_TOKEN`.
 /// * `master_key` - 64-char hex for `TIYGATE_MASTER_KEY`.
-/// * `db_url` - SQLite database URL (e.g. `sqlite:///path/to/tiygate.db?mode=rwc`).
+/// * `db_url` - SQLite database URL (e.g. `sqlite:/path/to/tiygate.db?mode=rwc`).
 pub async fn spawn_sidecar(
     app: &AppHandle,
     port: u16,
@@ -212,6 +227,24 @@ async fn wait_for_health(port: u16) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_database_url_preserves_windows_drive_letter() {
+        let url = sqlite_database_url(Path::new(r"C:\Users\test\AppData\Local\TiyGate"));
+        assert_eq!(
+            url,
+            "sqlite:C:/Users/test/AppData/Local/TiyGate/tiygate.db?mode=rwc"
+        );
+        assert!(!url.starts_with("sqlite://C:"));
+    }
+
+    #[test]
+    fn sqlite_database_url_builds_unix_absolute_path() {
+        assert_eq!(
+            sqlite_database_url(Path::new("/var/lib/tiygate")),
+            "sqlite:/var/lib/tiygate/tiygate.db?mode=rwc"
+        );
+    }
 
     #[test]
     fn find_available_port_returns_a_bindable_port() {
