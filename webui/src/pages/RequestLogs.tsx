@@ -1579,8 +1579,14 @@ function protocolCategory(
   p?: string | null,
 ): { label: string; tone: BadgeTone } | null {
   if (!p) return null;
-  // Three-segment form `suite/name/version` → category derived from the name.
+  // Three-segment form `suite/name/version`. Provider-specific endpoints may
+  // use an internal name such as `deepseek-responses`; categorize those by
+  // suite so the log UI still presents the public protocol as Responses.
   const parts = p.split("/");
+  const suite = parts.length >= 2 ? parts[0] : null;
+  if (suite === "openai-responses" || suite === "open_ai_responses") {
+    return { label: "Responses", tone: "success" };
+  }
   const name =
     parts.length >= 3 ? parts[1] : parts.length === 2 ? parts[1] : parts[0];
   switch (name) {
