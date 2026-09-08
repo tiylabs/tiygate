@@ -2152,6 +2152,9 @@ async fn test_deepseek_responses_prepares_reasoning_for_native_upstream() {
     let body = json!({
         "model": "deepseek-v4-pro",
         "reasoning": {"effort": "max", "summary": "none"},
+        "prompt_cache_key": "codex-session",
+        "prompt_cache_retention": "24h",
+        "prompt_cache_options": {"mode": "explicit"},
         "input": [
             {"role": "user", "content": "weather?"},
             {
@@ -2184,6 +2187,9 @@ async fn test_deepseek_responses_prepares_reasoning_for_native_upstream() {
     assert_eq!(upstream["input"][1]["content"][0]["type"], "reasoning_text");
     assert_eq!(upstream["input"][1]["content"][0]["text"], "call weather");
     assert!(upstream["input"][1].get("summary").is_none());
+    assert!(upstream.get("prompt_cache_key").is_none());
+    assert!(upstream.get("prompt_cache_retention").is_none());
+    assert!(upstream.get("prompt_cache_options").is_none());
 }
 
 #[tokio::test]

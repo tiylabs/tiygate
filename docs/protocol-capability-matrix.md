@@ -83,6 +83,10 @@ verbosity、自动 truncation、禁用并行工具调用、非空 metadata/inclu
 以及 `file_search`、`code_interpreter`、`computer_use`、`mcp` 等工具。允许的工具为
 function、web search，以及名为 `apply_patch` 的 custom tool。
 
+`prompt_cache_key`、`prompt_cache_retention`、`prompt_cache_options` 属于例外：DeepSeek
+自动管理上下文缓存，TiyGate 在 DeepSeek Responses 出站前显式移除这些缓存提示，不将其
+视为影响生成语义的有损转换，也不会因此拒绝 Codex 客户端请求。
+
 来源：[DeepSeek Responses API 指南](https://api-docs.deepseek.com/guides/responses_api/)、
 [DeepSeek Responses API Reference](https://api-docs.deepseek.com/api/create-response/)。
 

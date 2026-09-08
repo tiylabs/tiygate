@@ -360,6 +360,20 @@ fn prepare_deepseek_reasoning_item(item: &mut serde_json::Value) -> Result<bool,
 /// loss and converts replayable OpenAI reasoning summaries to DeepSeek's
 /// `reasoning_text` input form before sending the request.
 fn prepare_deepseek_responses_request(body: &mut serde_json::Value) -> Result<bool, String> {
+    // DeepSeek manages context caching automatically. Codex clients commonly
+    // send OpenAI cache-affinity hints, so strip those non-semantic controls
+    // instead of rejecting an otherwise compatible request.
+    let mut mutated = false;
+    if let Some(object) = body.as_object_mut() {
+        for field in [
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "prompt_cache_options",
+        ] {
+            mutated |= object.remove(field).is_some();
+        }
+    }
+
     for field in [
         "previous_response_id",
         "conversation",
@@ -368,9 +382,6 @@ fn prepare_deepseek_responses_request(body: &mut serde_json::Value) -> Result<bo
         "prompt",
         "service_tier",
         "safety_identifier",
-        "prompt_cache_key",
-        "prompt_cache_retention",
-        "prompt_cache_options",
         "context_management",
         "stream_options",
         "client_metadata",
@@ -464,7 +475,6 @@ fn prepare_deepseek_responses_request(body: &mut serde_json::Value) -> Result<bo
         }
     }
 
-    let mut mutated = false;
     if let Some(items) = body.get_mut("input").and_then(|value| value.as_array_mut()) {
         for item in items {
             let item_type = item.get("type").and_then(|value| value.as_str());
@@ -606,6 +616,9 @@ mod tests {
         let mut body = serde_json::json!({
             "model": "deepseek-v4-pro",
             "reasoning": {"effort": "max", "summary": "none"},
+            "prompt_cache_key": "codex-session",
+            "prompt_cache_retention": "24h",
+            "prompt_cache_options": {"mode": "explicit"},
             "input": [
                 {"role": "user", "content": "weather?"},
                 {
@@ -642,6 +655,8 @@ mod tests {
         assert_eq!(body["input"][1]["content"][0]["text"], "call weather");
         assert!(body["input"][1].get("summary").is_none());
         assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert!(body.get("prompt_cache_options").is_none());
     }
 
     #[test]
