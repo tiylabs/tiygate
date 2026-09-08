@@ -259,6 +259,16 @@ pub enum EventPayload {
         hop: usize,
         decision: String,
     },
+    /// Target-local Responses tool dialect adaptation. The payload contains
+    /// only target identity and outcome labels; it never carries tool
+    /// arguments or credentials.
+    ResponsesToolAdaptation {
+        target: String,
+        mode: String,
+        cache_hit: bool,
+        retry: bool,
+        outcome: String,
+    },
     /// Request completed (success or failure).
     RequestCompleted {
         status: String,

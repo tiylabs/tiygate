@@ -1,6 +1,10 @@
 //! Upstream executors and codec/URL builders for each protocol.
 
 use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -31,6 +35,7 @@ use super::headers::{
     reqwest_headers_to_vec, spawn_capture,
 };
 use super::response_model::ResponseModelOverride;
+use super::responses_tool_adapter::{self, NamespaceReverseMap, ResponsesToolMode};
 use super::streaming::{
     drive_upstream_stream, StreamCapture, StreamTranscode, UpstreamByteStream,
     DEFAULT_SSE_KEEPALIVE_INTERVAL,
@@ -470,6 +475,74 @@ fn check_nonstream_error_body(
     Some(app_err)
 }
 
+fn mark_responses_tool_schema_rejection(
+    mut error: AppError,
+    status: u16,
+    response_body: &Value,
+    tool_request: bool,
+    tool_mode: ResponsesToolMode,
+) -> AppError {
+    if tool_request
+        && matches!(
+            tool_mode,
+            ResponsesToolMode::Native | ResponsesToolMode::FlatTools
+        )
+        && responses_tool_schema_rejection(status, response_body)
+    {
+        error = error.with_target_capability_mismatch();
+    }
+    error
+}
+
+fn responses_tool_schema_rejection(status: u16, body: &Value) -> bool {
+    if status != 400 && status != 422 {
+        return false;
+    }
+    let mut fields = Vec::new();
+    collect_error_fields(body, &mut fields);
+    let joined = fields.join(" ").to_lowercase();
+    let explicit_code = fields.iter().any(|field| {
+        matches!(
+            field.to_ascii_lowercase().as_str(),
+            "unknown_parameter" | "unsupported_parameter" | "invalid_value"
+        )
+    });
+    let tool_path = joined.contains("tools[")
+        || joined.contains("tools.")
+        || joined.contains("namespace")
+        || joined.contains("tool_search")
+        || joined.contains("defer_loading")
+        || joined.contains("additional_tools");
+    tool_path
+        && (explicit_code
+            || joined.contains("unsupported")
+            || joined.contains("unknown")
+            || joined.contains("invalid")
+            || joined.contains("not allowed")
+            || joined.contains("unrecognized"))
+}
+
+fn collect_error_fields(value: &Value, fields: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                if matches!(key.as_str(), "code" | "param" | "parameter" | "message") {
+                    if let Some(text) = child.as_str() {
+                        fields.push(text.to_string());
+                    }
+                }
+                collect_error_fields(child, fields);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_error_fields(child, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_upstream(
     state: &AppState,
@@ -651,6 +724,7 @@ pub(super) async fn execute_upstream(
             trace,
             request_id,
             is_same_protocol,
+            NamespaceReverseMap::default(),
         );
         let websocket_result = if is_stream || nonstream_timeout_secs == 0 {
             websocket_future.await
@@ -1229,6 +1303,7 @@ pub(super) async fn execute_messages_upstream(
             trace,
             request_id,
             is_same_protocol,
+            NamespaceReverseMap::default(),
         );
         let websocket_result = if is_stream || nonstream_timeout_secs == 0 {
             websocket_future.await
@@ -1930,6 +2005,197 @@ pub(super) async fn execute_responses_upstream(
     request_id: &str,
     client_headers: &http::HeaderMap,
     api_key_id: &str,
+    adaptation_budget: Arc<AtomicUsize>,
+) -> Result<(Response, Option<u64>), AppError> {
+    let key = responses_tool_adapter::target_key(target);
+    let mode = if target.api_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses {
+        state.responses_tool_compat.get(&key)
+    } else {
+        ResponsesToolMode::Native
+    };
+    let native_tool_request = target.api_protocol.suite
+        == tiygate_core::ProtocolSuite::OpenAiResponses
+        && raw_passthrough_body
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .is_some_and(|body| responses_tool_adapter::requires_adaptation(&body));
+
+    let result = execute_responses_upstream_attempt(
+        state,
+        codec,
+        ingress_protocol,
+        ir_request,
+        target,
+        is_stream,
+        raw_passthrough_body,
+        trace,
+        request_id,
+        client_headers,
+        api_key_id,
+        mode,
+    )
+    .await;
+
+    match result {
+        Ok(response) => {
+            if native_tool_request || mode == ResponsesToolMode::FlatTools {
+                emit_responses_tool_adaptation(
+                    state,
+                    request_id,
+                    target,
+                    mode,
+                    mode == ResponsesToolMode::FlatTools,
+                    false,
+                    if mode == ResponsesToolMode::FlatTools {
+                        "cache_hit_or_flat_success"
+                    } else {
+                        "native_success"
+                    },
+                )
+                .await;
+            }
+            if mode == ResponsesToolMode::FlatTools {
+                state.responses_tool_compat.remember_flat(key);
+            } else if native_tool_request {
+                state.responses_tool_compat.remember_native(key);
+            }
+            Ok(response)
+        }
+        Err(error)
+            if mode == ResponsesToolMode::Native
+                && error.is_target_capability_mismatch()
+                && target.api_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses =>
+        {
+            emit_responses_tool_adaptation(
+                state,
+                request_id,
+                target,
+                ResponsesToolMode::Native,
+                false,
+                true,
+                "schema_rejected",
+            )
+            .await;
+            // A request may spend at most two native→flat adaptation attempts
+            // across all targets in one fallback chain. The per-target body
+            // hash/mode guard is provided by the learned cache.
+            let acquired = adaptation_budget
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    (used < 2).then_some(used + 1)
+                })
+                .is_ok();
+            if !acquired {
+                return Err(error);
+            }
+            match execute_responses_upstream_attempt(
+                state,
+                codec,
+                ingress_protocol,
+                ir_request,
+                target,
+                is_stream,
+                raw_passthrough_body,
+                trace,
+                request_id,
+                client_headers,
+                api_key_id,
+                ResponsesToolMode::FlatTools,
+            )
+            .await
+            {
+                Ok(response) => {
+                    emit_responses_tool_adaptation(
+                        state,
+                        request_id,
+                        target,
+                        ResponsesToolMode::FlatTools,
+                        false,
+                        true,
+                        "retry_success",
+                    )
+                    .await;
+                    state.responses_tool_compat.remember_flat(key);
+                    Ok(response)
+                }
+                Err(error) => {
+                    emit_responses_tool_adaptation(
+                        state,
+                        request_id,
+                        target,
+                        ResponsesToolMode::FlatTools,
+                        false,
+                        true,
+                        "capability_mismatch",
+                    )
+                    .await;
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            if mode == ResponsesToolMode::FlatTools && error.is_target_capability_mismatch() {
+                emit_responses_tool_adaptation(
+                    state,
+                    request_id,
+                    target,
+                    ResponsesToolMode::FlatTools,
+                    true,
+                    false,
+                    "capability_mismatch",
+                )
+                .await;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn emit_responses_tool_adaptation(
+    state: &AppState,
+    request_id: &str,
+    target: &tiygate_core::RoutingTarget,
+    mode: ResponsesToolMode,
+    cache_hit: bool,
+    retry: bool,
+    outcome: &str,
+) {
+    use chrono::Utc;
+    use tiygate_core::telemetry::{EventPayload, PipelineEvent};
+
+    state
+        .telemetry
+        .send(PipelineEvent {
+            request_id: request_id.to_string(),
+            timestamp: Utc::now(),
+            stage: "execute".to_string(),
+            payload: EventPayload::ResponsesToolAdaptation {
+                target: target.health_key(),
+                mode: match mode {
+                    ResponsesToolMode::Native => "native",
+                    ResponsesToolMode::FlatTools => "flat_tools",
+                }
+                .to_string(),
+                cache_hit,
+                retry,
+                outcome: outcome.to_string(),
+            },
+        })
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_responses_upstream_attempt(
+    state: &AppState,
+    codec: &ResponsesCodec,
+    ingress_protocol: &tiygate_core::ProtocolEndpoint,
+    ir_request: &IrRequest,
+    target: &tiygate_core::RoutingTarget,
+    is_stream: bool,
+    raw_passthrough_body: Option<&str>,
+    trace: &TraceContext,
+    request_id: &str,
+    client_headers: &http::HeaderMap,
+    api_key_id: &str,
+    tool_mode: ResponsesToolMode,
 ) -> Result<(Response, Option<u64>), AppError> {
     let egress_protocol = target.api_protocol.clone();
     let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
@@ -1969,7 +2235,31 @@ pub(super) async fn execute_responses_upstream(
         encode_cross_protocol(codec, &egress_protocol, ir_request)?
     };
 
+    let tool_request = egress_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses
+        && responses_tool_adapter::requires_adaptation(&upstream_body);
+    let mut reverse_map = NamespaceReverseMap::default();
+    let mut tool_adaptation_changed = false;
+    if tool_mode == ResponsesToolMode::FlatTools
+        && egress_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses
+    {
+        let adaptation =
+            responses_tool_adapter::flatten_request(&upstream_body).map_err(|error| {
+                AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("Responses tool capability mismatch: {error}"),
+                )
+                .with_target_capability_mismatch()
+            })?;
+        if adaptation.lossy {
+            tracing::debug!(target = %target.provider_id, "using lossy flat Responses tool adaptation");
+        }
+        tool_adaptation_changed = adaptation.changed;
+        upstream_body = adaptation.body;
+        reverse_map = adaptation.reverse_map;
+    }
+
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
+    body_mutated |= tool_adaptation_changed;
     body_mutated |=
         maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
     body_mutated |= normalize_openai_reasoning_for_target(
@@ -2057,6 +2347,7 @@ pub(super) async fn execute_responses_upstream(
             trace,
             request_id,
             is_same_protocol,
+            reverse_map.clone(),
         );
         let websocket_result = if is_stream || nonstream_timeout_secs == 0 {
             websocket_future.await
@@ -2149,9 +2440,11 @@ pub(super) async fn execute_responses_upstream(
                     upstream_error_class: None,
                 },
             );
+            let response_body = serde_json::from_str::<Value>(&error_body)
+                .unwrap_or_else(|_| json!({"error": {"message": error_body}}));
             let mut app_err = AppError::new(
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                format!("Upstream {}: {}", status, error_body),
+                format!("Upstream {}: {}", status, response_body),
             );
             app_err.upstream_status = Some(status.as_u16());
             app_err = app_err.with_class(tiygate_core::classify_upstream_error(
@@ -2161,7 +2454,13 @@ pub(super) async fn execute_responses_upstream(
             if let Some(ra) = retry_after {
                 app_err = app_err.with_retry_after_header(ra);
             }
-            return Err(app_err);
+            return Err(mark_responses_tool_schema_rejection(
+                app_err,
+                status.as_u16(),
+                &response_body,
+                tool_request,
+                tool_mode,
+            ));
         }
 
         let accum = std::sync::Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
@@ -2177,11 +2476,18 @@ pub(super) async fn execute_responses_upstream(
         let mut response = drive_upstream_stream(
             state,
             accum,
-            Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|result| result.map_err(|error| error.to_string())),
-            ),
+            {
+                let upstream: UpstreamByteStream = Box::pin(
+                    response
+                        .bytes_stream()
+                        .map(|result| result.map_err(|error| error.to_string())),
+                );
+                if reverse_map.is_empty() || !is_same_protocol {
+                    upstream
+                } else {
+                    responses_tool_adapter::restore_sse_stream(upstream, reverse_map.clone())
+                }
+            },
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -2316,7 +2622,13 @@ pub(super) async fn execute_responses_upstream(
             app_err = app_err.with_retry_after_header(ra);
         }
         app_err.rate_limit_headers = rate_limit_headers_vec;
-        return Err(app_err);
+        return Err(mark_responses_tool_schema_rejection(
+            app_err,
+            status.as_u16(),
+            &response_body,
+            tool_request,
+            tool_mode,
+        ));
     }
 
     let response_body = if openai_codex_profile {
@@ -2358,7 +2670,13 @@ pub(super) async fn execute_responses_upstream(
                 upstream_error_class: None,
             },
         );
-        return Err(app_err);
+        return Err(mark_responses_tool_schema_rejection(
+            app_err,
+            status.as_u16(),
+            &response_body,
+            tool_request,
+            tool_mode,
+        ));
     }
 
     let upstream_resp_body_capture = if openai_codex_profile {
@@ -2388,6 +2706,9 @@ pub(super) async fn execute_responses_upstream(
             )
         })?
     };
+    if is_same_protocol && egress_protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses {
+        responses_tool_adapter::restore_response(&mut response_body, &reverse_map);
+    }
     ResponseModelOverride::new(ingress_protocol.suite, &ir_request.model)
         .apply_json(&mut response_body);
     let body_str_capture = serde_json::to_string(&response_body).ok();
@@ -2455,6 +2776,7 @@ async fn execute_codex_responses_websocket(
     trace: &TraceContext,
     request_id: &str,
     is_same_protocol: bool,
+    reverse_map: NamespaceReverseMap,
 ) -> Result<(Response, Option<u64>), AppError> {
     upstream_body = codex_oauth::websocket_request_body(upstream_body)?;
 
@@ -2601,10 +2923,16 @@ async fn execute_codex_responses_websocket(
             tiygate_core::ErrorClass::DeadlineExceeded,
             None,
         );
+        let websocket_stream = websocket_event_stream(socket);
+        let websocket_stream = if is_same_protocol && !reverse_map.is_empty() {
+            responses_tool_adapter::restore_sse_stream(websocket_stream, reverse_map.clone())
+        } else {
+            websocket_stream
+        };
         let mut response = drive_upstream_stream(
             state,
             accum,
-            websocket_event_stream(socket),
+            websocket_stream,
             end_marker,
             error_marker,
             Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
@@ -2666,6 +2994,10 @@ async fn execute_codex_responses_websocket(
         }
     };
 
+    let mut upstream_response = upstream_response;
+    if is_same_protocol && !reverse_map.is_empty() {
+        responses_tool_adapter::restore_response(&mut upstream_response, &reverse_map);
+    }
     let upstream_resp_body_capture = serde_json::to_string(&upstream_response).ok();
     let mut response_body = if is_same_protocol {
         upstream_response
@@ -2886,6 +3218,7 @@ pub(super) async fn execute_gemini_upstream(
             trace,
             request_id,
             is_same_protocol,
+            NamespaceReverseMap::default(),
         );
         let websocket_result = if is_stream || nonstream_timeout_secs == 0 {
             websocket_future.await
