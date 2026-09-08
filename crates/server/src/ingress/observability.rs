@@ -943,6 +943,18 @@ pub(super) async fn embedding_cache_store(
     }
 }
 
+/// Serialize a protocol endpoint for operator-facing logs. Provider-specific
+/// Responses profiles share the public Responses wire protocol, so their
+/// internal endpoint names must not leak into log categorization.
+pub(super) fn protocol_log_label(protocol: &ProtocolEndpoint) -> String {
+    let name = if protocol.suite == tiygate_core::ProtocolSuite::OpenAiResponses {
+        protocol.suite.default_endpoint_id().0
+    } else {
+        protocol.name.as_str()
+    };
+    format!("{}/{}/{}", protocol.suite.label(), name, protocol.version)
+}
+
 /// Build a `RequestEvent` from the request hot-path data and push
 /// it to the telemetry bus. Phase-4 OltpSink picks it up; stdout
 /// sinks surface it as JSON.
@@ -978,13 +990,8 @@ pub(super) fn emit_request_event(
         trace_id: Some(trace.trace_id.clone()),
         span_id: Some(trace.parent_span_id.clone()),
         traceparent: Some(trace.to_traceparent()),
-        ingress_protocol: format!(
-            "{}/{}/{}",
-            ingress.suite.label(),
-            ingress.name,
-            ingress.version
-        ),
-        egress_protocol: egress.map(|e| format!("{}/{}/{}", e.suite.label(), e.name, e.version)),
+        ingress_protocol: protocol_log_label(ingress),
+        egress_protocol: egress.map(protocol_log_label),
         lossy,
         cache_hit: cache_hit.map(str::to_string),
         status,
@@ -1034,6 +1041,32 @@ pub(super) fn emit_request_event(
     tokio::spawn(async move {
         bus2.send(pe).await;
     });
+}
+
+#[cfg(test)]
+mod protocol_log_tests {
+    use super::protocol_log_label;
+    use tiygate_core::{ProtocolEndpoint, ProtocolSuite};
+
+    #[test]
+    fn responses_profiles_use_the_public_responses_label() {
+        let endpoint =
+            ProtocolEndpoint::new(ProtocolSuite::OpenAiResponses, "deepseek-responses", "v1");
+        assert_eq!(
+            protocol_log_label(&endpoint),
+            "openai-responses/responses/v1"
+        );
+    }
+
+    #[test]
+    fn non_responses_endpoint_names_are_preserved() {
+        let endpoint =
+            ProtocolEndpoint::new(ProtocolSuite::OpenAiCompatible, "images-generations", "v1");
+        assert_eq!(
+            protocol_log_label(&endpoint),
+            "openai-compatible/images-generations/v1"
+        );
+    }
 }
 
 /// Compute a single upstream URL + method + body triple from the

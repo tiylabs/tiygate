@@ -1584,7 +1584,8 @@ function protocolCategory(
   // suite so the log UI still presents the public protocol as Responses.
   const parts = p.split("/");
   const suite = parts.length >= 2 ? parts[0] : null;
-  if (suite === "openai-responses" || suite === "open_ai_responses") {
+  const normalizedSuite = suite?.replace(/[-_]/g, "").toLowerCase();
+  if (normalizedSuite === "openairesponses") {
     return { label: "Responses", tone: "success" };
   }
   const name =
@@ -1593,6 +1594,7 @@ function protocolCategory(
     case "chat-completions":
       return { label: "OpenAI-Compatible", tone: "primary" };
     case "responses":
+    case "deepseek-responses":
       return { label: "Responses", tone: "success" };
     case "messages":
       return { label: "Messages", tone: "warning" };

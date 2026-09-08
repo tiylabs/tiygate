@@ -14,6 +14,7 @@ use tiygate_core::{
     RetryPolicy,
 };
 
+use super::observability::protocol_log_label;
 use super::{build_strategy, AppError, AppState};
 
 async fn emit_hop_decision(
@@ -200,10 +201,7 @@ where
                     target: health_key.clone(),
                     provider: target.provider_id.clone(),
                     model: target.model_id.clone(),
-                    egress_protocol: format!(
-                        "{:?}/{}",
-                        target.api_protocol.suite, target.api_protocol.name
-                    ),
+                    egress_protocol: protocol_log_label(&target.api_protocol),
                     hop: current_hop,
                 },
             })
