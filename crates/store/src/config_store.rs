@@ -303,6 +303,11 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
             };
             let (api_protocol, api_base) =
                 provider_egress_for_target(provider, &t.model_id, &raw_base);
+            // The provider may normalize a route-level base override for the
+            // selected protocol (for example DeepSeek `/v1` Chat versus root
+            // `/responses`). Keep the effective override aligned with that
+            // resolved base instead of restoring the raw pre-normalized URL.
+            let api_base_override = t.api_base_override.as_ref().map(|_| api_base.clone());
             targets.push(RoutingTarget {
                 provider_id: provider.id.clone(),
                 model_id: t.model_id.clone(),
@@ -311,7 +316,7 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
                 api_protocol,
                 account_label: t.account_label.clone(),
                 api_key_override: t.api_key_override.clone(),
-                api_base_override: t.api_base_override.clone(),
+                api_base_override,
                 weight: t.weight,
                 oauth: oauth_config,
             });

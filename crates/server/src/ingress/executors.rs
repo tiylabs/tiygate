@@ -27,7 +27,7 @@ use crate::openai_codex_oauth as codex_oauth;
 use super::headers::{
     extract_rate_limit_headers, extract_retry_after, forward_upstream_resp_headers,
     forwarded_resp_headers_for_capture, header_map_to_vec, maybe_inject_prompt_cache_key,
-    merge_client_headers, normalize_openai_reasoning_for_target, override_model_in_body,
+    merge_client_headers, override_model_in_body, prepare_provider_request_body,
     reqwest_headers_to_vec, spawn_capture,
 };
 use super::response_model::ResponseModelOverride;
@@ -532,21 +532,20 @@ pub(super) async fn execute_upstream(
         encode_cross_protocol(codec, &egress_protocol, ir_request)?
     };
 
-    // Inject `prompt_cache_key` for OpenAI-family egress targets so that
-    // requests from the same caller are routed to the same inference
-    // machine, improving prompt-prefix cache hit rates.
-    let mut body_mutated =
-        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
-
     // Replace the (possibly virtual) model name with the routing
     // target's real upstream model id before sending and before we
     // snapshot the egress body for the request-log detail view.
-    body_mutated |= override_model_in_body(&mut upstream_body, &target.model_id);
-    body_mutated |= normalize_openai_reasoning_for_target(
+    let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
+    body_mutated |= prepare_provider_request_body(
         &mut upstream_body,
+        target,
         &egress_protocol.suite,
-        &target.model_id,
-    );
+        api_key_id,
+    )
+    .map_err(|message| {
+        AppError::new(StatusCode::BAD_REQUEST, message)
+            .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+    })?;
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
             target,
@@ -1132,13 +1131,16 @@ pub(super) async fn execute_messages_upstream(
     // Replace the (possibly virtual) model name with the routing
     // target's real upstream model id.
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
-    body_mutated |=
-        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
-    body_mutated |= normalize_openai_reasoning_for_target(
+    body_mutated |= prepare_provider_request_body(
         &mut upstream_body,
+        target,
         &egress_protocol.suite,
-        &target.model_id,
-    );
+        api_key_id,
+    )
+    .map_err(|message| {
+        AppError::new(StatusCode::BAD_REQUEST, message)
+            .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+    })?;
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
             target,
@@ -1970,13 +1972,16 @@ pub(super) async fn execute_responses_upstream(
     };
 
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
-    body_mutated |=
-        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
-    body_mutated |= normalize_openai_reasoning_for_target(
+    body_mutated |= prepare_provider_request_body(
         &mut upstream_body,
+        target,
         &egress_protocol.suite,
-        &target.model_id,
-    );
+        api_key_id,
+    )
+    .map_err(|message| {
+        AppError::new(StatusCode::BAD_REQUEST, message)
+            .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+    })?;
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
             target,
@@ -2802,13 +2807,16 @@ pub(super) async fn execute_gemini_upstream(
     };
 
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
-    body_mutated |=
-        maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
-    body_mutated |= normalize_openai_reasoning_for_target(
+    body_mutated |= prepare_provider_request_body(
         &mut upstream_body,
+        target,
         &egress_protocol.suite,
-        &target.model_id,
-    );
+        api_key_id,
+    )
+    .map_err(|message| {
+        AppError::new(StatusCode::BAD_REQUEST, message)
+            .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+    })?;
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
             target,

@@ -72,6 +72,35 @@ fn unique_responses_call_id(
     candidate
 }
 
+/// Extract replayable reasoning text from both OpenAI and DeepSeek Responses
+/// items. OpenAI carries summaries in `summary[].text`; DeepSeek carries the
+/// chain of thought in `content[{type:"reasoning_text",text:...}]`.
+fn responses_reasoning_text(item: &Value) -> String {
+    let content_text = item["content"].as_array().map(|content| {
+        content
+            .iter()
+            .filter(|part| part["type"] == "reasoning_text")
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    });
+
+    content_text
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            item["summary"].as_array().map(|summary| {
+                summary
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+        })
+        .filter(|text| !text.is_empty())
+        .or_else(|| item["text"].as_str().map(String::from))
+        .unwrap_or_default()
+}
+
 fn responses_function_call_output(
     tool_call_id: &str,
     content: &str,
@@ -506,25 +535,38 @@ impl EndpointCodec for ResponsesCodec {
                         prompt_cache_breakpoint: None,
                     }]
                 } else if let Some(content_arr) = item["content"].as_array() {
-                    let mut parts = Vec::new();
-                    for part in content_arr {
-                        match part["type"].as_str() {
-                            Some("input_text") | Some("output_text") => {
-                                parts.push(Content::Text {
-                                    text: part["text"].as_str().unwrap_or("").to_string(),
-                                    annotations: None,
-                                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
-                                });
-                            }
-                            Some("input_image") | Some("input_file") => {
-                                if let Some(media) = decode_responses_media_part(part) {
-                                    parts.push(media);
+                    if item["type"] == "reasoning" {
+                        vec![Content::Reasoning {
+                            text: responses_reasoning_text(item),
+                            signature: None,
+                            id: item["id"].as_str().map(|s| s.to_string()),
+                            encrypted_content: item["encrypted_content"]
+                                .as_str()
+                                .map(|s| s.to_string()),
+                        }]
+                    } else {
+                        let mut parts = Vec::new();
+                        for part in content_arr {
+                            match part["type"].as_str() {
+                                Some("input_text") | Some("output_text") => {
+                                    parts.push(Content::Text {
+                                        text: part["text"].as_str().unwrap_or("").to_string(),
+                                        annotations: None,
+                                        prompt_cache_breakpoint: decode_prompt_cache_breakpoint(
+                                            part,
+                                        ),
+                                    });
                                 }
+                                Some("input_image") | Some("input_file") => {
+                                    if let Some(media) = decode_responses_media_part(part) {
+                                        parts.push(media);
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
+                        parts
                     }
-                    parts
                 } else if item["type"] == "program" {
                     vec![Content::Program {
                         id: item["id"].as_str().unwrap_or("").to_string(),
@@ -618,19 +660,7 @@ impl EndpointCodec for ResponsesCodec {
                     }]
                 } else if item["type"] == "reasoning" {
                     // Reasoning input item (replayed assistant chain-of-thought).
-                    // Pull the text out of the `summary` array (or a plain
-                    // `text` field) so the thinking survives a round-trip.
-                    let text = item["summary"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|s| s["text"].as_str())
-                                .collect::<Vec<_>>()
-                                .join("")
-                        })
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| item["text"].as_str().map(String::from))
-                        .unwrap_or_default();
+                    let text = responses_reasoning_text(item);
                     vec![Content::Reasoning {
                         text,
                         signature: None,
@@ -1937,20 +1967,9 @@ impl EndpointCodec for ResponsesCodec {
                         });
                     }
                     Some("reasoning") => {
-                        // Join the summary parts into a single reasoning block
-                        // so the Responses `id` maps to exactly one IR
-                        // Reasoning content (and re-encodes to exactly one
-                        // reasoning item, avoiding duplicate-id orphans).
-                        let text = item["summary"]
-                            .as_array()
-                            .map(|summary| {
-                                summary
-                                    .iter()
-                                    .filter_map(|s| s["text"].as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("")
-                            })
-                            .unwrap_or_default();
+                        // Keep one IR reasoning block per Responses item. This
+                        // accepts OpenAI `summary` and DeepSeek `reasoning_text`.
+                        let text = responses_reasoning_text(item);
                         let id = item["id"].as_str().map(|s| s.to_string());
                         let encrypted_content =
                             item["encrypted_content"].as_str().map(|s| s.to_string());
@@ -3984,6 +4003,61 @@ mod tests {
             has_reasoning,
             "reasoning input item should decode to Reasoning"
         );
+    }
+
+    #[test]
+    fn test_decode_deepseek_reasoning_text_input_item() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_deepseek",
+                    "content": [
+                        {"type": "reasoning_text", "text": "first "},
+                        {"type": "reasoning_text", "text": "then second"}
+                    ],
+                    "summary": []
+                }
+            ]
+        });
+
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert!(ir.messages.iter().any(|message| {
+            message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    Content::Reasoning { text, id, .. }
+                        if text == "first then second" && id.as_deref() == Some("rs_deepseek")
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn test_decode_deepseek_reasoning_text_response_item() {
+        let codec = ResponsesCodec::new();
+        let body = json!({
+            "id": "resp_deepseek",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "id": "rs_deepseek",
+                "content": [{"type": "reasoning_text", "text": "native reasoning"}],
+                "summary": []
+            }]
+        });
+
+        let ir = codec.decode_response(body).unwrap();
+        assert!(matches!(
+            &ir.content[0],
+            Content::Reasoning { text, id, .. }
+                if text == "native reasoning" && id.as_deref() == Some("rs_deepseek")
+        ));
     }
 
     #[test]

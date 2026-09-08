@@ -67,6 +67,25 @@
 > 原始 response contract；拒绝错误携带 JSON Pointer。完整来源和 profile 基线见
 > `protocol-specs/structured-output/anthropic.toml`。
 
+### 3.1 DeepSeek Responses profile
+
+DeepSeek 官方 API 的 `deepseek-v4-flash`、`deepseek-v4-pro`、
+`deepseek-v4-flash-vision-exp` 使用原生 `POST /responses` 出站；旧版或未知模型继续使用
+`POST /v1/chat/completions`。DeepSeek Responses 的 reasoning item 使用
+`content: [{"type":"reasoning_text","text":"..."}]`，TiyGate 在该 provider profile 下会把
+OpenAI 风格的 `summary` 回放转换为 `reasoning_text`，但拒绝不可转换的
+`encrypted_content`。
+
+DeepSeek 会静默忽略部分 OpenAI Responses 能力。为维持 `lossy_default_reject` 契约，
+TiyGate 对有语义影响的不支持项返回 `400 LossyOrCapability`，包括
+`previous_response_id`、conversation/store/background 状态、非 `none` reasoning summary、
+verbosity、自动 truncation、禁用并行工具调用、非空 metadata/include、未支持的 input item，
+以及 `file_search`、`code_interpreter`、`computer_use`、`mcp` 等工具。允许的工具为
+function、web search，以及名为 `apply_patch` 的 custom tool。
+
+来源：[DeepSeek Responses API 指南](https://api-docs.deepseek.com/guides/responses_api/)、
+[DeepSeek Responses API Reference](https://api-docs.deepseek.com/api/create-response/)。
+
 ## 4. 确定性/种子
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |

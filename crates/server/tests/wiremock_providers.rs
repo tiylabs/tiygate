@@ -2031,6 +2031,30 @@ fn build_responses_same_protocol_app(upstream_url: String, model: &str) -> axum:
     }
 }
 
+fn build_deepseek_responses_app(upstream_url: String, virtual_model: &str) -> axum::Router {
+    let mut routing_table = RoutingTable::new();
+    routing_table.insert(
+        virtual_model.to_string(),
+        vec![tiygate_core::RoutingTarget {
+            provider_id: "deepseek".to_string(),
+            model_id: "deepseek-v4-pro".to_string(),
+            api_base: upstream_url,
+            api_key: "sk-deepseek".to_string(),
+            api_protocol: ProtocolEndpoint::new(ProtocolSuite::OpenAiResponses, "responses", "v1"),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+            oauth: None,
+        }],
+    );
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    let mut config = ServerConfig::default();
+    config.require_api_key = false;
+    ingress::router(config_store, health, &config)
+}
+
 /// Build a same-protocol Gemini app (Gemini ingress → Gemini upstream).
 fn build_gemini_same_protocol_app(upstream_url: String, model: &str) -> axum::Router {
     let mut routing_table = RoutingTable::new();
@@ -2103,6 +2127,88 @@ async fn test_nonstream_responses_same_protocol_passthrough() {
     assert!(serde_json::to_string(&v)
         .unwrap()
         .contains("Same protocol ok"));
+}
+
+#[tokio::test]
+async fn test_deepseek_responses_prepares_reasoning_for_native_upstream() {
+    let mock_server = wiremock::MockServer::start().await;
+    let upstream_body = json!({
+        "id": "resp_deepseek",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}]
+        }]
+    });
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/responses"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(upstream_body))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_deepseek_responses_app(mock_server.uri(), "deepseek-v4-pro");
+    let body = json!({
+        "model": "deepseek-v4-pro",
+        "reasoning": {"effort": "max", "summary": "none"},
+        "input": [
+            {"role": "user", "content": "weather?"},
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "call weather"}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "weather",
+                "arguments": "{}"
+            }
+        ],
+        "tools": [{"type": "function", "name": "weather", "parameters": {"type": "object"}}]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let upstream: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(upstream["reasoning"]["effort"], "max");
+    assert_eq!(upstream["input"][1]["content"][0]["type"], "reasoning_text");
+    assert_eq!(upstream["input"][1]["content"][0]["text"], "call weather");
+    assert!(upstream["input"][1].get("summary").is_none());
+}
+
+#[tokio::test]
+async fn test_deepseek_responses_rejects_unsupported_tool_before_upstream() {
+    let mock_server = wiremock::MockServer::start().await;
+    let app = build_deepseek_responses_app(mock_server.uri(), "deepseek-v4-pro");
+    let body = json!({
+        "model": "deepseek-v4-pro",
+        "input": "search files",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&response_body).contains("file_search"));
+    assert!(mock_server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
