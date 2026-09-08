@@ -53,10 +53,10 @@ impl Provider for DeepSeekProvider {
     }
 
     fn egress_protocol_for_model(&self, model_id: &str) -> ProtocolEndpoint {
-        if supports_responses_api(model_id) {
-            deepseek_responses_endpoint()
-        } else {
+        if uses_chat_completions(model_id) {
             ProtocolSuite::OpenAiCompatible.default_endpoint()
+        } else {
+            deepseek_responses_endpoint()
         }
     }
 
@@ -78,10 +78,10 @@ fn normalized_model_id(model_id: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn supports_responses_api(model_id: &str) -> bool {
+fn uses_chat_completions(model_id: &str) -> bool {
     matches!(
         normalized_model_id(model_id).as_str(),
-        "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-v4-flash-vision-exp"
+        "deepseek-chat" | "deepseek-reasoner"
     )
 }
 
@@ -127,13 +127,15 @@ mod tests {
     }
 
     #[test]
-    fn v4_models_use_responses_and_legacy_models_keep_chat() {
+    fn only_legacy_chat_models_use_chat_completions() {
         let provider = DeepSeekProvider::new();
 
         for model in [
             "deepseek-v4-flash",
             "deepseek/deepseek-v4-pro:official",
             "deepseek-v4-flash-vision-exp",
+            "deepseek-v5-preview",
+            "unknown-model",
         ] {
             assert_eq!(
                 provider.egress_protocol_for_model(model).suite,
@@ -146,7 +148,12 @@ mod tests {
             );
         }
 
-        for model in ["deepseek-chat", "deepseek-reasoner", "unknown-model"] {
+        for model in [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek/deepseek-chat:official",
+            "deepseek/deepseek-reasoner:official",
+        ] {
             assert_eq!(
                 provider.egress_protocol_for_model(model).suite,
                 ProtocolSuite::OpenAiCompatible,

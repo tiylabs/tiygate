@@ -69,9 +69,9 @@
 
 ### 3.1 DeepSeek Responses profile
 
-DeepSeek 官方 API 的 `deepseek-v4-flash`、`deepseek-v4-pro`、
-`deepseek-v4-flash-vision-exp` 使用原生 `POST /responses` 出站；旧版或未知模型继续使用
-`POST /v1/chat/completions`。DeepSeek Responses 的 reasoning item 使用
+DeepSeek Provider 仅将 `deepseek-chat` 与 `deepseek-reasoner` 发送到
+`POST /v1/chat/completions`；其余模型统一使用原生 `POST /responses` 出站。DeepSeek
+Responses 的 reasoning item 使用
 `content: [{"type":"reasoning_text","text":"..."}]`，TiyGate 在该 provider profile 下会把
 OpenAI 风格的 `summary` 回放转换为 `reasoning_text`，但拒绝不可转换的
 `encrypted_content`。
