@@ -2118,7 +2118,7 @@ fn normalized_models_endpoint(
         }
     } else if vendor == "openai"
         && matches!(auth_mode, AuthMode::ApiKey)
-        && (configured.is_empty() || configured == codex_models)
+        && configured == codex_models
     {
         return platform_models;
     }
@@ -3862,6 +3862,31 @@ mod tests {
         assert_eq!(
             normalized_models_endpoint("openai", AuthMode::OAuth, "", OPENAI_CODEX_BASE_URL),
             format!("{OPENAI_CODEX_BASE_URL}/models")
+        );
+    }
+
+    #[test]
+    fn openai_api_key_custom_base_derives_models_endpoint() {
+        assert_eq!(
+            normalized_models_endpoint("openai", AuthMode::ApiKey, "", "https://your-proxy.com/v1",),
+            "https://your-proxy.com/v1/models"
+        );
+        assert_eq!(
+            normalized_models_endpoint("openai", AuthMode::ApiKey, "", OPENAI_PLATFORM_BASE_URL),
+            format!("{OPENAI_PLATFORM_BASE_URL}/models")
+        );
+    }
+
+    #[test]
+    fn non_openai_api_key_custom_base_derives_models_endpoint() {
+        assert_eq!(
+            normalized_models_endpoint(
+                "anthropic",
+                AuthMode::ApiKey,
+                "",
+                "https://proxy.example.test/v1",
+            ),
+            "https://proxy.example.test/v1/models"
         );
     }
 

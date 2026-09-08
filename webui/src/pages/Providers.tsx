@@ -1014,10 +1014,11 @@ export default function Providers() {
           form.models_endpoint === `${OPENAI_PLATFORM_BASE_URL}/models`
           ? `${OPENAI_CODEX_BASE_URL}/models`
           : form.models_endpoint
-        : !form.models_endpoint ||
-            form.models_endpoint === `${OPENAI_CODEX_BASE_URL}/models`
-          ? `${OPENAI_PLATFORM_BASE_URL}/models`
-          : form.models_endpoint
+        : !form.models_endpoint
+          ? `${apiBase.replace(/\/+$/, "")}/models`
+          : form.models_endpoint === `${OPENAI_CODEX_BASE_URL}/models`
+            ? `${OPENAI_PLATFORM_BASE_URL}/models`
+            : form.models_endpoint
       : form.models_endpoint;
     const body: ProviderInput = {
       name: form.name,
