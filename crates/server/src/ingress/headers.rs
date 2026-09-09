@@ -360,15 +360,20 @@ fn prepare_deepseek_reasoning_item(item: &mut serde_json::Value) -> Result<bool,
 /// loss and converts replayable OpenAI reasoning summaries to DeepSeek's
 /// `reasoning_text` input form before sending the request.
 fn prepare_deepseek_responses_request(body: &mut serde_json::Value) -> Result<bool, String> {
-    // DeepSeek manages context caching automatically. Codex clients commonly
-    // send OpenAI cache-affinity hints, so strip those non-semantic controls
-    // instead of rejecting an otherwise compatible request.
+    // DeepSeek manages context caching automatically and silently ignores
+    // non-semantic OpenAI controls. Codex clients commonly send cache-affinity
+    // hints (`prompt_cache_*`), client-side tags (`metadata`), and a response
+    // item selector (`include`). DeepSeek never parses these, and it returns
+    // reasoning/tool items automatically, so stripping them is lossless.
+    // Strip them instead of rejecting an otherwise compatible request.
     let mut mutated = false;
     if let Some(object) = body.as_object_mut() {
         for field in [
             "prompt_cache_key",
             "prompt_cache_retention",
             "prompt_cache_options",
+            "metadata",
+            "include",
         ] {
             mutated |= object.remove(field).is_some();
         }
@@ -401,13 +406,6 @@ fn prepare_deepseek_responses_request(body: &mut serde_json::Value) -> Result<bo
     }
     if body.get("store").and_then(|value| value.as_bool()) == Some(true) {
         return Err(deepseek_capability_error("store=true is not supported"));
-    }
-    if body.get("metadata").is_some_and(is_meaningful)
-        || body.get("include").is_some_and(is_meaningful)
-    {
-        return Err(deepseek_capability_error(
-            "metadata and include are not supported",
-        ));
     }
     if body
         .get("parallel_tool_calls")
@@ -619,6 +617,8 @@ mod tests {
             "prompt_cache_key": "codex-session",
             "prompt_cache_retention": "24h",
             "prompt_cache_options": {"mode": "explicit"},
+            "metadata": {"user_id": "codex-session-1"},
+            "include": ["reasoning.encrypted_content"],
             "input": [
                 {"role": "user", "content": "weather?"},
                 {
@@ -657,6 +657,8 @@ mod tests {
         assert!(body.get("prompt_cache_key").is_none());
         assert!(body.get("prompt_cache_retention").is_none());
         assert!(body.get("prompt_cache_options").is_none());
+        assert!(body.get("metadata").is_none());
+        assert!(body.get("include").is_none());
     }
 
     #[test]

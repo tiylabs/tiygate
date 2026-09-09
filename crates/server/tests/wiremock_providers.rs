@@ -2155,6 +2155,8 @@ async fn test_deepseek_responses_prepares_reasoning_for_native_upstream() {
         "prompt_cache_key": "codex-session",
         "prompt_cache_retention": "24h",
         "prompt_cache_options": {"mode": "explicit"},
+        "metadata": {"user_id": "codex-session-1"},
+        "include": ["reasoning.encrypted_content"],
         "input": [
             {"role": "user", "content": "weather?"},
             {
@@ -2190,6 +2192,8 @@ async fn test_deepseek_responses_prepares_reasoning_for_native_upstream() {
     assert!(upstream.get("prompt_cache_key").is_none());
     assert!(upstream.get("prompt_cache_retention").is_none());
     assert!(upstream.get("prompt_cache_options").is_none());
+    assert!(upstream.get("metadata").is_none());
+    assert!(upstream.get("include").is_none());
 }
 
 #[tokio::test]
