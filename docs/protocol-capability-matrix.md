@@ -81,17 +81,19 @@ OpenAI 风格的 `summary` 回放转换为 `reasoning_text`，但拒绝不可转
 
 DeepSeek 会静默忽略部分 OpenAI Responses 能力。为维持 `lossy_default_reject` 契约，
 TiyGate 对有语义影响的不支持项返回 `400 LossyOrCapability`，包括
-`previous_response_id`、conversation/store/background 状态、非 `none` reasoning summary、
-verbosity、自动 truncation、禁用并行工具调用、未支持的 input item，
+`previous_response_id`、conversation/store/background 状态、自动 truncation、禁用并行工具
+调用、未支持的 input item，
 以及 `file_search`、`code_interpreter`、`computer_use`、`mcp` 等工具。允许的工具为
 function、web search，以及名为 `apply_patch` 的 custom tool。
 
-`prompt_cache_key`、`prompt_cache_retention`、`prompt_cache_options`、`metadata`、`include`
+`prompt_cache_key`、`prompt_cache_retention`、`prompt_cache_options`、`metadata`、`include`、
+`text.verbosity`、`reasoning.summary`
 属于例外：DeepSeek 自动管理上下文缓存并默认返回 reasoning/tool items，且从不解析
-这些非语义控制项，因此 TiyGate 在 DeepSeek Responses 出站前显式移除这些字段，不将其
-视为影响生成语义的有损转换，也不会因此拒绝 Codex 客户端请求。DeepSeek 不支持加密
-reasoning content，客户端请求 `include: ["reasoning.encrypted_content"]` 时收到的仍是
-明文 `reasoning_text`——这是 DeepSeek 固有限制，而非剥离所致。
+这些非语义控制项（`text.verbosity` 与 `reasoning.summary` 是“接受但忽略”），因此
+TiyGate 在 DeepSeek Responses 出站前显式移除这些字段，不将其视为影响生成语义的有损
+转换，也不会因此拒绝 Codex 客户端请求。DeepSeek 不支持加密 reasoning content，
+客户端请求 `include: ["reasoning.encrypted_content"]` 时收到的仍是明文 `reasoning_text`
+——这是 DeepSeek 固有限制，而非剥离所致。
 
 来源：[DeepSeek Responses API 指南](https://api-docs.deepseek.com/guides/responses_api/)、
 [DeepSeek Responses API Reference](https://api-docs.deepseek.com/api/create-response/)。

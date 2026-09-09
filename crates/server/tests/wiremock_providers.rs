@@ -2151,7 +2151,8 @@ async fn test_deepseek_responses_prepares_reasoning_for_native_upstream() {
     let app = build_deepseek_responses_app(mock_server.uri(), "deepseek-v4-pro");
     let body = json!({
         "model": "deepseek-v4-pro",
-        "reasoning": {"effort": "max", "summary": "none"},
+        "reasoning": {"effort": "max", "summary": "auto"},
+        "text": {"verbosity": "high"},
         "prompt_cache_key": "codex-session",
         "prompt_cache_retention": "24h",
         "prompt_cache_options": {"mode": "explicit"},
@@ -2194,6 +2195,8 @@ async fn test_deepseek_responses_prepares_reasoning_for_native_upstream() {
     assert!(upstream.get("prompt_cache_options").is_none());
     assert!(upstream.get("metadata").is_none());
     assert!(upstream.get("include").is_none());
+    assert!(upstream["reasoning"].get("summary").is_none());
+    assert!(upstream.get("text").is_none());
 }
 
 #[tokio::test]

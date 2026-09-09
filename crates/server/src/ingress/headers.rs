@@ -355,6 +355,32 @@ fn prepare_deepseek_reasoning_item(item: &mut serde_json::Value) -> Result<bool,
     Ok(!has_content || removed_summary || removed_text || removed_encrypted)
 }
 
+/// Remove a DeepSeek-accepted-but-ignored control field from a nested object.
+/// Returns true if `body` was mutated. When the container object becomes
+/// empty after the removal, the container is dropped so we never forward an
+/// empty object that DeepSeek may treat differently from an absent one.
+fn strip_ignored_deepseek_control(
+    body: &mut serde_json::Value,
+    container: &str,
+    field: &str,
+) -> bool {
+    let mut mutated = false;
+    if let Some(object) = body.pointer_mut(container).and_then(|value| value.as_object_mut()) {
+        mutated |= object.remove(field).is_some();
+    }
+    let emptied = body
+        .pointer(container)
+        .and_then(|value| value.as_object())
+        .is_some_and(|object| object.is_empty());
+    if emptied {
+        let key = container.trim_start_matches('/');
+        if let Some(root) = body.as_object_mut() {
+            mutated |= root.remove(key).is_some();
+        }
+    }
+    mutated
+}
+
 /// Apply the official DeepSeek Responses compatibility profile. The upstream
 /// silently ignores unsupported OpenAI fields, so TiyGate rejects semantic
 /// loss and converts replayable OpenAI reasoning summaries to DeepSeek's
@@ -425,20 +451,12 @@ fn prepare_deepseek_responses_request(body: &mut serde_json::Value) -> Result<bo
             "automatic truncation is not supported",
         ));
     }
-    if body.pointer("/text/verbosity").is_some_and(is_meaningful) {
-        return Err(deepseek_capability_error(
-            "text.verbosity is accepted but ignored by DeepSeek",
-        ));
-    }
-    if body
-        .pointer("/reasoning/summary")
-        .and_then(|value| value.as_str())
-        .is_some_and(|value| value != "none")
-    {
-        return Err(deepseek_capability_error(
-            "reasoning.summary is accepted but no summary is generated",
-        ));
-    }
+    // DeepSeek accepts but ignores `text.verbosity` and `reasoning.summary`.
+    // Codex clients commonly set them, so strip these no-op controls instead of
+    // rejecting an otherwise compatible request. If the container becomes empty
+    // after stripping, drop it so we never forward an empty object.
+    mutated |= strip_ignored_deepseek_control(body, "/text", "verbosity");
+    mutated |= strip_ignored_deepseek_control(body, "/reasoning", "summary");
 
     if let Some(tools) = body.get("tools").and_then(|value| value.as_array()) {
         for tool in tools {
@@ -613,7 +631,8 @@ mod tests {
         let target = deepseek_target();
         let mut body = serde_json::json!({
             "model": "deepseek-v4-pro",
-            "reasoning": {"effort": "max", "summary": "none"},
+            "reasoning": {"effort": "max", "summary": "auto"},
+            "text": {"verbosity": "high"},
             "prompt_cache_key": "codex-session",
             "prompt_cache_retention": "24h",
             "prompt_cache_options": {"mode": "explicit"},
@@ -659,6 +678,8 @@ mod tests {
         assert!(body.get("prompt_cache_options").is_none());
         assert!(body.get("metadata").is_none());
         assert!(body.get("include").is_none());
+        assert!(body["reasoning"].get("summary").is_none());
+        assert!(body.get("text").is_none());
     }
 
     #[test]
@@ -703,10 +724,6 @@ mod tests {
             (
                 "file_search",
                 serde_json::json!({"input": "hi", "tools": [{"type": "file_search"}]}),
-            ),
-            (
-                "verbosity",
-                serde_json::json!({"input": "hi", "text": {"verbosity": "high"}}),
             ),
             (
                 "encrypted_content",
