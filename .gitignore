@@ -64,3 +64,6 @@ Thumbs.db
 # Tauri client
 /src-tauri/binaries/
 /src-tauri/gen/
+
+# pi coding agent tooling artifacts (local session state, fusion output, task logs)
+.pi/
