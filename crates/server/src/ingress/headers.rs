@@ -246,18 +246,12 @@ fn is_official_deepseek_responses_target(
         .is_some_and(|host| host.eq_ignore_ascii_case("api.deepseek.com"))
 }
 
-fn deepseek_capability_error(detail: impl Into<String>) -> String {
-    let mut message = String::from("DeepSeek Responses capability rejected: ");
-    message.push_str(&detail.into());
-    message
-}
-
 pub(super) fn prepare_provider_request_body(
     body: &mut serde_json::Value,
     target: &tiygate_core::RoutingTarget,
     egress_suite: &tiygate_core::ProtocolSuite,
     api_key_id: &str,
-) -> Result<bool, String> {
+) -> Result<bool, tiygate_core::CapabilityReject> {
     let deepseek_responses = is_official_deepseek_responses_target(target, egress_suite);
     let mut mutated = false;
     if !deepseek_responses {
@@ -268,8 +262,7 @@ pub(super) fn prepare_provider_request_body(
         let outcome = tiygate_core::sanitize_with_profile(
             body,
             super::capability::deepseek_responses_profile(),
-        )
-        .map_err(|reject| deepseek_capability_error(reject.detail))?;
+        )?;
         mutated |= outcome.mutated;
     }
     Ok(mutated)
@@ -439,7 +432,7 @@ mod tests {
             "anonymous",
         );
         assert!(
-            matches!(&result, Err(error) if error.contains("mcp")),
+            matches!(&result, Err(error) if error.detail.contains("mcp")),
             "unexpected result: {result:?}"
         );
     }
@@ -464,7 +457,7 @@ mod tests {
                 "anonymous",
             );
             assert!(
-                matches!(&result, Err(error) if error.contains(field)),
+                matches!(&result, Err(error) if error.detail.contains(field)),
                 "unexpected result: {result:?}"
             );
         }

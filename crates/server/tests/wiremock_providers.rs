@@ -1648,7 +1648,9 @@ async fn spawn_slow_anthropic_sse_server(
         let _ = sock.flush().await;
         // Drop closes the socket → clean EOF for the gateway.
     });
-    format!("http://{addr}")
+    let mut url = String::from("http://");
+    url.push_str(&addr.to_string());
+    url
 }
 
 #[tokio::test]
@@ -2220,7 +2222,13 @@ async fn test_deepseek_responses_rejects_unsupported_tool_before_upstream() {
     let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    assert!(String::from_utf8_lossy(&response_body).contains("file_search"));
+    let v: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+    assert_eq!(v["capability"]["action"], "reject");
+    assert_eq!(v["capability"]["field"], "tool");
+    assert!(v["capability"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("file_search"));
     assert!(mock_server.received_requests().await.unwrap().is_empty());
 }
 

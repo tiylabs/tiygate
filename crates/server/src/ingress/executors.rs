@@ -542,9 +542,11 @@ pub(super) async fn execute_upstream(
         &egress_protocol.suite,
         api_key_id,
     )
-    .map_err(|message| {
+    .map_err(|reject| {
+        let message = reject.detail.clone();
         AppError::new(StatusCode::BAD_REQUEST, message)
             .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+            .with_capability(reject)
     })?;
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
@@ -1137,9 +1139,11 @@ pub(super) async fn execute_messages_upstream(
         &egress_protocol.suite,
         api_key_id,
     )
-    .map_err(|message| {
+    .map_err(|reject| {
+        let message = reject.detail.clone();
         AppError::new(StatusCode::BAD_REQUEST, message)
             .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+            .with_capability(reject)
     })?;
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
@@ -1978,9 +1982,11 @@ pub(super) async fn execute_responses_upstream(
         &egress_protocol.suite,
         api_key_id,
     )
-    .map_err(|message| {
+    .map_err(|reject| {
+        let message = reject.detail.clone();
         AppError::new(StatusCode::BAD_REQUEST, message)
             .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+            .with_capability(reject)
     })?;
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
@@ -2813,9 +2819,11 @@ pub(super) async fn execute_gemini_upstream(
         &egress_protocol.suite,
         api_key_id,
     )
-    .map_err(|message| {
+    .map_err(|reject| {
+        let message = reject.detail.clone();
         AppError::new(StatusCode::BAD_REQUEST, message)
             .with_class(tiygate_core::ErrorClass::LossyOrCapability)
+            .with_capability(reject)
     })?;
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(

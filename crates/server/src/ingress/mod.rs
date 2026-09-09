@@ -1236,6 +1236,11 @@ pub struct AppError {
     upstream_error_code: Option<String>,
     /// Upstream RateLimit-* headers to passthrough on the error response.
     rate_limit_headers: Vec<(&'static str, String)>,
+    /// Structured capability rejection, when the request was refused by a
+    /// provider capability profile. Rendered into the error body as a
+    /// machine-readable top-level `capability` object. Boxed to keep
+    /// `AppError` small (avoids clippy::result_large_err on every caller).
+    capability: Option<Box<tiygate_core::CapabilityReject>>,
 }
 
 impl AppError {
@@ -1249,6 +1254,7 @@ impl AppError {
             upstream_status: None,
             upstream_error_code: None,
             rate_limit_headers: Vec::new(),
+            capability: None,
         }
     }
 
@@ -1257,6 +1263,14 @@ impl AppError {
     /// response body and the fallback classifier's retry/stop decision.
     pub(crate) fn with_class(mut self, class: tiygate_core::ErrorClass) -> Self {
         self.error_class = class;
+        self
+    }
+
+    /// Attach a structured capability rejection. Rendered as a top-level
+    /// `capability` object in the error body so clients can read the field /
+    /// action / reason without parsing the human message.
+    pub(crate) fn with_capability(mut self, capability: tiygate_core::CapabilityReject) -> Self {
+        self.capability = Some(Box::new(capability));
         self
     }
 
@@ -1307,7 +1321,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // Generate protocol-native error body when the protocol suite
         // is known; otherwise fall back to a generic OpenAI-style body.
-        let body = if let Some(suite) = self.protocol_suite {
+        let mut body = if let Some(suite) = self.protocol_suite {
             tiygate_protocols::error_body::encode_error_body_for_suite(
                 suite,
                 &self.message,
@@ -1327,6 +1341,13 @@ impl IntoResponse for AppError {
             }
             serde_json::json!({"error": err})
         };
+        if let Some(ref capability) = self.capability {
+            if let Ok(value) = serde_json::to_value(capability.as_ref()) {
+                if let Some(object) = body.as_object_mut() {
+                    object.insert("capability".to_string(), value);
+                }
+            }
+        }
 
         let mut response = (self.status, Json(body)).into_response();
 
