@@ -114,13 +114,16 @@ impl ProtocolEndpoint {
 
     /// The full identifier with version.
     pub fn full_id(&self) -> String {
-        format!("{}/{}", self.canonical(), self.version)
+        let mut id = self.canonical();
+        id.push('/');
+        id.push_str(&self.version);
+        id
     }
 }
 
 impl fmt::Display for ProtocolEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.full_id())
+        f.write_str(&self.full_id())
     }
 }
 

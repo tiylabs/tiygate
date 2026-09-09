@@ -130,7 +130,7 @@ pub struct CapabilityReject {
 
 impl std::fmt::Display for CapabilityReject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.detail)
+        f.write_str(&self.detail)
     }
 }
 
