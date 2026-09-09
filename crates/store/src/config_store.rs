@@ -2565,6 +2565,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capabilities_json_round_trips_through_upsert_and_read() {
+        let store = boot_store(None).await;
+        // Build the endpoint JSON via serde from the real enum so the
+        // suite token always matches the serde representation.
+        let endpoint = serde_json::to_value(tiygate_core::ProtocolEndpoint::new(
+            tiygate_core::ProtocolSuite::OpenAiResponses,
+            "custom-deepseek",
+            "v1",
+        ))
+        .expect("endpoint serializes");
+        let overlay = serde_json::json!({
+            "endpoint": endpoint,
+            "fields": [
+                {"path": "store", "action": "strip", "reason": "not supported"}
+            ]
+        });
+        store
+            .upsert_provider(
+                "caps-provider",
+                "Caps",
+                "deepseek",
+                "https://api.deepseek.com",
+                "",
+                None,
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                &overlay.to_string(),
+                true,
+            )
+            .await
+            .expect("upsert provider with overlay");
+
+        let provider = store
+            .get_provider("caps-provider")
+            .await
+            .expect("get provider")
+            .expect("provider exists");
+        assert_eq!(provider.capabilities_json, overlay.to_string());
+
+        // The route table carries the parsed overlay on the target.
+        store
+            .upsert_route(
+                "route-caps",
+                "caps-model",
+                &[crate::models::RouteTarget {
+                    provider_id: "caps-provider".to_string(),
+                    model_id: "deepseek-v4-pro".to_string(),
+                    weight: 1.0,
+                    enabled: true,
+                    account_label: None,
+                    api_key_override: None,
+                    api_base_override: None,
+                }],
+                None,
+                None,
+                true,
+            )
+            .await
+            .expect("upsert route");
+        store.refresh().await.expect("refresh");
+        let snapshot = store
+            .snapshot()
+            .snapshot()
+            .expect("snapshot populated after refresh");
+        let table = snapshot_to_routing_table(&snapshot);
+        let targets = table.resolve("caps-model").expect("targets resolved");
+        assert!(!targets.is_empty(), "route should have a target");
+        let override_json = targets[0]
+            .capability_override
+            .as_ref()
+            .expect("capability_override parsed from provider row");
+        assert_eq!(override_json.fields.len(), 1);
+        assert_eq!(override_json.fields[0].path, "store");
+
+        // Empty string clears the overlay.
+        store
+            .upsert_provider(
+                "caps-provider",
+                "Caps",
+                "deepseek",
+                "https://api.deepseek.com",
+                "",
+                None,
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                "",
+                true,
+            )
+            .await
+            .expect("clear overlay");
+        let provider = store
+            .get_provider("caps-provider")
+            .await
+            .expect("get provider")
+            .expect("provider exists");
+        assert_eq!(provider.capabilities_json, "");
+    }
+
+    #[tokio::test]
     async fn oauth_status_update_preserves_encrypted_credential_metadata() {
         let key = KeyEncryption::from_secret(&master_key_hex()).expect("key");
         let store = boot_store(Some(Arc::new(key))).await;

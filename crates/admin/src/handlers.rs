@@ -510,7 +510,8 @@ fn anthropic_weekly_label(key: &str) -> Option<String> {
                 })
                 .collect::<Vec<String>>()
                 .join(" ");
-            format!("{name} · 7d")
+            let label = format!("{name} · 7d");
+            label
         }),
     }
 }
@@ -744,9 +745,11 @@ fn zenmux_subscription_usage_url(provider: &Provider) -> Option<String> {
     let api_base = if base.ends_with("/api") {
         base.to_string()
     } else {
-        format!("{base}/api")
+        let joined = format!("{base}/api");
+        joined
     };
-    Some(format!("{api_base}{ZENMUX_MANAGEMENT_USAGE_PATH}"))
+    let usage_url = format!("{api_base}{ZENMUX_MANAGEMENT_USAGE_PATH}");
+    Some(usage_url)
 }
 
 fn provider_oauth_account_email(provider: &Provider) -> Option<String> {
@@ -1748,7 +1751,8 @@ fn provider_models_url(provider: &Provider) -> String {
     {
         format!("{OPENAI_CODEX_BASE_URL}/models")
     } else if configured.is_empty() {
-        format!("{}/models", effective_provider_api_base(provider))
+        let models_url = format!("{}/models", effective_provider_api_base(provider));
+        models_url
     } else {
         configured.to_string()
     };
@@ -2151,7 +2155,8 @@ fn normalized_models_endpoint(
         return platform_models;
     }
     if configured.is_empty() && !api_base.is_empty() {
-        format!("{}/models", api_base.trim_end_matches('/'))
+        let models_url = format!("{}/models", api_base.trim_end_matches('/'));
+        models_url
     } else {
         configured.to_string()
     }
@@ -2907,7 +2912,8 @@ async fn create_api_key(
         use rand::RngCore;
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
-        format!("tg-{}", hex::encode(bytes))
+        let generated = format!("tg-{}", hex::encode(bytes));
+        generated
     });
     let (key, plain) = state
         .store
@@ -3881,6 +3887,38 @@ mod tests {
             usage_management_key_cleartext: None,
             oauth_meta_cleartext: None,
         }
+    }
+
+    #[test]
+    fn validated_capabilities_json_accepts_parseable_and_rejects_the_rest() {
+        // Empty / missing clears the override.
+        assert_eq!(validated_capabilities_json(None).expect("none"), "");
+        assert_eq!(validated_capabilities_json(Some("  ")).expect("blank"), "");
+
+        // A well-formed overlay round-trips verbatim.
+        let endpoint = serde_json::to_value(tiygate_core::ProtocolEndpoint::new(
+            tiygate_core::ProtocolSuite::OpenAiResponses,
+            "custom-deepseek",
+            "v1",
+        ))
+        .expect("endpoint serializes");
+        let overlay = serde_json::json!({
+            "endpoint": endpoint,
+            "fields": [
+                {"path": "store", "action": "strip", "reason": "not supported"}
+            ]
+        });
+        let stored = validated_capabilities_json(Some(overlay.to_string().as_str()))
+            .expect("valid overlay");
+        assert_eq!(stored, overlay.to_string());
+
+        // Invalid JSON / wrong shapes are rejected with a 400.
+        assert!(validated_capabilities_json(Some("{not json")).is_err());
+        assert!(validated_capabilities_json(Some("{}",)).is_err());
+        assert!(validated_capabilities_json(Some(
+            "{\"fields\": []}"
+        ))
+        .is_err());
     }
 
     #[test]
