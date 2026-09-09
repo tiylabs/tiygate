@@ -154,6 +154,44 @@ async fn acceptance_1_admin_crud_propagates_to_routing_table() {
 }
 
 #[tokio::test]
+async fn openai_api_key_custom_base_derives_models_endpoint_when_omitted() {
+    let (router, store, _pool) = boot_no_auth().await;
+    let resp = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/admin/v1/providers",
+            json!({
+                "id": "custom-openai",
+                "name": "Custom OpenAI",
+                "vendor": "openai",
+                "api_base": "https://your-proxy.com/v1",
+                "api_key": "sk-custom",
+                "auth_mode": "api_key",
+            }),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let body = axum::body::to_bytes(resp.into_body(), 8192)
+        .await
+        .expect("body");
+    let view: serde_json::Value = serde_json::from_slice(&body).expect("provider JSON");
+    assert_eq!(
+        view["models_endpoint"],
+        json!("https://your-proxy.com/v1/models")
+    );
+
+    let provider = store
+        .get_provider("custom-openai")
+        .await
+        .expect("get provider")
+        .expect("provider exists");
+    assert_eq!(provider.models_endpoint, "https://your-proxy.com/v1/models");
+}
+
+#[tokio::test]
 async fn provider_delete_impact_counts_linked_routes_and_empty_routes() {
     let (router, _store, _pool) = boot_no_auth().await;
     create_test_provider(&router, "prov-a").await;
