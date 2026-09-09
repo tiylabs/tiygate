@@ -54,6 +54,7 @@ async fn models_endpoint_enriches_visible_routes_from_catalog() {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let catalog = ModelCatalog::from_models_dev_json(
@@ -118,6 +119,7 @@ async fn models_endpoint_prefers_persisted_route_metadata_over_catalog() {
         auth_mode: AuthMode::None,
         encrypted_oauth_meta: String::new(),
         metadata_json: json!({}),
+        capabilities_json: String::new(),
         enabled: true,
         created_at: now,
         updated_at: now,
@@ -214,6 +216,7 @@ async fn models_endpoint_filters_and_rejects_by_api_key_model_access() {
             AuthMode::None,
             None,
             json!({}),
+            "",
             true,
         )
         .await

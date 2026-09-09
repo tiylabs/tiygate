@@ -130,6 +130,10 @@ pub struct CapabilityProfile {
 
 ## 遗留问题
 
-- 覆盖层（`capabilities_json`）的 schema 校验与冲突解决（内建 baseline vs 覆盖）的具体规则。
+- ~~覆盖层（`capabilities_json`）的 schema 校验与冲突解决（内建 baseline vs 覆盖）的具体规则。~~
+  **已解决（2026-02 实现）**：覆盖存储为每 provider 单列 JSON（`providers.capabilities_json`，
+  自带 `endpoint` 声明适用协议端点）；语义为**整表替换** —— 端点匹配时覆盖的 field rules 整体
+  取代内建规则，内建 structure 钩子（如 DeepSeek 工具白名单）保留（覆盖只携带规则、永不携带
+  钩子）；Admin API 保存时校验（非法 JSON 拒绝 400），路由表构建时容忍并忽略非法行。
 - structure 钩子是否需要针对非 DeepSeek provider 的通用形态（如 Anthropic 的工具校验收敛到同一套）。
 - 是否在 `EndpointCapabilities` 与 `CapabilityProfile` 之间做派生/归一，避免两处能力信息重复。

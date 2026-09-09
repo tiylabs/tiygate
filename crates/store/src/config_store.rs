@@ -133,6 +133,7 @@ impl ConfigStore {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             }];
 
             table.insert("gpt-4o".to_string(), openai_targets.clone());
@@ -164,6 +165,7 @@ impl ConfigStore {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             }];
             table.insert("claude-sonnet-4-20250514".to_string(), anthropic_targets);
         }
@@ -319,6 +321,9 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
                 api_base_override,
                 weight: t.weight,
                 oauth: oauth_config,
+                capability_override: tiygate_core::CapabilityProfileOverride::parse(
+                    &provider.capabilities_json,
+                ),
             });
         }
         if !targets.is_empty() {
@@ -793,8 +798,8 @@ impl DbConfigStore {
     pub async fn get_provider(&self, id: &str) -> Result<Option<Provider>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, \
-                    created_at, updated_at FROM providers WHERE id = $1",
+                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, \
+                    capabilities_json, enabled, created_at, updated_at FROM providers WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(self.pool.any())
@@ -817,8 +822,8 @@ impl DbConfigStore {
     ) -> Result<Option<Provider>, StoreError> {
         let row = sqlx::query(
             "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, \
-                    created_at, updated_at FROM providers WHERE id = $1",
+                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, \
+                    capabilities_json, enabled, created_at, updated_at FROM providers WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&mut **tx)
@@ -843,6 +848,7 @@ impl DbConfigStore {
         auth_mode: AuthMode,
         oauth_meta_plain: Option<&str>,
         metadata_json: serde_json::Value,
+        capabilities_json: &str,
         enabled: bool,
     ) -> Result<Provider, StoreError> {
         self.upsert_provider_with_usage_management_key(
@@ -855,6 +861,7 @@ impl DbConfigStore {
             auth_mode,
             oauth_meta_plain,
             metadata_json,
+            capabilities_json,
             enabled,
             None,
         )
@@ -877,6 +884,7 @@ impl DbConfigStore {
         auth_mode: AuthMode,
         oauth_meta_plain: Option<&str>,
         metadata_json: serde_json::Value,
+        capabilities_json: &str,
         enabled: bool,
         usage_management_key_plain: Option<&str>,
     ) -> Result<Provider, StoreError> {
@@ -941,14 +949,16 @@ impl DbConfigStore {
 
         sqlx::query(
             "INSERT INTO providers (id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-             encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+             encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, capabilities_json, \
+             enabled, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
              ON CONFLICT(id) DO UPDATE SET \
                 name=excluded.name, vendor=excluded.vendor, api_base=excluded.api_base, \
                 models_endpoint=excluded.models_endpoint, \
                 encrypted_api_key=excluded.encrypted_api_key, auth_mode=excluded.auth_mode, \
                 encrypted_usage_management_key=excluded.encrypted_usage_management_key, \
                 encrypted_oauth_meta=excluded.encrypted_oauth_meta, metadata_json=excluded.metadata_json, \
+                capabilities_json=excluded.capabilities_json, \
                 enabled=excluded.enabled, updated_at=excluded.updated_at",
         )
         .bind(id)
@@ -961,6 +971,7 @@ impl DbConfigStore {
         .bind(&encrypted_usage_management_key)
         .bind(&encrypted_oauth_meta)
         .bind(&metadata_str)
+        .bind(capabilities_json)
         .bind(enabled_int)
         .bind(&created_at)
         .bind(&now)
@@ -1215,8 +1226,8 @@ impl DbConfigStore {
     async fn load_providers(&self) -> Result<Vec<Provider>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, \
-                    created_at, updated_at FROM providers",
+                    encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, \
+                    capabilities_json, enabled, created_at, updated_at FROM providers",
         )
         .fetch_all(self.pool.any())
         .await?;
@@ -1669,8 +1680,9 @@ impl DbConfigStore {
             // effect.
             sqlx::query(
                 "INSERT INTO providers (id, name, vendor, api_base, models_endpoint, encrypted_api_key, auth_mode, \
-                 encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 encrypted_usage_management_key, encrypted_oauth_meta, metadata_json, capabilities_json, \
+                 enabled, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
                  ON CONFLICT(id) DO UPDATE SET \
                     name=excluded.name, vendor=excluded.vendor, api_base=excluded.api_base, \
                     models_endpoint=excluded.models_endpoint, \
@@ -1678,6 +1690,7 @@ impl DbConfigStore {
                     encrypted_usage_management_key=excluded.encrypted_usage_management_key, \
                     encrypted_oauth_meta=excluded.encrypted_oauth_meta, \
                     metadata_json=excluded.metadata_json, \
+                    capabilities_json=excluded.capabilities_json, \
                     enabled=excluded.enabled, updated_at=excluded.updated_at",
             )
             .bind(&p.id)
@@ -1690,6 +1703,7 @@ impl DbConfigStore {
             .bind(&enc_usage_management_key)
             .bind(&enc_oauth_meta)
             .bind(&metadata_str)
+            .bind(&p.capabilities_json)
             .bind(enabled_int)
             .bind(&created_at)
             .bind(&updated_at)
@@ -2026,6 +2040,7 @@ fn row_to_provider(row: sqlx::any::AnyRow) -> Result<Provider, StoreError> {
         encrypted_usage_management_key: row.get("encrypted_usage_management_key"),
         encrypted_oauth_meta: row.get("encrypted_oauth_meta"),
         metadata_json,
+        capabilities_json: row.get("capabilities_json"),
         enabled: enabled_int != 0,
         created_at: parse_dt(row.get("created_at"))?,
         updated_at: parse_dt(row.get("updated_at"))?,
@@ -2231,6 +2246,7 @@ mod tests {
             auth_mode: AuthMode::ApiKey,
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({}),
+            capabilities_json: String::new(),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -2289,6 +2305,7 @@ mod tests {
             auth_mode: AuthMode::ApiKey,
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({}),
+            capabilities_json: String::new(),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -2361,6 +2378,7 @@ mod tests {
             auth_mode: AuthMode::ApiKey,
             encrypted_oauth_meta: String::new(),
             metadata_json: serde_json::json!({}),
+            capabilities_json: String::new(),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -2474,6 +2492,7 @@ mod tests {
                 AuthMode::OAuth,
                 Some(&meta_str),
                 serde_json::json!({}),
+                "",
                 true,
             )
             .await
@@ -2517,6 +2536,7 @@ mod tests {
                 AuthMode::ApiKey,
                 None,
                 serde_json::json!({}),
+                "",
                 true,
                 Some("manage-key-secret"),
             )
@@ -2564,6 +2584,7 @@ mod tests {
                 AuthMode::OAuth,
                 Some(&meta.to_string()),
                 serde_json::json!({}),
+                "",
                 true,
             )
             .await
@@ -2618,6 +2639,7 @@ mod tests {
                 AuthMode::OAuth,
                 Some(&initial_meta.to_string()),
                 serde_json::json!({}),
+                "",
                 true,
             )
             .await
@@ -2693,6 +2715,7 @@ mod tests {
                     "scopes": ["openid", "profile", "email"],
                 }
             }),
+            capabilities_json: String::new(),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -2743,6 +2766,7 @@ mod tests {
                     "client_id": "client",
                 }
             }),
+            capabilities_json: String::new(),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -2775,6 +2799,7 @@ mod tests {
                     "client_id": "client",
                 }
             }),
+            capabilities_json: String::new(),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -2805,6 +2830,7 @@ mod tests {
                 AuthMode::OAuth,
                 None,
                 serde_json::json!({}),
+                "",
                 true,
             )
             .await
@@ -2846,6 +2872,7 @@ mod tests {
                 AuthMode::None,
                 None,
                 serde_json::json!({}),
+                "",
                 true,
             )
             .await
@@ -2916,6 +2943,7 @@ mod tests {
                 AuthMode::ApiKey,
                 None,
                 serde_json::json!({}),
+                "",
                 true,
             )
             .await
@@ -3091,6 +3119,7 @@ mod tests {
                 AuthMode::ApiKey,
                 None,
                 serde_json::json!({}),
+                "",
                 true,
             )
             .await
@@ -3113,6 +3142,7 @@ mod tests {
                     auth_mode: AuthMode::ApiKey,
                     encrypted_oauth_meta: String::new(),
                     metadata_json: serde_json::json!({}),
+                    capabilities_json: String::new(),
                     enabled: true,
                     created_at: now,
                     updated_at: now,
@@ -3131,6 +3161,7 @@ mod tests {
                     auth_mode: AuthMode::ApiKey,
                     encrypted_oauth_meta: String::new(),
                     metadata_json: serde_json::json!({}),
+                    capabilities_json: String::new(),
                     enabled: true,
                     created_at: now,
                     updated_at: now,
@@ -3195,6 +3226,7 @@ mod tests {
                 AuthMode::ApiKey,
                 None,
                 serde_json::json!({}),
+                "",
                 true,
             )
             .await
@@ -3383,6 +3415,7 @@ mod tests {
                 AuthMode::ApiKey,
                 None,
                 serde_json::json!({}),
+                "",
                 true,
             )
             .await
@@ -3404,6 +3437,7 @@ mod tests {
                 auth_mode: AuthMode::ApiKey,
                 encrypted_oauth_meta: String::new(),
                 metadata_json: serde_json::json!({}),
+                capabilities_json: String::new(),
                 enabled: true,
                 created_at: now,
                 updated_at: now,
@@ -3456,6 +3490,7 @@ mod tests {
                 auth_mode: AuthMode::ApiKey,
                 encrypted_oauth_meta: String::new(),
                 metadata_json: serde_json::json!({}),
+                capabilities_json: String::new(),
                 enabled: true,
                 created_at: now,
                 updated_at: now,

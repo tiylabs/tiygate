@@ -67,6 +67,7 @@ fn build_test_app_with_config(
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
 
@@ -106,6 +107,7 @@ fn build_anthropic_test_app_with_config(
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
 
@@ -149,6 +151,7 @@ fn build_anthropic_ingress_codex_egress_app(
                 extra_headers: Vec::new(),
                 account_id: None,
             }),
+            capability_override: None,
         }],
     );
 
@@ -183,6 +186,7 @@ fn build_openai_compatible_test_app(
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
 
@@ -823,6 +827,7 @@ async fn test_multi_target_fallback_5xx_transfers() {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             },
             tiygate_core::RoutingTarget {
                 provider_id: "secondary".to_string(),
@@ -839,6 +844,7 @@ async fn test_multi_target_fallback_5xx_transfers() {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             },
         ],
     );
@@ -1259,6 +1265,7 @@ fn build_chat_ingress_anthropic_egress_app(upstream_url: String, model: &str) ->
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
@@ -1291,6 +1298,7 @@ fn build_messages_ingress_openai_egress_app(upstream_url: String, model: &str) -
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
@@ -1568,6 +1576,7 @@ fn build_chat_ingress_anthropic_egress_app_with_config(
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
@@ -1749,6 +1758,7 @@ fn build_responses_ingress_openai_egress_app_with_config(
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
@@ -1789,6 +1799,7 @@ fn build_gemini_ingress_openai_egress_app_with_config(
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
@@ -2022,6 +2033,7 @@ fn build_responses_same_protocol_app(upstream_url: String, model: &str) -> axum:
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
@@ -2048,6 +2060,7 @@ fn build_deepseek_responses_app(upstream_url: String, virtual_model: &str) -> ax
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
@@ -2077,6 +2090,7 @@ fn build_gemini_same_protocol_app(upstream_url: String, model: &str) -> axum::Ro
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
@@ -2307,6 +2321,7 @@ fn build_app_with_require_api_key(
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }],
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
@@ -2432,6 +2447,7 @@ async fn test_api_key_model_access_rejects_before_upstream() {
             AuthMode::ApiKey,
             None,
             json!({}),
+            "",
             true,
         )
         .await

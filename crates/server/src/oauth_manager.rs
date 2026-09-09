@@ -1119,6 +1119,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth,
+            capability_override: None,
         }
     }
 
@@ -1264,6 +1265,7 @@ mod tests {
                         "token_request_style": "form"
                     }
                 }),
+                "",
                 true,
             )
             .await
@@ -1285,6 +1287,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: Some(oauth),
+            capability_override: None,
         };
         let manager = Arc::new(OAuthTokenManager::new(
             Some(store.clone()),
@@ -1355,6 +1358,7 @@ mod tests {
                         "token_request_style": "form"
                     }
                 }),
+                "",
                 true,
             )
             .await
@@ -1410,6 +1414,7 @@ mod tests {
                         "token_request_style": "form"
                     }
                 }),
+                "",
                 true,
             )
             .await
@@ -1468,6 +1473,7 @@ mod tests {
                     AuthMode::OAuth,
                     None,
                     oauth_config.clone(),
+                    "",
                     true,
                 )
                 .await
@@ -1485,6 +1491,7 @@ mod tests {
                 AuthMode::OAuth,
                 Some(&serde_json::json!({"refresh_token": "valid-refresh"}).to_string()),
                 oauth_config,
+                "",
                 true,
             )
             .await
@@ -1558,6 +1565,7 @@ mod tests {
                         "token_request_style": "form"
                     }
                 }),
+                "",
                 true,
             )
             .await
@@ -1619,6 +1627,7 @@ mod tests {
                         "token_request_style": "form"
                     }
                 }),
+                "",
                 true,
             )
             .await
@@ -1705,6 +1714,7 @@ mod tests {
                         "token_request_style": "form"
                     }
                 }),
+                "",
                 true,
             )
             .await
@@ -1809,6 +1819,7 @@ mod tests {
                         "token_request_style": "form"
                     }
                 }),
+                "",
                 true,
             )
             .await
@@ -1899,6 +1910,7 @@ mod tests {
                         "token_request_style": "form"
                     }
                 }),
+                "",
                 true,
             )
             .await
@@ -2001,6 +2013,7 @@ mod tests {
                         "token_request_style": "form"
                     }
                 }),
+                "",
                 true,
             )
             .await
@@ -2022,6 +2035,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: Some(build_oauth_target_config(&provider).unwrap()),
+            capability_override: None,
         };
         let cache_a = Box::leak(Box::new(OAuthTokenCache::new()));
         let cache_b = Box::leak(Box::new(OAuthTokenCache::new()));

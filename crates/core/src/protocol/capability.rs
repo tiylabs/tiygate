@@ -145,6 +145,48 @@ pub struct SanitizeOutcome {
     pub reject: Option<CapabilityReject>,
 }
 
+/// Serde-friendly declarative overlay stored on a provider row
+/// (`providers.capabilities_json`). When the overlay's endpoint matches
+/// the request's egress protocol suite, its field rules REPLACE the
+/// built-in profile's rules wholesale (ADR-0001: full-table replacement
+/// semantics; the built-in structure hook, e.g. the DeepSeek tool
+/// allow-list, is re-attached by the caller — overlays carry rules
+/// only, never hooks).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityProfileOverride {
+    /// The protocol endpoint this overlay applies to.
+    pub endpoint: ProtocolEndpoint,
+    /// Ordered field rules; the first rule matching a given path wins.
+    #[serde(default)]
+    pub fields: Vec<FieldRule>,
+}
+
+impl CapabilityProfileOverride {
+    /// Parse the JSON text stored on a provider row. Empty or
+    /// whitespace-only input yields `None`; unparseable JSON also yields
+    /// `None` (the Admin API validates at save time, so this is a
+    /// belt-and-braces tolerance for hand-edited rows).
+    pub fn parse(json: &str) -> Option<Self> {
+        let trimmed = json.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        serde_json::from_str(trimmed).ok()
+    }
+
+    /// Build a runtime [`CapabilityProfile`] from this overlay.
+    /// `structure` is the built-in hook re-attached by the caller
+    /// (`None` for providers without a built-in structural validator).
+    pub fn to_profile(&self, structure: Option<Box<dyn StructureValidator>>) -> CapabilityProfile {
+        CapabilityProfile {
+            endpoint: self.endpoint.clone(),
+            fields: self.fields.clone(),
+            structure,
+            allow_overrides: false,
+        }
+    }
+}
+
 /// Provider-specific structural validation that declarative field rules cannot
 /// express — e.g. tool allow-lists, input-item content-type checks, and
 /// per-item transforms. Returns whether the body was mutated, or a

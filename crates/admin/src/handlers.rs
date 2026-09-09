@@ -1864,6 +1864,26 @@ async fn info() -> impl IntoResponse {
 /// (`api_key`, `usage_management_key`, `oauth_meta`) go through
 /// [`KeyEncryption::redact`] so the
 /// audit table never stores cleartext secrets.
+/// Normalise and validate the optional capability-profile overlay from
+/// an admin request. Empty/whitespace clears the override (stored as an
+/// empty string); otherwise the JSON must parse as a
+/// [`tiygate_core::CapabilityProfileOverride`] — the Admin API is the
+/// validation gate, so the route-table builder can tolerate and ignore
+/// unparseable rows without breaking request routing.
+fn validated_capabilities_json(raw: Option<&str>) -> Result<String, AdminError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(String::new()),
+        Some(json) if tiygate_core::CapabilityProfileOverride::parse(json).is_some() => {
+            Ok(json.to_string())
+        }
+        Some(_) => Err(AdminError::BadRequest(
+            "capabilities_json is not a valid capability profile override \
+             (expected an object with \"endpoint\" and \"fields\")"
+                .to_string(),
+        )),
+    }
+}
+
 fn provider_snapshot(p: &Provider) -> serde_json::Value {
     json!({
         "id": p.id,
@@ -1874,6 +1894,7 @@ fn provider_snapshot(p: &Provider) -> serde_json::Value {
         "auth_mode": p.auth_mode.as_str(),
         "enabled": p.enabled,
         "metadata": p.metadata_json,
+        "capabilities_json": p.capabilities_json,
         "api_key": tiygate_store::encryption::KeyEncryption::redact(&p.encrypted_api_key),
         "usage_management_key": tiygate_store::encryption::KeyEncryption::redact(
             &p.encrypted_usage_management_key,
@@ -1973,6 +1994,11 @@ struct ProviderRequest {
     auth_mode: Option<String>,
     oauth_meta: Option<String>,
     metadata: Option<serde_json::Value>,
+    /// Optional capability-profile overlay (ADR-0001). Empty/whitespace
+    /// clears the override; otherwise it must parse as a
+    /// `CapabilityProfileOverride` (validated at save time).
+    #[serde(default)]
+    capabilities_json: Option<String>,
     enabled: Option<bool>,
 }
 
@@ -1996,6 +2022,7 @@ struct ProviderView {
     encrypted_oauth_meta: String,
     oauth_status: Option<ProviderOAuthStatusView>,
     metadata: serde_json::Value,
+    capabilities_json: String,
     enabled: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -2026,6 +2053,7 @@ impl From<Provider> for ProviderView {
             ),
             oauth_status,
             metadata: p.metadata_json,
+            capabilities_json: p.capabilities_json,
             enabled: p.enabled,
             created_at: p.created_at,
             updated_at: p.updated_at,
@@ -2230,6 +2258,7 @@ async fn create_provider(
             auth_mode,
             req.oauth_meta.as_deref(),
             metadata,
+            &validated_capabilities_json(req.capabilities_json.as_deref())?,
             req.enabled.unwrap_or(true),
             req.usage_management_key.as_deref(),
         )
@@ -2292,6 +2321,7 @@ async fn update_provider(
             let usage_management_key = req.usage_management_key.clone();
             let metadata = metadata.clone();
             let enabled = req.enabled.unwrap_or(true);
+            let capabilities_json = validated_capabilities_json(req.capabilities_json.as_deref())?;
             service
                 .mutate_provider_credentials(
                     &id,
@@ -2308,6 +2338,7 @@ async fn update_provider(
                                     auth_mode,
                                     oauth_meta.as_deref(),
                                     metadata,
+                                    &capabilities_json,
                                     enabled,
                                     usage_management_key.as_deref(),
                                 )
@@ -2337,6 +2368,7 @@ async fn update_provider(
                     auth_mode,
                     req.oauth_meta.as_deref(),
                     metadata,
+                    &validated_capabilities_json(req.capabilities_json.as_deref())?,
                     req.enabled.unwrap_or(true),
                     req.usage_management_key.as_deref(),
                 )
@@ -2362,6 +2394,7 @@ async fn update_provider(
                 auth_mode,
                 req.oauth_meta.as_deref(),
                 metadata,
+                &validated_capabilities_json(req.capabilities_json.as_deref())?,
                 req.enabled.unwrap_or(true),
                 req.usage_management_key.as_deref(),
             )
@@ -3840,6 +3873,7 @@ mod tests {
             auth_mode,
             encrypted_oauth_meta: String::new(),
             metadata_json: json!({}),
+            capabilities_json: String::new(),
             enabled: true,
             created_at: now,
             updated_at: now,

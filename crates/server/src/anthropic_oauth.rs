@@ -256,6 +256,7 @@ mod tests {
                 extra_headers: vec![],
                 account_id: None,
             }),
+            capability_override: None,
         }
     }
 

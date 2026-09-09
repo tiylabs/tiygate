@@ -86,6 +86,14 @@ pub struct Provider {
     /// Encrypted OAuth metadata JSON, or empty.
     pub encrypted_oauth_meta: String,
     pub metadata_json: serde_json::Value,
+    /// Provider-declared capability profile overlay (ADR-0001), or
+    /// empty. JSON `CapabilityProfileOverride`: when its endpoint
+    /// matches the egress suite, its field rules replace the built-in
+    /// profile's rules wholesale (structure hooks are retained).
+    /// Validated by the Admin API at save time; the route-table
+    /// builder ignores unparseable values.
+    #[serde(default)]
+    pub capabilities_json: String,
     pub enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,

@@ -65,6 +65,7 @@ async fn data_plane_sees_admin_writes_via_epoch_poll() {
             AuthMode::ApiKey,
             None,
             serde_json::json!({}),
+            "",
             true,
         )
         .await

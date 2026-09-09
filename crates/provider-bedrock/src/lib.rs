@@ -151,6 +151,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         };
         let mut headers = http::HeaderMap::new();
         applier.apply(&mut headers, &target).await.unwrap();

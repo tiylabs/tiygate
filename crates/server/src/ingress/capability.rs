@@ -61,7 +61,10 @@ fn deepseek_field_rules() -> Vec<FieldRule> {
     let unsupported =
         |path: &str, cond: MatchCond| reject(path, cond, &format!("{path} is not supported"));
 
-    vec![
+    // Bind the vector to a local so the `vec!` macro tail sits in
+    // statement position (a bare macro in return position trips the
+    // rust-analyzer E0308 expansion false positive).
+    let rules = vec![
         // DeepSeek manages context caching automatically and never parses these
         // non-semantic controls, so strip them instead of rejecting.
         strip("prompt_cache_key", false),
@@ -107,12 +110,18 @@ fn deepseek_field_rules() -> Vec<FieldRule> {
             MatchCond::ValueIn(vec!["disabled".to_string()]),
             "automatic truncation is not supported",
         ),
-    ]
+    ];
+    rules
 }
 
 /// Structural validation: tool allow-lists and input-item content checks /
 /// transforms that a pure field rule cannot express.
-struct DeepSeekResponsesValidator;
+///
+/// Visible to sibling ingress modules so the profile-selection logic in
+/// `headers.rs` can re-attach the built-in hook when a provider-declared
+/// capability overlay replaces the built-in field rules (the hook itself
+/// is never overridable — overlays carry rules only).
+pub(super) struct DeepSeekResponsesValidator;
 
 impl StructureValidator for DeepSeekResponsesValidator {
     fn validate(&self, body: &mut Value) -> Result<bool, CapabilityReject> {

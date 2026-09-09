@@ -264,6 +264,32 @@ pub(super) fn prepare_provider_request_body(
         mutated |= maybe_inject_prompt_cache_key(body, egress_suite, api_key_id);
     }
     mutated |= normalize_openai_reasoning_for_target(body, egress_suite, &target.model_id);
+
+    // Profile selection (ADR-0001): a provider-declared overlay replaces
+    // the built-in field rules wholesale when its endpoint matches the
+    // egress suite; the built-in structure hook is re-attached for
+    // official DeepSeek Responses targets (overlays carry rules only,
+    // never hooks). Without a matching overlay, the built-in DeepSeek
+    // profile applies when the target is identified as official
+    // DeepSeek Responses; other targets get no profile (pure
+    // passthrough plus the always-on generic transforms).
+    let overlay = target
+        .capability_override
+        .as_ref()
+        .filter(|ov| ov.endpoint.suite == *egress_suite)
+        .filter(|_| {
+            !deepseek_responses || super::capability::deepseek_responses_profile().allow_overrides
+        });
+    if let Some(overlay) = overlay {
+        let structure = deepseek_responses.then(|| {
+            Box::new(super::capability::DeepSeekResponsesValidator)
+                as Box<dyn tiygate_core::StructureValidator>
+        });
+        let profile = overlay.to_profile(structure);
+        let mut outcome = tiygate_core::sanitize_with_profile(body, &profile)?;
+        outcome.mutated |= mutated;
+        return Ok(outcome);
+    }
     if deepseek_responses {
         let mut outcome = tiygate_core::sanitize_with_profile(
             body,
@@ -358,6 +384,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }
     }
 
@@ -526,6 +553,50 @@ mod tests {
         assert_eq!(body["input"][1]["content"][0]["text"], "call weather");
         assert!(body["input"][1].get("encrypted_content").is_none());
         assert!(body["input"][1].get("summary").is_none());
+    }
+
+    #[test]
+    fn capability_overlay_replaces_builtin_field_rules_keeps_structure_hook() {
+        let mut target = deepseek_target();
+        target.capability_override = Some(tiygate_core::CapabilityProfileOverride {
+            endpoint: tiygate_core::ProtocolEndpoint::new(
+                tiygate_core::ProtocolSuite::OpenAiResponses,
+                "custom-deepseek",
+                "v1",
+            ),
+            fields: Vec::new(),
+        });
+
+        // Builtin rules are replaced wholesale: `store` is no longer
+        // rejected even though the DeepSeek profile rejects it.
+        let mut body = serde_json::json!({"input": "hi", "store": true});
+        let prepared = prepare_provider_request_body(
+            &mut body,
+            &target,
+            &tiygate_core::ProtocolSuite::OpenAiResponses,
+            "anonymous",
+        );
+        assert!(
+            matches!(&prepared, Ok(_)),
+            "overlay with no fields must not inherit builtin rejects: {prepared:?}"
+        );
+
+        // The built-in structure hook is retained: the tool allow-list
+        // still rejects unsupported tool types.
+        let mut body = serde_json::json!({
+            "input": "hi",
+            "tools": [{"type": "file_search"}]
+        });
+        let prepared = prepare_provider_request_body(
+            &mut body,
+            &target,
+            &tiygate_core::ProtocolSuite::OpenAiResponses,
+            "anonymous",
+        );
+        assert!(
+            matches!(&prepared, Err(error) if error.detail.contains("file_search")),
+            "overlay must keep the builtin tool allow-list: {prepared:?}"
+        );
     }
 
     #[test]

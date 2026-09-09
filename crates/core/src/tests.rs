@@ -31,6 +31,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         }];
 
         table.insert("gpt-4o".to_string(), targets.clone());
@@ -57,6 +58,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         };
 
         let mut table = RoutingTable::new();
@@ -117,6 +119,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         };
         assert_eq!(target.effective_api_key(), "override-key");
     }
@@ -434,6 +437,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         };
         let err = crate::Error::Routing("500 error".to_string());
 
@@ -460,6 +464,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         };
         let err = crate::Error::Routing("500 error".to_string());
 
@@ -533,6 +538,7 @@ mod tests {
                 api_base_override: None,
                 weight: 10.0,
                 oauth: None,
+                capability_override: None,
             },
             RoutingTarget {
                 provider_id: "b".to_string(),
@@ -545,6 +551,7 @@ mod tests {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             },
         ];
 
@@ -567,6 +574,7 @@ mod tests {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             },
             RoutingTarget {
                 provider_id: "high".to_string(),
@@ -579,6 +587,7 @@ mod tests {
                 api_base_override: None,
                 weight: 10.0,
                 oauth: None,
+                capability_override: None,
             },
         ];
 
@@ -606,6 +615,7 @@ mod tests {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             },
             RoutingTarget {
                 provider_id: "broken".to_string(),
@@ -618,6 +628,7 @@ mod tests {
                 api_base_override: None,
                 weight: 10.0,
                 oauth: None,
+                capability_override: None,
             },
         ];
 
@@ -645,6 +656,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         };
         let err = crate::Error::Routing("500 error".to_string());
 
@@ -684,6 +696,7 @@ mod tests {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             },
             RoutingTarget {
                 provider_id: "b".to_string(),
@@ -696,6 +709,7 @@ mod tests {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             },
             RoutingTarget {
                 provider_id: "c".to_string(),
@@ -708,6 +722,7 @@ mod tests {
                 api_base_override: None,
                 weight: 1.0,
                 oauth: None,
+                capability_override: None,
             },
         ];
 
@@ -751,6 +766,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         };
         let err = crate::Error::Routing("500".to_string());
 
@@ -788,6 +804,7 @@ mod tests {
             api_base_override: None,
             weight: 1.0,
             oauth: None,
+            capability_override: None,
         };
         let max_attempts = policy.max_total_attempts;
         let err = crate::Error::Routing("429 rate limit exceeded".to_string());

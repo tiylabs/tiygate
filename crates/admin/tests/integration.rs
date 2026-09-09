@@ -562,6 +562,7 @@ async fn acceptance_1_with_master_key_decrypts_into_routing_table() {
             AuthMode::ApiKey,
             None,
             serde_json::json!({}),
+            "",
             true,
         )
         .await
@@ -1261,6 +1262,7 @@ async fn config_import_skips_existing_ids() {
             AuthMode::ApiKey,
             None,
             json!({}),
+            "",
             true,
         )
         .await
@@ -1327,6 +1329,7 @@ async fn config_import_overwrites_when_selected() {
             AuthMode::ApiKey,
             None,
             json!({}),
+            "",
             true,
         )
         .await

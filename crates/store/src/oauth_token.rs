@@ -403,6 +403,7 @@ mod tests {
                 crate::models::AuthMode::OAuth,
                 Some("{\"refresh_token\":\"rt\"}"),
                 serde_json::json!({"oauth": {}}),
+                "",
                 true,
             )
             .await
@@ -447,6 +448,7 @@ mod tests {
                 crate::models::AuthMode::OAuth,
                 Some("{\"refresh_token\":\"rt-secret\"}"),
                 serde_json::json!({"oauth": {}}),
+                "",
                 true,
             )
             .await

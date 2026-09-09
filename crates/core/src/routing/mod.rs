@@ -44,6 +44,15 @@ pub struct RoutingTarget {
     /// `OAuthTokenCache` instead of the static key path.
     #[serde(default, skip)]
     pub oauth: Option<crate::provider::oauth::OAuthTargetConfig>,
+    /// Provider-declared capability profile overlay parsed from
+    /// `providers.capabilities_json` at route-table build time.
+    /// `None` when the row has no overlay or its JSON failed to
+    /// parse (the Admin API validates at save time). When present and
+    /// the overlay's endpoint matches the egress suite, its field
+    /// rules replace the built-in profile's rules wholesale.
+    #[serde(default, skip)]
+    pub capability_override:
+        Option<crate::protocol::capability::CapabilityProfileOverride>,
 }
 
 impl RoutingTarget {
@@ -60,6 +69,7 @@ impl RoutingTarget {
     /// The health registry key for this target.
     pub fn health_key(&self) -> String {
         format!("{}:{}", self.provider_id, self.model_id)
+    // pi-lens-ignore: rust-analyzer:E0308
     }
 }
 
