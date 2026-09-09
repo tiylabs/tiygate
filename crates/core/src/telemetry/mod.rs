@@ -259,6 +259,14 @@ pub enum EventPayload {
         hop: usize,
         decision: String,
     },
+    /// Provider capability-profile decisions recorded while preparing
+    /// the upstream request body (fields stripped/converted by the
+    /// active [`crate::protocol::CapabilityProfile`]). Consumed by the
+    /// OLTP log sink to populate `request_logs.capability_decisions_json`
+    /// order-independently of the terminal `RequestEvent` insert.
+    CapabilityChecked {
+        decisions: Vec<crate::protocol::capability::CapabilityDecision>,
+    },
     /// Request completed (success or failure).
     RequestCompleted {
         status: String,

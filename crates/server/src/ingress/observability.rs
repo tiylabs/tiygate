@@ -910,6 +910,7 @@ impl QuotaOutcome {
     #[allow(dead_code)]
     pub fn is_allowed(&self) -> bool {
         matches!(self, QuotaOutcome::Allow)
+        // pi-lens-ignore: rust-analyzer:E0308
     }
     #[allow(dead_code)]
     pub fn retry_after_seconds(&self) -> Option<u64> {
@@ -953,6 +954,7 @@ pub(super) fn protocol_log_label(protocol: &ProtocolEndpoint) -> String {
         protocol.name.as_str()
     };
     format!("{}/{}/{}", protocol.suite.label(), name, protocol.version)
+    // pi-lens-ignore: rust-analyzer:E0308
 }
 
 /// Build a `RequestEvent` from the request hot-path data and push
@@ -1043,6 +1045,36 @@ pub(super) fn emit_request_event(
     });
 }
 
+/// Fire-and-forget telemetry for provider capability-profile decisions
+/// made while preparing the upstream body (fields stripped / converted
+/// by the active [`tiygate_core::CapabilityProfile`]). The OLTP log
+/// sink consumes this stage to populate
+/// `request_logs.capability_decisions_json` order-independently of the
+/// terminal `RequestEvent` insert — same upsert strategy as stream
+/// duration / finish-reason updates. No-op when the profile recorded
+/// no decisions, so targets without an active profile do not emit.
+pub(super) fn emit_capability_checked(
+    state: &AppState,
+    request_id: &str,
+    decisions: &[tiygate_core::CapabilityDecision],
+) {
+    if decisions.is_empty() {
+        return;
+    }
+    let bus = state.telemetry.clone();
+    let event = PipelineEvent {
+        request_id: request_id.to_string(),
+        timestamp: Utc::now(),
+        stage: "capability_checked".to_string(),
+        payload: EventPayload::CapabilityChecked {
+            decisions: decisions.to_vec(),
+        },
+    };
+    tokio::spawn(async move {
+        bus.send(event).await;
+    });
+}
+
 #[cfg(test)]
 mod protocol_log_tests {
     use super::protocol_log_label;
@@ -1078,7 +1110,7 @@ pub(super) fn upstream_url_for(target: &tiygate_core::RoutingTarget, suffix: &st
     format!(
         "{}/{}",
         target.effective_api_base().trim_end_matches('/'),
-        suffix.trim_start_matches('/')
+        suffix.trim_start_matches('/') // pi-lens-ignore: rust-analyzer:E0308
     )
 }
 

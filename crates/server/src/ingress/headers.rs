@@ -246,12 +246,18 @@ fn is_official_deepseek_responses_target(
         .is_some_and(|host| host.eq_ignore_ascii_case("api.deepseek.com"))
 }
 
+/// Prepare the upstream body for a provider target. Applies the
+/// always-on generic transforms (prompt-cache-key injection,
+/// reasoning normalization) plus, when the target is governed by a
+/// [`CapabilityProfile`](tiygate_core::CapabilityProfile), the
+/// declarative sanitize pass. Returns the outcome so callers can
+/// persist the structured decisions to the request log.
 pub(super) fn prepare_provider_request_body(
     body: &mut serde_json::Value,
     target: &tiygate_core::RoutingTarget,
     egress_suite: &tiygate_core::ProtocolSuite,
     api_key_id: &str,
-) -> Result<bool, tiygate_core::CapabilityReject> {
+) -> Result<tiygate_core::SanitizeOutcome, tiygate_core::CapabilityReject> {
     let deepseek_responses = is_official_deepseek_responses_target(target, egress_suite);
     let mut mutated = false;
     if !deepseek_responses {
@@ -259,13 +265,18 @@ pub(super) fn prepare_provider_request_body(
     }
     mutated |= normalize_openai_reasoning_for_target(body, egress_suite, &target.model_id);
     if deepseek_responses {
-        let outcome = tiygate_core::sanitize_with_profile(
+        let mut outcome = tiygate_core::sanitize_with_profile(
             body,
             super::capability::deepseek_responses_profile(),
         )?;
-        mutated |= outcome.mutated;
+        outcome.mutated |= mutated;
+        return Ok(outcome);
     }
-    Ok(mutated)
+    Ok(tiygate_core::SanitizeOutcome {
+        mutated,
+        decisions: Vec::new(),
+        reject: None,
+    })
 }
 
 /// Extract Retry-After value from response headers.
@@ -390,7 +401,7 @@ mod tests {
             "key-1",
         );
         assert!(
-            matches!(prepared, Ok(true)),
+            matches!(&prepared, Ok(outcome) if outcome.mutated),
             "unexpected result: {prepared:?}"
         );
         assert_eq!(body["reasoning"]["effort"], "max");
@@ -484,7 +495,7 @@ mod tests {
             "anonymous",
         );
         assert!(
-            matches!(prepared, Ok(true)),
+            matches!(&prepared, Ok(outcome) if outcome.mutated),
             "encrypted-only reasoning should be stripped, not rejected: {prepared:?}"
         );
         assert_eq!(body["input"].as_array().map(|arr| arr.len()), Some(0));
@@ -508,13 +519,37 @@ mod tests {
             "anonymous",
         );
         assert!(
-            matches!(prepared, Ok(true)),
+            matches!(&prepared, Ok(outcome) if outcome.mutated),
             "encrypted reasoning with plaintext should be converted: {prepared:?}"
         );
         assert_eq!(body["input"][1]["content"][0]["type"], "reasoning_text");
         assert_eq!(body["input"][1]["content"][0]["text"], "call weather");
         assert!(body["input"][1].get("encrypted_content").is_none());
         assert!(body["input"][1].get("summary").is_none());
+    }
+
+    #[test]
+    fn prepare_returns_capability_decisions_for_log_persistence() {
+        let target = deepseek_target();
+        let mut body = serde_json::json!({
+            "input": "hi",
+            "metadata": {"env": "test"},
+            "store": false,
+        });
+        let decisions = prepare_provider_request_body(
+            &mut body,
+            &target,
+            &tiygate_core::ProtocolSuite::OpenAiResponses,
+            "anonymous",
+        )
+        .map(|outcome| outcome.decisions)
+        .unwrap_or_default();
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.field == "metadata" && d.action == tiygate_core::FieldAction::Strip),
+            "metadata strip should be recorded as a decision: {decisions:?}"
+        );
     }
 
     #[test]

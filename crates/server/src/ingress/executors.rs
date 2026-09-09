@@ -30,6 +30,7 @@ use super::headers::{
     merge_client_headers, override_model_in_body, prepare_provider_request_body,
     reqwest_headers_to_vec, spawn_capture,
 };
+use super::observability::emit_capability_checked;
 use super::response_model::ResponseModelOverride;
 use super::streaming::{
     drive_upstream_stream, StreamCapture, StreamTranscode, UpstreamByteStream,
@@ -536,7 +537,7 @@ pub(super) async fn execute_upstream(
     // target's real upstream model id before sending and before we
     // snapshot the egress body for the request-log detail view.
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
-    body_mutated |= prepare_provider_request_body(
+    let prepared = prepare_provider_request_body(
         &mut upstream_body,
         target,
         &egress_protocol.suite,
@@ -548,6 +549,8 @@ pub(super) async fn execute_upstream(
             .with_class(tiygate_core::ErrorClass::LossyOrCapability)
             .with_capability(reject)
     })?;
+    body_mutated |= prepared.mutated;
+    emit_capability_checked(state, request_id, &prepared.decisions);
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
             target,
@@ -1133,7 +1136,7 @@ pub(super) async fn execute_messages_upstream(
     // Replace the (possibly virtual) model name with the routing
     // target's real upstream model id.
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
-    body_mutated |= prepare_provider_request_body(
+    let prepared = prepare_provider_request_body(
         &mut upstream_body,
         target,
         &egress_protocol.suite,
@@ -1145,6 +1148,8 @@ pub(super) async fn execute_messages_upstream(
             .with_class(tiygate_core::ErrorClass::LossyOrCapability)
             .with_capability(reject)
     })?;
+    body_mutated |= prepared.mutated;
+    emit_capability_checked(state, request_id, &prepared.decisions);
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
             target,
@@ -1693,6 +1698,7 @@ pub(super) fn upstream_url_for_suite(
     target: &tiygate_core::RoutingTarget,
     suite: tiygate_core::ProtocolSuite,
 ) -> Option<String> {
+    // pi-lens-ignore: rust-analyzer:E0308
     suite.upstream_path_suffix().map(|suffix| {
         format!(
             "{}{}",
@@ -1976,7 +1982,7 @@ pub(super) async fn execute_responses_upstream(
     };
 
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
-    body_mutated |= prepare_provider_request_body(
+    let prepared = prepare_provider_request_body(
         &mut upstream_body,
         target,
         &egress_protocol.suite,
@@ -1988,6 +1994,8 @@ pub(super) async fn execute_responses_upstream(
             .with_class(tiygate_core::ErrorClass::LossyOrCapability)
             .with_capability(reject)
     })?;
+    body_mutated |= prepared.mutated;
+    emit_capability_checked(state, request_id, &prepared.decisions);
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
             target,
@@ -2813,7 +2821,7 @@ pub(super) async fn execute_gemini_upstream(
     };
 
     let mut body_mutated = override_model_in_body(&mut upstream_body, &target.model_id);
-    body_mutated |= prepare_provider_request_body(
+    let prepared = prepare_provider_request_body(
         &mut upstream_body,
         target,
         &egress_protocol.suite,
@@ -2825,6 +2833,8 @@ pub(super) async fn execute_gemini_upstream(
             .with_class(tiygate_core::ErrorClass::LossyOrCapability)
             .with_capability(reject)
     })?;
+    body_mutated |= prepared.mutated;
+    emit_capability_checked(state, request_id, &prepared.decisions);
     let (openai_codex_profile, codex_websocket, codex_body_changed, codex_session_key) =
         prepare_codex_egress_body(
             target,

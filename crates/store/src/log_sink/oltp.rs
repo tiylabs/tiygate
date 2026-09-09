@@ -133,6 +133,14 @@ impl EventSink for OltpSink {
                 self.update_attempt_decision(event, target, *hop, decision)
                     .await
             }
+            EventPayload::CapabilityChecked { decisions } => match serde_json::to_string(decisions)
+            {
+                Ok(decisions_json) => {
+                    self.update_request_capability_decisions(&event.request_id, &decisions_json)
+                        .await
+                }
+                Err(e) => Err(sqlx::Error::Configuration(Box::new(e))),
+            },
             EventPayload::RequestStarted { .. }
             | EventPayload::RouteResolved { .. }
             | EventPayload::RequestCompleted { .. } => Ok(()),
@@ -815,6 +823,39 @@ impl OltpSink {
         .bind(request_id)
         .bind(now)
         .bind(reason)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    /// Persist the provider capability-profile decisions recorded while
+    /// preparing the upstream body (`EventPayload::CapabilityChecked`)
+    /// onto the `request_logs` row. Upserts a placeholder row when the
+    /// terminal `RequestEvent` has not landed yet and updates only
+    /// `capability_decisions_json` when it has. Order-independent with
+    /// `write_request_event` — same strategy as
+    /// [`Self::update_request_truncation`]: the `RequestEvent` insert's
+    /// `ON CONFLICT` clause does not list the column, so a value
+    /// written here is never clobbered. Last write wins when a
+    /// fallback retry re-runs the sanitize pass for a second target.
+    async fn update_request_capability_decisions(
+        &self,
+        request_id: &str,
+        decisions_json: &str,
+    ) -> Result<(), sqlx::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO request_logs (\
+                request_id, ts, virtual_model, ingress_protocol, status, \
+                total_latency_ms, upstream_latency_ms, queue_latency_ms, lossy, \
+                capability_decisions_json) \
+             VALUES ($1, $2, '', '', 'pending', 0, 0, 0, 0, $3) \
+             ON CONFLICT(request_id) DO UPDATE SET \
+                capability_decisions_json = excluded.capability_decisions_json",
+        )
+        .bind(request_id)
+        .bind(now)
+        .bind(decisions_json)
         .execute(self.pool.any())
         .await?;
         Ok(())
@@ -2823,6 +2864,11 @@ pub struct RequestLogEntry {
     /// `None` for non-stream exchanges. Used to compute output token
     /// rate: `completion_tokens / (stream_duration_ms / 1000)`.
     pub stream_duration_ms: Option<u64>,
+    /// JSON array of `CapabilityDecision` records emitted by the
+    /// active provider CapabilityProfile while preparing the upstream
+    /// body (fields stripped/converted/rejected before egress). `None`
+    /// when no profile ran for the request.
+    pub capability_decisions_json: Option<String>,
     pub total_latency_ms: u64,
     pub upstream_latency_ms: u64,
     pub queue_latency_ms: u64,
@@ -2886,6 +2932,7 @@ fn row_to_entry(row: &sqlx::any::AnyRow) -> RequestLogEntry {
         stream_duration_ms: row
             .get::<Option<i64>, _>("stream_duration_ms")
             .map(|n| n as u64),
+        capability_decisions_json: row.get("capability_decisions_json"),
         total_latency_ms: row.get::<i64, _>("total_latency_ms") as u64,
         upstream_latency_ms: row.get::<i64, _>("upstream_latency_ms") as u64,
         queue_latency_ms: row.get::<i64, _>("queue_latency_ms") as u64,
@@ -2978,7 +3025,7 @@ pub async fn list_requests(
                     cache_read_tokens, cache_write_tokens, total_tokens, \
                     cost, input_cost, output_cost, cache_read_cost, cache_write_cost, \
                     api_key_id, client_ip, user_agent, truncation_reason, finish_reason, \
-                    stream_duration_ms \
+                    stream_duration_ms, capability_decisions_json \
              FROM request_logs \
              WHERE request_id = $1 \
              ORDER BY ts DESC \
@@ -3113,7 +3160,7 @@ pub async fn list_requests(
                 cache_read_tokens, cache_write_tokens, total_tokens, \
                 cost, input_cost, output_cost, cache_read_cost, cache_write_cost, \
                 api_key_id, client_ip, user_agent, truncation_reason, finish_reason, \
-                stream_duration_ms \
+                stream_duration_ms, capability_decisions_json \
          FROM request_logs \
          WHERE {where_str} \
          ORDER BY ts DESC \
@@ -3267,6 +3314,10 @@ pub struct RequestReplay {
     pub request_id: String,
     pub raw_envelope_json: Option<String>,
     pub redacted_headers_json: Option<String>,
+    /// JSON array of `CapabilityDecision` records from the active
+    /// provider CapabilityProfile (fields stripped/converted/rejected
+    /// while preparing the upstream body). `None` when no profile ran.
+    pub capability_decisions_json: Option<String>,
     // ---- full exchange payload (LEFT JOIN request_payloads) ----
     /// HTTP method used for the gateway → provider request
     /// (e.g. "POST"). Empty when the exchange was not captured.
@@ -3309,6 +3360,7 @@ pub async fn get_request_replay(
     let row = sqlx::query(
         "SELECT l.request_id AS request_id, l.raw_envelope_json AS raw_envelope_json, \
                 l.redacted_headers_json AS redacted_headers_json, \
+                l.capability_decisions_json AS capability_decisions_json, \
                 p.egress_method AS egress_method, p.egress_path AS egress_path, \
                 p.egress_headers_json AS egress_headers_json, \
                 p.egress_body AS egress_body, \
@@ -3344,6 +3396,7 @@ pub async fn get_request_replay(
             request_id: r.get("request_id"),
             raw_envelope_json: r.get("raw_envelope_json"),
             redacted_headers_json: r.get("redacted_headers_json"),
+            capability_decisions_json: r.get("capability_decisions_json"),
             egress_method: r.get("egress_method"),
             egress_path: r.get("egress_path"),
             egress_headers_json: r.get("egress_headers_json"),
