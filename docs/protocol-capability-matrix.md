@@ -5,7 +5,7 @@
 ## 判定符号
 
 | 符号 | 含义 |
-|------|------|
+| ------ | ------ |
 | ✅ | 无损（双向可逆） |
 | ⚠️ | 有损（`lossy_default_reject` 拒绝） |
 | ❌ | 不支持（目标协议无此能力，拒绝） |
@@ -14,7 +14,7 @@
 ## 1. Tool Calling（工具调用）
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | `function_calling` | ✅ | ✅ | ✅ | ✅ | N/A |
 | `parallel_tool_calls` | ✅ | ⚠️ → chat→msg: 并行工具调用无法在 Anthropic 表达 | ✅ | ⚠️ | N/A |
 | `tool_choice=required` | ✅ | ✅ (via `{type:"any"}`) | ✅ | ✅ (via `toolConfig.functionCallingConfig.mode=ANY`) | N/A |
@@ -22,13 +22,14 @@
 | `tool_result` 引用 | ✅ | ✅ | ✅ | ✅ | N/A |
 
 **有损组合（阶段 1-3 已知）**：
+
 - `chat_completions → messages` 且请求包含 `parallel_tool_calls=true` → **拒绝**
 - `messages → gemini` tool_use 块结构 → **有损**（Gemini 用 `functionCall`/`functionResponse` parts，语义不完全等价）
 
 ## 2. 多模态（Multimodal）
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | `multimodal` | ✅ | ✅ | ✅ | ✅ | N/A |
 | inline base64 | ✅（image） | ✅（image, document） | ✅ | ✅（image, audio, video, pdf） | N/A |
 | URL 引用 | ✅ | ⚠️ → 需要先下载转 inline | ✅ | ✅ | N/A |
@@ -38,6 +39,7 @@
 | `image_url.detail` | ✅ | ❌（lossy：字段丢弃） | ✅ | ❌（lossy：字段丢弃） | N/A |
 
 **有损组合（阶段 1-3 已知）**：
+
 - URL 承载 → `messages`（Anthropic 需要 inline base64，无法传递 URL）→ **拒绝**
 - inline audio → `chat_completions`/`messages` → **拒绝**
 - inline video → 任何非 Gemini → **拒绝**
@@ -47,7 +49,7 @@
 ## 3. Reasoning / 结构化输出
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | `reasoning` | ✅ | ✅ | ✅ | ✅ | N/A |
 | `extended_reasoning` | ❌ | ✅ | ✅ | ✅ | N/A |
 | `structured_output` | ✅ | ✅ | ✅ | ✅ | N/A |
@@ -55,6 +57,7 @@
 | `response_format json_object` | ✅ | ✅¹ | ✅ | ✅ | N/A |
 
 **有损组合（阶段 1-3 已知）**：
+
 - `chat_completions` → 任意 且请求含 `extended_reasoning` → OpenAI 不产生 reasoning，但也不报错，所以 **⚠️ 方向单向有损**
 
 > ¹ Anthropic Messages 以 `output_config.format: {type: "json_schema"}` 表达结构化输出；
@@ -79,13 +82,16 @@ OpenAI 风格的 `summary` 回放转换为 `reasoning_text`，但拒绝不可转
 DeepSeek 会静默忽略部分 OpenAI Responses 能力。为维持 `lossy_default_reject` 契约，
 TiyGate 对有语义影响的不支持项返回 `400 LossyOrCapability`，包括
 `previous_response_id`、conversation/store/background 状态、非 `none` reasoning summary、
-verbosity、自动 truncation、禁用并行工具调用、非空 metadata/include、未支持的 input item，
+verbosity、自动 truncation、禁用并行工具调用、未支持的 input item，
 以及 `file_search`、`code_interpreter`、`computer_use`、`mcp` 等工具。允许的工具为
 function、web search，以及名为 `apply_patch` 的 custom tool。
 
-`prompt_cache_key`、`prompt_cache_retention`、`prompt_cache_options` 属于例外：DeepSeek
-自动管理上下文缓存，TiyGate 在 DeepSeek Responses 出站前显式移除这些缓存提示，不将其
-视为影响生成语义的有损转换，也不会因此拒绝 Codex 客户端请求。
+`prompt_cache_key`、`prompt_cache_retention`、`prompt_cache_options`、`metadata`、`include`
+属于例外：DeepSeek 自动管理上下文缓存并默认返回 reasoning/tool items，且从不解析
+这些非语义控制项，因此 TiyGate 在 DeepSeek Responses 出站前显式移除这些字段，不将其
+视为影响生成语义的有损转换，也不会因此拒绝 Codex 客户端请求。DeepSeek 不支持加密
+reasoning content，客户端请求 `include: ["reasoning.encrypted_content"]` 时收到的仍是
+明文 `reasoning_text`——这是 DeepSeek 固有限制，而非剥离所致。
 
 来源：[DeepSeek Responses API 指南](https://api-docs.deepseek.com/guides/responses_api/)、
 [DeepSeek Responses API Reference](https://api-docs.deepseek.com/api/create-response/)。
@@ -101,7 +107,7 @@ function、web search，以及名为 `apply_patch` 的 custom tool。
 ## 5. 诊断用 N×N 跨协议组合矩阵
 
 | Ingress ↓ / Egress → | chat_completions | messages | responses | gemini |
-|----------------------|:---:|:---:|:---:|:---:|
+| ---------------------- | :---: | :---: | :---: | :---: |
 | **chat_completions** | PassThrough ✅ | ⚠️ parallel_tc 可能拒绝 | ✅ | ✅ |
 | **messages** | ✅ | PassThrough ✅ | ✅ | ⚠️ tool_use→functionCall 有损 |
 | **responses** | ⚠️ file_id 丢失 | ⚠️ file_id | PassThrough ✅ | ⚠️ file_id+audio 拒绝 |
@@ -116,7 +122,7 @@ function、web search，以及名为 `apply_patch` 的 custom tool。
 ## 6. Thinking / Reasoning 配置
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | `effort` (none/minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`，含 `none`/`max`) | ✅（`none` 表示不下发 thinking；其余使用 `output_config.effort`） | ✅ (`reasoning.effort`，含 `none`/`max`) | ✅（2.5 的 `none` → `thinkingBudget: 0`；3+ 近似为 `minimal`） | N/A |
 | `budget_tokens` | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinking.budget_tokens`，enabled 类型) | ✅ → 推导 effort（`budget_to_effort`） | ✅ (Gemini 2.5 `thinkingConfig.thinkingBudget`；3+ → 推导 `thinkingLevel`) | N/A |
 | `display` (summarized/omitted) | ⚠️ → 丢弃 | ✅ (`thinking.display`) | ⚠️ → 丢弃 | ✅ → 推导 `includeThoughts` | N/A |
@@ -127,6 +133,7 @@ function、web search，以及名为 `apply_patch` 的 custom tool。
 **跨协议策略**：普通 thinking 配置跨协议时映射或丢弃，不拒绝（thinking 配置不影响语义正确性，只影响模型行为质量）。`mode` / `context` 是 Responses-only 的持久化推理控制；向其他协议转换会以 `LossyDimension::ExtendedReasoning` 明确拒绝，避免静默改变请求行为。
 
 **effort 级别映射**：IR 使用 7 级枚举（None/Minimal/Low/Medium/High/XHigh/Max）。各协议支持级别不同：
+
 - OpenAI Chat/Responses: none/minimal/low/medium/high/xhigh/**max**；server 按真实 upstream model 判定，仅 GPT-5.6 系列保留 max，旧模型降为 xhigh。
 - Anthropic: low/medium/high/xhigh/max；None 不下发 thinking，Minimal → low。
 - Gemini: 3+ 使用 minimal/low/medium/high（None → minimal 近似，XHigh/Max → high）；2.5 使用 `thinkingBudget`，None → 0。官方协议不允许同一请求同时包含 `thinkingLevel` 和 `thinkingBudget`。
@@ -138,7 +145,7 @@ function、web search，以及名为 `apply_patch` 的 custom tool。
 ## 6.1 Hosted Tools（Responses 托管工具）
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | function tools | ✅ | ✅ | ✅ | ✅ | N/A |
 | custom tools (`type: "custom"`) | ✅ | ❌ 跨协议拒绝 (`CustomTools`) | ✅ | ❌ 跨协议拒绝 (`CustomTools`) | N/A |
 | hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅（`Tool.tool_type` + `config` 往返） | ❌ 跨协议拒绝 | N/A |
@@ -149,7 +156,7 @@ function、web search，以及名为 `apply_patch` 的 custom tool。
 ## 6.2 Explicit Prompt Caching
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | `prompt_cache_key` | ✅（`openai_extra` 透传） | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
 | `prompt_cache_retention` | ✅（`openai_extra` 透传） | N/A | ✅（`responses_extra` 透传） | N/A | N/A |
 | `prompt_cache_options` | ✅（Chat ↔ Responses 重放） | N/A | ✅（Chat ↔ Responses 重放） | N/A | N/A |
@@ -161,7 +168,7 @@ function、web search，以及名为 `apply_patch` 的 custom tool。
 ## 6.3 GPT-5.6 Text Controls 与 Beta 边界
 
 | 维度 | chat_completions | messages | responses | gemini |
-|------|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: |
 | `verbosity` | ✅ 顶层 `verbosity` | ❌ 跨协议拒绝 | ✅ `text.verbosity` | ❌ 跨协议拒绝 |
 | `safety_identifier` | ✅ | N/A | ✅ | N/A |
 | image `detail: "original"` | ✅ | ⚠️ 无等价语义 | ✅ | ⚠️ 无等价语义 |
@@ -172,7 +179,7 @@ Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v
 ## 7. Metadata
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | `metadata` KV 对 | ✅ | ⚠️ → 仅保留 `user_id` | ✅ | ✅ (`labels`) | N/A |
 | `user_id` | ✅ | ✅ | ✅ | ✅ | N/A |
 
@@ -181,7 +188,7 @@ Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v
 ## 8. Annotations / Citations
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | URL citation | ✅ (`annotations[]`) | ⚠️ → 丢弃 | ✅ (`annotations[]`) | ✅ (`groundingMetadata`) | N/A |
 | File citation | ✅ | ⚠️ → 丢弃 | ✅ | ⚠️ → 丢弃 | N/A |
 
@@ -190,7 +197,7 @@ Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v
 ## 9. Refusal
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | refusal 文本 | ✅ (`message.refusal`) | ⚠️ → 作为 text 输出 | ✅ (`refusal` output item) | ⚠️ → 作为 text 输出 | N/A |
 | refusal stop_reason | ✅ → `content_filter` | ✅ (`stop_reason:"refusal"`) | ✅ → `incomplete` | ✅ → `SAFETY` | N/A |
 
@@ -219,7 +226,7 @@ Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字�
 ### Codex Input Item 类型
 
 | Item 类型 | 跨协议行为 |
-|-----------|-----------|
+| ----------- | ----------- |
 | `local_shell_call` | ✅ 映射为 IR `Content::ToolCall { name: "local_shell" }`，跨协议可转换 |
 | `local_shell_call_output` | ✅ 映射为 IR `Content::ToolResult`，跨协议可转换 |
 | `custom_tool_call` | ✅ 映射为 IR `Content::ToolCall`（`wire_type=custom_tool_call`，input 文本包装为 JSON arguments）；同协议 re-encode 恢复 `custom_tool_call` |
@@ -236,7 +243,7 @@ Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字�
 ### Codex Response Output Item 类型
 
 | Item 类型 | 跨协议行为 |
-|-----------|-----------|
+| ----------- | ----------- |
 | `local_shell_call` | ✅ 映射为 IR `Content::ToolCall`，计入 `FinishReason::ToolCalls` 判断 |
 | `custom_tool_call` | ✅ 映射为 IR `Content::ToolCall` |
 | `tool_search_call` / `agent_message` / `compaction` 等 | ⚠️ 静默丢弃（响应中的这些 item 对跨协议客户端无意义） |
@@ -244,7 +251,7 @@ Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字�
 ### Codex 扩展字段
 
 | 字段 | 跨协议行为 |
-|------|-----------|
+| ------ | ----------- |
 | `reasoning.summary` | ✅ 解析到 IR `ThinkingConfig.summary`，Responses egress 时回写；跨协议到 Anthropic/Gemini 时丢弃（不拒绝） |
 | `text.verbosity` | ✅ 解析到 IR `params.verbosity`；Responses 同协议还通过 `extensions["text"]` 保留完整 `text` 对象；跨协议到非 OpenAI egress 时由 `LossyDimension::Verbosity` **拒绝**（不是静默丢弃） |
 | `client_metadata` | ✅ 加入 `responses_extra` 透传列表，同协议 egress 自动回写；跨协议时丢弃 |
@@ -252,7 +259,7 @@ Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字�
 ### Codex 自定义请求头
 
 | 头 | 跨协议行为 |
-|----|-----------|
+| ---- | ----------- |
 | `x-codex-*` | ✅ 不在 `DEFAULT_REQUEST_DENY` / `DEFAULT_RESPONSE_DENY` 中，C→G→P 和 P→G→C 方向均自动转发 |
 | `x-openai-subagent` | ✅ 同上 |
 | `x-codex-turn-state` | ✅ 响应头，不在 `DEFAULT_RESPONSE_DENY` 中，自动转发回客户端 |
@@ -263,12 +270,13 @@ Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字�
 OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）仅在 **Responses 同协议**路径上支持透传；跨协议一律拒绝，不做 IR 类型化或转换。
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
-|------|:---:|:---:|:---:|:---:|:---:|
+| ------ | :---: | :---: | :---: | :---: | :---: |
 | 顶层 `multi_agent` | ❌ 拒绝 | ❌ 拒绝 | ✅ 同协议透传 / re-encode 保活 | ❌ 拒绝 | N/A |
 | `multi_agent_call` / `multi_agent_call_output` input items | ❌ 拒绝 | ❌ 拒绝 | ✅ 存入有序 `responses_opaque_input_items` + 内容袋 `multi_agent_items`，同协议按原顺序回放 | ❌ 拒绝 | N/A |
 | 跨协议 Convert | ❌ | ❌ | N/A（同协议） | ❌ | N/A |
 
 **运行时行为**：
+
 - 同协议（Responses→Responses）：raw passthrough 与 IR re-encode 均保留 `multi_agent` 与 multi-agent input items；re-encode 通过 `responses_opaque_input_items` 的原始 index 保持与 user/assistant 消息的交错顺序；`OpenAI-Beta` 头按现有 denylist 策略转发。
 - 跨协议：`check_lossy_conversion` 检测到 `responses_extra.multi_agent` 或非空 `multi_agent_items` 时，以 `LossyDimension::MultiAgent` **拒绝**（HTTP 400），不静默丢弃。
 - 不支持 WebSocket multi-agent 长连接；本网关 Responses 面仅为 HTTP + SSE。
