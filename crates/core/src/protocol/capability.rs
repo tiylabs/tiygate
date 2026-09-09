@@ -285,13 +285,16 @@ pub fn sanitize_with_profile(
                 });
             }
             FieldAction::Convert => {
-                let converted = match rule.convert.unwrap_or(ConvertKind::SummariesToReasoningText)
+                let converted = match rule
+                    .convert
+                    .unwrap_or(ConvertKind::SummariesToReasoningText)
                 {
-                    ConvertKind::SummariesToReasoningText => match resolve_path_mut(body, &rule.path)
-                    {
-                        Some(node) => convert_reasoning_to_text(node),
-                        None => false,
-                    },
+                    ConvertKind::SummariesToReasoningText => {
+                        match resolve_path_mut(body, &rule.path) {
+                            Some(node) => convert_reasoning_to_text(node),
+                            None => false,
+                        }
+                    }
                     ConvertKind::DropItem => remove_path(body, &rule.path, false),
                 };
                 if converted {
@@ -360,7 +363,10 @@ fn resolve_path_mut<'a>(
 /// Remove the value at a dotted path. When `drop_empty_container` is set and the
 /// immediate parent object becomes empty after removal, the parent is removed too.
 fn remove_path(root: &mut serde_json::Value, path: &str, drop_empty_container: bool) -> bool {
-    let segments: Vec<&str> = path.split('.').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     remove_path_inner(root, &segments, drop_empty_container)
 }
 
@@ -474,9 +480,7 @@ mod tests {
             drop_container_when_empty: false,
         };
         let mut body = serde_json::json!({ "store": true });
-        assert!(
-            sanitize_with_profile(&mut body, &profile(vec![store_false.clone()])).is_err()
-        );
+        assert!(sanitize_with_profile(&mut body, &profile(vec![store_false.clone()])).is_err());
 
         // store:false must NOT fire the rule.
         let mut body = serde_json::json!({ "store": false });
@@ -539,7 +543,10 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.mutated);
-        assert!(body.get("text").is_none(), "empty container should be dropped");
+        assert!(
+            body.get("text").is_none(),
+            "empty container should be dropped"
+        );
     }
 
     #[test]
@@ -595,7 +602,8 @@ mod tests {
 
     #[test]
     fn is_encrypted_only_reasoning_detects_shell() {
-        let shell = serde_json::json!({ "type": "reasoning", "encrypted_content": "blob", "summary": [] });
+        let shell =
+            serde_json::json!({ "type": "reasoning", "encrypted_content": "blob", "summary": [] });
         assert!(is_encrypted_only_reasoning(&shell));
         let with_text = serde_json::json!({
             "type": "reasoning",

@@ -157,7 +157,10 @@ fn validate_tools(body: &Value) -> Result<(), CapabilityReject> {
                 ));
             }
             Some(other) => {
-                return Err(reject("tool", format!("tool type {other} is not supported")));
+                return Err(reject(
+                    "tool",
+                    format!("tool type {other} is not supported"),
+                ));
             }
             None => return Err(reject("tool", "tool type is required")),
         }
@@ -228,8 +231,7 @@ enum ReasoningOutcome {
 fn prepare_reasoning(item: &mut Value) -> Result<ReasoningOutcome, CapabilityReject> {
     // DeepSeek cannot decrypt OpenAI-style encrypted reasoning. Strip the blob
     // and keep any plaintext; drop encrypted-only shells entirely.
-    if item.get("encrypted_content").is_some_and(is_meaningful)
-        && is_encrypted_only_reasoning(item)
+    if item.get("encrypted_content").is_some_and(is_meaningful) && is_encrypted_only_reasoning(item)
     {
         return Ok(ReasoningOutcome::Drop);
     }

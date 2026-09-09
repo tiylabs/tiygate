@@ -38,9 +38,9 @@ pub use pipeline::{
 };
 pub use protocol::{
     capability::{
-        CapabilityDecision, CapabilityProfile, CapabilityReject, ConvertKind, FieldAction,
-        FieldRule, MatchCond, SanitizeOutcome, StructureValidator, convert_reasoning_to_text,
-        is_encrypted_only_reasoning, is_meaningful, sanitize_with_profile,
+        convert_reasoning_to_text, is_encrypted_only_reasoning, is_meaningful,
+        sanitize_with_profile, CapabilityDecision, CapabilityProfile, CapabilityReject,
+        ConvertKind, FieldAction, FieldRule, MatchCond, SanitizeOutcome, StructureValidator,
     },
     CodecRegistration, EndpointCapabilities, EndpointCodec, Error, PassThroughPolicy,
     ProtocolEndpoint, ProtocolSuite, StreamCaps, StreamDecoder, StreamEncoder, StreamPartStream,
