@@ -37,6 +37,11 @@ pub use pipeline::{
     RouteHook, SettlementRecorder, StreamAction, StreamHook, StreamInterest,
 };
 pub use protocol::{
+    capability::{
+        CapabilityDecision, CapabilityProfile, CapabilityReject, ConvertKind, FieldAction,
+        FieldRule, MatchCond, SanitizeOutcome, StructureValidator, convert_reasoning_to_text,
+        is_encrypted_only_reasoning, is_meaningful, sanitize_with_profile,
+    },
     CodecRegistration, EndpointCapabilities, EndpointCodec, Error, PassThroughPolicy,
     ProtocolEndpoint, ProtocolSuite, StreamCaps, StreamDecoder, StreamEncoder, StreamPartStream,
 };

@@ -370,5 +370,6 @@ pub struct CodecRegistration {
 
 inventory::collect!(CodecRegistration);
 
+pub mod capability;
 pub mod lossy;
 pub mod structured_output;
