@@ -32,10 +32,10 @@ pub(crate) fn is_enabled(target: &RoutingTarget, egress_suite: ProtocolSuite) ->
 
 /// Whether this profile should attempt the Codex Responses WebSocket transport.
 pub(crate) fn uses_websocket(target: &RoutingTarget) -> bool {
-    matches!(
-        target.oauth.as_ref().map(|oauth| oauth.upstream_transport),
-        Some(UpstreamTransport::CodexResponsesWebSocket)
-    )
+    target
+        .oauth
+        .as_ref()
+        .is_some_and(|oauth| oauth.upstream_transport == UpstreamTransport::CodexResponsesWebSocket)
 }
 
 /// Normalize an OpenAI Responses body for the Codex OAuth contract.
@@ -756,6 +756,7 @@ mod tests {
                 extra_headers: vec![],
                 account_id: None,
             }),
+            capability_override: None,
         }
     }
 
