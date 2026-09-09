@@ -76,8 +76,10 @@ DeepSeek Provider 仅将 `deepseek-chat` 与 `deepseek-reasoner` 发送到
 `POST /v1/chat/completions`；其余模型统一使用原生 `POST /responses` 出站。DeepSeek
 Responses 的 reasoning item 使用
 `content: [{"type":"reasoning_text","text":"..."}]`，TiyGate 在该 provider profile 下会把
-OpenAI 风格的 `summary` 回放转换为 `reasoning_text`，但拒绝不可转换的
-`encrypted_content`。
+OpenAI 风格的 `summary` 回放转换为 `reasoning_text`。DeepSeek 无法解密 OpenAI 风格加密推理，
+因此当客户端回传带 `encrypted_content` 的 reasoning 项时，TiyGate 会**剥离该加密字段并保留明文
+`summary`/`reasoning_text`**；若该项仅有密文、无任何明文可回放（加密-only shell），则**丢弃整个
+reasoning 项**，而不是拒绝整单请求——与 DeepSeek 对其它“接受但忽略”非语义控制项的处理方式一致。
 
 DeepSeek 会静默忽略部分 OpenAI Responses 能力。为维持 `lossy_default_reject` 契约，
 TiyGate 对有语义影响的不支持项返回 `400 LossyOrCapability`，包括
@@ -93,7 +95,8 @@ function、web search，以及名为 `apply_patch` 的 custom tool。
 TiyGate 在 DeepSeek Responses 出站前显式移除这些字段，不将其视为影响生成语义的有损
 转换，也不会因此拒绝 Codex 客户端请求。DeepSeek 不支持加密 reasoning content，
 客户端请求 `include: ["reasoning.encrypted_content"]` 时收到的仍是明文 `reasoning_text`
-——这是 DeepSeek 固有限制，而非剥离所致。
+——这是 DeepSeek 固有限制，而非剥离所致；同理，回传的加密 blob 在出站前被剥离，
+不构成有语义影响的有损转换。
 
 来源：[DeepSeek Responses API 指南](https://api-docs.deepseek.com/guides/responses_api/)、
 [DeepSeek Responses API Reference](https://api-docs.deepseek.com/api/create-response/)。

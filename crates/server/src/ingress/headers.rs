@@ -302,11 +302,39 @@ fn validate_deepseek_tool_output(item: &serde_json::Value) -> Result<(), String>
     Ok(())
 }
 
-fn prepare_deepseek_reasoning_item(item: &mut serde_json::Value) -> Result<bool, String> {
+/// How a DeepSeek reasoning input item should be handled after preparation.
+enum PreparedReasoningItem {
+    /// Keep the item; the bool reports whether its body was mutated.
+    Keep { changed: bool },
+    /// Drop the whole item — nothing DeepSeek can consume remains.
+    Drop,
+}
+
+fn prepare_deepseek_reasoning_item(
+    item: &mut serde_json::Value,
+) -> Result<PreparedReasoningItem, String> {
+    // DeepSeek cannot decrypt OpenAI-style encrypted reasoning. When a client
+    // echoes a reasoning item back that carries an encrypted blob, DeepSeek can
+    // never consume it. Treat it like the other "accepted-but-ignored" controls:
+    // strip the blob and keep any plaintext instead of rejecting the whole
+    // request. When the item is encrypted-only (no plaintext summary or
+    // reasoning_text), there is nothing DeepSeek can use, so drop the item.
     if item.get("encrypted_content").is_some_and(is_meaningful) {
-        return Err(deepseek_capability_error(
-            "reasoning.encrypted_content is not supported",
-        ));
+        let has_plaintext = item
+            .get("content")
+            .and_then(|value| value.as_array())
+            .is_some_and(|parts| !parts.is_empty())
+            || item
+                .get("summary")
+                .and_then(|value| value.as_array())
+                .is_some_and(|parts| !parts.is_empty())
+            || item
+                .get("text")
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| !text.is_empty());
+        if !has_plaintext {
+            return Ok(PreparedReasoningItem::Drop);
+        }
     }
 
     if let Some(parts) = item.get("content").and_then(|value| value.as_array()) {
@@ -352,7 +380,9 @@ fn prepare_deepseek_reasoning_item(item: &mut serde_json::Value) -> Result<bool,
     let removed_summary = object.remove("summary").is_some();
     let removed_text = object.remove("text").is_some();
     let removed_encrypted = object.remove("encrypted_content").is_some();
-    Ok(!has_content || removed_summary || removed_text || removed_encrypted)
+    Ok(PreparedReasoningItem::Keep {
+        changed: !has_content || removed_summary || removed_text || removed_encrypted,
+    })
 }
 
 /// Remove a DeepSeek-accepted-but-ignored control field from a nested object.
@@ -495,10 +525,14 @@ fn prepare_deepseek_responses_request(body: &mut serde_json::Value) -> Result<bo
     }
 
     if let Some(items) = body.get_mut("input").and_then(|value| value.as_array_mut()) {
-        for item in items {
+        let mut drop_indices: Vec<usize> = Vec::new();
+        for (idx, item) in items.iter_mut().enumerate() {
             let item_type = item.get("type").and_then(|value| value.as_str());
             match item_type {
-                Some("reasoning") => mutated |= prepare_deepseek_reasoning_item(item)?,
+                Some("reasoning") => match prepare_deepseek_reasoning_item(item)? {
+                    PreparedReasoningItem::Keep { changed } => mutated |= changed,
+                    PreparedReasoningItem::Drop => drop_indices.push(idx),
+                },
                 Some("message") | None if item.get("role").is_some() => {
                     validate_deepseek_message_content(item)?;
                 }
@@ -524,6 +558,14 @@ fn prepare_deepseek_responses_request(body: &mut serde_json::Value) -> Result<bo
                     ));
                 }
             }
+        }
+        // Remove reasoning items DeepSeek can no longer consume (encrypted-only
+        // shells with no plaintext). Reverse order keeps indices valid.
+        if !drop_indices.is_empty() {
+            for idx in drop_indices.into_iter().rev() {
+                items.remove(idx);
+            }
+            mutated = true;
         }
     }
     Ok(mutated)
@@ -728,16 +770,6 @@ mod tests {
                 "file_search",
                 serde_json::json!({"input": "hi", "tools": [{"type": "file_search"}]}),
             ),
-            (
-                "encrypted_content",
-                serde_json::json!({
-                    "input": [{
-                        "type": "reasoning",
-                        "encrypted_content": "opaque",
-                        "summary": []
-                    }]
-                }),
-            ),
         ] {
             let result = prepare_provider_request_body(
                 &mut body,
@@ -750,6 +782,60 @@ mod tests {
                 "unexpected result: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn deepseek_responses_strips_or_drops_encrypted_reasoning() {
+        let target = deepseek_target();
+
+        // 1. Encrypted-only shell (no plaintext summary / content / text):
+        //    DeepSeek can consume nothing, so the whole reasoning item is
+        //    dropped rather than rejecting the entire request.
+        let mut body = serde_json::json!({
+            "input": [{
+                "type": "reasoning",
+                "encrypted_content": "opaque",
+                "summary": []
+            }]
+        });
+        let prepared = prepare_provider_request_body(
+            &mut body,
+            &target,
+            &tiygate_core::ProtocolSuite::OpenAiResponses,
+            "anonymous",
+        );
+        assert!(
+            matches!(prepared, Ok(true)),
+            "encrypted-only reasoning should be stripped, not rejected: {prepared:?}"
+        );
+        assert_eq!(body["input"].as_array().map(|arr| arr.len()), Some(0));
+
+        // 2. Encrypted blob alongside a plaintext summary: strip the blob and
+        //    keep the plaintext as DeepSeek `reasoning_text`.
+        let mut body = serde_json::json!({
+            "input": [
+                {"role": "user", "content": "weather?"},
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "opaque",
+                    "summary": [{"type": "summary_text", "text": "call weather"}]
+                }
+            ]
+        });
+        let prepared = prepare_provider_request_body(
+            &mut body,
+            &target,
+            &tiygate_core::ProtocolSuite::OpenAiResponses,
+            "anonymous",
+        );
+        assert!(
+            matches!(prepared, Ok(true)),
+            "encrypted reasoning with plaintext should be converted: {prepared:?}"
+        );
+        assert_eq!(body["input"][1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(body["input"][1]["content"][0]["text"], "call weather");
+        assert!(body["input"][1].get("encrypted_content").is_none());
+        assert!(body["input"][1].get("summary").is_none());
     }
 
     #[test]
