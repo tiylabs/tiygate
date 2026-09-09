@@ -8,6 +8,7 @@
 //! - Error source distinction (gateway vs upstream)
 //! - UsageAccumulator for disconnected streaming billing
 
+mod capability;
 mod executors;
 mod fallback;
 mod handlers;

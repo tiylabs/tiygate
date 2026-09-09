@@ -89,7 +89,7 @@ pub struct CapabilityProfile {
 | 层 | 职责 |
 | --- | --- |
 | `crates/core` | 类型 + 通用 sanitizer 骨架（纯函数：`sanitize_with_profile(body, profile) -> SanitizeOutcome`） |
-| `crates/providers` | 内建 provider 注册 profile（并入 `ProviderMetadata.defaults` 或平行 registry） |
+| `crates/server` (ingress) | 内建 provider profile（如 DeepSeek Responses）——放在 ingress 层而非 `crates/providers`，因为 `tiygate-providers` 是可选的 `providers` feature，而 egress sanitizer 运行在常开的数据通路上 |
 | `crates/store` | 用户自定义/覆盖层的 profile 存储（`Provider.capabilities_json`），`snapshot_to_routing_table` 时注入解析后的 target |
 | `crates/server`(executors) | 4 个调用点改走通用 sanitizer；`decisions` 挂进 `ExchangeCapture`；reject 映射为 `LossyOrCapability` 400 |
 
