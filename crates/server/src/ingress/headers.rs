@@ -365,7 +365,10 @@ fn strip_ignored_deepseek_control(
     field: &str,
 ) -> bool {
     let mut mutated = false;
-    if let Some(object) = body.pointer_mut(container).and_then(|value| value.as_object_mut()) {
+    if let Some(object) = body
+        .pointer_mut(container)
+        .and_then(|value| value.as_object_mut())
+    {
         mutated |= object.remove(field).is_some();
     }
     let emptied = body
