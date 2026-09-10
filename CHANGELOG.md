@@ -1,11 +1,14 @@
 # Changelog
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.2.4] - 2026-09-09
+
 ### :bug: Bug Fixes
+
 - [`6e09907`](https://github.com/tiylabs/tiygate/commit/6e099077fcb59a487a3e843a517af409a16917ac) - **admin**: 🐛 parse nested reset credits accurately *(PR [#64](https://github.com/tiylabs/tiygate/pull/64) by [@jorben](https://github.com/jorben))*
 - [`75027f6`](https://github.com/tiylabs/tiygate/commit/75027f6221d083c761dd710c046d90913508df54) - **stats**: 🐛 Make token dashboard stats atomic *(PR [#66](https://github.com/tiylabs/tiygate/pull/66) by [@jorben](https://github.com/jorben))*
 - [`2b92928`](https://github.com/tiylabs/tiygate/commit/2b92928dec17e1b609ca5166010b04759a85f79f) - **desktop**: 🐛 enforce single instance and unify SQLite URLs *(PR [#68](https://github.com/tiylabs/tiygate/pull/68) by [@jorben](https://github.com/jorben))*
@@ -14,61 +17,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - :arrow_lower_right: *fixes issue [#69](https://github.com/tiylabs/tiygate/issues/69) opened by [@Sereinfy](https://github.com/Sereinfy)*
 - [`61a79a6`](https://github.com/tiylabs/tiygate/commit/61a79a6348fb881fc51e90de2fc7fe126443919e) - **deepseek**: 🐛 Default non-legacy models to Responses *(PR [#71](https://github.com/tiylabs/tiygate/pull/71) by [@jorben](https://github.com/jorben))*
 
-
 ## [0.2.3] - 2026-08-29
+
 ### :sparkles: New Features
+
 - [`d4daad0`](https://github.com/tiylabs/tiygate/commit/d4daad0a47359aee61becfdd5eba6ca1d6e9fe61) - **webui**: ✨ Add page refresh controls *(PR [#62](https://github.com/tiylabs/tiygate/pull/62) by [@jorben](https://github.com/jorben))*
 
-
 ## [0.2.2] - 2026-08-25
+
 ### :sparkles: New Features
+
 - [`1831a1b`](https://github.com/tiylabs/tiygate/commit/1831a1b2345abfe18e02cdc1318e6d50d8625225) - ✨ Add API key virtual model access controls *(PR [#51](https://github.com/tiylabs/tiygate/pull/51) by [@jorben](https://github.com/jorben))*
   - :arrow_lower_right: *addresses issue [#49](https://github.com/tiylabs/tiygate/issues/49) opened by [@2niuhe](https://github.com/2niuhe)*
 
 ### :bug: Bug Fixes
+
 - [`04d019c`](https://github.com/tiylabs/tiygate/commit/04d019c0544fb264667245a6a49eab680fdd1316) - 🐛 strip unsupported Codex output token parameter *(PR [#47](https://github.com/tiylabs/tiygate/pull/47) by [@jorben](https://github.com/jorben))*
 - [`7752c69`](https://github.com/tiylabs/tiygate/commit/7752c695e4991624ea6fd57d80896f0c68685d6f) - **oauth**: 🐛 force store false for Codex requests *(PR [#50](https://github.com/tiylabs/tiygate/pull/50) by [@jorben](https://github.com/jorben))*
 - [`f4f9c7e`](https://github.com/tiylabs/tiygate/commit/f4f9c7e07b1c2c3925bf9da6b19b17e58f60ffb0) - 🐛 preserve Codex OAuth metadata across provider requests *(PR [#53](https://github.com/tiylabs/tiygate/pull/53) by [@jorben](https://github.com/jorben))*
   - :arrow_lower_right: *fixes issue [#52](https://github.com/tiylabs/tiygate/issues/52) opened by [@2niuhe](https://github.com/2niuhe)*
 
-
 ## [0.2.1] - 2026-08-13
+
 ### :sparkles: New Features
+
 - [`30914b4`](https://github.com/tiylabs/tiygate/commit/30914b42176a1ec01bc737be3374b1deb9921968) - **protocols**: ✨ add comprehensive GPT-5.6 protocol support *(PR [#38](https://github.com/tiylabs/tiygate/pull/38) by [@jorben](https://github.com/jorben))*
 - [`bd12eb9`](https://github.com/tiylabs/tiygate/commit/bd12eb909e6964865ee7014b28c11e800f5525a4) - **auth**: ✨ Add coordinated OAuth token keepalive *(PR [#39](https://github.com/tiylabs/tiygate/pull/39) by [@jorben](https://github.com/jorben))*
 - [`2674082`](https://github.com/tiylabs/tiygate/commit/267408245bafb11b20f2bc1060ecb62eb18ec43f) - **oauth**: ✨ Add provider egress profiles and usage windows *(PR [#40](https://github.com/tiylabs/tiygate/pull/40) by [@jorben](https://github.com/jorben))*
 
 ### :bug: Bug Fixes
+
 - [`18a6426`](https://github.com/tiylabs/tiygate/commit/18a64267b384a416ef2f927d9127994cb58a3a0c) - 🐛 Make non-stream upstream timeout configurable *(PR [#44](https://github.com/tiylabs/tiygate/pull/44) by [@jorben](https://github.com/jorben))*
   - :arrow_lower_right: *fixes issue [#43](https://github.com/tiylabs/tiygate/issues/43) opened by [@ddmonster](https://github.com/ddmonster)*
 
-
 ## [0.2.0] - 2026-07-08
+
 ### :sparkles: New Features
+
 - [`ff89669`](https://github.com/tiylabs/tiygate/commit/ff89669d544eab545a019901d85d196f8268f15a) - **store**: ✨ Add per-request cost breakdown and route model-metadata auto-resolution *(PR [#32](https://github.com/tiylabs/tiygate/pull/32) by [@jorben](https://github.com/jorben))*
 - [`29fd594`](https://github.com/tiylabs/tiygate/commit/29fd594a18377fbc374c92dbe62939b3d57a582d) - **ui**: ✨ remove OAuth navigation item from sidebar *(PR [#33](https://github.com/tiylabs/tiygate/pull/33) by [@HayWolf](https://github.com/HayWolf))*
 
 ### :bug: Bug Fixes
+
 - [`b394942`](https://github.com/tiylabs/tiygate/commit/b3949421b6dd30cd3407315d0ab8aa3964a8b2c9) - **webui**: 🐛 keep JSON editor mounted and mark disabled routes *(PR [#36](https://github.com/tiylabs/tiygate/pull/36) by [@jorben](https://github.com/jorben))*
 
 ### :recycle: Refactors
+
 - [`c2c0c96`](https://github.com/tiylabs/tiygate/commit/c2c0c96ad9c22927ad78909c50633b47b612ffb1) - **ui**: ♻️ reorganize request log detail view into tabbed interface *(PR [#34](https://github.com/tiylabs/tiygate/pull/34) by [@HayWolf](https://github.com/HayWolf))*
 
-
 ## [0.1.9] - 2026-07-03
+
 ### :sparkles: New Features
+
 - [`454ac5f`](https://github.com/tiylabs/tiygate/commit/454ac5fdbae900a3891c7faeeac504d4d26719e8) - **admin,webui**: ✨ add route target model auto-discovery with searchable dropdown *(PR [#28](https://github.com/tiylabs/tiygate/pull/28) by [@jorben](https://github.com/jorben))*
 - [`a60cc7e`](https://github.com/tiylabs/tiygate/commit/a60cc7e7d5dc66ccc39a147a43813b5177ab0f56) - **routes**: ✨ add virtual model metadata *(PR [#30](https://github.com/tiylabs/tiygate/pull/30) by [@HayWolf](https://github.com/HayWolf))*
 
 ### :bug: Bug Fixes
+
 - [`ac44de1`](https://github.com/tiylabs/tiygate/commit/ac44de15615381e46b86e8d836e87c1d480a1426) - **store**: 🐛 cast AVG and throughput queries to DOUBLE PRECISION for PostgreSQL *(PR [#24](https://github.com/tiylabs/tiygate/pull/24) by [@HayWolf](https://github.com/HayWolf))*
 - [`1bd9ccd`](https://github.com/tiylabs/tiygate/commit/1bd9ccd737f0135b2cc6020b69166ed4f57fe7fc) - **ingress**: 🐛 disable upstream redirect following to prevent Authorization header stripping *(PR [#27](https://github.com/tiylabs/tiygate/pull/27) by [@jorben](https://github.com/jorben))*
   - :arrow_lower_right: *fixes issue [#26](https://github.com/tiylabs/tiygate/issues/26) opened by [@2niuhe](https://github.com/2niuhe)*
 - [`2981fd7`](https://github.com/tiylabs/tiygate/commit/2981fd735ed49c9dcde165f53e235d3d3dcd455c) - **ui**: 🐛 make Combobox dropdown scrollable inside Radix Dialog *(PR [#29](https://github.com/tiylabs/tiygate/pull/29) by [@jorben](https://github.com/jorben))*
 
-
 ## [0.1.8] - 2026-06-30
+
 ### :boom: BREAKING CHANGES
+
 - due to [`d202df8`](https://github.com/tiylabs/tiygate/commit/d202df88fea7adb51a3c6619b4a7fa4d8fc300e6) - ✨ pass structured error code through to client responses *(PR [#18](https://github.com/tiylabs/tiygate/pull/18) by [@HayWolf](https://github.com/HayWolf))*:
 
   error.type field no longer returns "gateway_error";  
@@ -78,70 +92,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   
   ---------
 
-
 ### :sparkles: New Features
+
 - [`eed5228`](https://github.com/tiylabs/tiygate/commit/eed5228d4d8846469a21a0d1e53d40f6339d71b2) - **protocols**: ✨ Preserve encrypted reasoning content across multi-turn replay *(PR [#14](https://github.com/tiylabs/tiygate/pull/14) by [@jorben](https://github.com/jorben))*
 - [`e973d71`](https://github.com/tiylabs/tiygate/commit/e973d71cf939f0340e7b72c7440b3c2209399681) - **server**: ✨ add per-hop request attempt logging and fix Anthropic output_config field placement *(PR [#17](https://github.com/tiylabs/tiygate/pull/17) by [@jorben](https://github.com/jorben))*
 - [`d202df8`](https://github.com/tiylabs/tiygate/commit/d202df88fea7adb51a3c6619b4a7fa4d8fc300e6) - **core**: ✨ pass structured error code through to client responses *(PR [#18](https://github.com/tiylabs/tiygate/pull/18) by [@HayWolf](https://github.com/HayWolf))*
 - [`cfc089d`](https://github.com/tiylabs/tiygate/commit/cfc089d95cee6e8be10c7121247107cd0f7396c7) - **models**: ✨ Add models.dev catalog with embedded baseline and runtime refresh *(PR [#20](https://github.com/tiylabs/tiygate/pull/20) by [@jorben](https://github.com/jorben))*
 
 ### :bug: Bug Fixes
+
 - [`f9337e5`](https://github.com/tiylabs/tiygate/commit/f9337e502e22f70aafa674651cb1bc9269be4ef6) - **desktop**: 🐛 Restore missing tray icon *(PR [#16](https://github.com/tiylabs/tiygate/pull/16) by [@jorben](https://github.com/jorben))*
 - [`1286a84`](https://github.com/tiylabs/tiygate/commit/1286a84fc81ebf4f3458e3b5daa591dbeb0f1857) - **streaming**: 🐛 skip end frame when upstream already sent terminal signal *(PR [#19](https://github.com/tiylabs/tiygate/pull/19) by [@jorben](https://github.com/jorben))*
 - [`a3a3e9a`](https://github.com/tiylabs/tiygate/commit/a3a3e9a80afba806e1ef662b1d6c9936078f72bf) - **ingress**: 🐛 add upstream_ttfb_timeout to bound streaming TTFB phase *(PR [#22](https://github.com/tiylabs/tiygate/pull/22) by [@jorben](https://github.com/jorben))*
 
-
 ## [0.1.7] - 2026-06-26
+
 ### :sparkles: New Features
+
 - [`db90c48`](https://github.com/tiylabs/tiygate/commit/db90c48fef0e15a8be809165eed8eaffbe169570) - **auth**: ✨ Implement OAuth 2.0 support for Codex/Claude/xAI providers *(PR [#11](https://github.com/tiylabs/tiygate/pull/11) by [@HayWolf](https://github.com/HayWolf))*
 
-
 ## [0.1.6] - 2026-06-24
+
 ### :sparkles: New Features
+
 - [`9704b38`](https://github.com/tiylabs/tiygate/commit/9704b3843d82280f4106b3f16feb52d3c42e03e7) - **store**: ✨ add token stats export/import and fix Tauri desktop download *(PR [#6](https://github.com/tiylabs/tiygate/pull/6) by [@jorben](https://github.com/jorben))*
 
 ### :bug: Bug Fixes
+
 - [`8e56a1c`](https://github.com/tiylabs/tiygate/commit/8e56a1cb00f56ef75a658d8c28179a6bc29cd7ed) - **ingress**: 🐛 inject end frame after stream error and improve admin console UX *(PR [#9](https://github.com/tiylabs/tiygate/pull/9) by [@jorben](https://github.com/jorben))*
 
-
 ## [0.1.5] - 2026-06-23
+
 ### :sparkles: New Features
+
 - [`d2accf6`](https://github.com/tiylabs/tiygate/commit/d2accf63c2d1097afe23fd815eb423e5e5ef2ece) - **ui**: ✨ show enabled state in target badges *(commit by [@jorben](https://github.com/jorben))*
 - [`982b5c0`](https://github.com/tiylabs/tiygate/commit/982b5c0eb14aad65d3b00d1d57b9d43266a63a91) - **protocol**: ✨ preserve image_url.detail across protocol translation *(commit by [@jorben](https://github.com/jorben))*
 
 ### :bug: Bug Fixes
+
 - [`0bb6b29`](https://github.com/tiylabs/tiygate/commit/0bb6b29bda1aebce4301b247e7755e3d1c4bbb48) - **ingress**: 🐛 fix passthrough forwarding media-stripped body upstream *(commit by [@jorben](https://github.com/jorben))*
 
-
 ## [0.1.4] - 2026-06-22
+
 ### :sparkles: New Features
+
 - [`b4d06e4`](https://github.com/tiylabs/tiygate/commit/b4d06e4b265f0286c92190bcecdd8ddd51739c02) - **ingress**: ✨ detect and log downstream client disconnects during SSE streaming *(commit by [@jorben](https://github.com/jorben))*
 - [`84c3874`](https://github.com/tiylabs/tiygate/commit/84c387418f04721fc597a5d89d6f49839014f375) - **webui**: ✨ add cache hit ratio display and conditionally hide fields in request logs *(commit by [@jorben](https://github.com/jorben))*
 
 ### :recycle: Refactors
+
 - [`58a2912`](https://github.com/tiylabs/tiygate/commit/58a29123143b1e7f5ff9a417705e27d7c64f6164) - **telemetry**: ♻️ normalise request log status and error_class into typed enums *(commit by [@jorben](https://github.com/jorben))*
 
-
 ## [0.1.3] - 2026-06-22
+
 ### :sparkles: New Features
+
 - [`aaeb050`](https://github.com/tiylabs/tiygate/commit/aaeb050d1ccfe4f5e2619a7fcbb731fb4c0a6f7e) - **routes**: ✨ enhance target reorder with pointer and keyboard support *(commit by [@jorben](https://github.com/jorben))*
 
 ### :bug: Bug Fixes
+
 - [`212d6f4`](https://github.com/tiylabs/tiygate/commit/212d6f459cdaaf0d7e37b14e5d8c0218bdf5bb8f) - **routes**: ✅ improve target drag-and-drop cancellation and state reset *(commit by [@jorben](https://github.com/jorben))*
 
-
 ## [0.1.2] - 2026-06-22
+
 ### :bug: Bug Fixes
+
 - [`8979b0b`](https://github.com/tiylabs/tiygate/commit/8979b0b3a3eec1bb673eacd0e39c4195cbc25442) - **auth**: 🐛 allow remote instances to bypass local first-run setup *(commit by [@jorben](https://github.com/jorben))*
 
-
 ## [0.1.1] - 2026-06-21
+
 ### :sparkles: New Features
+
 - [`db91200`](https://github.com/tiylabs/tiygate/commit/db9120082502897fb79e24dc5c0b56530a1aabdd) - **store**: ✨ add SQLite local database maintenance *(commit by [@jorben](https://github.com/jorben))*
 
-
 ## [0.1.0] - 2026-06-20
+
 ### :boom: BREAKING CHANGES
+
 - due to [`9ffb875`](https://github.com/tiylabs/tiygate/commit/9ffb875a921c64485af0b4d45fac4dc0a1361758) - 🐛 correct admin UI routing basename and login redirect *(commit by [@jorben](https://github.com/jorben))*:
 
   Admin console deep links now resolve under `/admin/ui/` with a trailing slash
@@ -167,6 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ---------
 
 ### :sparkles: New Features
+
 - [`0ac7de0`](https://github.com/tiylabs/tiygate/commit/0ac7de0c67686031df9fa1607059919f797839ae) - ✨ Ship complete TiyGate AI gateway — multi-protocol transcoding, admin console, and CI/CD *(commit by [@jorben](https://github.com/jorben))*
 - [`accbd30`](https://github.com/tiylabs/tiygate/commit/accbd30a3bf4722a81f59c1b176d9647a29c4063) - **protocols**: ✨ extend IR with thinking, refusal, metadata, and annotations *(commit by [@jorben](https://github.com/jorben))*
 - [`3c976e1`](https://github.com/tiylabs/tiygate/commit/3c976e14bfdd3eb839a3f2a33239c4415a390da6) - **thinking**: ✨ unify cross-protocol thinking config with 6-level effort enum and bidirectional budget mapping *(commit by [@jorben](https://github.com/jorben))*
@@ -192,6 +220,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [`7bb8062`](https://github.com/tiylabs/tiygate/commit/7bb8062d317c2764a826743a41bc1b86fe797d8f) - **ui**: ✨ show instance indicator on login page and enable logout in Tauri *(commit by [@jorben](https://github.com/jorben))*
 
 ### :bug: Bug Fixes
+
 - [`9ffb875`](https://github.com/tiylabs/tiygate/commit/9ffb875a921c64485af0b4d45fac4dc0a1361758) - **webui**: 🐛 correct admin UI routing basename and login redirect *(commit by [@jorben](https://github.com/jorben))*
 - [`8610ef6`](https://github.com/tiylabs/tiygate/commit/8610ef6ba64b30785099cda74f68af2a093993f6) - **protocols**: 🐛 preserve tool call args and usage in OpenAI→Messages streaming *(commit by [@jorben](https://github.com/jorben))*
 - [`9508d6a`](https://github.com/tiylabs/tiygate/commit/9508d6a044de9b2fadba14a0ff72bca678dc14c5) - **oltp**: 🐛 let Anthropic message_delta usage override message_start *(commit by [@jorben](https://github.com/jorben))*
@@ -212,13 +241,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [`c196fa2`](https://github.com/tiylabs/tiygate/commit/c196fa228c1f592010643dbc346b5ed018f89011) - **desktop**: 🐛 resolve Windows build and runtime issues *(commit by [@jorben](https://github.com/jorben))*
 
 ### :recycle: Refactors
+
 - [`26d30df`](https://github.com/tiylabs/tiygate/commit/26d30dff8a4b7712577361700cb52e7142d5629b) - **auth**: ♻️ consolidate AuthApplier implementations into crates/auth *(commit by [@jorben](https://github.com/jorben))*
 - [`6a77a51`](https://github.com/tiylabs/tiygate/commit/6a77a5103844b07bfe245d8f6dd9a1a112e73ca8) - **ui**: ♻️ extract useStickyTableScroll hook for sticky table columns *(commit by [@jorben](https://github.com/jorben))*
 
 ### :white_check_mark: Tests
+
 - [`56a891b`](https://github.com/tiylabs/tiygate/commit/56a891bcf6089b59bc7a34c5e72b6881531aa4a8) - **images**: ✅ add snapshot for image generations decode request *(commit by [@jorben](https://github.com/jorben))*
 
 ### :wrench: Chores
+
 - [`2a8d283`](https://github.com/tiylabs/tiygate/commit/2a8d2839339fe300087bc5d09b1ff23e66261c2e) - **ci**: 🔧 add Docker, GitHub Actions workflows and project config *(commit by [@jorben](https://github.com/jorben))*
 - [`bc924f5`](https://github.com/tiylabs/tiygate/commit/bc924f52d52a20fbacedd68b5d66fdf224285393) - 🔧 use env_file for docker-compose service config *(commit by [@jorben](https://github.com/jorben))*
 - [`cca153f`](https://github.com/tiylabs/tiygate/commit/cca153fed6d0b89242d835dd617af65524bc18fb) - **build**: 🔧 make webui dependency installation idempotent *(commit by [@jorben](https://github.com/jorben))*
