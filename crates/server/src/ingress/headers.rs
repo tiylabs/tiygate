@@ -212,7 +212,7 @@ pub(super) fn spawn_capture(state: &AppState, capture: tiygate_core::ExchangeCap
 pub(super) fn maybe_inject_prompt_cache_key(
     body: &mut serde_json::Value,
     egress_suite: &tiygate_core::ProtocolSuite,
-    api_key_id: &str,
+    caller_key_id: &str,
 ) -> bool {
     let dominated_by_openai = matches!(
         egress_suite,
@@ -227,10 +227,10 @@ pub(super) fn maybe_inject_prompt_cache_key(
         return false;
     }
     // "anonymous" callers have no stable identity → skip injection.
-    if api_key_id == "anonymous" {
+    if caller_key_id == "anonymous" {
         return false;
     }
-    body["prompt_cache_key"] = serde_json::Value::String(api_key_id.to_string());
+    body["prompt_cache_key"] = serde_json::Value::String(caller_key_id.to_string());
     true
 }
 
@@ -669,6 +669,41 @@ pub(super) fn extract_rate_limit_headers(headers: &HeaderMap) -> Vec<(&'static s
     out
 }
 
+/// Inject provider-specific extra headers into the upstream request.
+///
+/// Some providers require custom headers (e.g. OpenCode requires
+/// `x-opencode-session`) that clients don't know about. The provider
+/// generates these based on the caller's TiyGate key ID. This function
+/// is called *after* `apply_provider_auth` so provider auth headers
+/// always win.
+pub(super) fn inject_provider_extra_headers(
+    provider: &dyn tiygate_core::Provider,
+    caller_key_id: &str,
+    upstream: &mut http::HeaderMap,
+) {
+    // When there is no real caller identity (anonymous / empty key),
+    // still inject the header — OpenCode requires it — but use a
+    // fixed sentinel so all anonymous callers share one session
+    // rather than each producing a different hash of "".
+    let effective_key = if caller_key_id.is_empty() || caller_key_id == "anonymous" {
+        "tiygate-anonymous"
+    } else {
+        caller_key_id
+    };
+    for (name, value) in provider.extra_headers(effective_key) {
+        if let (Ok(hn), Ok(hv)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) {
+            // Use entry() to preserve client-provided headers — only
+            // insert when the header is not already present.  This
+            // respects a valid session ID supplied by the client and
+            // prevents extra_headers from overwriting auth headers.
+            upstream.entry(hn).or_insert(hv);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +872,7 @@ mod tests {
     fn deepseek_target() -> tiygate_core::RoutingTarget {
         tiygate_core::RoutingTarget {
             provider_id: "deepseek".to_string(),
+            vendor: None,
             model_id: "deepseek-v4-pro".to_string(),
             api_base: "https://api.deepseek.com".to_string(),
             api_key: "sk-test".to_string(),
@@ -1030,5 +1066,153 @@ mod tests {
             &tiygate_core::ProtocolSuite::OpenAiResponses,
             "other"
         ));
+    }
+
+    #[test]
+    fn inject_provider_extra_headers_adds_headers() {
+        use std::sync::Arc;
+        use tiygate_core::{ProtocolEndpoint, Provider, ProviderMetadata};
+
+        struct TestProvider;
+        impl Provider for TestProvider {
+            fn id(&self) -> &str {
+                "test"
+            }
+            fn metadata(&self) -> &ProviderMetadata {
+                unreachable!()
+            }
+            fn supported_protocols(&self) -> &[ProtocolEndpoint] {
+                unreachable!()
+            }
+            fn auth(&self) -> Arc<dyn tiygate_core::AuthApplier> {
+                unreachable!()
+            }
+            fn extra_headers(&self, caller_key_id: &str) -> Vec<(&'static str, String)> {
+                vec![("x-test-header", format!("session-{caller_key_id}"))]
+            }
+        }
+
+        let provider = TestProvider;
+        let mut headers = http::HeaderMap::new();
+        inject_provider_extra_headers(&provider, "my-key", &mut headers);
+
+        assert_eq!(
+            headers.get("x-test-header").unwrap().to_str().unwrap(),
+            "session-my-key"
+        );
+    }
+
+    #[test]
+    fn inject_provider_extra_headers_empty_by_default() {
+        use std::sync::Arc;
+        use tiygate_core::{ProtocolEndpoint, Provider, ProviderMetadata};
+
+        struct DefaultProvider;
+        impl Provider for DefaultProvider {
+            fn id(&self) -> &str {
+                "default"
+            }
+            fn metadata(&self) -> &ProviderMetadata {
+                unreachable!()
+            }
+            fn supported_protocols(&self) -> &[ProtocolEndpoint] {
+                unreachable!()
+            }
+            fn auth(&self) -> Arc<dyn tiygate_core::AuthApplier> {
+                unreachable!()
+            }
+        }
+
+        let provider = DefaultProvider;
+        let mut headers = http::HeaderMap::new();
+        inject_provider_extra_headers(&provider, "any-key", &mut headers);
+
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn inject_provider_extra_headers_preserves_client_header() {
+        use std::sync::Arc;
+        use tiygate_core::{ProtocolEndpoint, Provider, ProviderMetadata};
+
+        struct TestProvider;
+        impl Provider for TestProvider {
+            fn id(&self) -> &str {
+                "test"
+            }
+            fn metadata(&self) -> &ProviderMetadata {
+                unreachable!()
+            }
+            fn supported_protocols(&self) -> &[ProtocolEndpoint] {
+                unreachable!()
+            }
+            fn auth(&self) -> Arc<dyn tiygate_core::AuthApplier> {
+                unreachable!()
+            }
+            fn extra_headers(&self, caller_key_id: &str) -> Vec<(&'static str, String)> {
+                vec![("x-opencode-session", format!("generated-{caller_key_id}"))]
+            }
+        }
+
+        let provider = TestProvider;
+        let mut headers = http::HeaderMap::new();
+        // Client already provided a session header
+        headers.insert(
+            http::HeaderName::from_static("x-opencode-session"),
+            http::HeaderValue::from_static("client-existing-session"),
+        );
+
+        inject_provider_extra_headers(&provider, "my-key", &mut headers);
+
+        // Client value should be preserved, not overwritten
+        assert_eq!(
+            headers.get("x-opencode-session").unwrap().to_str().unwrap(),
+            "client-existing-session"
+        );
+    }
+
+    #[test]
+    fn inject_provider_extra_headers_uses_default_for_anonymous() {
+        use std::sync::Arc;
+        use tiygate_core::{ProtocolEndpoint, Provider, ProviderMetadata};
+
+        struct TestProvider;
+        impl Provider for TestProvider {
+            fn id(&self) -> &str {
+                "test"
+            }
+            fn metadata(&self) -> &ProviderMetadata {
+                unreachable!()
+            }
+            fn supported_protocols(&self) -> &[ProtocolEndpoint] {
+                unreachable!()
+            }
+            fn auth(&self) -> Arc<dyn tiygate_core::AuthApplier> {
+                unreachable!()
+            }
+            fn extra_headers(&self, caller_key_id: &str) -> Vec<(&'static str, String)> {
+                vec![("x-opencode-session", format!("session-{caller_key_id}"))]
+            }
+        }
+
+        let provider = TestProvider;
+
+        // Empty key → uses "tiygate-anonymous" sentinel
+        let mut headers = http::HeaderMap::new();
+        inject_provider_extra_headers(&provider, "", &mut headers);
+        let val = headers.get("x-opencode-session").unwrap().to_str().unwrap();
+        assert_eq!(val, "session-tiygate-anonymous");
+
+        // "anonymous" key → same sentinel
+        let mut headers = http::HeaderMap::new();
+        inject_provider_extra_headers(&provider, "anonymous", &mut headers);
+        let val = headers.get("x-opencode-session").unwrap().to_str().unwrap();
+        assert_eq!(val, "session-tiygate-anonymous");
+
+        // Real key → uses the actual key
+        let mut headers = http::HeaderMap::new();
+        inject_provider_extra_headers(&provider, "real-key-123", &mut headers);
+        let val = headers.get("x-opencode-session").unwrap().to_str().unwrap();
+        assert_eq!(val, "session-real-key-123");
     }
 }

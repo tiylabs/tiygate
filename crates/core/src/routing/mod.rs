@@ -19,6 +19,11 @@ use crate::telemetry::RequestErrorClass;
 pub struct RoutingTarget {
     /// Provider identifier (e.g., "openai", "anthropic").
     pub provider_id: String,
+    /// Provider vendor name for registered-provider lookup (e.g., "opencode-go").
+    /// Used by `find_provider` to match the in-memory provider registration.
+    /// Falls back to `provider_id` when not set (legacy targets).
+    #[serde(default)]
+    pub vendor: Option<String>,
     /// The specific model name to send to the upstream.
     pub model_id: String,
     /// The API base URL.

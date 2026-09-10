@@ -673,6 +673,7 @@ mod tests {
     fn make_target(base: &str) -> RoutingTarget {
         RoutingTarget {
             provider_id: "bedrock".to_string(),
+            vendor: None,
             model_id: "anthropic.claude-sonnet-4-20250514-v1:0".to_string(),
             api_base: base.to_string(),
             api_key: "AKID:secret:us-east-1".to_string(),

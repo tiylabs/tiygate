@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-09-09
+### :bug: Bug Fixes
+- [`6e09907`](https://github.com/tiylabs/tiygate/commit/6e099077fcb59a487a3e843a517af409a16917ac) - **admin**: 🐛 parse nested reset credits accurately *(PR [#64](https://github.com/tiylabs/tiygate/pull/64) by [@jorben](https://github.com/jorben))*
+- [`75027f6`](https://github.com/tiylabs/tiygate/commit/75027f6221d083c761dd710c046d90913508df54) - **stats**: 🐛 Make token dashboard stats atomic *(PR [#66](https://github.com/tiylabs/tiygate/pull/66) by [@jorben](https://github.com/jorben))*
+- [`2b92928`](https://github.com/tiylabs/tiygate/commit/2b92928dec17e1b609ca5166010b04759a85f79f) - **desktop**: 🐛 enforce single instance and unify SQLite URLs *(PR [#68](https://github.com/tiylabs/tiygate/pull/68) by [@jorben](https://github.com/jorben))*
+  - :arrow_lower_right: *fixes issue [#35](https://github.com/tiylabs/tiygate/issues/35) opened by [@sir2024](https://github.com/sir2024)*
+- [`3a7b273`](https://github.com/tiylabs/tiygate/commit/3a7b2730a18cb00d02e5b07b3fa7268d0b023da7) - **admin**: 🐛 preserve custom provider models endpoint ([#69](https://github.com/tiylabs/tiygate/pull/69)) *(PR [#70](https://github.com/tiylabs/tiygate/pull/70) by [@jorben](https://github.com/jorben))*
+  - :arrow_lower_right: *fixes issue [#69](https://github.com/tiylabs/tiygate/issues/69) opened by [@Sereinfy](https://github.com/Sereinfy)*
+- [`61a79a6`](https://github.com/tiylabs/tiygate/commit/61a79a6348fb881fc51e90de2fc7fe126443919e) - **deepseek**: 🐛 Default non-legacy models to Responses *(PR [#71](https://github.com/tiylabs/tiygate/pull/71) by [@jorben](https://github.com/jorben))*
+
+
 ## [0.2.3] - 2026-08-29
 ### :sparkles: New Features
 - [`d4daad0`](https://github.com/tiylabs/tiygate/commit/d4daad0a47359aee61becfdd5eba6ca1d6e9fe61) - **webui**: ✨ Add page refresh controls *(PR [#62](https://github.com/tiylabs/tiygate/pull/62) by [@jorben](https://github.com/jorben))*
@@ -228,3 +239,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.2.1]: https://github.com/tiylabs/tiygate/compare/0.2.0...0.2.1
 [0.2.2]: https://github.com/tiylabs/tiygate/compare/0.2.1...0.2.2
 [0.2.3]: https://github.com/tiylabs/tiygate/compare/0.2.2...0.2.3
+[0.2.4]: https://github.com/tiylabs/tiygate/compare/0.2.3...0.2.4

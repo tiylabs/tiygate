@@ -351,7 +351,7 @@ pub(super) async fn handle_chat_completions(
     // resolved `api_key` is bound to the scope so the terminal
     // RequestEvent attributes the row to the right caller.
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
-    scope.set_api_key_id(api_key.key_id.clone());
+    scope.set_caller_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
@@ -507,7 +507,7 @@ pub(super) async fn handle_messages(
     // bound to the scope so the terminal `RequestEvent` attributes
     // the row to the right caller.
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
-    scope.set_api_key_id(api_key.key_id.clone());
+    scope.set_caller_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
@@ -653,7 +653,7 @@ pub(super) async fn handle_embeddings(
     // requests count against the same `requests_per_minute` /
     // `requests_per_day` bucket as chat completions.
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
-    scope.set_api_key_id(api_key.key_id.clone());
+    scope.set_caller_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
@@ -773,6 +773,7 @@ pub(super) async fn handle_embeddings(
                 &request_id,
                 &headers,
                 cache_key,
+                &api_key.key_id,
             ))
         },
     )
@@ -855,7 +856,7 @@ pub(super) async fn handle_responses(
     // Bind the api key id so the terminal RequestEvent attributes the
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
-    scope.set_api_key_id(api_key.key_id.clone());
+    scope.set_caller_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
@@ -1026,7 +1027,7 @@ pub(super) async fn handle_gemini_generate(
     // Bind the api key id so the terminal RequestEvent attributes the
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
-    scope.set_api_key_id(api_key.key_id.clone());
+    scope.set_caller_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
@@ -1179,7 +1180,7 @@ pub(super) async fn handle_images_generations(
         enforce_body_limit_or_log(&state, scope, content_type, body_size, codec.id().suite)?;
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
-    scope.set_api_key_id(api_key.key_id.clone());
+    scope.set_caller_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));
@@ -1383,7 +1384,7 @@ pub(super) async fn handle_images_edits(
     )?;
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
-    scope.set_api_key_id(api_key.key_id.clone());
+    scope.set_caller_key_id(api_key.key_id.clone());
     if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
         scope.emit_error(class, Some(&err.message), Some(err.http_status().as_u16()));
         return Err(err.with_protocol_suite(codec.id().suite));

@@ -38,6 +38,7 @@ fn build_images_test_app(
     routing_table.insert(
         virtual_model.to_string(),
         vec![tiygate_core::RoutingTarget {
+            vendor: None,
             provider_id: "openai".to_string(),
             model_id: upstream_model.to_string(),
             api_base: upstream_url,

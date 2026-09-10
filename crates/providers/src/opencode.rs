@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
 use tiygate_auth::bearer::BearerAuthApplier;
 use tiygate_core::{
     AuthApplier, AuthMode, ProtocolEndpoint, ProtocolSuite, Provider, ProviderMetadata,
@@ -67,6 +68,10 @@ impl Provider for OpenCodeZenProvider {
     fn egress_protocol_for_model(&self, model_id: &str) -> ProtocolEndpoint {
         opencode_egress_protocol_for_model(model_id)
     }
+
+    fn extra_headers(&self, caller_key_id: &str) -> Vec<(&'static str, String)> {
+        vec![("x-opencode-session", opencode_session_id(caller_key_id))]
+    }
 }
 
 impl Provider for OpenCodeGoProvider {
@@ -89,6 +94,21 @@ impl Provider for OpenCodeGoProvider {
     fn egress_protocol_for_model(&self, model_id: &str) -> ProtocolEndpoint {
         opencode_egress_protocol_for_model(model_id)
     }
+
+    fn extra_headers(&self, caller_key_id: &str) -> Vec<(&'static str, String)> {
+        vec![("x-opencode-session", opencode_session_id(caller_key_id))]
+    }
+}
+
+/// Derive a stable session identifier from the caller's TiyGate key ID.
+///
+/// OpenCode requires an `x-opencode-session` header to correlate requests
+/// into sessions for service optimization. We generate a stable SHA-256
+/// hex digest of the caller's TiyGate API key ID so that each customer
+/// gets a unique, consistent session identifier.
+fn opencode_session_id(caller_key_id: &str) -> String {
+    let digest = Sha256::digest(caller_key_id.as_bytes());
+    hex::encode(digest)
 }
 
 fn opencode_metadata(display_name: &str, base_url: &str) -> ProviderMetadata {
@@ -260,5 +280,49 @@ mod tests {
             provider.egress_api_base("https://example.test/zen/go/v1", &compatible),
             "https://example.test/zen/go/v1"
         );
+    }
+
+    #[test]
+    fn test_opencode_extra_headers_returns_session_header() {
+        let provider = OpenCodeGoProvider::new();
+        let headers = provider.extra_headers("test-api-key-123");
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "x-opencode-session");
+        assert!(!headers[0].1.is_empty());
+    }
+
+    #[test]
+    fn test_opencode_session_id_is_deterministic() {
+        let key = "my-secret-api-key";
+        let id1 = opencode_session_id(key);
+        let id2 = opencode_session_id(key);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_opencode_session_id_varies_by_key() {
+        let id1 = opencode_session_id("key-a");
+        let id2 = opencode_session_id("key-b");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_opencode_session_id_is_64_hex_chars() {
+        let id = opencode_session_id("any-key");
+        assert_eq!(id.len(), 64);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_zen_and_go_share_session_logic() {
+        let zen = OpenCodeZenProvider::new();
+        let go = OpenCodeGoProvider::new();
+
+        let zen_headers = zen.extra_headers("shared-key");
+        let go_headers = go.extra_headers("shared-key");
+
+        // Both providers should generate the same session ID for the same key
+        assert_eq!(zen_headers[0].1, go_headers[0].1);
     }
 }
