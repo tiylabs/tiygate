@@ -446,6 +446,87 @@ fn remove_path_inner(
     }
 }
 
+/// The declarative field rules of the built-in DeepSeek Responses
+/// capability profile. Kept in core (as pure data) so the Admin API can
+/// render the built-in baseline for the provider capability-override UI
+/// without depending on the server crate; the profile assembly and the
+/// structure hook (tool allow-list / input-item validation) remain
+/// server-side.
+pub fn deepseek_responses_field_rules() -> Vec<FieldRule> {
+    let strip = |path: &str, drop_container_when_empty: bool| FieldRule {
+        path: path.to_string(),
+        action: FieldAction::Strip,
+        convert: None,
+        cond: MatchCond::Present,
+        reason: format!("{path} is not parsed by DeepSeek and is removed"),
+        extra: None,
+        drop_container_when_empty,
+    };
+    let reject = |path: &str, cond: MatchCond, reason: &str| FieldRule {
+        path: path.to_string(),
+        action: FieldAction::Reject,
+        convert: None,
+        cond,
+        reason: reason.to_string(),
+        extra: None,
+        drop_container_when_empty: false,
+    };
+    let unsupported =
+        |path: &str, cond: MatchCond| reject(path, cond, &format!("{path} is not supported"));
+
+    // Bind the vector to a local so the `vec!` macro tail sits in
+    // statement position (a bare macro in return position trips the
+    // rust-analyzer E0308 expansion false positive).
+    let rules = vec![
+        // DeepSeek manages context caching automatically and never parses these
+        // non-semantic controls, so strip them instead of rejecting.
+        strip("prompt_cache_key", false),
+        strip("prompt_cache_retention", false),
+        strip("prompt_cache_options", false),
+        strip("metadata", false),
+        strip("include", false),
+        // DeepSeek accepts but ignores `text.verbosity` and `reasoning.summary`;
+        // drop the container when it becomes empty.
+        strip("text.verbosity", true),
+        strip("reasoning.summary", true),
+        // Semantic fields DeepSeek does not support.
+        unsupported("previous_response_id", MatchCond::Meaningful),
+        unsupported("conversation", MatchCond::Meaningful),
+        unsupported("background", MatchCond::Meaningful),
+        unsupported("max_tool_calls", MatchCond::Meaningful),
+        unsupported("prompt", MatchCond::Meaningful),
+        unsupported("service_tier", MatchCond::Meaningful),
+        unsupported("safety_identifier", MatchCond::Meaningful),
+        unsupported("context_management", MatchCond::Meaningful),
+        unsupported("stream_options", MatchCond::Meaningful),
+        unsupported("client_metadata", MatchCond::Meaningful),
+        unsupported("multi_agent", MatchCond::Meaningful),
+        unsupported("stop", MatchCond::Meaningful),
+        unsupported("presence_penalty", MatchCond::Meaningful),
+        unsupported("frequency_penalty", MatchCond::Meaningful),
+        unsupported("seed", MatchCond::Meaningful),
+        unsupported("n", MatchCond::Meaningful),
+        unsupported("logprobs", MatchCond::Meaningful),
+        // Conditional rejects.
+        reject(
+            "store",
+            MatchCond::EqBool(true),
+            "store=true is not supported",
+        ),
+        reject(
+            "parallel_tool_calls",
+            MatchCond::EqBool(false),
+            "parallel_tool_calls=false is not supported; DeepSeek always enables it",
+        ),
+        reject(
+            "truncation",
+            MatchCond::ValueIn(vec!["disabled".to_string()]),
+            "automatic truncation is not supported",
+        ),
+    ];
+    rules
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
