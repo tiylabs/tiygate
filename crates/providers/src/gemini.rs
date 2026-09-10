@@ -150,6 +150,7 @@ mod tests {
     fn dummy_target(key: &str) -> RoutingTarget {
         RoutingTarget {
             provider_id: GEMINI_VENDOR_ID.to_string(),
+            vendor: None,
             model_id: "gemini-1.5-pro".to_string(),
             api_base: GEMINI_DEFAULT_BASE_URL.to_string(),
             api_key: key.to_string(),

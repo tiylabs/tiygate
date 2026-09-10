@@ -16,6 +16,8 @@ http.workspace = true
 inventory.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
