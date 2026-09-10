@@ -25,12 +25,11 @@ pub(super) fn reqwest_headers_to_vec(
 }
 
 /// Merge client request headers into the upstream header map per the
-/// denylist forwarding policy (C→G→P). Called *after* the codec / auth
-/// have populated `upstream_headers` and *before* `apply_provider_auth`
-/// runs, so a forwarded client header never overwrites a header the
-/// gateway already set (codec content-type, etc.) and auth injection
-/// always wins last. Headers blocked by the policy (credentials,
-/// hop-by-hop, gateway-controlled, trace) are skipped.
+/// denylist forwarding policy (C→G→P). Called after the codec has populated
+/// `upstream_headers` and before `apply_provider_auth` runs, so a forwarded
+/// client header never overwrites a header the codec already set (such as
+/// content-type) and auth injection always wins last. Headers blocked by the
+/// policy (credentials, hop-by-hop, gateway-controlled, trace) are skipped.
 pub(super) fn merge_client_headers(
     client: &http::HeaderMap,
     upstream: &mut http::HeaderMap,
@@ -47,6 +46,58 @@ pub(super) fn merge_client_headers(
             continue;
         }
         upstream.insert(name.clone(), value.clone());
+    }
+}
+
+const GATEWAY_IDENTITY_HEADERS: [(&str, &str); 2] = [
+    ("x-title", "TiyGate"),
+    ("http-referer", "https://tiy.ai/gateway"),
+];
+
+/// Resolve TiyGate's upstream identity headers after provider authentication.
+///
+/// Precedence is request denylist → native OAuth client profile → client value
+/// → gateway default. Native profiles only retain values explicitly declared
+/// in their OAuth `extra_headers`; otherwise these headers are omitted so the
+/// gateway does not break the provider's client impersonation contract.
+pub(super) fn apply_gateway_identity_headers(
+    client: &http::HeaderMap,
+    upstream: &mut http::HeaderMap,
+    policy: &tiygate_core::HeaderForwardPolicy,
+    oauth: Option<&tiygate_core::provider::oauth::OAuthTargetConfig>,
+) {
+    let native_oauth = oauth.filter(|config| {
+        !matches!(
+            config.egress_profile,
+            tiygate_core::provider::oauth::OAuthEgressProfile::Standard
+        )
+    });
+
+    for (name, default_value) in GATEWAY_IDENTITY_HEADERS {
+        if !policy.should_forward_request(name) {
+            upstream.remove(name);
+            continue;
+        }
+
+        if let Some(config) = native_oauth {
+            let native_controls_header = config
+                .extra_headers
+                .iter()
+                .any(|(extra_name, _)| extra_name.eq_ignore_ascii_case(name));
+            if !native_controls_header {
+                upstream.remove(name);
+            }
+            continue;
+        }
+
+        if let Some(client_value) = client.get(name) {
+            upstream.insert(http::HeaderName::from_static(name), client_value.clone());
+        } else if !upstream.contains_key(name) {
+            upstream.insert(
+                http::HeaderName::from_static(name),
+                http::HeaderValue::from_static(default_value),
+            );
+        }
     }
 }
 
@@ -621,6 +672,133 @@ pub(super) fn extract_rate_limit_headers(headers: &HeaderMap) -> Vec<(&'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tiygate_core::provider::oauth::{
+        OAuthEgressProfile, OAuthTargetConfig, TokenRequestStyle, UpstreamTransport,
+    };
+
+    fn oauth_config(
+        egress_profile: OAuthEgressProfile,
+        extra_headers: Vec<(String, String)>,
+    ) -> OAuthTargetConfig {
+        OAuthTargetConfig {
+            upstream_transport: UpstreamTransport::Http,
+            egress_profile,
+            token_url: "https://example.com/token".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            refresh_token: "test-refresh-token".to_string(),
+            scopes: Vec::new(),
+            token_request_style: TokenRequestStyle::Form,
+            authorization_header: None,
+            authorization_prefix: None,
+            extra_headers,
+            account_id: None,
+        }
+    }
+
+    #[test]
+    fn gateway_identity_headers_inject_defaults() {
+        let client = http::HeaderMap::new();
+        let mut upstream = http::HeaderMap::new();
+
+        apply_gateway_identity_headers(
+            &client,
+            &mut upstream,
+            &tiygate_core::HeaderForwardPolicy::with_defaults(),
+            None,
+        );
+
+        assert_eq!(upstream["x-title"], "TiyGate");
+        assert_eq!(upstream["http-referer"], "https://tiy.ai/gateway");
+    }
+
+    #[test]
+    fn gateway_identity_headers_preserve_client_values() {
+        let mut client = http::HeaderMap::new();
+        client.insert("x-title", http::HeaderValue::from_static("Client App"));
+        client.insert(
+            "http-referer",
+            http::HeaderValue::from_static("https://client.example"),
+        );
+        let mut upstream = http::HeaderMap::new();
+        upstream.insert("x-title", http::HeaderValue::from_static("Provider App"));
+
+        apply_gateway_identity_headers(
+            &client,
+            &mut upstream,
+            &tiygate_core::HeaderForwardPolicy::with_defaults(),
+            None,
+        );
+
+        assert_eq!(upstream["x-title"], "Client App");
+        assert_eq!(upstream["http-referer"], "https://client.example");
+    }
+
+    #[test]
+    fn gateway_identity_headers_respect_request_denylist() {
+        let mut client = http::HeaderMap::new();
+        client.insert("x-title", http::HeaderValue::from_static("Client App"));
+        client.insert(
+            "http-referer",
+            http::HeaderValue::from_static("https://client.example"),
+        );
+        let mut upstream = client.clone();
+        let policy = tiygate_core::HeaderForwardPolicy::with_defaults()
+            .with_request_deny_extra(["x-title", "http-referer"]);
+
+        apply_gateway_identity_headers(&client, &mut upstream, &policy, None);
+
+        assert!(!upstream.contains_key("x-title"));
+        assert!(!upstream.contains_key("http-referer"));
+    }
+
+    #[test]
+    fn native_oauth_profile_omits_client_and_gateway_values_by_default() {
+        let mut client = http::HeaderMap::new();
+        client.insert("x-title", http::HeaderValue::from_static("Client App"));
+        client.insert(
+            "http-referer",
+            http::HeaderValue::from_static("https://client.example"),
+        );
+        let mut upstream = client.clone();
+        let oauth = oauth_config(OAuthEgressProfile::AnthropicOAuth, Vec::new());
+
+        apply_gateway_identity_headers(
+            &client,
+            &mut upstream,
+            &tiygate_core::HeaderForwardPolicy::with_defaults(),
+            Some(&oauth),
+        );
+
+        assert!(!upstream.contains_key("x-title"));
+        assert!(!upstream.contains_key("http-referer"));
+    }
+
+    #[test]
+    fn native_oauth_profile_honors_explicit_headers() {
+        let mut client = http::HeaderMap::new();
+        client.insert("x-title", http::HeaderValue::from_static("Client App"));
+        client.insert(
+            "http-referer",
+            http::HeaderValue::from_static("https://client.example"),
+        );
+        let mut upstream = client.clone();
+        upstream.insert("x-title", http::HeaderValue::from_static("Codex Desktop"));
+        let oauth = oauth_config(
+            OAuthEgressProfile::OpenAiCodex,
+            vec![("x-title".to_string(), "Codex Desktop".to_string())],
+        );
+
+        apply_gateway_identity_headers(
+            &client,
+            &mut upstream,
+            &tiygate_core::HeaderForwardPolicy::with_defaults(),
+            Some(&oauth),
+        );
+
+        assert_eq!(upstream["x-title"], "Codex Desktop");
+        assert!(!upstream.contains_key("http-referer"));
+    }
 
     #[test]
     fn reasoning_max_is_target_model_aware() {
