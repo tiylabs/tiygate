@@ -8,8 +8,14 @@
 //! Design: space-for-time trade-off. The background task runs every
 //! `interval` (default 5 min), re-aggregates today's row from
 //! `request_logs`, and recomputes the single-row `token_summary`.
-//! Historical days (before today) are aggregated only once — the
-//! task upserts but skips days whose `request_count` hasn't changed.
+//!
+//! Days before today are *monotonic*: the upsert only applies when the
+//! fresh aggregate is not smaller than the stored one. Retention deletes
+//! old `request_logs`, so a naive overwrite would re-aggregate a partially
+//! purged day with fewer logs and shrink historical totals (and with them
+//! `lifetime_tokens`). Late-arriving logs still grow a closed day; deletions
+//! never shrink it. Today is always written verbatim because its raw logs
+//! are never touched by retention.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,8 +133,13 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
         .await?;
 
     let updated_at = now.to_rfc3339();
+    let today_str = today.format("%Y-%m-%d").to_string();
 
-    // Step 2: Upsert each day into token_daily_stats.
+    // Step 2: Upsert each day into token_daily_stats. The final `WHERE`
+    // clause keeps closed days monotonic: `$11` is today, so today is
+    // always overwritten while older days only accept a non-shrinking
+    // aggregate. This is what stops `retention::cleanup_once` from
+    // lowering historical (and therefore lifetime) token totals.
     for r in &rows {
         let day: String = r.get("day");
         let request_count: i64 = r.get("cnt");
@@ -154,7 +165,11 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
                 total_cost = excluded.total_cost, \
                 peak_single_request = excluded.peak_single_request, \
                 longest_task_ms = excluded.longest_task_ms, \
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at \
+             WHERE excluded.day = $11 \
+                OR (excluded.total_tokens >= token_daily_stats.total_tokens \
+                    AND excluded.request_count >= token_daily_stats.request_count \
+                    AND excluded.total_cost >= token_daily_stats.total_cost)",
         )
         .bind(&day)
         .bind(request_count)
@@ -166,6 +181,7 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
         .bind(peak_single_request)
         .bind(longest_task_ms)
         .bind(&updated_at)
+        .bind(&today_str)
         .execute(&mut *tx)
         .await?;
     }
@@ -674,6 +690,54 @@ mod tests {
         let summary = get_token_summary(pool.as_ref()).await.expect("summary");
         assert_eq!(summary.lifetime_tokens, 0);
         assert_eq!(summary.peak_day_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn retention_cleanup_never_lowers_lifetime_tokens() {
+        let pool = in_mem_pool().await;
+        // A log old enough for a 30-day retention pass to purge, and a live
+        // log that survives. Different calendar days keep the assertions
+        // independent of the wall-clock time of day.
+        let expired_ts = (Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        let live_ts = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+
+        insert_log(
+            pool.as_ref(),
+            "expired",
+            &expired_ts,
+            1000,
+            0,
+            Some(1_000_000),
+        )
+        .await;
+        insert_log(pool.as_ref(), "live", &live_ts, 10, 0, Some(1_000)).await;
+
+        aggregate_once(pool.as_ref(), 400).await.expect("aggregate");
+        let before = get_token_summary(pool.as_ref()).await.expect("summary");
+        assert_eq!(before.lifetime_tokens, 1010);
+
+        // Retention purges the expired raw log, then the aggregator runs
+        // again. The closed day must keep its already-recorded total.
+        let deleted = crate::retention::cleanup_once(pool.as_ref(), 30)
+            .await
+            .expect("cleanup");
+        assert!(deleted >= 1, "the expired request log must be purged");
+        aggregate_once(pool.as_ref(), 400).await.expect("aggregate");
+
+        let after = get_token_summary(pool.as_ref()).await.expect("summary");
+        assert_eq!(
+            after.lifetime_tokens, 1010,
+            "closed days must never be lowered by retention cleanup"
+        );
+
+        // Late-arriving logs for an already-closed day must still be merged
+        // in: the guard blocks shrinkage, not growth. (The original expired
+        // log was already purged, so the late log alone must exceed the
+        // recorded total for the day to advance.)
+        insert_log(pool.as_ref(), "late", &expired_ts, 1500, 0, Some(1_500_000)).await;
+        aggregate_once(pool.as_ref(), 400).await.expect("aggregate");
+        let grown = get_token_summary(pool.as_ref()).await.expect("summary");
+        assert_eq!(grown.lifetime_tokens, 1510);
     }
 
     #[tokio::test]
