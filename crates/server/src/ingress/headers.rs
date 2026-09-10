@@ -1096,10 +1096,7 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         inject_provider_extra_headers(&provider, "my-key", &mut headers);
 
-        assert_eq!(
-            headers.get("x-test-header").unwrap().to_str().unwrap(),
-            "session-my-key"
-        );
+        assert_eq!(headers["x-test-header"], "session-my-key");
     }
 
     #[test]
@@ -1165,10 +1162,7 @@ mod tests {
         inject_provider_extra_headers(&provider, "my-key", &mut headers);
 
         // Client value should be preserved, not overwritten
-        assert_eq!(
-            headers.get("x-opencode-session").unwrap().to_str().unwrap(),
-            "client-existing-session"
-        );
+        assert_eq!(headers["x-opencode-session"], "client-existing-session");
     }
 
     #[test]
@@ -1200,19 +1194,16 @@ mod tests {
         // Empty key → uses "tiygate-anonymous" sentinel
         let mut headers = http::HeaderMap::new();
         inject_provider_extra_headers(&provider, "", &mut headers);
-        let val = headers.get("x-opencode-session").unwrap().to_str().unwrap();
-        assert_eq!(val, "session-tiygate-anonymous");
+        assert_eq!(headers["x-opencode-session"], "session-tiygate-anonymous");
 
         // "anonymous" key → same sentinel
         let mut headers = http::HeaderMap::new();
         inject_provider_extra_headers(&provider, "anonymous", &mut headers);
-        let val = headers.get("x-opencode-session").unwrap().to_str().unwrap();
-        assert_eq!(val, "session-tiygate-anonymous");
+        assert_eq!(headers["x-opencode-session"], "session-tiygate-anonymous");
 
         // Real key → uses the actual key
         let mut headers = http::HeaderMap::new();
         inject_provider_extra_headers(&provider, "real-key-123", &mut headers);
-        let val = headers.get("x-opencode-session").unwrap().to_str().unwrap();
-        assert_eq!(val, "session-real-key-123");
+        assert_eq!(headers["x-opencode-session"], "session-real-key-123");
     }
 }
