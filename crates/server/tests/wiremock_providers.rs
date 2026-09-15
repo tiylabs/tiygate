@@ -207,6 +207,11 @@ async fn test_happy_path_openai_chat_completion() {
             "authorization",
             "Bearer sk-test",
         ))
+        .and(wiremock::matchers::header("x-title", "TiyGate"))
+        .and(wiremock::matchers::header(
+            "http-referer",
+            "https://tiy.ai/gateway",
+        ))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "id": "chatcmpl-test",
             "object": "chat.completion",

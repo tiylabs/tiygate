@@ -7,7 +7,7 @@ header 可见、且仅对敏感值脱敏。
 ## 四段链路
 
 | 段 | 含义 | header 字段 | body 字段 | 数据来源 |
-|----|------|-------------|-----------|----------|
+| ---- | ------ | ------------- | ----------- | ---------- |
 | c→g | 客户端 → 网关（ingress 请求） | `redacted_headers_json` | `raw_envelope_json` | `RawEnvelope`（`request_logs`） |
 | g→p | 网关 → 供应商（egress 请求） | `egress_headers_json` | `egress_body` | `ExchangeCapture`（`request_payloads`） |
 | p→g | 供应商 → 网关（upstream 响应） | `upstream_resp_headers_json` | `upstream_resp_body` | `ExchangeCapture` |
@@ -116,10 +116,11 @@ responses、gemini）的 stream 与 non-stream 分支共 9 个发送点，统一
 
 ### 请求方向（C→G→P）
 
-`merge_client_headers()`（`crates/server/src/ingress.rs`）在
+`merge_client_headers()`（`crates/server/src/ingress/headers.rs`）在
 `upstream_headers` 初始化之后、`apply_provider_auth()` 之前，把客户端请求
 header 按 `should_forward_request` 合并进上游请求；已被 codec 设置的 header
-不被覆盖，auth 注入始终最后胜出。默认**不转发**的请求 header：
+不被覆盖，auth 注入始终最后胜出（下述网关身份 header 除外）。默认**不转发**
+的请求 header：
 
 - 凭证类（客户端对网关的凭证，绝不能泄露给 Provider，且网关注入自己的）：
   `authorization`、`proxy-authorization`、`x-api-key`、`anthropic-version`、
@@ -132,6 +133,17 @@ header 按 `should_forward_request` 合并进上游请求；已被 codec 设置�
 
 其余 header（如 `x-debug-id`、`x-correlation-id`）默认转发给 Provider，并如实
 出现在 g→p 段记录中。
+
+所有常规 G→P HTTP 数据面请求还会携带网关身份 header：
+
+- `x-title: TiyGate`
+- `http-referer: https://tiy.ai/gateway`
+
+这两个 header 的优先级为：请求方向黑名单 > 模拟原生 Client 的 OAuth egress
+profile > 客户端 C→G 携带值 > 网关默认值。客户端已经携带时原值转发，不被默认值
+覆盖；`openai_codex`、`anthropic_oauth` 等非 `standard` profile 默认不发送它们，
+但可通过该 OAuth 配置的 `extra_headers` 声明原生 Client 所需的值。黑名单始终拥有
+最高优先级，即使 Provider/OAuth 配置写入同名 header，最终也会移除。
 
 ### 响应方向（P→G→C）
 
@@ -157,8 +169,10 @@ stream 与 non-stream 均生效，且 `client_resp_headers` 记录与实际下�
 在硬编码默认黑名单之上，可通过环境变量追加额外要拦截的 header（逗号分隔，
 大小写不敏感）：
 
-- `TIYGATE_FORWARD_REQUEST_HEADER_DENY` —— 追加请求方向黑名单
-- `TIYGATE_FORWARD_RESPONSE_HEADER_DENY` —— 追加响应方向黑名单
+- `TIYGATE_FORWARD_REQUEST_HEADER_DENY`（运行时设置键：
+  `gateway.forward.request_header_deny`）——追加请求方向黑名单
+- `TIYGATE_FORWARD_RESPONSE_HEADER_DENY`（运行时设置键：
+  `gateway.forward.response_header_deny`）——追加响应方向黑名单
 
 例如 `TIYGATE_FORWARD_REQUEST_HEADER_DENY=x-stainless-lang,x-internal` 会在
 默认基础上额外屏蔽这两个客户端 header。

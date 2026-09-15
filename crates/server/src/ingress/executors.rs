@@ -25,10 +25,10 @@ use tiygate_protocols::responses::ResponsesCodec;
 use crate::openai_codex_oauth as codex_oauth;
 
 use super::headers::{
-    extract_rate_limit_headers, extract_retry_after, forward_upstream_resp_headers,
-    forwarded_resp_headers_for_capture, header_map_to_vec, maybe_inject_prompt_cache_key,
-    merge_client_headers, override_model_in_body, prepare_provider_request_body,
-    reqwest_headers_to_vec, spawn_capture,
+    apply_gateway_identity_headers, extract_rate_limit_headers, extract_retry_after,
+    forward_upstream_resp_headers, forwarded_resp_headers_for_capture, header_map_to_vec,
+    maybe_inject_prompt_cache_key, merge_client_headers, override_model_in_body,
+    prepare_provider_request_body, reqwest_headers_to_vec, spawn_capture,
 };
 use super::response_model::ResponseModelOverride;
 use super::streaming::{
@@ -598,6 +598,12 @@ pub(super) async fn execute_upstream(
     if anthropic_oauth_profile {
         apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
     }
+    apply_gateway_identity_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+        target.oauth.as_ref(),
+    );
 
     // Capture the egress request (headers + body) for the request-log
     // detail view. We snapshot here, *after* auth injection and just
@@ -1199,6 +1205,12 @@ pub(super) async fn execute_messages_upstream(
     if anthropic_oauth_profile {
         apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
     }
+    apply_gateway_identity_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+        target.oauth.as_ref(),
+    );
 
     // Capture egress request (headers + body) for the detail view.
     let mut egress_body_capture = if pass_through_verbatim {
@@ -1788,6 +1800,12 @@ pub(super) async fn execute_embeddings_upstream(
         caller_key_id,
     )
     .await?;
+    apply_gateway_identity_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+        target.oauth.as_ref(),
+    );
 
     let egress_body_capture = serde_json::to_string(&upstream_body).ok();
     let req_id_capture = request_id.to_string();
@@ -2044,6 +2062,12 @@ pub(super) async fn execute_responses_upstream(
     if anthropic_oauth_profile {
         apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
     }
+    apply_gateway_identity_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+        target.oauth.as_ref(),
+    );
 
     let mut egress_body_capture = if pass_through_verbatim {
         raw_passthrough_body.map(|s| s.to_string())
@@ -2885,6 +2909,12 @@ pub(super) async fn execute_gemini_upstream(
     if anthropic_oauth_profile {
         apply_anthropic_oauth_egress_headers(target, &mut upstream_headers, is_stream, request_id)?;
     }
+    apply_gateway_identity_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+        target.oauth.as_ref(),
+    );
 
     let mut egress_body_capture = if pass_through_verbatim {
         raw_passthrough_body.map(|s| s.to_string())
@@ -3357,6 +3387,12 @@ pub(super) async fn execute_images_generations_upstream(
         caller_key_id,
     )
     .await?;
+    apply_gateway_identity_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+        target.oauth.as_ref(),
+    );
 
     let egress_body_capture = if pass_through_verbatim {
         raw_passthrough_body.map(|s| s.to_string())
@@ -3737,6 +3773,12 @@ pub(super) async fn execute_images_edits_upstream(
         caller_key_id,
     )
     .await?;
+    apply_gateway_identity_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+        target.oauth.as_ref(),
+    );
 
     // TODO(prompt-cache): multipart re-encoding is not implemented in
     // v1, so prompt_cache_key cannot be injected for edits requests.
