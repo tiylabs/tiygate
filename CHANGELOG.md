@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-09-15
+### :sparkles: New Features
+- [`1af464c`](https://github.com/tiylabs/tiygate/commit/1af464cb9f801a60a696750d156084f711f13722) - ✨ inject x-opencode-session header for OpenCode providers *(PR [#67](https://github.com/tiylabs/tiygate/pull/67) by [@shansb](https://github.com/shansb))*
+- [`3349bd0`](https://github.com/tiylabs/tiygate/commit/3349bd03dab27306a1808885b8b7709d188199d4) - **ingress**: ✨ Inject gateway identity headers upstream *(PR [#74](https://github.com/tiylabs/tiygate/pull/74) by [@jorben](https://github.com/jorben))*
+
+### :bug: Bug Fixes
+- [`0ca74c1`](https://github.com/tiylabs/tiygate/commit/0ca74c17edd1d1b725cb6bfe1d03ab7d631a8e21) - **store**: 🐛 Keep closed-day token stats monotonic ([#75](https://github.com/tiylabs/tiygate/pull/75)) *(PR [#76](https://github.com/tiylabs/tiygate/pull/76) by [@jorben](https://github.com/jorben))*
+  - :arrow_lower_right: *fixes issue [#75](https://github.com/tiylabs/tiygate/issues/75) opened by [@2niuhe](https://github.com/2niuhe)*
+
+
 ## [0.2.4] - 2026-09-09
 
 ### :bug: Bug Fixes
@@ -272,3 +282,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.2.2]: https://github.com/tiylabs/tiygate/compare/0.2.1...0.2.2
 [0.2.3]: https://github.com/tiylabs/tiygate/compare/0.2.2...0.2.3
 [0.2.4]: https://github.com/tiylabs/tiygate/compare/0.2.3...0.2.4
+[0.2.5]: https://github.com/tiylabs/tiygate/compare/0.2.4...0.2.5
