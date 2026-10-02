@@ -230,11 +230,11 @@ pub async fn run_once(
     report.freelist_pages = read_pragma_u64(pool, "PRAGMA freelist_count").await?;
     report.page_count = read_pragma_u64(pool, "PRAGMA page_count").await?;
     report.page_size = read_pragma_u64(pool, "PRAGMA page_size").await?;
-    report.free_ratio_percent = if report.page_count > 0 {
-        report.freelist_pages.saturating_mul(100) / report.page_count
-    } else {
-        0
-    };
+    report.free_ratio_percent = report
+        .freelist_pages
+        .saturating_mul(100)
+        .checked_div(report.page_count)
+        .unwrap_or(0);
     report.reclaimable_bytes = report.freelist_pages.saturating_mul(report.page_size);
 
     if should_vacuum(cfg, &report) {

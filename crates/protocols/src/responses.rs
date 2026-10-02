@@ -5240,7 +5240,6 @@ mod tests {
             id,
             name,
             arguments,
-            call_id: _,
             ..
         } = tool_call
         {
@@ -5272,7 +5271,6 @@ mod tests {
             id,
             name,
             arguments,
-            call_id: _,
             ..
         } = tool_call
         {

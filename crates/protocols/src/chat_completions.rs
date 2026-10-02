@@ -606,7 +606,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         }
                     }
                 }
-                Content::Reasoning { text: _, .. } => {
+                Content::Reasoning { .. } => {
                     // OpenAI doesn't natively expose reasoning text in the content field
                     // (it goes into a separate reasoning_tokens field)
                 }

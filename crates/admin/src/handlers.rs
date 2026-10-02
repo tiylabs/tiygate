@@ -3394,13 +3394,7 @@ fn archived_json_field_text(text: &str, field: &str) -> Option<String> {
 }
 
 fn archived_json_field_non_empty_text(text: &str, field: &str) -> Option<String> {
-    archived_json_field_text(text, field).and_then(|value| {
-        if value.is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    })
+    archived_json_field_text(text, field).filter(|value| !value.is_empty())
 }
 
 fn archived_json_field_u16(text: &str, field: &str) -> Option<u16> {

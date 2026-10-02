@@ -664,11 +664,9 @@ fn strip_media_from_value(value: &mut Value) {
                 strip_media_from_value(v);
             }
         }
-        Value::String(s) => {
-            if is_large_base64(s) {
-                let meta = build_media_meta(s);
-                *value = meta;
-            }
+        Value::String(s) if is_large_base64(s) => {
+            let meta = build_media_meta(s);
+            *value = meta;
         }
         _ => {}
     }

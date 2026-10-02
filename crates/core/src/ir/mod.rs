@@ -823,7 +823,7 @@ impl UsageAccumulator {
     /// Rough heuristic: ~4 chars per token for normal text,
     /// ~2 chars per token for structured/control output.
     pub fn estimate_usage(&self) -> Usage {
-        let completion_tokens = (self.chars_received / 4).max(1) + (self.control_chars / 2).max(0);
+        let completion_tokens = (self.chars_received / 4).max(1) + (self.control_chars / 2);
         Usage {
             completion_tokens: completion_tokens as u64,
             total_tokens: completion_tokens as u64,

@@ -336,7 +336,7 @@ async fn upload_payload(
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
-    value.and_then(|value| if value.is_empty() { None } else { Some(value) })
+    value.filter(|value| !value.is_empty())
 }
 
 fn parsed_object(
