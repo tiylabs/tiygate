@@ -64,6 +64,8 @@ pub struct IrResponse {
 pub enum StreamPart {
     /// An incremental text delta.
     TextDelta { text: String },
+    /// Incremental refusal text, kept separate from the visible answer.
+    RefusalDelta { text: String },
     /// An incremental reasoning/thinking delta.
     ReasoningDelta {
         text: String,

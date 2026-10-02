@@ -429,24 +429,24 @@ fn parse_nonstream_upstream_body(
 /// retry / try the next target, instead of silently passing the error
 /// body to the client as a success.
 ///
-/// Only triggers when the top-level JSON object has an `"error"` key
-/// and does NOT simultaneously contain normal response fields
-/// (`choices`, `candidates`, `output`, `data`, etc.) that would
-/// indicate a mixed/success response. This avoids false positives on
-/// responses that merely mention "error" in metadata.
+/// Meaningful top-level errors are failures when no normal payload exists.
+/// Responses `status: failed` remains an error even with `output: []`.
+/// Success payloads with `error: null` and metadata mentions are unaffected.
 fn check_nonstream_error_body(
     response_body: &Value,
     status: u16,
     retry_after: Option<String>,
     rate_limit_headers: Vec<(&'static str, String)>,
 ) -> Option<AppError> {
-    let error = response_body.get("error")?;
+    let error = response_body
+        .get("error")
+        .filter(|error| error.is_object())?;
     // Guard against false positives: if the body also contains
     // normal response fields, it's not a pure error response.
     let has_normal_field = ["choices", "candidates", "output", "data", "messages"]
         .iter()
         .any(|k| response_body.get(k).is_some());
-    if has_normal_field {
+    if has_normal_field && response_body["status"].as_str() != Some("failed") {
         return None;
     }
     let message = error["message"]
@@ -454,7 +454,11 @@ fn check_nonstream_error_body(
         .unwrap_or("upstream returned error in 200 response body");
     let code = error["code"].as_str().or_else(|| error["type"].as_str());
     let mut app_err = AppError::new(
-        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+        if (200..300).contains(&status) {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY)
+        },
         format!("Upstream error: {}", message),
     );
     app_err.upstream_status = Some(status);

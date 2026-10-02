@@ -263,8 +263,18 @@ impl EndpointCodec for MessagesCodec {
                                     wire_type: None,
                                 });
                             }
-                            Some("image") => {
+                            Some("image") | Some("document") => {
                                 let source = block["source"].clone();
+                                if block["type"] == "document"
+                                    && !matches!(
+                                        source["type"].as_str(),
+                                        Some("base64") | Some("url")
+                                    )
+                                {
+                                    return Err(tiygate_core::Error::Codec(
+                                        "unsupported Messages document source".into(),
+                                    ));
+                                }
                                 if source["type"] == "url" {
                                     parts.push(Content::Media {
                                         source: tiygate_core::ir::MediaSource::Url {
@@ -272,7 +282,11 @@ impl EndpointCodec for MessagesCodec {
                                         },
                                         mime_type: source["media_type"]
                                             .as_str()
-                                            .unwrap_or("image/*")
+                                            .unwrap_or(if block["type"] == "document" {
+                                                "application/pdf"
+                                            } else {
+                                                "image/*"
+                                            })
                                             .to_string(),
                                         metadata: Default::default(),
                                         prompt_cache_breakpoint: None,
@@ -284,7 +298,11 @@ impl EndpointCodec for MessagesCodec {
                                         },
                                         mime_type: source["media_type"]
                                             .as_str()
-                                            .unwrap_or("image/*")
+                                            .unwrap_or(if block["type"] == "document" {
+                                                "application/pdf"
+                                            } else {
+                                                "image/*"
+                                            })
                                             .to_string(),
                                         metadata: Default::default(),
                                         prompt_cache_breakpoint: None,
@@ -319,6 +337,7 @@ impl EndpointCodec for MessagesCodec {
                         description: t["description"].as_str().map(|s| s.to_string()),
                         parameters: Some(t["input_schema"].clone()),
                         required: false,
+                        config: t.get("strict").map(|strict| json!({"strict": strict})),
                         ..Default::default()
                     })
                     .collect()
@@ -412,6 +431,9 @@ impl EndpointCodec for MessagesCodec {
                 // Parse Anthropic native tool_choice into normalized extensions
                 // format so cross-protocol targets can interpret it.
                 if let Some(tc) = body.get("tool_choice") {
+                    if let Some(disable) = tc["disable_parallel_tool_use"].as_bool() {
+                        ext.insert("parallel_tool_calls".into(), json!(!disable));
+                    }
                     if let Some(tc_type) = tc["type"].as_str() {
                         let normalized = match tc_type {
                             "auto" => json!("auto"),
@@ -669,11 +691,11 @@ impl EndpointCodec for MessagesCodec {
                         source, mime_type, ..
                     } => match source {
                         tiygate_core::ir::MediaSource::Url { url } => Some(json!({
-                            "type": "image",
+                            "type": if mime_type.starts_with("image/") { "image" } else { "document" },
                             "source": {"type": "url", "url": url, "media_type": mime_type}
                         })),
                         tiygate_core::ir::MediaSource::Inline { data } => Some(json!({
-                            "type": "image",
+                            "type": if mime_type.starts_with("image/") { "image" } else { "document" },
                             "source": {"type": "base64", "media_type": mime_type, "data": data}
                         })),
                         _ => None,
@@ -740,6 +762,11 @@ impl EndpointCodec for MessagesCodec {
                             "description": t.description,
                             "input_schema": t.parameters,
                         });
+                        if let Some(strict) =
+                            t.config.as_ref().and_then(|config| config.get("strict"))
+                        {
+                            tool["strict"] = strict.clone();
+                        }
                         // 在最后一个 tool 上打断点即可缓存整段 tools 前缀
                         // （Anthropic 缓存层级中 tools 是第一级）。
                         if inject_cache && idx + 1 == tool_count {
@@ -858,6 +885,18 @@ impl EndpointCodec for MessagesCodec {
                 json!({"type": "auto"})
             };
             body["tool_choice"] = anthropic_tc;
+        }
+        if let Some(parallel) = ir
+            .extensions
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+        {
+            if !body["tool_choice"].is_object() {
+                body["tool_choice"] = json!({"type": "auto"});
+            }
+            if body["tool_choice"]["type"] != "none" {
+                body["tool_choice"]["disable_parallel_tool_use"] = json!(!parallel);
+            }
         }
         // Metadata: Anthropic only supports user_id
         if let Some(ref metadata) = ir.metadata {
@@ -1051,6 +1090,7 @@ pub struct MessagesStreamEncoder {
     last_usage: Option<Usage>,
     pending_stop_reason: Option<&'static str>,
     tool_indices: std::collections::HashMap<String, usize>,
+    terminal: bool,
 }
 
 impl Default for MessagesStreamEncoder {
@@ -1069,6 +1109,7 @@ impl MessagesStreamEncoder {
             last_usage: None,
             pending_stop_reason: None,
             tool_indices: std::collections::HashMap::new(),
+            terminal: false,
         }
     }
 
@@ -1156,6 +1197,15 @@ impl MessagesStreamEncoder {
 
 impl StreamEncoder for MessagesStreamEncoder {
     fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
+        if self.terminal {
+            return Ok(Vec::new());
+        }
+        if matches!(
+            part,
+            StreamPart::ResponseCompleted { .. } | StreamPart::Error { .. }
+        ) {
+            self.terminal = true;
+        }
         let event = match part {
             StreamPart::ResponseStarted { id } => {
                 let data = json!({
@@ -1168,7 +1218,7 @@ impl StreamEncoder for MessagesStreamEncoder {
                     serde_json::to_string(&data).unwrap_or_default()
                 )
             }
-            StreamPart::TextDelta { text } => {
+            StreamPart::TextDelta { text } | StreamPart::RefusalDelta { text } => {
                 // Open (or keep) a text block at the correct index, then emit
                 // the delta against that same index.
                 let mut out = self.ensure_block("text", json!({"type": "text", "text": ""}));
@@ -1318,6 +1368,7 @@ impl StreamEncoder for MessagesStreamEncoder {
         class: ErrorClass,
         _upstream_code: Option<&str>,
     ) -> Vec<u8> {
+        self.terminal = true;
         let err = json!({"type": error_type_for_class(class), "message": message});
         format!(
             "event: error\ndata: {}\n\n",

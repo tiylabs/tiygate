@@ -1339,6 +1339,7 @@ impl EndpointCodec for GeminiCodec {
 pub struct GeminiStreamEncoder {
     calls: std::collections::BTreeMap<String, (Option<String>, String)>,
     finished: std::collections::HashSet<String>,
+    terminal: bool,
 }
 
 impl GeminiStreamEncoder {
@@ -1373,8 +1374,17 @@ impl GeminiStreamEncoder {
 
 impl StreamEncoder for GeminiStreamEncoder {
     fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
+        if self.terminal {
+            return Ok(Vec::new());
+        }
+        if matches!(
+            part,
+            StreamPart::ResponseCompleted { .. } | StreamPart::Error { .. }
+        ) {
+            self.terminal = true;
+        }
         let chunk = match part {
-            StreamPart::TextDelta { text } => format!(
+            StreamPart::TextDelta { text } | StreamPart::RefusalDelta { text } => format!(
                 "data: {}\n\n",
                 json!({"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}}]})
             ),
@@ -1493,6 +1503,7 @@ impl StreamEncoder for GeminiStreamEncoder {
         class: ErrorClass,
         _upstream_code: Option<&str>,
     ) -> Vec<u8> {
+        self.terminal = true;
         let status = error_status_for_class(class);
         format!(
             "data: {}\n\n",

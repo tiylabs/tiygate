@@ -403,6 +403,13 @@ impl EndpointCodec for ChatCompletionsCodec {
                                     .map(|s| s.to_string()),
                                 parameters: Some(t["function"]["parameters"].clone()),
                                 required: mark_required,
+                                config: t["function"].as_object().and_then(|function| {
+                                    let mut config = function.clone();
+                                    for key in ["name", "description", "parameters"] {
+                                        config.remove(key);
+                                    }
+                                    (!config.is_empty()).then_some(Value::Object(config))
+                                }),
                                 ..Default::default()
                             }
                         }
@@ -415,6 +422,12 @@ impl EndpointCodec for ChatCompletionsCodec {
         // https://developers.openai.com/api/docs/guides/function-calling#tool-choice
         // Allowed forms: "none", "auto", "required", {"type":"function","function":{"name":"x"}}
         let mut extensions = std::collections::HashMap::new();
+        if let Some(parallel) = body["parallel_tool_calls"].as_bool() {
+            extensions.insert("parallel_tool_calls".to_string(), json!(parallel));
+        }
+        if let Some(n) = body["n"].as_u64() {
+            extensions.insert("choice_count".to_string(), json!(n));
+        }
         if let Some(tc) = body.get("tool_choice") {
             if let Some(s) = tc.as_str() {
                 extensions.insert("tool_choice".to_string(), json!(s));
@@ -497,14 +510,19 @@ impl EndpointCodec for ChatCompletionsCodec {
             frequency_penalty: body["frequency_penalty"].as_f64().map(|v| v as f32),
             presence_penalty: body["presence_penalty"].as_f64().map(|v| v as f32),
             seed: body["seed"].as_i64(),
-            stop: body["stop"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            stop: if let Some(stop) = body["stop"].as_str() {
+                vec![stop.to_string()]
+            } else {
+                body["stop"]
+                    .as_array()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
             thinking: body["reasoning_effort"].as_str().and_then(|s| {
                 use tiygate_core::ThinkingEffort;
                 let effort = match s {
@@ -976,14 +994,19 @@ impl EndpointCodec for ChatCompletionsCodec {
                         }
                         Value::Object(obj)
                     } else {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": t.name,
-                                "description": t.description,
-                                "parameters": t.parameters,
+                        let mut function = json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        });
+                        if let Some(Value::Object(config)) = &t.config {
+                            if let Some(object) = function.as_object_mut() {
+                                for (key, value) in config {
+                                    object.entry(key.clone()).or_insert_with(|| value.clone());
+                                }
                             }
-                        })
+                        }
+                        json!({"type": "function", "function": function})
                     }
                 })
                 .collect();
@@ -1062,6 +1085,9 @@ impl EndpointCodec for ChatCompletionsCodec {
                 };
         }
 
+        if let Some(parallel) = ir.extensions.get("parallel_tool_calls") {
+            body["parallel_tool_calls"] = parallel.clone();
+        }
         // Metadata: output from ir.metadata as JSON object
         if let Some(ref metadata) = ir.metadata {
             if !metadata.is_empty() {
@@ -1162,6 +1188,15 @@ impl EndpointCodec for ChatCompletionsCodec {
         let mut content = Vec::new();
 
         if let Some(choices) = body["choices"].as_array() {
+            if choices.len() > 1
+                || choices
+                    .iter()
+                    .any(|choice| choice["index"].as_u64().is_some_and(|index| index != 0))
+            {
+                return Err(tiygate_core::Error::Codec(
+                    "multiple Chat choices are unsupported by IR conversion".into(),
+                ));
+            }
             if let Some(choice) = choices.first() {
                 let msg = &choice["message"];
 
@@ -1225,7 +1260,11 @@ impl EndpointCodec for ChatCompletionsCodec {
                             let args: serde_json::Value = serde_json::from_str(
                                 tc["function"]["arguments"].as_str().unwrap_or("{}"),
                             )
-                            .unwrap_or(json!({}));
+                            .map_err(|error| {
+                                tiygate_core::Error::Codec(format!(
+                                    "invalid Chat tool arguments: {error}"
+                                ))
+                            })?;
                             content.push(Content::ToolCall {
                                 id: tc["id"].as_str().unwrap_or("").to_string(),
                                 name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
@@ -1360,6 +1399,7 @@ pub struct ChatCompletionsStreamEncoder {
     /// `tool_calls[].index`. OpenAI clients reassemble streamed tool calls by
     /// this index, so two distinct tool calls must NOT share index 0.
     tool_call_indices: std::collections::HashMap<String, usize>,
+    terminal: bool,
 }
 
 impl Default for ChatCompletionsStreamEncoder {
@@ -1373,6 +1413,7 @@ impl ChatCompletionsStreamEncoder {
         Self {
             response_id: None,
             tool_call_indices: std::collections::HashMap::new(),
+            terminal: false,
         }
     }
 
@@ -1391,7 +1432,23 @@ impl ChatCompletionsStreamEncoder {
 
 impl StreamEncoder for ChatCompletionsStreamEncoder {
     fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
+        if self.terminal {
+            return Ok(Vec::new());
+        }
+        if matches!(
+            part,
+            StreamPart::ResponseCompleted { .. } | StreamPart::Error { .. }
+        ) {
+            self.terminal = true;
+        }
         let chunk = match part {
+            StreamPart::RefusalDelta { text } => format!(
+                "data: {}\n\n",
+                json!({
+                    "id": self.response_id.as_deref().unwrap_or(""), "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"refusal": text}, "finish_reason": null}]
+                })
+            ),
             StreamPart::ResponseStarted { id } => {
                 self.response_id = Some(id.clone());
                 String::new() // OpenAI SSE doesn't need a start event
@@ -1562,6 +1619,7 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
         class: ErrorClass,
         upstream_code: Option<&str>,
     ) -> Vec<u8> {
+        self.terminal = true;
         let mut err = json!({"message": message, "type": error_type_for_class(class)});
         if let Some(c) = upstream_code {
             err["code"] = json!(c);
@@ -1711,6 +1769,16 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                 // Handle choices
                 let mut pending_finishes = Vec::new();
                 if let Some(choices) = chunk["choices"].as_array() {
+                    if choices.len() > 1
+                        || choices
+                            .iter()
+                            .any(|choice| choice["index"].as_u64().is_some_and(|index| index != 0))
+                    {
+                        return Err(tiygate_core::Error::Codec(
+                            "multiple Chat streaming choices are unsupported by IR conversion"
+                                .into(),
+                        ));
+                    }
                     for choice in choices {
                         let delta = &choice["delta"];
 
@@ -1722,6 +1790,13 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                             }
                         }
 
+                        if let Some(text) =
+                            delta["refusal"].as_str().filter(|text| !text.is_empty())
+                        {
+                            parts.push(StreamPart::RefusalDelta {
+                                text: text.to_string(),
+                            });
+                        }
                         // Deepseek thinking mode streams `reasoning_content` as
                         // a sibling of `content` inside `delta`. DeepSeek v4-pro
                         // uses just `reasoning`. OpenAI's Responses API uses

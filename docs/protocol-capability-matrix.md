@@ -16,7 +16,7 @@
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
 | ------ | :---: | :---: | :---: | :---: | :---: |
 | `function_calling` | ✅ | ✅ | ✅ | ✅ | N/A |
-| `parallel_tool_calls` | ✅ | ⚠️ → chat→msg: 并行工具调用无法在 Anthropic 表达 | ✅ | ⚠️ | N/A |
+| `parallel_tool_calls` | ✅ | ✅ 禁用并行映射为 `disable_parallel_tool_use:true`；显式启用仍按既有契约拒绝 | ✅ | ⚠️ 禁用并行无等价 carrier，拒绝 | N/A |
 | `tool_choice=required` | ✅ | ✅ (via `{type:"any"}`) | ✅ | ✅ (via `toolConfig.functionCallingConfig.mode=ANY`) | N/A |
 | `tool_choice=具体函数` | ✅ | ✅ (via `{type:"tool", name:"x"}`) | ✅ | ✅ (via `mode=ANY` + `allowedFunctionNames`) | N/A |
 | `tool_result` 引用 | ✅ | ✅ | ✅ | ✅ | N/A |
@@ -156,7 +156,7 @@ TiyGate 在 DeepSeek Responses 出站前显式移除这些字段，不将其视�
 | hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅（`Tool.tool_type` + `config` 往返） | ❌ 跨协议拒绝 | N/A |
 | Programmatic Tool Calling (`programmatic_tool_calling` / `allowed_callers` / `program` / `caller` / `program_output`) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ 稳定版有序往返 | ❌ 跨协议拒绝 | N/A |
 
-**跨协议策略**：Responses 保留 hosted/function tool 的完整配置，并建模 PTC 的 program、caller 与 program_output 关系。目标协议不能表达 hosted tool 或 PTC 时由 lossy guard 明确拒绝，不再静默过滤。Hosted tool 的 provider-specific 输出 item（`web_search_call` / `file_search_call` / `code_interpreter_call` / `computer_call` 等）在同协议 Convert/re-encode 路径通过有序 `extensions["responses_opaque_output_items"]` 保活；跨协议仍丢弃（客户端不会消费这些 wire item）。raw PassThrough 路径始终字节级无损。
+**跨协议策略**：Responses 保留 hosted/function tool 的完整配置，并建模 PTC 的 program、caller 与 program_output 关系。目标协议不能表达 hosted tool 或 PTC 时由 lossy guard 明确拒绝，不再静默过滤。Hosted tool 的 provider-specific 输出 item（`web_search_call` / `file_search_call` / `code_interpreter_call` / `computer_call` 等）在同协议 Convert/re-encode 路径通过有序 `extensions["responses_opaque_output_items"]` 保活；跨协议仍丢弃（客户端不会消费这些 wire item）。raw PassThrough 路径保留原生 JSON 字段；入口 JSON 解析、模型改写和 Provider profile mutation 不承诺客户端原始空白、键顺序或数字文本的字节保真。
 
 ## 6.2 Explicit Prompt Caching
 
@@ -226,7 +226,7 @@ Multi-agent 仍要求客户端显式提供 `OpenAI-Beta: responses_multi_agent=v
 
 ## 12. Codex 扩展兼容性
 
-Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字段。同协议 Passthrough（Responses→Responses）时原始字节无损通过；以下行为仅适用于跨协议转换（Convert 模式）。
+Codex 客户端在 OpenAI Responses 协议上扩展了若干 item 类型和字段。同协议 Passthrough（Responses→Responses）保留原生字段，模型改写和 Provider profile mutation 另有边界；以下行为仅适用于跨协议转换（Convert 模式）。
 
 ### Codex Input Item 类型
 
@@ -292,7 +292,7 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 
 - **SSE 字节与事件**：跨协议流在 server 层按完整事件 framing；支持 UTF-8 跨网络分片、CRLF/CR、多个 `data:` 行以及冒号后可选空格。单事件缓冲上限 16 MiB，超限/非法 UTF-8/损坏 JSON 显式错误并结束转换，不以成功终止掩盖。
 - **工具流关联**：Messages 输出工具块按 call ID/index 维护，交错参数不写入最近工具块；各块在 Finish/ResponseCompleted 时成对关闭。Chat 数组工具结果保持消息级 `tool_call_id`。
-- **终止**：Gemini `usageMetadata` 不是终止信号，必须等待 `finishReason`；EOF 缺真实终态不生成成功完成。Chat 错误后的 `[DONE]` 不生成 Responses 成功 `response.completed`。Responses incomplete 终态保留已有 usage。
+- **终止**：Gemini `usageMetadata` 不是终止信号，必须等待 `finishReason`；EOF 缺真实终态不生成成功完成。Chat 错误后的 `[DONE]` 不生成 Responses 成功 `response.completed`。Responses encoder 等待 `ResponseCompleted` 后才封存最终累计 usage；长度/过滤终态输出原生 `response.incomplete` 和 `incomplete_details`，item 状态保持一致。完成/错误后不输出新的语义内容。
 - **用量**：IR `completion_tokens` 包含 reasoning；Gemini decode 将 `candidatesTokenCount + thoughtsTokenCount` 合并，encode 再拆分，缓存 input 约定不变。
 - **Gemini 请求/回放**：读取 `systemInstruction`（兼容历史 `system_instruction`），出站使用 camelCase；保留 functionCall/functionResponse 原生 ID。无 ID 的同名调用按出现次数分配独立 ID，历史 name-only result 按调用顺序匹配；无法匹配时拒绝。真实 thoughtSignature 按 call ID 原样回放，不能被 sentinel 覆盖。多个 candidate 的 IR 转换明确拒绝，正常同协议 raw 不承诺 IR 多候选支持。
 - **Schema**：Gemini `responseJsonSchema` 进入 canonical JsonSchema；需要 `additionalProperties`/`$ref`/`$defs`/`prefixItems` 时使用原生 JSON Schema carrier，其余保留 Schema 支持的边界约束。不能安全等价的组合/校验关键字（如 multipleOf、oneOf、allOf、not、条件 schema）明确拒绝，绝不降为 prompt 或 JSON-object 简写。
@@ -300,5 +300,17 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 - **工具失败**：IR ToolResult 保留 `is_error`；Messages 回放原 flag，Gemini 用 `response.error` 承载。目标 Chat/Responses 没有原生 error flag 时，包含 `is_error=true` 的请求明确拒绝（`ToolResultError`），不默默视为成功。
 - **Reasoning/refusal**：Messages `redacted_thinking.data` 在同协议 re-encode 使用密文 carrier 原样回放；跨供应商加密数据仍非通用可验证载体。Responses 原生 `message.content[].refusal` 保留到 canonical refusal。
 - **媒体**：loss guard 除 source 形式也检查 MIME，audio→Chat/Messages、video→非 Gemini 明确拒绝，避免编码为伪 image。
+
+### 14.1 Follow-up 修复契约（TG-PROTO-023～036）
+
+- Chat 字符串 `stop` 归一为一个停止序列，数组保留全部序列。
+- OpenAI 函数工具的 `strict:true/false` 双向保留；Chat→Responses 缺省时显式发送 `strict:false`，Responses→Chat 缺省时显式发送 `strict:true`，避免协议默认值差异。Messages 支持 native `strict`；严格工具转换到无 carrier 的 Gemini 时拒绝。
+- `parallel_tool_calls:false` ↔ Messages `tool_choice.disable_parallel_tool_use:true`；未知/未指定与 false 分开。向 Gemini 转换禁用并行时拒绝。
+- Responses `conversation` 在同协议 IR 重编码保活；带 `previous_response_id` 或 `conversation` 的跨协议请求明确拒绝，网关不下载或猜测历史上下文。同协议账号/模型作用域仍由目标 Provider 管理，不承诺跨账号 fallback 可续接。
+- 当前 IR 只支持一个候选。跨协议 `n>1`、多 Chat choices 或非零 choice index 明确拒绝；同协议 raw 响应可保留多个候选，IR 不合并答案。
+- 非流 Chat/Responses 工具参数损坏时返回 codec 错误，不替换为 `{}`。Responses 完整 arguments.done/output_item.done 根据 item/call ID 补交付缺失后缀；重复完整 payload 不重复参数，不一致或损坏则报错。
+- `RefusalDelta` 独立于答案文本：Chat 输出 delta.refusal，Responses 输出原生 refusal 生命周期，Messages/Gemini 以文本承载；完整 refusal 与 delta 去重。
+- Messages `document` 的 base64/URL carrier 进入媒体 IR；不支持的 document source 显式拒绝，不能入口丢弃。文档到 Chat 无等价输入 carrier 时拒绝，Responses/Gemini 保留文件语义，Messages 重编码使用 document 类型。
+- HTTP 200 Responses `status:failed` 即使带 `output:[]` 仍是上游失败；客户端获得原生错误 envelope 和非成功状态，不能转换为空答案/stop。
 
 回归语料为本项目自行编写的官方 wire 合成输入，见 `crates/protocols/tests/review_regressions.rs`、`crates/server/tests/protocol_review.rs`；不引入参考项目代码或 AGPL fixture。以上是有限已验证输入的契约，不代表全部模型/账号/生产上游兼容。

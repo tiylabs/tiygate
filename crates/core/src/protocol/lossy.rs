@@ -35,6 +35,12 @@ pub enum LossyDimension {
     /// Request has `parallel_tool_calls` semantics but the egress protocol cannot
     /// express parallel tool calls.
     ParallelToolCalls,
+    /// Target cannot preserve function-tool strictness.
+    StrictTools,
+    /// A request depends on server-owned Responses conversation state.
+    ConversationState,
+    /// Multiple independent choices cannot be represented by the canonical IR.
+    MultipleChoices,
     /// Request has `tool_choice=required` semantics but the egress protocol cannot
     /// express that.
     ToolChoiceRequired,
@@ -73,6 +79,9 @@ impl LossyDimension {
         match self {
             Self::ToolCalling => "tool_calling",
             Self::ParallelToolCalls => "parallel_tool_calls",
+            Self::StrictTools => "tools.strict",
+            Self::ConversationState => "conversation_state",
+            Self::MultipleChoices => "multiple_choices",
             Self::ToolChoiceRequired => "tool_choice=required",
             Self::ToolChoiceSpecific => "tool_choice=specific_function",
             Self::ToolResultError => "tool_result.is_error",
@@ -106,6 +115,68 @@ pub fn check_lossy_conversion(
     egress: &ProtocolEndpoint,
     egress_caps: &EndpointCapabilities,
 ) -> Result<(), (LossyDimension, Error)> {
+    use crate::protocol::ProtocolSuite;
+    let openai_target = matches!(
+        egress.suite,
+        ProtocolSuite::OpenAiCompatible | ProtocolSuite::OpenAiResponses
+    );
+    if request
+        .extensions
+        .get("choice_count")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|n| n > 1)
+        && egress.suite != ProtocolSuite::OpenAiCompatible
+    {
+        let dim = LossyDimension::MultipleChoices;
+        return Err((dim, lossy_error(dim, egress, "n > 1")));
+    }
+    let has_state = request
+        .extensions
+        .get("responses_extra")
+        .is_some_and(|extra| {
+            ["previous_response_id", "conversation"]
+                .iter()
+                .any(|field| {
+                    extra
+                        .get(*field)
+                        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+                })
+        });
+    if has_state && egress.suite != ProtocolSuite::OpenAiResponses {
+        let dim = LossyDimension::ConversationState;
+        return Err((
+            dim,
+            lossy_error(
+                dim,
+                egress,
+                "previous_response_id/conversation requires its original upstream context",
+            ),
+        ));
+    }
+    if request.tools.iter().any(|tool| {
+        tool.config
+            .as_ref()
+            .is_some_and(|config| config["strict"].as_bool() == Some(true))
+    }) && !matches!(
+        egress.suite,
+        ProtocolSuite::OpenAiCompatible
+            | ProtocolSuite::OpenAiResponses
+            | ProtocolSuite::AnthropicMessages
+    ) {
+        let dim = LossyDimension::StrictTools;
+        return Err((dim, lossy_error(dim, egress, "strict function parameters")));
+    }
+    if request
+        .extensions
+        .get("parallel_tool_calls")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        && !openai_target
+        && egress.suite != ProtocolSuite::AnthropicMessages
+    {
+        let dim = LossyDimension::ParallelToolCalls;
+        return Err((dim, lossy_error(dim, egress, "parallel_tool_calls=false")));
+    }
     // 1. Tool calling — request has tools but target can't call functions.
     if !request.tools.is_empty() && !egress_caps.function_calling {
         return Err((
@@ -196,7 +267,10 @@ pub fn check_lossy_conversion(
                 let unsupported_mime = match egress.suite {
                     crate::protocol::ProtocolSuite::OpenAiCompatible
                     | crate::protocol::ProtocolSuite::AnthropicMessages => {
-                        mime_type.starts_with("audio/") || mime_type.starts_with("video/")
+                        mime_type.starts_with("audio/")
+                            || mime_type.starts_with("video/")
+                            || (egress.suite == crate::protocol::ProtocolSuite::OpenAiCompatible
+                                && !mime_type.starts_with("image/"))
                     }
                     crate::protocol::ProtocolSuite::OpenAiResponses => {
                         mime_type.starts_with("video/")

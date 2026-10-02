@@ -49,5 +49,27 @@
     "codec regressions do not replace real HTTP framing",
     "HTTP tests use a local synthetic upstream and do not prove production provider/account compatibility",
     "is_error=true to Chat/Responses is rejected because the native failure flag cannot be preserved"
-  ]
+  ],
+  "followup": {
+    "review_head": "a11d4cc521791eec6de7f158d2b82fe7c7095498",
+    "origin": "original synthetic JSON/SSE; no reference implementation or fixtures copied",
+    "report": "/tmp/tiygate-protocol-review-WU3xRZZ6/report.md",
+    "findings": {
+      "TG-PROTO-023": "review_followup::chat_string_stop_preserved_or_rejected",
+      "TG-PROTO-024": "review_followup::strict_function_responses_to_chat_preserved_or_rejected",
+      "TG-PROTO-025": "review_followup::previous_response_id_crossing_requires_rejection",
+      "TG-PROTO-026": "review_lifecycle::refusal_text_survives_every_target_once",
+      "TG-PROTO-027": "review_followup::chat_multiple_stream_choices_not_merged",
+      "TG-PROTO-028": "review_followup::incomplete_response_uses_native_incomplete_event",
+      "TG-PROTO-029": "review_followup::malformed_nonstream_tool_arguments_not_replaced_with_empty_object",
+      "TG-PROTO-030": "review_media_state::chat_parallel_false_to_messages_preserved_or_rejected",
+      "TG-PROTO-031": "review_lifecycle::tool_done_payload_completes_a_prefix_without_duplication",
+      "TG-PROTO-032": "review_lifecycle::all_encoders_stop_semantic_content_after_terminal",
+      "TG-PROTO-033": "review_late_usage::earlier_usage_does_not_seal_response_before_final_usage",
+      "TG-PROTO-034": "review_media_state::messages_document_preserved_or_rejected",
+      "TG-PROTO-035": "server::protocol_review_followup::http_failed_response_with_output_not_accepted",
+      "TG-PROTO-036": "review_media_state::responses_conversation_preserved_on_reencode"
+    },
+    "http_target": "crates/server/tests/protocol_review_followup.rs"
+  }
 }
