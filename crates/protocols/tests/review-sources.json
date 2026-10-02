@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "review_head": "6db40e54663455fb99d675bd8985e4dc50f68a14",
+  "origin": "original synthetic JSON/SSE written for the 2026-10-02 review; no copied third-party implementation or fixture",
+  "test_target": "review_regressions",
+  "official_local_sources": [
+    "protocol-specs/api-wire/openai/openapi.yaml",
+    "protocol-specs/api-wire/gemini/v1beta.discovery.json",
+    "protocol-specs/api-wire/lock.json",
+    "protocol-specs/structured-output/gemini.toml"
+  ],
+  "official_sdk": {
+    "repository": "anthropics/anthropic-sdk-typescript",
+    "commit": "d49bdab458000bcdffe77bd84b03293f31824fb3",
+    "path": "src/resources/messages/messages.ts",
+    "use": "read-only field and replay contract evidence"
+  },
+  "findings": {
+    "TG-PROTO-001": "chat_interleaved_tools_to_messages_keep_argument_identity",
+    "TG-PROTO-003": "chat_error_followed_by_done_does_not_become_responses_success",
+    "TG-PROTO-004": "gemini_schema_constraints_preserved_or_rejected",
+    "TG-PROTO-005": "chat_array_tool_result_preserves_reference",
+    "TG-PROTO-006": "gemini_repeated_same_name_calls_have_unique_ids",
+    "TG-PROTO-007": "gemini_usage_before_finish_does_not_complete_early",
+    "TG-PROTO-008": "gemini_thinking_usage_maps_to_openai_total_output",
+    "TG-PROTO-009": "inline_audio_to_messages_guard_rejects",
+    "TG-PROTO-010": "gemini_camelcase_system_instruction_survives_conversion",
+    "TG-PROTO-011": "gemini_response_json_schema_does_not_degrade_to_json_object",
+    "TG-PROTO-012": "gemini_allowlist_keeps_all_allowed_tools_or_rejects",
+    "TG-PROTO-013": "messages_redacted_thinking_replay_survives",
+    "TG-PROTO-014": "messages_tool_error_flag_preserved_or_rejected",
+    "TG-PROTO-015": "gemini_request_signature_replayed_verbatim",
+    "TG-PROTO-016": "gemini_multiple_candidates_not_concatenated",
+    "TG-PROTO-017": "responses_nested_refusal_is_preserved",
+    "TG-PROTO-018": "responses_incomplete_preserves_usage",
+    "TG-PROTO-019": "sse_data_without_optional_space_is_accepted",
+    "TG-PROTO-021": "gemini_native_function_ids_survive_reencode"
+  },
+  "http_tests": {
+    "path": "crates/server/tests/protocol_review.rs",
+    "TG-PROTO-001": "http_interleaved_tools_preserve_block_references",
+    "TG-PROTO-002": "http_utf8_byte_split_preserves_text",
+    "TG-PROTO-003": "http_chat_error_done_has_no_success_completion",
+    "TG-PROTO-019": "http_multiline_sse_data_is_one_event"
+  },
+  "oracle": "inspect native output JSON fields and SSE lifecycle references, not target decoder roundtrips",
+  "limitations": [
+    "matrix test covers basic text for 16 directions, not every capability/profile",
+    "codec regressions do not replace real HTTP framing",
+    "HTTP tests use a local synthetic upstream and do not prove production provider/account compatibility",
+    "is_error=true to Chat/Responses is rejected because the native failure flag cannot be preserved"
+  ]
+}

@@ -234,6 +234,10 @@ pub enum Content {
         tool_call_id: String,
         name: String,
         content: String,
+        /// Whether the tool execution failed. Protocols without an explicit
+        /// error flag carry a structured error result instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
         /// Responses-specific item reference id for `function_call_output`.
         /// Required by the Responses HTTP API so each output item has a
         /// unique id that can be matched via `item_reference`.
@@ -604,7 +608,8 @@ pub enum ResponseFormat {
 pub struct Usage {
     /// Prompt / input tokens.
     pub prompt_tokens: u64,
-    /// Completion / output tokens.
+    /// Completion / output tokens, including reasoning tokens. Gemini's
+    /// separate candidate and thought counts are combined on decode.
     pub completion_tokens: u64,
     /// Reasoning / thinking tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]

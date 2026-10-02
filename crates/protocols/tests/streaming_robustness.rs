@@ -495,10 +495,9 @@ fn gemini_decoder_ignores_traffic_type_only_usage_metadata() {
 }
 
 #[test]
-fn gemini_decoder_synthesizes_finish_on_usage_only() {
-    // Proxy stripped `finishReason`; only `usageMetadata` arrives. The decoder
-    // must synthesize exactly one Finish(Stop) so the cross-protocol ingress
-    // encoder can still emit a terminator.
+fn gemini_decoder_usage_only_does_not_fabricate_finish() {
+    // Token usage can precede more content. Missing finishReason is not
+    // evidence that the model finished; EOF remains incomplete.
     let mut dec = GeminiStreamDecoder::new();
     let _ = dec
         .feed(r#"data: {"responseId":"r1","candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#)
@@ -508,24 +507,18 @@ fn gemini_decoder_synthesizes_finish_on_usage_only() {
         .unwrap();
     assert_eq!(
         count_finish(&parts),
-        1,
-        "usage-only frame must synthesize exactly one Finish, got: {parts:?}"
+        0,
+        "usage must not finish generation: {parts:?}"
     );
-    assert!(matches!(
-        parts
-            .iter()
-            .find(|p| matches!(p, StreamPart::Finish { .. })),
-        Some(StreamPart::Finish {
-            reason: FinishReason::Stop
-        })
-    ));
+    assert!(
+        dec.finish().unwrap().is_empty(),
+        "EOF without finishReason is incomplete"
+    );
 }
 
 #[test]
-fn gemini_decoder_usage_only_fallback_maps_tool_call_to_tool_calls() {
-    // Proxy stripped `finishReason` on a tool-call turn; only `usageMetadata`
-    // arrives. The fallback must map to ToolCalls, NOT Stop, or the client
-    // would stop instead of running the tool.
+fn gemini_decoder_usage_after_tool_call_requires_real_finish() {
+    // A tool call and usage still do not prove completion of the turn.
     let mut dec = GeminiStreamDecoder::new();
     let _ = dec
         .feed(r#"data: {"responseId":"r1","candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"cmd":"ls"}}}]}}]}"#)
@@ -533,17 +526,16 @@ fn gemini_decoder_usage_only_fallback_maps_tool_call_to_tool_calls() {
     let parts = dec
         .feed(r#"data: {"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}"#)
         .unwrap();
-    assert!(
-        matches!(
-            parts
-                .iter()
-                .find(|p| matches!(p, StreamPart::Finish { .. })),
-            Some(StreamPart::Finish {
-                reason: FinishReason::ToolCalls
-            })
-        ),
-        "usage-only fallback after functionCall must map to ToolCalls, got: {parts:?}"
-    );
+    assert_eq!(count_finish(&parts), 0);
+    let terminal = dec
+        .feed(r#"data: {"candidates":[{"finishReason":"STOP"}]}"#)
+        .unwrap();
+    assert!(terminal.iter().any(|p| matches!(
+        p,
+        StreamPart::Finish {
+            reason: FinishReason::ToolCalls
+        }
+    )));
 }
 
 #[test]
@@ -596,7 +588,7 @@ fn gemini_decoder_stop_after_prior_function_call_maps_to_tool_calls() {
 fn gemini_stream_encoder_tool_calls_finish_emits_stop() {
     // Gemini has no TOOL_CALLS finishReason; tool-call turns are represented as
     // functionCall parts plus STOP on the wire.
-    let mut enc = GeminiStreamEncoder;
+    let mut enc = GeminiStreamEncoder::default();
     let bytes = enc
         .encode_part(&StreamPart::Finish {
             reason: FinishReason::ToolCalls,

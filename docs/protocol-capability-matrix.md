@@ -286,3 +286,19 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 - 跨协议：`check_lossy_conversion` 检测到 `responses_extra.multi_agent` 或非空 `multi_agent_items` 时，以 `LossyDimension::MultiAgent` **拒绝**（HTTP 400），不静默丢弃。
 - 不支持 WebSocket multi-agent 长连接；本网关 Responses 面仅为 HTTP + SSE。
 - 不建模 agent 调度语义；不做跨协议转换。
+
+
+## 14. Protocol Review 回归契约（2026-10-02）
+
+- **SSE 字节与事件**：跨协议流在 server 层按完整事件 framing；支持 UTF-8 跨网络分片、CRLF/CR、多个 `data:` 行以及冒号后可选空格。单事件缓冲上限 16 MiB，超限/非法 UTF-8/损坏 JSON 显式错误并结束转换，不以成功终止掩盖。
+- **工具流关联**：Messages 输出工具块按 call ID/index 维护，交错参数不写入最近工具块；各块在 Finish/ResponseCompleted 时成对关闭。Chat 数组工具结果保持消息级 `tool_call_id`。
+- **终止**：Gemini `usageMetadata` 不是终止信号，必须等待 `finishReason`；EOF 缺真实终态不生成成功完成。Chat 错误后的 `[DONE]` 不生成 Responses 成功 `response.completed`。Responses incomplete 终态保留已有 usage。
+- **用量**：IR `completion_tokens` 包含 reasoning；Gemini decode 将 `candidatesTokenCount + thoughtsTokenCount` 合并，encode 再拆分，缓存 input 约定不变。
+- **Gemini 请求/回放**：读取 `systemInstruction`（兼容历史 `system_instruction`），出站使用 camelCase；保留 functionCall/functionResponse 原生 ID。无 ID 的同名调用按出现次数分配独立 ID，历史 name-only result 按调用顺序匹配；无法匹配时拒绝。真实 thoughtSignature 按 call ID 原样回放，不能被 sentinel 覆盖。多个 candidate 的 IR 转换明确拒绝，正常同协议 raw 不承诺 IR 多候选支持。
+- **Schema**：Gemini `responseJsonSchema` 进入 canonical JsonSchema；需要 `additionalProperties`/`$ref`/`$defs`/`prefixItems` 时使用原生 JSON Schema carrier，其余保留 Schema 支持的边界约束。不能安全等价的组合/校验关键字（如 multipleOf、oneOf、allOf、not、条件 schema）明确拒绝，绝不降为 prompt 或 JSON-object 简写。
+- **工具选择**：Gemini ANY + allowedFunctionNames 保留 required 和全部允许名称，跨协议只提供允许的声明；允许集合与声明交集为空时拒绝。
+- **工具失败**：IR ToolResult 保留 `is_error`；Messages 回放原 flag，Gemini 用 `response.error` 承载。目标 Chat/Responses 没有原生 error flag 时，包含 `is_error=true` 的请求明确拒绝（`ToolResultError`），不默默视为成功。
+- **Reasoning/refusal**：Messages `redacted_thinking.data` 在同协议 re-encode 使用密文 carrier 原样回放；跨供应商加密数据仍非通用可验证载体。Responses 原生 `message.content[].refusal` 保留到 canonical refusal。
+- **媒体**：loss guard 除 source 形式也检查 MIME，audio→Chat/Messages、video→非 Gemini 明确拒绝，避免编码为伪 image。
+
+回归语料为本项目自行编写的官方 wire 合成输入，见 `crates/protocols/tests/review_regressions.rs`、`crates/server/tests/protocol_review.rs`；不引入参考项目代码或 AGPL fixture。以上是有限已验证输入的契约，不代表全部模型/账号/生产上游兼容。

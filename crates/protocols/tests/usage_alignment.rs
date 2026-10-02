@@ -240,13 +240,15 @@ fn reasoning_gemini_to_chat_completions() {
         "usageMetadata": {
             "promptTokenCount": 10,
             "candidatesTokenCount": 20,
-            "totalTokenCount": 30,
+            "totalTokenCount": 80,
             "thoughtsTokenCount": 50
         }
     });
     let ir = in_codec.decode_response(body).unwrap();
     assert_eq!(ir.usage.as_ref().unwrap().reasoning_tokens, Some(50));
+    assert_eq!(ir.usage.as_ref().unwrap().completion_tokens, 70);
     let encoded = out_codec.encode_response(&ir).unwrap();
+    assert_eq!(encoded["usage"]["total_tokens"], 80);
     assert_eq!(
         encoded["usage"]["completion_tokens_details"]["reasoning_tokens"],
         50
@@ -428,7 +430,7 @@ fn stream_anthropic_encoder_writes_cache_and_input() {
 #[test]
 fn stream_gemini_usage_writes_total_and_cached() {
     use tiygate_protocols::gemini::GeminiStreamEncoder;
-    let mut enc = GeminiStreamEncoder;
+    let mut enc = GeminiStreamEncoder::default();
     let usage = Usage {
         prompt_tokens: 10,
         completion_tokens: 5,

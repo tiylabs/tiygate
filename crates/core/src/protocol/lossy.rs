@@ -41,6 +41,8 @@ pub enum LossyDimension {
     /// Request pins `tool_choice` to a specific function name but the egress
     /// protocol can only express it as `auto`/`any`/`required`.
     ToolChoiceSpecific,
+    /// Target has no native carrier for a tool execution error flag.
+    ToolResultError,
     /// Request contains a media part whose `MediaSource` kind is not expressible
     /// on the egress protocol (e.g. URL → Anthropic, file_id → non-Responses).
     MediaSourceUnsupported,
@@ -73,6 +75,7 @@ impl LossyDimension {
             Self::ParallelToolCalls => "parallel_tool_calls",
             Self::ToolChoiceRequired => "tool_choice=required",
             Self::ToolChoiceSpecific => "tool_choice=specific_function",
+            Self::ToolResultError => "tool_result.is_error",
             Self::MediaSourceUnsupported => "media_source",
             Self::StructuredOutput => "response_format (structured output)",
             Self::HostedTools => "hosted_tools",
@@ -172,7 +175,38 @@ pub fn check_lossy_conversion(
     // kind is not expressible on the egress protocol.
     for msg in &request.messages {
         for content in &msg.content {
-            if let Content::Media { source, .. } = content {
+            if matches!(
+                content,
+                Content::ToolResult {
+                    is_error: Some(true),
+                    ..
+                }
+            ) && !matches!(
+                egress.suite,
+                crate::protocol::ProtocolSuite::AnthropicMessages
+                    | crate::protocol::ProtocolSuite::GoogleGemini
+            ) {
+                let dim = LossyDimension::ToolResultError;
+                return Err((dim, lossy_error(dim, egress, "tool execution failed")));
+            }
+            if let Content::Media {
+                source, mime_type, ..
+            } = content
+            {
+                let unsupported_mime = match egress.suite {
+                    crate::protocol::ProtocolSuite::OpenAiCompatible
+                    | crate::protocol::ProtocolSuite::AnthropicMessages => {
+                        mime_type.starts_with("audio/") || mime_type.starts_with("video/")
+                    }
+                    crate::protocol::ProtocolSuite::OpenAiResponses => {
+                        mime_type.starts_with("video/")
+                    }
+                    crate::protocol::ProtocolSuite::GoogleGemini => false,
+                };
+                if unsupported_mime {
+                    let dim = LossyDimension::MediaSourceUnsupported;
+                    return Err((dim, lossy_error(dim, egress, mime_type)));
+                }
                 if let Some(dim) = media_source_dimension(source, egress, egress_caps) {
                     let hint = format!("media part with kind {:?}", media_kind(source));
                     return Err((dim, lossy_error(dim, egress, &hint)));

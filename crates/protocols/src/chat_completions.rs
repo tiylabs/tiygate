@@ -148,18 +148,29 @@ impl EndpointCodec for ChatCompletionsCodec {
                     // (upstream 400 invalid_params). The content may also be an
                     // array of content parts in newer OpenAI variants, which
                     // `parse_content_array` already handles for Role::Tool.
-                    if let Some(arr) = msg["content"].as_array() {
-                        parse_content_array(arr, &role)
+                    let result = if let Some(arr) = msg["content"].as_array() {
+                        let mut text = String::new();
+                        for part in arr {
+                            if part["type"].as_str() != Some("text") {
+                                return Err(tiygate_core::Error::Codec(
+                                    "Chat tool results support only text content parts".into(),
+                                ));
+                            }
+                            text.push_str(part["text"].as_str().unwrap_or(""));
+                        }
+                        text
                     } else {
-                        vec![Content::ToolResult {
-                            tool_call_id: msg["tool_call_id"].as_str().unwrap_or("").to_string(),
-                            name: msg["name"].as_str().unwrap_or("").to_string(),
-                            content: msg["content"].as_str().unwrap_or("").to_string(),
-                            id: None,
-                            caller: None,
-                            wire_type: None,
-                        }]
-                    }
+                        msg["content"].as_str().unwrap_or("").to_string()
+                    };
+                    vec![Content::ToolResult {
+                        is_error: None,
+                        tool_call_id: msg["tool_call_id"].as_str().unwrap_or("").to_string(),
+                        name: msg["name"].as_str().unwrap_or("").to_string(),
+                        content: result,
+                        id: None,
+                        caller: None,
+                        wire_type: None,
+                    }]
                 } else if let Some(text) = msg["content"].as_str() {
                     // A non-empty assistant text alongside tool_calls is common;
                     // skip empty strings to avoid emitting blank text blocks.
@@ -1042,6 +1053,15 @@ impl EndpointCodec for ChatCompletionsCodec {
             });
         }
 
+        if let Some(choice) = ir.extensions.get("tool_choice") {
+            body["tool_choice"] =
+                if choice["type"].as_str() == Some("function") && choice.get("name").is_some() {
+                    json!({"type":"function", "function":{"name":choice["name"]}})
+                } else {
+                    choice.clone()
+                };
+        }
+
         // Metadata: output from ir.metadata as JSON object
         if let Some(ref metadata) = ir.metadata {
             if !metadata.is_empty() {
@@ -1570,6 +1590,8 @@ pub struct ChatCompletionsStreamDecoder {
     /// `Finish(ToolCalls)` on `[DONE]` when a proxy ends a tool-call turn
     /// without sending `finish_reason: "tool_calls"`.
     saw_tool_calls: bool,
+    saw_error: bool,
+    completed: bool,
 }
 
 impl Default for ChatCompletionsStreamDecoder {
@@ -1585,6 +1607,8 @@ impl ChatCompletionsStreamDecoder {
             tool_calls: Vec::new(),
             saw_finish: false,
             saw_tool_calls: false,
+            saw_error: false,
+            completed: false,
         }
     }
 
@@ -1602,8 +1626,18 @@ impl ChatCompletionsStreamDecoder {
 impl StreamDecoder for ChatCompletionsStreamDecoder {
     fn feed(&mut self, line: &str) -> Result<Vec<StreamPart>, tiygate_core::Error> {
         let line = line.trim();
-        if line.is_empty() || line == "data: [DONE]" {
-            if line == "data: [DONE]" {
+        if self.completed {
+            return Ok(vec![]);
+        }
+        let is_done = line
+            .strip_prefix("data:")
+            .is_some_and(|data| data.trim() == "[DONE]");
+        if line.is_empty() || is_done {
+            if is_done {
+                self.completed = true;
+                if self.saw_error {
+                    return Ok(vec![]);
+                }
                 let mut parts = Vec::new();
                 // Tool-call turn fallback: some OpenAI-compatible proxies end a
                 // tool-call turn with `[DONE]` but never send the
@@ -1628,7 +1662,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
             return Ok(vec![]);
         }
 
-        let data = if let Some(stripped) = line.strip_prefix("data: ") {
+        let data = if let Some(stripped) = line.strip_prefix("data:") {
             stripped
         } else {
             return Ok(vec![]);
@@ -1658,6 +1692,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                     .and_then(|value| value.as_object())
                     .filter(|error| !error.is_empty())
                 {
+                    self.saw_error = true;
                     let error = Value::Object(error.clone());
                     let code = error["code"].as_str().or_else(|| error["type"].as_str());
                     let upstream_code = code.map(String::from);
@@ -1858,6 +1893,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                 parts.extend(pending_finishes);
             }
             Some("error") => {
+                self.saw_error = true;
                 let error = &chunk["error"];
                 let code = error["code"].as_str().or_else(|| error["type"].as_str());
                 let upstream_code = code.map(String::from);
@@ -1927,6 +1963,7 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
             Some("tool_use") | Some("tool_result") => {
                 if *role == Role::Tool {
                     Content::ToolResult {
+                        is_error: None,
                         tool_call_id: item["tool_call_id"].as_str().unwrap_or("").to_string(),
                         name: String::new(),
                         content: item["content"].as_str().unwrap_or("").to_string(),
@@ -2795,6 +2832,7 @@ mod tests {
                 Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: "call_1".to_string(),
                         name: "get_weather".to_string(),
                         content: "sunny".to_string(),

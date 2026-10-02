@@ -208,6 +208,28 @@ fn walk_schema_array(
 }
 
 fn is_known_unsupported_keyword(target: ProtocolSuite, keyword: &str) -> bool {
+    if target == ProtocolSuite::GoogleGemini {
+        return matches!(
+            keyword,
+            "allOf"
+                | "oneOf"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "dependentSchemas"
+                | "contains"
+                | "propertyNames"
+                | "uniqueItems"
+                | "multipleOf"
+                | "exclusiveMinimum"
+                | "exclusiveMaximum"
+                | "patternProperties"
+                | "unevaluatedProperties"
+                | "minContains"
+                | "maxContains"
+        );
+    }
     matches!(target, ProtocolSuite::AnthropicMessages)
         && matches!(
             keyword,

@@ -631,28 +631,6 @@ fn detect_verbatim_signals(bytes: &[u8], accum: &Arc<std::sync::Mutex<UsageAccum
     }
 }
 
-/// Split a UTF-8 SSE buffer into complete lines, returning the parsed lines
-/// and any trailing partial line (no terminating `\n` yet) that must be
-/// carried over to the next chunk. SSE events are delimited by blank lines
-/// and each protocol decoder parses a single `data:` line at a time while
-/// ignoring `event:` / blank lines, so line-granular feeding is sufficient
-/// and robust to TCP packet boundaries that split a frame mid-line.
-fn split_sse_lines(buf: &str) -> (Vec<String>, String) {
-    let mut lines: Vec<String> = Vec::new();
-    let mut remainder = String::new();
-    let mut last_end = 0usize;
-    for (idx, ch) in buf.char_indices() {
-        if ch == '\n' {
-            lines.push(buf[last_end..idx].to_string());
-            last_end = idx + 1;
-        }
-    }
-    if last_end < buf.len() {
-        remainder.push_str(&buf[last_end..]);
-    }
-    (lines, remainder)
-}
-
 #[allow(clippy::too_many_arguments, clippy::let_underscore_must_use)]
 pub(super) fn drive_upstream_stream(
     _state: &AppState,
@@ -700,7 +678,9 @@ pub(super) fn drive_upstream_stream(
     // normalization here, after either passthrough or transcoding, so every
     // client sees its requested virtual model without leaking target ids.
     let mut model_rewriter = response_model.map(|override_| override_.sse_rewriter());
-    let mut frame_buf = String::new();
+    let mut framer = super::sse_framing::SseFramer::new();
+    let mut transcode_failed = false;
+    let mut decoded_error = false;
     // Transcode-only: tracks whether the upstream actually delivered a
     // genuine terminal signal in-band (a `Finish` or `ResponseCompleted`
     // IR part decoded from the upstream SSE). Some decoders (notably
@@ -792,14 +772,30 @@ pub(super) fn drive_upstream_stream(
                                 // and feed each *complete* line to the egress
                                 // decoder; the trailing partial line (if any)
                                 // is held over to the next chunk.
-                                frame_buf.push_str(&String::from_utf8_lossy(&bytes));
-                                let (lines, remainder) = split_sse_lines(&frame_buf);
-                                frame_buf = remainder;
+                                let lines = match framer.feed(&bytes) {
+                                    Ok(lines) => lines,
+                                    Err(error) => {
+                                        if let Ok(mut a) = accum.lock() {
+                                            a.set_upstream_error(&error, Some("invalid_sse"));
+                                            a.mark_truncated(TruncationReason::UpstreamError);
+                                        }
+                                        capture_guard.set_reason(Some(TruncationReason::UpstreamError));
+                                        let error_frame = tc.encoder.encode_error(
+                                            &error, tiygate_core::ErrorClass::Transient, None,
+                                        );
+                                        capture_guard.append_client(&error_frame);
+                                        yield Ok(Bytes::from(error_frame));
+                                        capture_guard.finalize_spawn();
+                                        break;
+                                    }
+                                };
                                 let mut out: Vec<u8> = Vec::new();
                                 for line in lines {
+                                    if transcode_failed { break; }
                                     match tc.decoder.feed(&line) {
                                         Ok(parts) => {
                                             for part in &parts {
+                                                if transcode_failed { break; }
                                                 if matches!(
                                                     part,
                                                     tiygate_core::ir::StreamPart::Finish { .. }
@@ -840,12 +836,19 @@ pub(super) fn drive_upstream_stream(
                                                     if let Ok(mut a) = accum.lock() {
                                                         a.set_upstream_error(message, upstream_code.as_deref());
                                                     }
-                                                    // Use the class from the decoded error frame
-                                                    let _ = class; // class is used via encode_part
+                                                    // Failure is terminal for this attempt, even when
+                                                    // the upstream appends [DONE] or more semantic frames.
+                                                    transcode_failed = true;
+                                                    decoded_error = true;
+                                                    let _ = class;
                                                 }
                                                 match tc.encoder.encode_part(part) {
                                                     Ok(b) => out.extend_from_slice(&b),
                                                     Err(e) => {
+                                                        transcode_failed = true;
+                                                        if let Ok(mut a) = accum.lock() {
+                                                            a.set_upstream_error(&e.to_string(), Some("transcode_encode"));
+                                                        }
                                                         let ef = tc.encoder.encode_error(
                                                             &format!("transcode encode error: {e}"),
                                                             tiygate_core::ErrorClass::LossyOrCapability, None,
@@ -856,6 +859,10 @@ pub(super) fn drive_upstream_stream(
                                             }
                                         }
                                         Err(e) => {
+                                            transcode_failed = true;
+                                            if let Ok(mut a) = accum.lock() {
+                                                a.set_upstream_error(&e.to_string(), Some("transcode_decode"));
+                                            }
                                             let ef = tc.encoder.encode_error(
                                                 &format!("transcode decode error: {e}"),
                                                 tiygate_core::ErrorClass::LossyOrCapability, None,
@@ -879,6 +886,24 @@ pub(super) fn drive_upstream_stream(
                                         capture_guard.append_client(&out);
                                         yield Ok(Bytes::from(out));
                                     }
+                                }
+                                if transcode_failed {
+                                    // encode_error() already includes a terminal
+                                    // marker where needed. Only decoded error parts
+                                    // (encoded with encode_part) need this bridge.
+                                    if decoded_error {
+                                        let done = tc.encoder.encode_done();
+                                        if !done.is_empty() {
+                                            capture_guard.append_client(&done);
+                                            yield Ok(Bytes::from(done));
+                                        }
+                                    }
+                                    capture_guard.set_reason(Some(TruncationReason::UpstreamError));
+                                    if let Ok(mut a) = accum.lock() {
+                                        a.mark_truncated(TruncationReason::UpstreamError);
+                                    }
+                                    capture_guard.finalize_spawn();
+                                    break;
                                 }
                             } else {
                                 // Forward upstream bytes VERBATIM. The upstream
@@ -1000,23 +1025,46 @@ pub(super) fn drive_upstream_stream(
                                 // what was already yielded in previous
                                 // chunks, so it would never fire).
                                 let mut out: Vec<u8> = Vec::new();
-                                if !frame_buf.trim().is_empty() {
-                                    if let Ok(parts) = tc.decoder.feed(&frame_buf) {
-                                        for part in &parts {
-                                            if matches!(
-                                                part,
-                                                tiygate_core::ir::StreamPart::Finish { .. }
-                                                    | tiygate_core::ir::StreamPart::ResponseCompleted { .. }
-                                            ) {
-                                                saw_terminal = true;
-                                            }
-                                            if let Ok(b) = tc.encoder.encode_part(part) {
-                                                out.extend_from_slice(&b);
+                                match framer.finish() {
+                                    Ok(events) => {
+                                        for event in events {
+                                            match tc.decoder.feed(&event) {
+                                                Ok(parts) => {
+                                                    for part in &parts {
+                                                        if matches!(part, tiygate_core::StreamPart::Finish { .. } | tiygate_core::StreamPart::ResponseCompleted { .. }) { saw_terminal = true; }
+                                                        if let tiygate_core::StreamPart::Error { message, upstream_code, .. } = part {
+                                                            if let Ok(mut a) = accum.lock() { a.set_upstream_error(message, upstream_code.as_deref()); }
+                                                        }
+                                                        match tc.encoder.encode_part(part) {
+                                                            Ok(bytes) => out.extend(bytes),
+                                                            Err(error) => {
+                                                                transcode_failed = true;
+                                                                if let Ok(mut a) = accum.lock() { a.set_upstream_error(&error.to_string(), Some("transcode_encode")); }
+                                                                out.extend(tc.encoder.encode_error(&error.to_string(), tiygate_core::ErrorClass::Transient, None));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    transcode_failed = true;
+                                                    if let Ok(mut a) = accum.lock() { a.set_upstream_error(&error.to_string(), Some("transcode_decode")); }
+                                                    out.extend(tc.encoder.encode_error(&error.to_string(), tiygate_core::ErrorClass::Transient, None));
+                                                }
                                             }
                                         }
                                     }
+                                    Err(error) => {
+                                        transcode_failed = true;
+                                        if let Ok(mut a) = accum.lock() { a.set_upstream_error(&error, Some("invalid_sse")); }
+                                        out.extend(tc.encoder.encode_error(&error, tiygate_core::ErrorClass::Transient, None));
+                                    }
                                 }
-                                frame_buf.clear();
+                                if transcode_failed {
+                                    saw_terminal = false;
+                                    capture_guard.set_reason(Some(TruncationReason::UpstreamError));
+                                    if let Ok(mut a) = accum.lock() { a.mark_truncated(TruncationReason::UpstreamError); }
+                                }
+
                                 // Bridge `decoder.finish()` ONLY when the
                                 // upstream actually delivered a genuine terminal
                                 // signal in-band (`saw_terminal`). Some decoders
@@ -1037,7 +1085,8 @@ pub(super) fn drive_upstream_stream(
                                 // turn a recoverable gap into a corrupt
                                 // "successful" response. End at EOF instead so
                                 // the client can detect the truncation and retry.
-                                if saw_terminal {
+                                let has_error = accum.lock().map(|a| a.upstream_error.is_some()).unwrap_or(true);
+                                if saw_terminal && !has_error && !transcode_failed {
                                     if let Ok(parts) = tc.decoder.finish() {
                                         for part in &parts {
                                             if let Ok(b) = tc.encoder.encode_part(part) {
@@ -1061,7 +1110,7 @@ pub(super) fn drive_upstream_stream(
                                         .lock()
                                         .map(|a| a.upstream_error.is_some())
                                         .unwrap_or(false);
-                                    if has_upstream_error {
+                                    if has_upstream_error && !transcode_failed {
                                         let done = tc.encoder.encode_done();
                                         if !done.is_empty() {
                                             out.extend_from_slice(&done);

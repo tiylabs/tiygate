@@ -226,10 +226,10 @@ impl EndpointCodec for MessagesCodec {
                                 // rather than plain text; keep it as reasoning
                                 // so the block survives the round-trip.
                                 parts.push(Content::Reasoning {
-                                    text: block["data"].as_str().unwrap_or("").to_string(),
+                                    text: String::new(),
                                     signature: None,
                                     id: None,
-                                    encrypted_content: None,
+                                    encrypted_content: block["data"].as_str().map(String::from),
                                 });
                             }
                             Some("tool_use") => {
@@ -251,6 +251,7 @@ impl EndpointCodec for MessagesCodec {
                             }
                             Some("tool_result") => {
                                 parts.push(Content::ToolResult {
+                                    is_error: block["is_error"].as_bool(),
                                     tool_call_id: block["tool_use_id"]
                                         .as_str()
                                         .unwrap_or("")
@@ -622,7 +623,7 @@ impl EndpointCodec for MessagesCodec {
             }
         }
 
-        fn blocks_for(msg: &Message) -> Vec<Value> {
+        fn blocks_for(msg: &Message, anthropic_ingress: bool) -> Vec<Value> {
             msg.content
                 .iter()
                 .filter_map(|c| match c {
@@ -634,11 +635,13 @@ impl EndpointCodec for MessagesCodec {
                     // originated from another protocol (OpenAI/Gemini) — which
                     // has no Anthropic signature — is dropped on the request
                     // side rather than replayed.
-                    Content::Reasoning {
-                        text, signature, ..
-                    } => signature
-                        .as_ref()
-                        .map(|sig| json!({"type": "thinking", "thinking": text, "signature": sig})),
+                    Content::Reasoning { text, signature, encrypted_content, .. } => {
+                        if let Some(data) = encrypted_content.as_ref().filter(|_| anthropic_ingress) {
+                            Some(json!({"type":"redacted_thinking", "data":data}))
+                        } else {
+                            signature.as_ref().map(|sig| json!({"type":"thinking", "thinking":text, "signature":sig}))
+                        }
+                    },
                     Content::ToolCall {
                         id,
                         name,
@@ -655,12 +658,13 @@ impl EndpointCodec for MessagesCodec {
                         tool_call_id,
                         name: _,
                         content,
+                        is_error,
                         ..
-                    } => Some(json!({
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id,
-                        "content": content,
-                    })),
+                    } => {
+                        let mut result = json!({"type":"tool_result", "tool_use_id":tool_call_id, "content":content});
+                        if let Some(error) = is_error { result["is_error"] = json!(error); }
+                        Some(result)
+                    },
                     Content::Media {
                         source, mime_type, ..
                     } => match source {
@@ -684,7 +688,10 @@ impl EndpointCodec for MessagesCodec {
         let mut merged: Vec<(&'static str, Vec<Value>)> = Vec::new();
         for msg in &ir.messages {
             let role = wire_role(msg.role);
-            let mut blocks = blocks_for(msg);
+            let mut blocks = blocks_for(
+                msg,
+                ir.ingress_protocol.suite == ProtocolSuite::AnthropicMessages,
+            );
             if blocks.is_empty() {
                 continue;
             }
@@ -1043,6 +1050,7 @@ pub struct MessagesStreamEncoder {
     /// still carries real cache/read token counts.
     last_usage: Option<Usage>,
     pending_stop_reason: Option<&'static str>,
+    tool_indices: std::collections::HashMap<String, usize>,
 }
 
 impl Default for MessagesStreamEncoder {
@@ -1060,6 +1068,7 @@ impl MessagesStreamEncoder {
             next_index: 0,
             last_usage: None,
             pending_stop_reason: None,
+            tool_indices: std::collections::HashMap::new(),
         }
     }
 
@@ -1108,6 +1117,20 @@ impl MessagesStreamEncoder {
             serde_json::to_string(&data).unwrap_or_default()
         )
     }
+    fn close_tools(&mut self) -> String {
+        let mut indices: Vec<_> = self.tool_indices.drain().map(|(_, index)| index).collect();
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .map(|index| {
+                format!(
+                    "event: content_block_stop\ndata: {}\n\n",
+                    json!({"type":"content_block_stop", "index":index})
+                )
+            })
+            .collect()
+    }
+
     fn usage_delta(&self, usage: &Usage, stop_reason: Option<&str>) -> String {
         let mut usage_obj = json!({"output_tokens": usage.completion_tokens});
         if usage.prompt_tokens > 0 {
@@ -1182,44 +1205,45 @@ impl StreamEncoder for MessagesStreamEncoder {
                 arguments,
                 ..
             } => {
-                // The opener carries `name`: always close any prior block and
-                // open a FRESH tool_use block. Two consecutive openers (e.g.
-                // parallel tool calls) both have kind "tool_use", so we cannot
-                // rely on `ensure_block`'s same-kind short-circuit — that would
-                // merge two distinct calls into one block. Force the
-                // close+open here. Argument-only fragments (`name == None`)
-                // append to the currently-open tool_use block.
+                let mut out = String::new();
                 if let Some(n) = name {
-                    let mut out = self.close_block();
-                    out.push_str(&self.open_block(
-                        "tool_use",
-                        json!({"type": "tool_use", "id": id, "name": n, "input": {}}),
-                    ));
-                    if !arguments.is_empty() {
-                        let idx = self.current_index.unwrap_or(0);
-                        let data = json!({
-                            "type": "content_block_delta",
-                            "index": idx,
-                            "delta": {"type": "input_json_delta", "partial_json": arguments},
-                        });
-                        out.push_str(&format!(
-                            "event: content_block_delta\ndata: {}\n\n",
-                            serde_json::to_string(&data).unwrap_or_default()
+                    if id.is_empty() || self.tool_indices.contains_key(id) {
+                        return Err(tiygate_core::Error::Codec(
+                            "missing or duplicate streamed tool id".into(),
                         ));
                     }
-                    out
-                } else {
-                    let idx = self.current_index.unwrap_or(0);
-                    let data = json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "input_json_delta", "partial_json": arguments},
-                    });
-                    format!(
-                        "event: content_block_delta\ndata: {}\n\n",
-                        serde_json::to_string(&data).unwrap_or_default()
-                    )
+                    if self.tool_indices.len() >= 256 {
+                        return Err(tiygate_core::Error::Codec(
+                            "too many streamed tool calls".into(),
+                        ));
+                    }
+                    out.push_str(&self.close_block());
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    self.tool_indices.insert(id.clone(), index);
+                    out.push_str(&format!(
+                        "event: content_block_start\ndata: {}\n\n",
+                        json!({
+                            "type":"content_block_start", "index":index,
+                            "content_block":{"type":"tool_use","id":id,"name":n,"input":{}}
+                        })
+                    ));
                 }
+                let index = self.tool_indices.get(id).ok_or_else(|| {
+                    tiygate_core::Error::Codec(format!(
+                        "tool arguments reference unknown call {id:?}"
+                    ))
+                })?;
+                if !arguments.is_empty() {
+                    out.push_str(&format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        json!({
+                            "type":"content_block_delta", "index":index,
+                            "delta":{"type":"input_json_delta","partial_json":arguments}
+                        })
+                    ));
+                }
+                out
             }
             // PTC is Responses-only; no Anthropic wire carrier.
             StreamPart::ProgramDelta { .. } | StreamPart::ProgramOutputDelta { .. } => {
@@ -1240,6 +1264,7 @@ impl StreamEncoder for MessagesStreamEncoder {
                 // Close any open content block before signalling the stop
                 // reason, per the Anthropic streaming contract.
                 let mut out = self.close_block();
+                out.push_str(&self.close_tools());
                 if let Some(u) = &self.last_usage {
                     out.push_str(&self.usage_delta(u, Some(stop_reason)));
                 } else {
@@ -1252,6 +1277,7 @@ impl StreamEncoder for MessagesStreamEncoder {
             }
             StreamPart::ResponseCompleted { .. } => {
                 let mut out = self.close_block();
+                out.push_str(&self.close_tools());
                 if let Some(stop_reason) = self.pending_stop_reason.take() {
                     let data = json!({
                         "type": "message_delta",
@@ -1397,11 +1423,11 @@ impl MessagesStreamDecoder {
 impl StreamDecoder for MessagesStreamDecoder {
     fn feed(&mut self, line: &str) -> Result<Vec<StreamPart>, tiygate_core::Error> {
         let line = line.trim();
-        if line.is_empty() || !line.starts_with("data: ") {
+        if line.is_empty() || !line.starts_with("data:") {
             return Ok(vec![]);
         }
 
-        let data = line.strip_prefix("data: ").unwrap_or("");
+        let data = line.strip_prefix("data:").unwrap_or("");
         let event: Value = serde_json::from_str(data).map_err(|e| {
             tiygate_core::Error::Codec(format!("Failed to parse Anthropic SSE: {}", e))
         })?;
@@ -2226,6 +2252,7 @@ mod tests {
                 Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: "t1".to_string(),
                         name: "f".to_string(),
                         content: "r1".to_string(),
@@ -2237,6 +2264,7 @@ mod tests {
                 Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: "t2".to_string(),
                         name: "f".to_string(),
                         content: "r2".to_string(),
@@ -2336,11 +2364,20 @@ mod tests {
         ] {
             all.push_str(&String::from_utf8(enc.encode_part(&part).unwrap()).unwrap());
         }
-        // Two distinct content_block_start with index 0 and 1, and a
-        // content_block_stop between them.
+        // Distinct blocks stay open until all interleaved fragments arrive.
         assert!(all.contains("\"index\":0"));
         assert!(all.contains("\"index\":1"));
-        assert!(all.contains("content_block_stop"));
+        assert!(!all.contains("content_block_stop"));
+        all.push_str(
+            &String::from_utf8(
+                enc.encode_part(&StreamPart::Finish {
+                    reason: FinishReason::ToolCalls,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(all.matches("event: content_block_stop").count(), 2);
     }
 
     #[test]
@@ -2362,7 +2399,7 @@ mod tests {
         assert!(out.contains("input_json_delta"));
         let delta = out
             .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| line.strip_prefix("data:"))
             .filter_map(|data| serde_json::from_str::<Value>(data).ok())
             .find(|event| event["type"] == "content_block_delta")
             .expect("content_block_delta");
@@ -2398,7 +2435,7 @@ mod tests {
         }
         let deltas: Vec<Value> = all
             .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| line.strip_prefix("data:"))
             .filter_map(|data| serde_json::from_str::<Value>(data).ok())
             .filter(|event| event["type"] == "content_block_delta")
             .collect();

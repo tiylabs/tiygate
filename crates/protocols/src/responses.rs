@@ -651,6 +651,7 @@ impl EndpointCodec for ResponsesCodec {
                     // can be replayed when re-encoding for Responses HTTP.
                     let item_id = item["id"].as_str().map(|s| s.to_string());
                     vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id,
                         name: String::new(),
                         content: output,
@@ -696,6 +697,7 @@ impl EndpointCodec for ResponsesCodec {
                     };
                     let raw_id = responses_call_id(item).unwrap_or("");
                     vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: raw_id.to_string(),
                         name: String::new(),
                         content: output,
@@ -727,6 +729,7 @@ impl EndpointCodec for ResponsesCodec {
                     };
                     let raw_id = responses_call_id(item).unwrap_or("");
                     vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: raw_id.to_string(),
                         name: String::new(),
                         content: output,
@@ -1473,6 +1476,7 @@ impl EndpointCodec for ResponsesCodec {
                                 id,
                                 caller,
                                 wire_type,
+                                ..
                             } => {
                                 flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 // Cross-protocol Anthropic Messages carries
@@ -1556,6 +1560,7 @@ impl EndpointCodec for ResponsesCodec {
                             id,
                             caller,
                             wire_type,
+                            ..
                         } = c
                         {
                             if wire_type.as_deref() == Some("custom_tool_call_output") {
@@ -1896,7 +1901,14 @@ impl EndpointCodec for ResponsesCodec {
                     Some("message") => {
                         if let Some(content_arr) = item["content"].as_array() {
                             for part in content_arr {
-                                if part["type"] == "output_text" {
+                                if part["type"] == "refusal" {
+                                    if let Some(text) = part["refusal"].as_str() {
+                                        content.push(Content::Refusal {
+                                            text: text.to_string(),
+                                            category: None,
+                                        });
+                                    }
+                                } else if part["type"] == "output_text" {
                                     if let Some(text) = part["text"].as_str() {
                                         let annotations = part.get("annotations")
                                             .and_then(|a| a.as_array())
@@ -2183,6 +2195,7 @@ pub struct ResponsesStreamEncoder {
     /// Whether a terminal `response.completed` has already been emitted, so we
     /// do not emit it twice when both `Finish` and `ResponseCompleted` arrive.
     completed_sent: bool,
+    failed: bool,
     /// Status stashed from `Finish` when `pending_usage` was not yet available.
     /// When the upstream sends `finish_reason` and `usage` as separate SSE
     /// chunks (OpenAI-compatible: finish chunk → usage chunk → [DONE]), the
@@ -2237,6 +2250,7 @@ impl ResponsesStreamEncoder {
             sequence_number: 0,
             pending_usage: None,
             completed_sent: false,
+            failed: false,
             pending_finish_status: None,
             reasoning_output_index: None,
             reasoning_text: String::new(),
@@ -2551,6 +2565,9 @@ impl ResponsesStreamEncoder {
 
 impl StreamEncoder for ResponsesStreamEncoder {
     fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
+        if self.failed {
+            return Ok(vec![]);
+        }
         let chunk = match part {
             StreamPart::ResponseStarted { id } => {
                 self.response_id = Some(id.clone());
@@ -2797,6 +2814,7 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 class,
                 upstream_code,
             } => {
+                self.failed = true;
                 let mut err = json!({"message": message, "type": error_type_for_class(*class)});
                 if let Some(c) = upstream_code {
                     err["code"] = json!(c);
@@ -2812,6 +2830,7 @@ impl StreamEncoder for ResponsesStreamEncoder {
         class: ErrorClass,
         upstream_code: Option<&str>,
     ) -> Vec<u8> {
+        self.failed = true;
         let mut err = json!({"message": message, "type": error_type_for_class(class)});
         if let Some(c) = upstream_code {
             err["code"] = json!(c);
@@ -2879,8 +2898,11 @@ impl ResponsesStreamDecoder {
 impl StreamDecoder for ResponsesStreamDecoder {
     fn feed(&mut self, line: &str) -> Result<Vec<StreamPart>, tiygate_core::Error> {
         let line = line.trim();
-        if line.is_empty() || line == "data: [DONE]" {
-            if line == "data: [DONE]" {
+        let is_done = line
+            .strip_prefix("data:")
+            .is_some_and(|data| data.trim() == "[DONE]");
+        if line.is_empty() || is_done {
+            if is_done {
                 return Ok(vec![StreamPart::ResponseCompleted {
                     id: self.response_id.clone().unwrap_or_default(),
                     status: "completed".to_string(),
@@ -2890,7 +2912,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
             }
             return Ok(vec![]);
         }
-        let data = if let Some(s) = line.strip_prefix("data: ") {
+        let data = if let Some(s) = line.strip_prefix("data:") {
             s
         } else {
             return Ok(vec![]);
@@ -3240,6 +3262,25 @@ impl StreamDecoder for ResponsesStreamDecoder {
                 });
             }
             Some("response.incomplete") => {
+                if let Some(usage) = event["response"].get("usage").filter(|u| u.is_object()) {
+                    let cache_read = usage["input_tokens_details"]["cached_tokens"].as_u64();
+                    let cache_write = usage["input_tokens_details"]["cache_write_tokens"].as_u64();
+                    parts.push(StreamPart::Usage {
+                        usage: Usage {
+                            prompt_tokens: usage["input_tokens"]
+                                .as_u64()
+                                .unwrap_or(0)
+                                .saturating_sub(cache_read.unwrap_or(0))
+                                .saturating_sub(cache_write.unwrap_or(0)),
+                            completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+                            total_tokens: usage["total_tokens"].as_u64().unwrap_or(0),
+                            reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
+                                .as_u64(),
+                            cache_read_tokens: cache_read,
+                            cache_write_tokens: cache_write,
+                        },
+                    });
+                }
                 let reason = if self.saw_function_call {
                     FinishReason::ToolCalls
                 } else {
@@ -3515,7 +3556,7 @@ mod tests {
         .unwrap();
         let event: Value = completed
             .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| line.strip_prefix("data:"))
             .filter_map(|payload| serde_json::from_str(payload).ok())
             .find(|event: &Value| event["type"] == "response.completed")
             .expect("response.completed event");
@@ -4773,6 +4814,7 @@ mod tests {
                 Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: "call_1".to_string(),
                         name: "get_weather".to_string(),
                         content: "cloudy".to_string(),
