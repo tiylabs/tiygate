@@ -49,6 +49,8 @@ pub enum LossyDimension {
     ToolChoiceSpecific,
     /// Target has no native carrier for a tool execution error flag.
     ToolResultError,
+    /// The current tool-result IR cannot express native non-text blocks.
+    ToolResultContent,
     /// Request contains a media part whose `MediaSource` kind is not expressible
     /// on the egress protocol (e.g. URL → Anthropic, file_id → non-Responses).
     MediaSourceUnsupported,
@@ -85,6 +87,7 @@ impl LossyDimension {
             Self::ToolChoiceRequired => "tool_choice=required",
             Self::ToolChoiceSpecific => "tool_choice=specific_function",
             Self::ToolResultError => "tool_result.is_error",
+            Self::ToolResultContent => "tool_result.content",
             Self::MediaSourceUnsupported => "media_source",
             Self::StructuredOutput => "response_format (structured output)",
             Self::HostedTools => "hosted_tools",
@@ -120,6 +123,19 @@ pub fn check_lossy_conversion(
         egress.suite,
         ProtocolSuite::OpenAiCompatible | ProtocolSuite::OpenAiResponses
     );
+    if request
+        .extensions
+        .get("messages_tool_result_content")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|items| !items.is_empty())
+        && egress.suite != ProtocolSuite::AnthropicMessages
+    {
+        let dim = LossyDimension::ToolResultContent;
+        return Err((
+            dim,
+            lossy_error(dim, egress, "non-text Messages tool result"),
+        ));
+    }
     if request
         .extensions
         .get("choice_count")
@@ -322,7 +338,13 @@ pub fn check_lossy_conversion(
         crate::protocol::ProtocolSuite::OpenAiCompatible
             | crate::protocol::ProtocolSuite::OpenAiResponses
     );
-    if request.tools.iter().any(|tool| tool.is_hosted()) && !egress_caps.hosted_tools {
+    let native_gemini_tools = request.ingress_protocol.suite == ProtocolSuite::GoogleGemini;
+    let hosted_target_supported = if native_gemini_tools {
+        egress.suite == ProtocolSuite::GoogleGemini
+    } else {
+        egress_caps.hosted_tools
+    };
+    if request.tools.iter().any(|tool| tool.is_hosted()) && !hosted_target_supported {
         return Err((
             LossyDimension::HostedTools,
             lossy_error(

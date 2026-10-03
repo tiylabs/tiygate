@@ -373,7 +373,7 @@ fn chat_final_chunk_finish_and_usage_transcodes_to_responses_completed_usage() {
     let mut chat_dec = ChatCompletionsStreamDecoder::new();
     let mut responses_enc = tiygate_protocols::responses::ResponsesStreamEncoder::new();
     let lines = [
-        r#"data: {"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#,
+        r#"data: {"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}"#,
         r#"data: {"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":24602,"completion_tokens":142,"total_tokens":24744,"prompt_tokens_details":{"cached_tokens":24320},"completion_tokens_details":{"reasoning_tokens":18}}}"#,
         "data: [DONE]",
     ];

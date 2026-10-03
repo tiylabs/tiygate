@@ -11,3 +11,5 @@ pub mod gemini;
 pub mod images;
 pub mod messages;
 pub mod responses;
+
+mod tool_choice;

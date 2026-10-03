@@ -1650,6 +1650,15 @@ pub(super) fn get_egress_codec(
     }
 }
 
+fn gemini_api_base(target: &tiygate_core::RoutingTarget) -> String {
+    let base = target.effective_api_base().trim_end_matches('/');
+    if base.ends_with("/v1beta") || base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/v1beta")
+    }
+}
+
 /// Build the non-streaming upstream URL by egress suite, with Gemini support.
 /// Google Gemini's non-streaming URL embeds the model and uses the
 /// `:generateContent` method; the other suites have a fixed path suffix.
@@ -1659,8 +1668,8 @@ pub(super) fn gemini_aware_upstream_url(
 ) -> Option<String> {
     match suite {
         tiygate_core::ProtocolSuite::GoogleGemini => Some(format!(
-            "{}/v1beta/models/{}:generateContent",
-            target.effective_api_base().trim_end_matches('/'),
+            "{}/models/{}:generateContent",
+            gemini_api_base(target),
             target.model_id
         )),
         _ => upstream_url_for_suite(target, suite),
@@ -1701,8 +1710,8 @@ pub(super) fn upstream_stream_url_for_suite(
 ) -> Option<String> {
     match suite {
         tiygate_core::ProtocolSuite::GoogleGemini => Some(format!(
-            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
-            target.effective_api_base().trim_end_matches('/'),
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            gemini_api_base(target),
             target.model_id
         )),
         _ => upstream_url_for_suite(target, suite),

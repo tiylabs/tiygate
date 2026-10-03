@@ -163,7 +163,7 @@ async fn http_chat_error_done_has_no_success_completion() {
 async fn http_interleaved_tools_preserve_block_references() {
     let wire = concat!(
       "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"f\",\"arguments\":\"\"}},{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"g\",\"arguments\":\"\"}}]}}]}\n\n",
-      "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}},{\"index\":1,\"function\":{\"arguments\":\"{ \"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+      "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}},{\"index\":1,\"function\":{\"arguments\":\"{ }\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
     );
     let out = http_transcode(vec![wire.as_bytes().to_vec()], ProtocolSuite::OpenAiCompatible, "/v1/messages",
         json!({"model":"m","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]})).await;

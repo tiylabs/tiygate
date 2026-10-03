@@ -628,7 +628,11 @@ impl EndpointCodec for ResponsesCodec {
                         id: ir_id,
                         name: item["name"].as_str().unwrap_or("").to_string(),
                         arguments: serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
-                            .unwrap_or(json!({})),
+                            .map_err(|error| {
+                                tiygate_core::Error::Codec(format!(
+                                    "invalid Responses history tool arguments: {error}"
+                                ))
+                            })?,
                         call_id: ir_call_id,
                         caller: decode_tool_caller(item),
                         wire_type: None,
@@ -935,7 +939,10 @@ impl EndpointCodec for ResponsesCodec {
             extensions.insert("parallel_tool_calls".to_string(), json!(parallel));
         }
         if let Some(tc) = body.get("tool_choice") {
-            extensions.insert("tool_choice".to_string(), tc.clone());
+            extensions.insert(
+                "tool_choice".to_string(),
+                crate::tool_choice::normalize(tc)?,
+            );
         }
         if let Some(tf) = body.get("text") {
             extensions.insert("text".to_string(), tf.clone());
@@ -1783,7 +1790,7 @@ impl EndpointCodec for ResponsesCodec {
         }
         // Replay modeled Responses extensions captured at decode time.
         if let Some(tc) = ir.extensions.get("tool_choice") {
-            body["tool_choice"] = tc.clone();
+            body["tool_choice"] = crate::tool_choice::responses(tc)?;
         }
         if let Some(tf) = ir.extensions.get("text") {
             body["text"] = tf.clone();
@@ -5998,8 +6005,8 @@ mod tests {
 
         let (chat_encoded, _) = chat.encode_request(&ir).unwrap();
         assert_eq!(chat_encoded["tools"][0]["type"], "custom");
-        assert_eq!(chat_encoded["tools"][0]["name"], "code_exec");
-        assert_eq!(chat_encoded["tools"][0]["format"]["type"], "text");
+        assert_eq!(chat_encoded["tools"][0]["custom"]["name"], "code_exec");
+        assert_eq!(chat_encoded["tools"][0]["custom"]["format"]["type"], "text");
     }
 
     #[test]

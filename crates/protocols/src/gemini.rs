@@ -52,8 +52,11 @@ fn lookup_tool_call_name(messages: &[Message], tool_call_id: &str) -> Option<Str
                 continue;
             }
             for content in &msg.content {
-                if let Content::ToolCall { id, name, .. } = content {
-                    if id == tool_call_id && !name.is_empty() {
+                if let Content::ToolCall {
+                    id, call_id, name, ..
+                } = content
+                {
+                    if call_id.as_deref().unwrap_or(id) == tool_call_id && !name.is_empty() {
                         return Some(name.clone());
                     }
                 }
@@ -61,10 +64,7 @@ fn lookup_tool_call_name(messages: &[Message], tool_call_id: &str) -> Option<Str
         }
     }
 
-    tool_call_id
-        .strip_prefix("gemini_call_")
-        .filter(|name| !name.is_empty())
-        .map(String::from)
+    None
 }
 
 /// Sentinel value injected as `thoughtSignature` when a Gemini 3 model
@@ -121,6 +121,55 @@ fn uses_json_schema_carrier(schema: &Value) -> bool {
         }
         Value::Array(values) => values.iter().any(uses_json_schema_carrier),
         _ => false,
+    }
+}
+
+/// Decode Google's Schema dialect without walking JSON instance values such
+/// as enum/default. JSON Schema carriers bypass this transformation.
+fn decode_gemini_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema.clone();
+    };
+    let mut result = object.clone();
+    if let Some(kind) = object.get("type").and_then(Value::as_str) {
+        result.insert("type".into(), json!(kind.to_ascii_lowercase()));
+    }
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(children) = object.get(key).and_then(Value::as_object) {
+            result.insert(
+                key.into(),
+                Value::Object(
+                    children
+                        .iter()
+                        .map(|(name, child)| (name.clone(), decode_gemini_schema(child)))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    for key in ["items", "additionalProperties"] {
+        if let Some(child) = object.get(key) {
+            result.insert(key.into(), decode_gemini_schema(child));
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(children) = object.get(key).and_then(Value::as_array) {
+            result.insert(
+                key.into(),
+                json!(children
+                    .iter()
+                    .map(decode_gemini_schema)
+                    .collect::<Vec<_>>()),
+            );
+        }
+    }
+    let nullable = result.remove("nullable").and_then(|v| v.as_bool()) == Some(true);
+    if nullable {
+        // Wrap the complete constraints: merely adding null to `type` would
+        // still exclude null when enum/anyOf is present on the same node.
+        json!({"anyOf":[Value::Object(result), {"type":"null"}]})
+    } else {
+        Value::Object(result)
     }
 }
 
@@ -533,8 +582,8 @@ impl EndpointCodec for GeminiCodec {
                                     description: fd["description"].as_str().map(String::from),
                                     parameters: fd
                                         .get("parametersJsonSchema")
-                                        .or_else(|| fd.get("parameters"))
-                                        .cloned(),
+                                        .cloned()
+                                        .or_else(|| fd.get("parameters").map(decode_gemini_schema)),
                                     required: false,
                                     ..Default::default()
                                 })
@@ -546,6 +595,22 @@ impl EndpointCodec for GeminiCodec {
         } else {
             Vec::new()
         };
+
+        if let Some(definitions) = body["tools"].as_array() {
+            for definition in definitions {
+                if let Some(object) = definition.as_object() {
+                    for (kind, config) in object {
+                        if kind != "functionDeclarations" {
+                            tools.push(Tool {
+                                tool_type: Some(kind.clone()),
+                                config: Some(config.clone()),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         let gc = &body["generationConfig"];
         let params = tiygate_core::GenerationParams {
@@ -614,14 +679,15 @@ impl EndpointCodec for GeminiCodec {
 
         // Parse inbound structured-output config. Gemini carries it in
         // generationConfig.responseSchema (+ responseMimeType=application/json).
-        let response_format = if let Some(schema) = gc
+        let native_schema = gc
             .get("responseJsonSchema")
-            .or_else(|| gc.get("responseSchema"))
-        {
+            .cloned()
+            .or_else(|| gc.get("responseSchema").map(decode_gemini_schema));
+        let response_format = if let Some(schema) = native_schema {
             if !schema.is_null() {
                 Some(tiygate_core::ResponseFormat::JsonSchema {
                     name: "response".to_string(),
-                    schema: schema.clone(),
+                    schema,
                     strict: None,
                 })
             } else {
@@ -688,8 +754,12 @@ impl EndpointCodec for GeminiCodec {
             .get("allowed_tool_names")
             .and_then(Value::as_array)
         {
-            tools.retain(|tool| allowed.iter().any(|name| name.as_str() == Some(&tool.name)));
-            if tools.is_empty() {
+            // Keep native hosted carriers visible to the loss guard even
+            // when the function allowlist narrows callable declarations.
+            tools.retain(|tool| {
+                tool.is_hosted() || allowed.iter().any(|name| name.as_str() == Some(&tool.name))
+            });
+            if !tools.iter().any(Tool::is_function) {
                 return Err(tiygate_core::Error::Codec(
                     "required tool allowlist has no declared functions".into(),
                 ));
@@ -718,7 +788,9 @@ impl EndpointCodec for GeminiCodec {
         let mut parts = Vec::new();
         for c in &ir.content {
             match c {
-                Content::Text { text, .. } => parts.push(json!({"text": text})),
+                Content::Text { text, .. } | Content::Refusal { text, .. } => {
+                    parts.push(json!({"text": text}))
+                }
                 Content::Reasoning { text, .. } => {
                     // Gemini's standard "thought" format is a text part flagged
                     // with `thought: true`, not `{"thought": text}`. Emit the
@@ -1034,8 +1106,21 @@ impl EndpointCodec for GeminiCodec {
                     declaration
                 })
                 .collect();
+            let mut tools = Vec::new();
             if !declarations.is_empty() {
-                body["tools"] = json!([{"functionDeclarations": declarations}]);
+                tools.push(json!({"functionDeclarations": declarations}));
+            }
+            if ir.ingress_protocol.suite == ProtocolSuite::GoogleGemini {
+                for tool in ir.tools.iter().filter(|tool| tool.is_hosted()) {
+                    if let Some(kind) = &tool.tool_type {
+                        let mut definition = serde_json::Map::new();
+                        definition.insert(kind.clone(), tool.config.clone().unwrap_or(json!({})));
+                        tools.push(json!(definition));
+                    }
+                }
+            }
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
             }
         }
 

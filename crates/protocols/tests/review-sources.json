@@ -71,5 +71,60 @@
       "TG-PROTO-036": "review_media_state::responses_conversation_preserved_on_reencode"
     },
     "http_target": "crates/server/tests/protocol_review_followup.rs"
+  },
+  "final_review": {
+    "review_head": "adcb4487f29d6ebd1d3a0dd110408932edc21b56",
+    "origin": "original synthetic JSON/SSE; no copied third-party implementation or fixture",
+    "report": "/tmp/tiygate-protocol-review-9SsMLKSA/report.md",
+    "codec_target": "review_final",
+    "http_target": "protocol_review_final",
+    "findings": {
+      "TG-PROTO-029": "malformed_responses_history_not_replaced_with_empty_object",
+      "TG-PROTO-037": "chat_specific_tool_to_responses_uses_flat_name / responses_specific_tool_to_messages_preserves_name",
+      "TG-PROTO-038": "responses_tool_result_to_gemini_matches_call_id",
+      "TG-PROTO-039": "gemini_response_schema_normalizes_enum_and_nullable / gemini_native_parameters_normalized_to_json_schema",
+      "TG-PROTO-040": "gemini_code_execution_to_chat_rejects_instead_of_dropping",
+      "TG-PROTO-041": "messages_tool_image_to_responses_preserved_or_rejected / multimodal_tool_result_survives_messages_reencode",
+      "TG-PROTO-042": "chat_stream_incomplete_tool_json_not_completed_successfully",
+      "TG-PROTO-043": "chat_custom_tool_definition_has_native_nested_carrier / responses_custom_tool_definition_to_chat_uses_custom_object",
+      "TG-PROTO-044": "chat_custom_tool_stream_preserves_freeform_input / custom_stream_both_directions_preserve_input",
+      "TG-PROTO-045": "chat_repeated_tool_name_does_not_reopen_same_call / chat_late_tool_id_is_buffered_until_identity_available",
+      "TG-PROTO-046": "gemini_nonstream_refusal_text_survives",
+      "TG-PROTO-047": "messages_stream_refusal_stop_reason_survives / content_filter_to_messages_stream_does_not_become_end_turn",
+      "TG-PROTO-048": "enormous_chat_tool_index_errors_without_panic / enormous_messages_tool_index_errors_without_panic",
+      "TG-PROTO-049": "gemini_tool_result_text_order_to_chat_preserved",
+      "TG-PROTO-050": "http_gemini_versioned_base_uses_one_version"
+    },
+    "official_local_sources": [
+      "protocol-specs/api-wire/openai/openapi.yaml",
+      "protocol-specs/api-wire/gemini/v1beta.discovery.json"
+    ],
+    "official_sdk": {
+      "repository": "anthropics/anthropic-sdk-typescript",
+      "commit": "d49bdab458000bcdffe77bd84b03293f31824fb3",
+      "path": "src/resources/messages/messages.ts",
+      "use": "read-only field and replay contract evidence"
+    },
+    "oracle": "native JSON fields, media refusal, call/result refs, SSE block identity/terminal and no-success-on-invalid semantics",
+    "limitations": [
+      "Messages multimodal tool results cross-protocol are rejected until canonical content carrier is modeled",
+      "Chat index 0-255/16MiB args and Messages content index 0-1023 are gateway bounds",
+      "temporary reports may be cleaned by host",
+      "no live provider calls"
+    ],
+    "supplemental_tests": [
+      "schema_nullable_enum_and_instance_values_preserved",
+      "native_hosted_tool_survives_gemini_reencode",
+      "multimodal_tool_result_survives_messages_reencode",
+      "gemini_allowlist_does_not_hide_hosted_tools_from_guard",
+      "sparse_and_invalid_tool_indices_are_bounded",
+      "tool_arguments_memory_is_bounded",
+      "duplicate_ids_on_different_indices_are_rejected",
+      "length_truncated_tool_preserves_incomplete",
+      "http_named_function_to_messages_never_panics",
+      "http_large_indices_emit_error_without_success",
+      "http_late_identity_is_buffered_until_open",
+      "http_gemini_result_text_order_survives"
+    ]
   }
 }

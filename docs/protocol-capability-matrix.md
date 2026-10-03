@@ -153,7 +153,8 @@ TiyGate 在 DeepSeek Responses 出站前显式移除这些字段，不将其视�
 | ------ | :---: | :---: | :---: | :---: | :---: |
 | function tools | ✅ | ✅ | ✅ | ✅ | N/A |
 | custom tools (`type: "custom"`) | ✅ | ❌ 跨协议拒绝 (`CustomTools`) | ✅ | ❌ 跨协议拒绝 (`CustomTools`) | N/A |
-| hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅（`Tool.tool_type` + `config` 往返） | ❌ 跨协议拒绝 | N/A |
+| Responses hosted tools (`web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅（`Tool.tool_type` + `config` 往返） | ❌ 跨协议拒绝 | N/A |
+| Gemini native tools (`codeExecution` / `googleSearch` 等) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ 同协议保留配置 | N/A |
 | Programmatic Tool Calling (`programmatic_tool_calling` / `allowed_callers` / `program` / `caller` / `program_output`) | ❌ 跨协议拒绝 | ❌ 跨协议拒绝 | ✅ 稳定版有序往返 | ❌ 跨协议拒绝 | N/A |
 
 **跨协议策略**：Responses 保留 hosted/function tool 的完整配置，并建模 PTC 的 program、caller 与 program_output 关系。目标协议不能表达 hosted tool 或 PTC 时由 lossy guard 明确拒绝，不再静默过滤。Hosted tool 的 provider-specific 输出 item（`web_search_call` / `file_search_call` / `code_interpreter_call` / `computer_call` 等）在同协议 Convert/re-encode 路径通过有序 `extensions["responses_opaque_output_items"]` 保活；跨协议仍丢弃（客户端不会消费这些 wire item）。raw PassThrough 路径保留原生 JSON 字段；入口 JSON 解析、模型改写和 Provider profile mutation 不承诺客户端原始空白、键顺序或数字文本的字节保真。
@@ -314,3 +315,19 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 - HTTP 200 Responses `status:failed` 即使带 `output:[]` 仍是上游失败；客户端获得原生错误 envelope 和非成功状态，不能转换为空答案/stop。
 
 回归语料为本项目自行编写的官方 wire 合成输入，见 `crates/protocols/tests/review_regressions.rs`、`crates/server/tests/protocol_review.rs`；不引入参考项目代码或 AGPL fixture。以上是有限已验证输入的契约，不代表全部模型/账号/生产上游兼容。
+
+
+### 14.2 Final review 修复契约（TG-PROTO-029、037～050）
+
+- **指定工具选择**：Chat 的 `tool_choice.function.name` 与 Responses 的 `tool_choice.name` 在入口归一，出站恢复目标原生 carrier；缺名称明确 codec 错误，不索引缺失键而 panic。函数工具和 custom 选择的类型分别保留。
+- **工具历史**：Gemini 名称查找使用 canonical `call_id.unwrap_or(id)`，不从合成 ID 前缀猜名称。Responses 请求历史中损坏的 function arguments 返回入口错误，不替换为 `{}`。含文本与工具结果的有序内容转换到 Chat 时按出现顺序拆成 user/tool 消息。
+- **Gemini Schema**：`responseSchema` 与 function declaration `parameters` 属于原生 Schema dialect；递归归一 `OBJECT`/`STRING` 等类型，`nullable:true` 使用包含 null 的 `anyOf`，同时保留 enum 等约束。`responseJsonSchema` / `parametersJsonSchema` 已是 JSON Schema，原样进入 IR；不转换 enum/default 中的实例值。
+- **Gemini hosted 工具**：`codeExecution`、`googleSearch` 等非函数 carrier 保留类型与配置。同协议重编码回放，跨协议目标明确以 `HostedTools` 拒绝；不能在入口删除后绕过 guard，也不能与 Responses hosted 工具名称混用。
+- **Messages 工具结果媒体**：文本数组继续使用文本 IR；包含 image/document 或其他非文本块时保留原始有序数组供同协议回放。当前 ToolResult IR 没有通用多模态内容载体，因此跨协议以 `ToolResultContent` 明确拒绝，不能将图片 JSON 当作文本工具结果发送。重复的非文本 result ID 明确拒绝。
+- **Custom tools**：Chat 定义使用 `tools[].custom`，Responses 使用扁平定义；Chat 兼容历史扁平输入，输出使用原生嵌套结构。流式调用按 `custom.name/input` 解码，向 Chat/Responses 输出原生 custom 增量与完整 free-form input，不按函数 JSON 校验。
+- **Chat 工具流身份**：按 index 保存调用身份；重复相同 ID/name 幂等，冲突拒绝，迟到身份有界缓冲到 ID/name 齐全再创建一次工具块。不合成工具名或 ID；成功结束时缺身份或函数参数 JSON 损坏明确错误，Length/ContentFilter 保留截断语义。
+- **流式资源上界**：Chat tool index 为 0～255，Messages content index 为 0～1023；非法类型、负值和超限 index 返回 codec 错误。Chat 单个 ID/name 上限 1 KiB，总工具参数缓存上限 16 MiB，防止巨大或稀疏 index 驱动无界扩容。上限是网关资源契约，不宣称协议官方 index 上限相同。
+- **Refusal**：Gemini 非流响应以 text 保留 refusal 文本；Messages 流/非流使用原生 `stop_reason:"refusal"`，映射为 canonical ContentFilter，不能变成自然 end_turn/stop。
+- **Gemini URL**：出站 base 可为无版本 proxy root 或以 `/v1beta`（也兼容 `/v1`）结尾的 versioned base；只添加一次版本，stream/nonstream 分别拼原生 method。模型/账号 profile 的实际能力仍需独立验证。
+
+原始语料与独立断言见 `crates/protocols/tests/review_final.rs` 和 `crates/server/tests/protocol_review_final.rs`。CI 缺口 TG-PROTO-020 不由本轮 codec 修复解决；真实账号、全部 profile 和大内存压力不属于这些离线用例的证明范围。
