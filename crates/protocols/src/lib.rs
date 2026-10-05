@@ -12,4 +12,5 @@ pub mod images;
 pub mod messages;
 pub mod responses;
 
+mod tool_arguments;
 mod tool_choice;

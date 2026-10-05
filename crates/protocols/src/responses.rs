@@ -627,12 +627,10 @@ impl EndpointCodec for ResponsesCodec {
                     vec![Content::ToolCall {
                         id: ir_id,
                         name: item["name"].as_str().unwrap_or("").to_string(),
-                        arguments: serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
-                            .map_err(|error| {
-                                tiygate_core::Error::Codec(format!(
-                                    "invalid Responses history tool arguments: {error}"
-                                ))
-                            })?,
+                        arguments: crate::tool_arguments::parse_function_arguments(
+                            item["arguments"].as_str().unwrap_or("{}"),
+                            "Responses history tool arguments",
+                        )?,
                         call_id: ir_call_id,
                         caller: decode_tool_caller(item),
                         wire_type: None,
@@ -1986,13 +1984,10 @@ impl EndpointCodec for ResponsesCodec {
                         });
                     }
                     Some("function_call") => {
-                        let args: Value =
-                            serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
-                                .map_err(|error| {
-                                    tiygate_core::Error::Codec(format!(
-                                        "invalid Responses tool arguments: {error}"
-                                    ))
-                                })?;
+                        let args: Value = crate::tool_arguments::parse_function_arguments(
+                            item["arguments"].as_str().unwrap_or("{}"),
+                            "Responses tool arguments",
+                        )?;
                         // Responses function_call items carry two distinct ids:
                         // `id` (item reference, e.g. `fc_xxx`) and `call_id`
                         // (function-call identifier, e.g. `call_xxx`). Both
@@ -2411,16 +2406,23 @@ impl ResponsesStreamEncoder {
             }
             let idx = self.tool_output_indices.get(&call_id).copied().unwrap_or(0);
             let name = self.tool_names.get(&call_id).cloned().unwrap_or_default();
-            let arguments = self
-                .tool_arguments
-                .get(&call_id)
-                .cloned()
-                .unwrap_or_default();
             let item_type = self
                 .tool_wire_types
                 .get(&call_id)
                 .cloned()
                 .unwrap_or_else(|| "function_call".to_string());
+            // A no-argument call has no argument deltas; the completed payload
+            // must still be a valid JSON object so clients (and the next
+            // request's history) can parse it.
+            let mut arguments = self
+                .tool_arguments
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_default();
+            if item_type == "function_call" && crate::tool_arguments::is_empty_arguments(&arguments)
+            {
+                arguments = "{}".to_string();
+            }
             let wire_item_id = self
                 .tool_item_ids
                 .get(&call_id)
@@ -3016,9 +3018,11 @@ impl ResponsesStreamDecoder {
                     "complete arguments reference unknown function call".into(),
                 )
             })?;
-        serde_json::from_str::<Value>(arguments).map_err(|error| {
-            tiygate_core::Error::Codec(format!("invalid completed tool arguments: {error}"))
-        })?;
+        if !crate::tool_arguments::is_empty_arguments(arguments) {
+            serde_json::from_str::<Value>(arguments).map_err(|error| {
+                tiygate_core::Error::Codec(format!("invalid completed tool arguments: {error}"))
+            })?;
+        };
         let delivered = self.function_arguments.entry(id.clone()).or_default();
         let remaining = arguments.strip_prefix(delivered.as_str()).ok_or_else(|| {
             tiygate_core::Error::Codec(

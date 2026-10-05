@@ -238,6 +238,13 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 // object. If it is not valid JSON, preserve the raw
                                 // string as a JSON string value rather than dropping
                                 // it to `{}`, so non-standard payloads survive.
+                                // An empty payload is the documented no-argument
+                                // representation and normalizes to `{}`.
+                                serde_json::Value::String(s)
+                                    if crate::tool_arguments::is_empty_arguments(s) =>
+                                {
+                                    json!({})
+                                }
                                 serde_json::Value::String(s) => serde_json::from_str(s)
                                     .unwrap_or_else(|_| serde_json::Value::String(s.clone())),
                                 // Some compatible providers may already send an object.
@@ -1264,14 +1271,11 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 wire_type: Some("custom".to_string()),
                             });
                         } else {
-                            let args: serde_json::Value = serde_json::from_str(
-                                tc["function"]["arguments"].as_str().unwrap_or("{}"),
-                            )
-                            .map_err(|error| {
-                                tiygate_core::Error::Codec(format!(
-                                    "invalid Chat tool arguments: {error}"
-                                ))
-                            })?;
+                            let args: serde_json::Value =
+                                crate::tool_arguments::parse_function_arguments(
+                                    tc["function"]["arguments"].as_str().unwrap_or("{}"),
+                                    "Chat tool arguments",
+                                )?;
                             content.push(Content::ToolCall {
                                 id: tc["id"].as_str().unwrap_or("").to_string(),
                                 name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
@@ -1821,7 +1825,13 @@ impl ChatCompletionsStreamDecoder {
                     "stream ended before tool id/name arrived".into(),
                 ));
             }
-            if call.custom != Some(true) {
+            if call.custom != Some(true)
+                && !crate::tool_arguments::is_empty_arguments(&call.arguments)
+            {
+                // A non-empty payload must be valid JSON: a truncated call can
+                // never complete as success. An empty payload is the documented
+                // no-argument representation (OpenAI streams the first tool
+                // chunk as `arguments: ""`), so it completes with no arguments.
                 serde_json::from_str::<Value>(&call.arguments).map_err(|error| {
                     tiygate_core::Error::Codec(format!("invalid completed tool arguments: {error}"))
                 })?;
