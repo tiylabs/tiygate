@@ -325,7 +325,9 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 - **Gemini hosted 工具**：`codeExecution`、`googleSearch` 等非函数 carrier 保留类型与配置。同协议重编码回放，跨协议目标明确以 `HostedTools` 拒绝；不能在入口删除后绕过 guard，也不能与 Responses hosted 工具名称混用。
 - **Messages 工具结果媒体**：文本数组继续使用文本 IR；包含 image/document 或其他非文本块时保留原始有序数组供同协议回放。当前 ToolResult IR 没有通用多模态内容载体，因此跨协议以 `ToolResultContent` 明确拒绝，不能将图片 JSON 当作文本工具结果发送。重复的非文本 result ID 明确拒绝。
 - **Custom tools**：Chat 定义使用 `tools[].custom`，Responses 使用扁平定义；Chat 兼容历史扁平输入，输出使用原生嵌套结构。流式调用按 `custom.name/input` 解码，向 Chat/Responses 输出原生 custom 增量与完整 free-form input，不按函数 JSON 校验。
-- **Chat 工具流身份**：按 index 保存调用身份；重复相同 ID/name 幂等，冲突拒绝，迟到身份有界缓冲到 ID/name 齐全再创建一次工具块。不合成工具名或 ID；成功结束时缺身份或函数参数 JSON 损坏明确错误，Length/ContentFilter 保留截断语义。
+- **Chat 工具流身份**：按 index 保存调用身份；重复相同 ID/name 幂等，冲突拒绝，迟到身份有界缓冲到 ID/name 齐全再创建一次工具块。不合成工具名或 ID；成功结束时缺身份明确错误，非空但 JSON 损坏的函数参数明确错误（不自动修补），Length/ContentFilter 保留截断语义。
+- **无参工具调用**：函数工具参数为空串或缺失（OpenAI 流式首帧 `arguments:""`、无后续分片）表示无参数调用，入站统一归一为 `{}`，流式完成校验、非流响应/请求历史、Responses 历史与 `.done` 行为一致；Responses 流式出站对无参调用输出 `"{}"` 以保证客户端可解析且多轮回放合法。非空参数仍必须是合法 JSON。
+- **重复 tool_result ID**：Messages 请求中同一 `tool_use_id` 出现多个 tool_result（文本或多模态）在入口明确拒绝，避免同协议回放时把多模态内容错位写到其他 result。
 - **流式资源上界**：Chat tool index 为 0～255，Messages content index 为 0～1023；非法类型、负值和超限 index 返回 codec 错误。Chat 单个 ID/name 上限 1 KiB，总工具参数缓存上限 16 MiB，防止巨大或稀疏 index 驱动无界扩容。上限是网关资源契约，不宣称协议官方 index 上限相同。
 - **Refusal**：Gemini 非流响应以 text 保留 refusal 文本；Messages 流/非流使用原生 `stop_reason:"refusal"`，映射为 canonical ContentFilter，不能变成自然 end_turn/stop。
 - **Gemini URL**：出站 base 可为无版本 proxy root 或以 `/v1beta`（也兼容 `/v1`）结尾的 versioned base；只添加一次版本，stream/nonstream 分别拼原生 method。模型/账号 profile 的实际能力仍需独立验证。
