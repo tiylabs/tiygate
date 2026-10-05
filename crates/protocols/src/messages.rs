@@ -169,6 +169,7 @@ impl EndpointCodec for MessagesCodec {
 
         let mut messages = Vec::new();
         let mut opaque_tool_results = serde_json::Map::new();
+        let mut seen_tool_results = std::collections::HashSet::new();
 
         // System prompt (can be string or array of text blocks)
         let system = if let Some(sys) = body.get("system") {
@@ -247,6 +248,18 @@ impl EndpointCodec for MessagesCodec {
                                 });
                             }
                             Some("tool_result") => {
+                                // One tool_result per tool_use id: duplicates are
+                                // invalid Anthropic wire and would cross-attribute
+                                // opaque (multimodal) content on re-encode.
+                                if let Some(id) =
+                                    block["tool_use_id"].as_str().filter(|id| !id.is_empty())
+                                {
+                                    if !seen_tool_results.insert(id.to_string()) {
+                                        return Err(tiygate_core::Error::Codec(
+                                            "duplicate tool_result tool_use_id".into(),
+                                        ));
+                                    }
+                                }
                                 if block["content"].as_array().is_some_and(|blocks| {
                                     blocks
                                         .iter()
@@ -261,14 +274,7 @@ impl EndpointCodec for MessagesCodec {
                                                     .into(),
                                             )
                                         })?;
-                                    if opaque_tool_results
-                                        .insert(id.into(), block["content"].clone())
-                                        .is_some()
-                                    {
-                                        return Err(tiygate_core::Error::Codec(
-                                            "duplicate multimodal tool_result id".into(),
-                                        ));
-                                    }
+                                    opaque_tool_results.insert(id.into(), block["content"].clone());
                                 }
                                 parts.push(Content::ToolResult {
                                     is_error: block["is_error"].as_bool(),
