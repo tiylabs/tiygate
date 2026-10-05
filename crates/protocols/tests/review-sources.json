@@ -126,5 +126,36 @@
       "http_late_identity_is_buffered_until_open",
       "http_gemini_result_text_order_survives"
     ]
+  },
+  "d7f_fix_round": {
+    "review_head": "d7ffb80195f52751c3368628c72e11a0948c353b",
+    "origin": "original synthetic JSON/SSE written for the TG-PROTO-051/052 fix round; no reference implementation or fixtures copied",
+    "report": "/tmp/tiygate-protocol-review-fix-d7f/report.md",
+    "codec_target": "review_final",
+    "http_target": "protocol_review_final",
+    "findings": {
+      "TG-PROTO-051": "chat_stream_noarg_tool_empty_first_chunk_completes / chat_stream_noarg_tool_missing_arguments_key_completes / chat_stream_noarg_tool_to_responses_emits_empty_object / chat_response_empty_arguments_defaults_to_object / chat_request_history_empty_arguments_defaults_to_object / responses_history_empty_arguments_defaults_to_object",
+      "TG-PROTO-052": "messages_duplicate_tool_use_id_is_rejected"
+    },
+    "http_tests": {
+      "path": "crates/server/tests/protocol_review_final.rs",
+      "TG-PROTO-051": "http_noarg_tool_stream_completes"
+    },
+    "guard_tests": {
+      "TG-PROTO-042": "chat_stream_malformed_tool_arguments_still_rejected"
+    },
+    "fixture_restored": {
+      "path": "crates/protocols/tests/streaming_robustness.rs",
+      "test": "chat_final_chunk_finish_and_usage_transcodes_to_responses_completed_usage",
+      "note": "restored the OpenAI-documented arguments:\"\" first chunk weakened by d7ffb80"
+    },
+    "official_local_sources": [
+      "protocol-specs/api-wire/openai/openapi.yaml"
+    ],
+    "oracle": "native Messages/Responses SSE lifecycle, empty-object argument payloads and duplicate-id rejection",
+    "limitations": [
+      "offline synthetic upstream only; no live provider calls",
+      "empty arguments normalization does not loosen non-empty malformed JSON rejection"
+    ]
   }
 }

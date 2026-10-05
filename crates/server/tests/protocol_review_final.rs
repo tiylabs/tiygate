@@ -347,3 +347,40 @@ async fn http_gemini_result_text_order_survives() -> Result<(), Box<dyn std::err
     assert_eq!(req["messages"][3]["content"], "after");
     Ok(())
 }
+
+/// TG-PROTO-051: an OpenAI-compatible upstream that streams a no-argument
+/// function call the way OpenAI documents it (first chunk carries
+/// `arguments: ""`, no further fragments) must still produce a successful
+/// Messages stream for the client.
+#[tokio::test]
+async fn http_noarg_tool_stream_completes() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, out, status) = run(
+        ProtocolSuite::OpenAiCompatible,
+        "/v1/messages",
+        json!({"model":"m","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}),
+        concat!(
+            "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        true,
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "valid no-arg tool call rejected: {out}"
+    );
+    assert!(
+        events(&out)
+            .iter()
+            .any(|e| e["type"] == "message_delta" && e["delta"]["stop_reason"] == "tool_use")
+            && events(&out).iter().any(|e| e["type"] == "message_stop"),
+        "no-arg tool call did not complete: {out}"
+    );
+    assert!(
+        !events(&out).iter().any(|e| e["type"] == "error"),
+        "no-arg tool call produced an error event: {out}"
+    );
+    Ok(())
+}

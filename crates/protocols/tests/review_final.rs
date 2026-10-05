@@ -608,3 +608,190 @@ fn gemini_allowlist_does_not_hide_hosted_tools_from_guard() -> TestResult {
     assert!(check_lossy_conversion(&ir, chat.id(), chat.capabilities()).is_err());
     Ok(())
 }
+
+// --- TG-PROTO-051: no-argument tool calls must not be treated as corrupt ---
+
+/// Drive an upstream Chat stream (frames end with the protocol terminator)
+/// through the decoder and one stream encoder, returning emitted wire events.
+fn chat_stream_frames(
+    src: &ChatCompletionsCodec,
+    dst: &dyn EndpointCodec,
+    frames: &[Value],
+) -> Result<Vec<Value>, tiygate_core::Error> {
+    let mut dec = src.stream_decoder();
+    let mut enc = dst.stream_encoder();
+    let mut bytes = Vec::new();
+    for frame in frames {
+        let line = match frame.as_str() {
+            Some("[done]") => "data: [DONE]".to_string(),
+            _ => format!("data: {frame}"),
+        };
+        for p in dec.feed(&line)? {
+            bytes.extend(enc.encode_part(&p)?);
+        }
+    }
+    for p in dec.finish()? {
+        bytes.extend(enc.encode_part(&p)?);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    println!("wire={text}");
+    Ok(text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect())
+}
+
+#[test]
+fn chat_stream_noarg_tool_empty_first_chunk_completes() -> TestResult {
+    let events = chat_stream_frames(
+        &ChatCompletionsCodec::new(),
+        &MessagesCodec::new(),
+        &[
+            json!({"id":"r","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_time","arguments":""}}]},"finish_reason":null}]}),
+            json!({"id":"r","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            json!("[done]"),
+        ],
+    )?;
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "message_delta" && e["delta"]["stop_reason"] == "tool_use")
+            && events.iter().any(|e| e["type"] == "message_stop"),
+        "no-arg tool call did not complete: {events:?}"
+    );
+    let start = events
+        .iter()
+        .find(|e| e["type"] == "content_block_start")
+        .ok_or("missing tool block")?;
+    assert_eq!(start["content_block"]["name"], "get_time");
+    assert_eq!(start["content_block"]["input"], json!({}));
+    Ok(())
+}
+
+#[test]
+fn chat_stream_noarg_tool_missing_arguments_key_completes() -> TestResult {
+    let events = chat_stream_frames(
+        &ChatCompletionsCodec::new(),
+        &MessagesCodec::new(),
+        &[
+            json!({"id":"r","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_time"}}]},"finish_reason":null}]}),
+            json!({"id":"r","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            json!("[done]"),
+        ],
+    )?;
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "message_delta" && e["delta"]["stop_reason"] == "tool_use")
+            && events.iter().any(|e| e["type"] == "message_stop"),
+        "no-arg tool call did not complete: {events:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn chat_stream_noarg_tool_to_responses_emits_empty_object() -> TestResult {
+    let events = chat_stream_frames(
+        &ChatCompletionsCodec::new(),
+        &ResponsesCodec::new(),
+        &[
+            json!({"id":"r","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_time","arguments":""}}]},"finish_reason":null}]}),
+            json!({"id":"r","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            json!("[done]"),
+        ],
+    )?;
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "response.function_call_arguments.done")
+        .ok_or("missing function_call_arguments.done")?;
+    assert_eq!(done["arguments"], "{}");
+    let item = events
+        .iter()
+        .find(|e| e["type"] == "response.output_item.done" && e["item"]["type"] == "function_call")
+        .ok_or("missing completed function_call item")?;
+    let arguments = item["item"]["arguments"]
+        .as_str()
+        .ok_or("function_call arguments must be a JSON string")?;
+    assert_eq!(
+        serde_json::from_str::<Value>(arguments).map_err(|e| e.to_string())?,
+        json!({}),
+        "no-arg function_call must carry a valid empty object payload"
+    );
+    Ok(())
+}
+
+#[test]
+fn chat_stream_malformed_tool_arguments_still_rejected() -> TestResult {
+    let mut decoder = ChatCompletionsCodec::new().stream_decoder();
+    decoder.feed(
+        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"x\\\":\"}}]},\"finish_reason\":null}]}",
+    )?;
+    let finish = decoder
+        .feed("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}");
+    assert!(
+        finish.is_err(),
+        "truncated arguments must stay rejected: {finish:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn chat_response_empty_arguments_defaults_to_object() -> TestResult {
+    let ir = ChatCompletionsCodec::new().decode_response(json!({
+        "id":"r","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"get_time","arguments":""}}]},"finish_reason":"tool_calls"}]
+    }))?;
+    let out = ResponsesCodec::new().encode_response(&ir)?;
+    println!("out={out}");
+    let call = out
+        .pointer("/output/0")
+        .ok_or("missing completed function_call")?;
+    assert_eq!(call["arguments"], "{}");
+    Ok(())
+}
+
+#[test]
+fn chat_request_history_empty_arguments_defaults_to_object() -> TestResult {
+    let ir = ChatCompletionsCodec::new().decode_request(
+        json!({"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"get_time","arguments":""}}]}]}),
+        &env(),
+    )?;
+    let out = MessagesCodec::new().encode_request(&ir)?.0;
+    assert_eq!(out["messages"][1]["content"][0]["input"], json!({}));
+    Ok(())
+}
+
+#[test]
+fn responses_history_empty_arguments_defaults_to_object() -> TestResult {
+    let ir = ResponsesCodec::new().decode_request(
+        json!({"model":"m","input":[{"type":"function_call","id":"fc","call_id":"call","name":"get_time","arguments":""}]}),
+        &env(),
+    )?;
+    let out = MessagesCodec::new().encode_request(&ir)?.0;
+    assert_eq!(out["messages"][0]["content"][0]["input"], json!({}));
+    Ok(())
+}
+
+// --- TG-PROTO-052: duplicate tool_use_id must not cross-attribute content ---
+
+#[test]
+fn messages_duplicate_tool_use_id_is_rejected() -> TestResult {
+    for second_content in [
+        json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1n"}}]),
+        json!("plain"),
+    ] {
+        let result = MessagesCodec::new().decode_request(
+            json!({"model":"m","max_tokens":100,"messages":[
+              {"role":"assistant","content":[{"type":"tool_use","id":"dup","name":"f","input":{}}]},
+              {"role":"user","content":[{"type":"tool_result","tool_use_id":"dup","content":"plain"}]},
+              {"role":"user","content":[{"type":"tool_result","tool_use_id":"dup","content":second_content}]}
+            ]}),
+            &env(),
+        );
+        assert!(
+            result.is_err(),
+            "duplicate tool_use_id silently accepted: {result:?}"
+        );
+    }
+    Ok(())
+}
