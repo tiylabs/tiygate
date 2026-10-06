@@ -7,7 +7,12 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Concrete Redis I/O stays outside core; server forwards its existing feature.
+redis-quota = ["dep:redis"]
+
 [dependencies]
+redis = { workspace = true, optional = true }
 tiygate-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

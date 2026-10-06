@@ -44,10 +44,10 @@ bedrock = ["dep:tiygate-provider-bedrock"]
 control-plane = []
 
 # Redis-backed backends. Enables both the Redis quota counter in
-# `tiygate-core` and the Redis brute-force limiter in
+# `tiygate-store` and the Redis brute-force limiter in
 # `tiygate-admin`. Operators set `TIYGATE_REDIS_URL` and build with
 # `--features redis-quota` to share state across replicas.
-redis-quota = ["tiygate-core/redis-quota", "tiygate-admin?/redis"]
+redis-quota = ["tiygate-store/redis-quota", "tiygate-admin?/redis"]
 
 # ---------------------------------------------------------------------------
 # Runtime features — used by the default binary entry point (`main.rs`).

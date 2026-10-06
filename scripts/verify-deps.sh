@@ -3,9 +3,10 @@
 # do not leak into core or other provider crates.
 set -euo pipefail
 
-echo "=== Checking core has no AWS dependencies ==="
-if cargo tree -p tiygate-core --depth 3 2>/dev/null | grep -qi 'aws\|bedrock'; then
-    echo "FAIL: AWS/Bedrock dependencies found in core!"
+echo "=== Checking core has no concrete HTTP/database/AWS dependencies ==="
+CORE_DEPS=$(cargo tree --locked -p tiygate-core --all-features --edges normal --prefix none)
+if printf '%s\n' "$CORE_DEPS" | grep -Ei '^(reqwest|redis|sqlx|tiygate-store|tiygate-protocols|tiygate-providers|aws[^ ]*|tiygate-provider-bedrock) ' >/dev/null; then
+    echo "FAIL: Concrete I/O/provider/protocol dependency found in core!"
     exit 1
 fi
 echo "PASS: Core is clean"
