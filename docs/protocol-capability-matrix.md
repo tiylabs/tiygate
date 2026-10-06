@@ -317,7 +317,7 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 回归语料为本项目自行编写的官方 wire 合成输入，见 `crates/protocols/tests/review_regressions.rs`、`crates/server/tests/protocol_review.rs`；不引入参考项目代码或 AGPL fixture。以上是有限已验证输入的契约，不代表全部模型/账号/生产上游兼容。
 
 
-### 14.2 Final review 修复契约（TG-PROTO-029、037～050）
+### 14.2 Final review 修复契约（TG-PROTO-029、037～052）
 
 - **指定工具选择**：Chat 的 `tool_choice.function.name` 与 Responses 的 `tool_choice.name` 在入口归一，出站恢复目标原生 carrier；缺名称明确 codec 错误，不索引缺失键而 panic。函数工具和 custom 选择的类型分别保留。
 - **工具历史**：Gemini 名称查找使用 canonical `call_id.unwrap_or(id)`，不从合成 ID 前缀猜名称。Responses 请求历史中损坏的 function arguments 返回入口错误，不替换为 `{}`。含文本与工具结果的有序内容转换到 Chat 时按出现顺序拆成 user/tool 消息。
@@ -333,3 +333,15 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 - **Gemini URL**：出站 base 可为无版本 proxy root 或以 `/v1beta`（也兼容 `/v1`）结尾的 versioned base；只添加一次版本，stream/nonstream 分别拼原生 method。模型/账号 profile 的实际能力仍需独立验证。
 
 原始语料与独立断言见 `crates/protocols/tests/review_final.rs` 和 `crates/server/tests/protocol_review_final.rs`。CI 缺口 TG-PROTO-020 不由本轮 codec 修复解决；真实账号、全部 profile 和大内存压力不属于这些离线用例的证明范围。
+
+### 14.3 协议契约补全（TG-PROTO-053～061）
+
+- **Messages 工具流**：按 content index/call ID 累计参数，在正常 stop_reason/message_stop 前校验非空 JSON；损坏参数返回流错误，不能生成成功完成。`max_tokens`/refusal 保留截断状态，不对截断 JSON 自动修补。无参调用继续按 `{}`；参数总缓存上限 16 MiB，重复或缺失身份明确错误。
+- **非流截断**：Responses `status:incomplete` 的原因优先于工具存在；`max_output_tokens` → Length，`content_filter` → ContentFilter。非流 Responses 出站附原生 `incomplete_details`，message/function item 状态与响应一致。
+- **Refusal**：Messages 非流响应用 text 保留 canonical refusal 文本；Responses 用 `output[].type:message` 内的 `content[].type:refusal`，不生成顶层 refusal output item。
+- **指令层级**：canonical `Role::System` 在 Messages/Gemini 出站加入 `system`/`systemInstruction`，不映射为 user 内容；顶层已有 instructions/system 与有序 system 内容均保留。模型对多个指令位置的全部语义仍需 profile 核验。
+- **Messages 原生工具**：带原生 type 的 web_search 等工具保留 type/config；普通函数的 strict/cache_control/allowed_callers 等配置同协议回放。Messages 原生 hosted 工具跨到非 Messages 目标明确拒绝；不能把托管工具伪装成客户端函数。原生 allowed_callers 同协议可回放，跨到不能表达程序调用的目标拒绝。
+- **Messages 原生 thinking/cache**：IR extensions 保存原生 thinking 对象（adaptive 无 effort、disabled、enabled 等）和系统块；消息内容的 cache_control 按 message/content 索引保存并原位回放，工具缓存配置保留 TTL。同协议 raw 与 IR 重编码分别覆盖；跨协议 thinking 仍按 §6 的映射/近似契约，不声明所有模式等价。
+- **Gemini thinkingLevel**：入口接受官方 `MINIMAL/LOW/MEDIUM/HIGH` 与兼容小写形式，映射 canonical effort；`THINKING_LEVEL_UNSPECIFIED` 维持模型默认，不伪造 effort。
+
+回归为自有合成原生 JSON/SSE，见 `crates/protocols/tests/review_contracts.rs`、`crates/server/tests/protocol_review_contracts.rs`；HTTP 工具流以每字节分片验证。未确认的 final snapshot、dynamic budget、非空工具 opener 等候选未纳入本次支持承诺。

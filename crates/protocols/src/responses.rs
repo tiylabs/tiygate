@@ -1067,6 +1067,14 @@ impl EndpointCodec for ResponsesCodec {
         if let Some(id) = &ir.response_id {
             response["id"] = json!(id);
         }
+        let status = if matches!(
+            ir.finish_reason,
+            Some(FinishReason::Length | FinishReason::ContentFilter)
+        ) {
+            "incomplete"
+        } else {
+            "completed"
+        };
         let mut output_items = Vec::new();
         let mut pending_text = String::new();
         let flush_text = |pending: &mut String, output: &mut Vec<Value>| {
@@ -1078,6 +1086,7 @@ impl EndpointCodec for ResponsesCodec {
                 "id": format!("{}_msg_{index}", ir.response_id.as_deref().unwrap_or("msg")),
                 "type": "message",
                 "role": "assistant",
+                "status": status,
                 "content": [{"type": "output_text", "text": std::mem::take(pending)}]
             }));
         };
@@ -1155,6 +1164,7 @@ impl EndpointCodec for ResponsesCodec {
                     if let Some(caller) = caller {
                         tc["caller"] = json!(caller);
                     }
+                    tc["status"] = json!(status);
                     output_items.push(tc);
                 }
                 Content::Program {
@@ -1189,7 +1199,14 @@ impl EndpointCodec for ResponsesCodec {
                 }
                 Content::Refusal { text, .. } => {
                     flush_text(&mut pending_text, &mut output_items);
-                    output_items.push(json!({"type": "refusal", "refusal": text}));
+                    let index = output_items.len();
+                    output_items.push(json!({
+                        "id": format!("{}_msg_{index}", ir.response_id.as_deref().unwrap_or("msg")),
+                        "type": "message",
+                        "role": "assistant",
+                        "status": status,
+                        "content": [{"type": "refusal", "refusal": text}],
+                    }));
                 }
                 _ => {}
             }
@@ -1222,6 +1239,13 @@ impl EndpointCodec for ResponsesCodec {
                 FinishReason::ToolCalls => "completed",
                 _ => "completed",
             });
+        }
+        if status == "incomplete" {
+            response["incomplete_details"] = json!({"reason": if ir.finish_reason == Some(FinishReason::ContentFilter) {
+                "content_filter"
+            } else {
+                "max_output_tokens"
+            }});
         }
         if let Some(usage) = &ir.usage {
             // OpenAI Responses 规范：input_tokens 必须含 cache 命中，所以从其他协议流入时
@@ -2101,8 +2125,8 @@ impl EndpointCodec for ResponsesCodec {
                 }
             }
             "incomplete" => {
-                if has_tool_call {
-                    FinishReason::ToolCalls
+                if body["incomplete_details"]["reason"].as_str() == Some("content_filter") {
+                    FinishReason::ContentFilter
                 } else {
                     FinishReason::Length
                 }

@@ -157,5 +157,40 @@
       "offline synthetic upstream only; no live provider calls",
       "empty arguments normalization does not loosen non-empty malformed JSON rejection"
     ]
+  },
+  "contract_fix_round": {
+    "review_head": "f130a224355d5e6f08a80bb20a397e69998e8a78",
+    "report": "/tmp/tiygate-protocol-fix-5T8hAWGb/report.md",
+    "origin": "original synthetic native JSON/SSE; no third-party code/fixtures copied",
+    "codec_target": "review_contracts",
+    "http_target": "protocol_review_contracts",
+    "findings": {
+      "TG-PROTO-053": "messages_malformed_stream_tool_cannot_complete_successfully",
+      "TG-PROTO-054": "responses_incomplete_tool_preserves_reason",
+      "TG-PROTO-055": "messages_nonstream_refusal_preserves_text",
+      "TG-PROTO-056": "responses_nonstream_refusal_uses_message_content",
+      "TG-PROTO-057": "responses_system_and_developer_keep_instruction_level",
+      "TG-PROTO-058": "messages_hosted_tool_keeps_native_config_and_rejects_crossings",
+      "TG-PROTO-059": "messages_native_thinking_modes_survive_reencode",
+      "TG-PROTO-060": "messages_native_cache_breakpoints_keep_position_and_ttl",
+      "TG-PROTO-061": "gemini_native_uppercase_thinking_levels_map_to_effort",
+      "TG-PROTO-062": "store::quota plus scripts/verify-deps.sh"
+    },
+    "official_sources": [
+      "protocol-specs/api-wire/openai/openapi.yaml",
+      "protocol-specs/api-wire/gemini/v1beta.discovery.json",
+      {
+        "repository": "anthropics/anthropic-sdk-typescript",
+        "commit": "d49bdab458000bcdffe77bd84b03293f31824fb3",
+        "path": "src/resources/messages/messages.ts"
+      }
+    ],
+    "oracle": "native wire fields, tool JSON validity, terminal status, instruction carrier and pre-upstream rejection",
+    "limitations": [
+      "no live Provider requests",
+      "Messages native thinking/cache IR extensions are separate from raw passthrough",
+      "TG-PROTO-063 through 069 remain unconfirmed/outside this fix",
+      "TG-PROTO-020 CI gate remains open"
+    ]
   }
 }

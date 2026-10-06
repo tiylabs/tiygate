@@ -639,7 +639,7 @@ impl EndpointCodec for GeminiCodec {
             // Gemini supports minimal/low/medium/high (4 levels).
             let effort = tc["thinkingLevel"].as_str().and_then(|s| {
                 use tiygate_core::ThinkingEffort;
-                match s {
+                match s.to_ascii_lowercase().as_str() {
                     "none" => Some(ThinkingEffort::None),
                     "minimal" => Some(ThinkingEffort::Minimal),
                     "low" => Some(ThinkingEffort::Low),
@@ -887,6 +887,23 @@ impl EndpointCodec for GeminiCodec {
             .unwrap_or_default();
         let mut sig_idx = 0usize;
         for msg in &ir.messages {
+            if msg.role == Role::System {
+                let mut instructions = body["systemInstruction"]["parts"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                for content in &msg.content {
+                    if let Content::Text { text, .. } = content {
+                        instructions.push(json!({"text":text}));
+                    } else {
+                        return Err(tiygate_core::Error::Codec(
+                            "Gemini system instructions support only text".into(),
+                        ));
+                    }
+                }
+                body["systemInstruction"] = json!({"parts":instructions});
+                continue;
+            }
             let role_str = match msg.role {
                 Role::User => "user",
                 Role::Assistant => "model",

@@ -338,11 +338,12 @@ pub fn check_lossy_conversion(
         crate::protocol::ProtocolSuite::OpenAiCompatible
             | crate::protocol::ProtocolSuite::OpenAiResponses
     );
-    let native_gemini_tools = request.ingress_protocol.suite == ProtocolSuite::GoogleGemini;
-    let hosted_target_supported = if native_gemini_tools {
-        egress.suite == ProtocolSuite::GoogleGemini
-    } else {
-        egress_caps.hosted_tools
+    let hosted_target_supported = match request.ingress_protocol.suite {
+        ProtocolSuite::GoogleGemini => egress.suite == ProtocolSuite::GoogleGemini,
+        ProtocolSuite::AnthropicMessages => egress.suite == ProtocolSuite::AnthropicMessages,
+        ProtocolSuite::OpenAiCompatible | ProtocolSuite::OpenAiResponses => {
+            egress_caps.hosted_tools
+        }
     };
     if request.tools.iter().any(|tool| tool.is_hosted()) && !hosted_target_supported {
         return Err((
@@ -394,7 +395,10 @@ pub fn check_lossy_conversion(
                 .and_then(|config| config.get("allowed_callers"))
                 .is_some()
     });
-    if (has_programmatic_state || tool_config_uses_programmatic_callers)
+    let native_messages_replay = request.ingress_protocol.suite == ProtocolSuite::AnthropicMessages
+        && egress.suite == ProtocolSuite::AnthropicMessages;
+    if (has_programmatic_state
+        || (tool_config_uses_programmatic_callers && !native_messages_replay))
         && !egress_caps.programmatic_tool_calling
     {
         return Err((
