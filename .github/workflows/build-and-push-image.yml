@@ -4,8 +4,18 @@ on:
   release:
     types: [prereleased, released]
 
+permissions:
+  contents: read
+
 jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: refs/tags/${{ github.event.release.tag_name }}
+
   build:
+    needs: checks
+    timeout-minutes: 60
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -18,8 +28,10 @@ jobs:
             runner: ubuntu-24.04-arm
             suffix: arm64
     steps:
-      - name: Checkout
+      - name: Checkout validated release commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.checks.outputs.sha }}
       - name: Get release tag
         id: get-tag
         shell: bash
@@ -47,6 +59,7 @@ jobs:
 
   merge:
     needs: build
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - name: Get release tag

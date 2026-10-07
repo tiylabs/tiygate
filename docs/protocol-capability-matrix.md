@@ -332,7 +332,7 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 - **Refusal**：Gemini 非流响应以 text 保留 refusal 文本；Messages 流/非流使用原生 `stop_reason:"refusal"`，映射为 canonical ContentFilter，不能变成自然 end_turn/stop。
 - **Gemini URL**：出站 base 可为无版本 proxy root 或以 `/v1beta`（也兼容 `/v1`）结尾的 versioned base；只添加一次版本，stream/nonstream 分别拼原生 method。模型/账号 profile 的实际能力仍需独立验证。
 
-原始语料与独立断言见 `crates/protocols/tests/review_final.rs` 和 `crates/server/tests/protocol_review_final.rs`。CI 缺口 TG-PROTO-020 不由本轮 codec 修复解决；真实账号、全部 profile 和大内存压力不属于这些离线用例的证明范围。
+原始语料与独立断言见 `crates/protocols/tests/review_final.rs` 和 `crates/server/tests/protocol_review_final.rs`。CI 缺口 TG-PROTO-020 的仓库内门禁与发布检查已由后续 [协议 CI](protocol-ci.md) 补齐；远端 required status check 和真实 Actions 结果需分别核验。真实账号、全部 profile 和大内存压力不属于这些离线用例的证明范围。
 
 ### 14.3 协议契约补全（TG-PROTO-053～061）
 

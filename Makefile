@@ -181,8 +181,19 @@ sync-protocol-specs: ## 刷新官方 API wire-schema 快照及其锁定摘要
 	sh scripts/sync-protocol-specs.sh
 
 .PHONY: check-protocol-specs
-check-protocol-specs: ## 检查已提交的 API wire-schema 快照是否仍与官方来源一致
+check-protocol-specs: ## 检查已提交的 API wire-schema 快照是否仍与官方来源一致(联网)
 	sh scripts/sync-protocol-specs.sh --check
+
+.PHONY: check-protocol-specs-offline
+check-protocol-specs-offline: ## 离线校验已提交 wire-schema 快照的摘要与 revision
+	python3 scripts/check-protocol-specs.py
+
+.PHONY: test-protocols
+test-protocols: check-protocol-specs-offline ## 运行 core/codec 与 server 离线回归(默认 features)
+	python3 -B -m unittest discover -s scripts/tests -v
+	bash scripts/verify-deps.sh
+	$(CARGO_TEST) --locked -p tiygate-core -p tiygate-protocols
+	$(CARGO_TEST) --locked -p $(SERVER_CRATE)
 
 .PHONY: test-structured-output-profiles
 test-structured-output-profiles: ## 验证 Structured Output profile 与核心协议规则一致
