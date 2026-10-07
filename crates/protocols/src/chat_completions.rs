@@ -1213,6 +1213,10 @@ impl EndpointCodec for ChatCompletionsCodec {
             }
             if let Some(choice) = choices.first() {
                 let msg = &choice["message"];
+                let truncated = matches!(
+                    choice["finish_reason"].as_str(),
+                    Some("length" | "content_filter")
+                );
 
                 // Text content
                 if let Some(text) = msg["content"].as_str() {
@@ -1271,11 +1275,14 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 wire_type: Some("custom".to_string()),
                             });
                         } else {
-                            let args: serde_json::Value =
-                                crate::tool_arguments::parse_function_arguments(
-                                    tc["function"]["arguments"].as_str().unwrap_or("{}"),
-                                    "Chat tool arguments",
-                                )?;
+                            let Some(args) = crate::tool_arguments::parse_response_arguments(
+                                tc["function"]["arguments"].as_str().unwrap_or("{}"),
+                                "Chat tool arguments",
+                                truncated,
+                            )?
+                            else {
+                                continue;
+                            };
                             content.push(Content::ToolCall {
                                 id: tc["id"].as_str().unwrap_or("").to_string(),
                                 name: tc["function"]["name"].as_str().unwrap_or("").to_string(),

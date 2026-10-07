@@ -25,3 +25,17 @@ pub(crate) fn parse_function_arguments(raw: &str, label: &str) -> Result<Value, 
 pub(crate) fn is_empty_arguments(raw: &str) -> bool {
     raw.trim().is_empty()
 }
+
+/// A truncated turn can retain text/usage without exposing its unfinished
+/// function call as executable. Completed turns still reject malformed JSON.
+pub(crate) fn parse_response_arguments(
+    raw: &str,
+    label: &str,
+    truncated: bool,
+) -> Result<Option<Value>, Error> {
+    match parse_function_arguments(raw, label) {
+        Ok(arguments) => Ok(Some(arguments)),
+        Err(_) if truncated => Ok(None),
+        Err(error) => Err(error),
+    }
+}

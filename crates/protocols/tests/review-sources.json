@@ -212,6 +212,10 @@
       "TG-PROTO-064": {
         "codec": "gemini_tools_accept_separate_trailing_whitespace",
         "http": "http_review_fix_gemini_tool_trailing_whitespace"
+      },
+      "TG-PROTO-065": {
+        "codec": "truncated_nonstream_functions_preserve_turn_without_executable_tail",
+        "http": "http_review_fix_nonstream_truncated_tool"
       }
     },
     "official_sources": [
@@ -226,7 +230,7 @@
         "retrieved_on": "2026-10-07"
       }
     ],
-    "oracle": "strict schema constraints and native omission, exactly one terminal with final usage, one tool call with legal trailing whitespace",
+    "oracle": "strict schema constraints and native omission, exactly one terminal with final usage, one tool call with legal trailing whitespace, truncation reason/text/usage without executable malformed tails",
     "limitations": [
       "offline synthetic HTTP upstreams; no live Provider requests",
       "implicit strict inference uses a conservative supported subset",

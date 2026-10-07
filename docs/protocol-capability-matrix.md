@@ -351,5 +351,6 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 - **Responses 隐式 strict**：省略 `strict` 或设置 `null` 时，对可确认兼容的函数 schema 子集递归补齐对象的 `additionalProperties:false` 和全部属性的 `required`，包括数组、`anyOf`、`$defs`/`definitions` 中的 schema；不遍历 enum/const 等实例值。已知不兼容或未分类的 schema 保留原约束，并使用 `strict:false`，不删除约束来强行获得严格模式。检查严格 schema 的深度、属性/枚举数量、字符串总量和 format 限制。显式 `strict:true/false` 不由网关改写。原始 parameters 与 strict 的省略/null 状态保存在 IR extensions 中，同协议重编码仅在 canonical schema 和 strictness 未被修改时回放；跨协议输出使用有效 schema/strictness。模型及 Provider 的具体支持范围仍需独立核验。
 - **Gemini 完成桥接**：真实 `finishReason` 决定是否能在 EOF 生成 `ResponseCompleted`，不依赖可选 `responseId`；缺失时使用空 ID，保持既有兼容 carrier。完成桥接最多一次，最终累计 usage 仍在 ResponseCompleted 前收集。usage-only、缺终态 EOF、错误后的 EOF 不产生成功完成。
 - **Gemini 工具参数尾随空白**：函数参数已经作为完整对象输出后，允许没有新名称的纯空白参数续片，不重复输出工具调用；非空白续片仍明确报错。
+- **非流式截断工具**：Chat 的 `length`/`content_filter`、Responses 的 `status:incomplete` 保留文本、finish reason 和 usage。不能解析的函数参数尾部不进入可执行的 canonical ToolCall，也不替换为 `{}`；Responses 原生回放仍可保留带截断终态的原始 item。正常完成时损坏参数继续返回 codec 错误，合法工具调用不受影响。
 
-原始输入与独立断言见 `crates/protocols/tests/review_fixes.rs`；三项真实 HTTP 转换回归见 `crates/server/tests/protocol_review_final.rs` 中的 `http_review_fix_*`。以上覆盖不包含真实账号或全部 Provider/model profile。
+原始输入与独立断言见 `crates/protocols/tests/review_fixes.rs`；四项真实 HTTP 转换回归见 `crates/server/tests/protocol_review_final.rs` 中的 `http_review_fix_*`。以上覆盖不包含真实账号或全部 Provider/model profile。

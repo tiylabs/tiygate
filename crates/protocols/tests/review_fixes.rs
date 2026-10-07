@@ -1,6 +1,6 @@
 //! Original wire regressions for the 2026-10-07 branch delta review.
 use serde_json::{json, Value};
-use tiygate_core::{EndpointCodec, RawEnvelope, StreamPart};
+use tiygate_core::{Content, EndpointCodec, FinishReason, RawEnvelope, StreamPart};
 use tiygate_protocols::{
     chat_completions::ChatCompletionsCodec, gemini::GeminiCodec, messages::MessagesCodec,
     responses::ResponsesCodec,
@@ -315,3 +315,75 @@ fn gemini_tools_still_reject_semantic_suffixes() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn truncated_nonstream_functions_preserve_turn_without_executable_tail() -> TestResult {
+    for (chat_reason, responses_reason, expected) in [
+        ("length", "max_output_tokens", FinishReason::Length),
+        (
+            "content_filter",
+            "content_filter",
+            FinishReason::ContentFilter,
+        ),
+    ] {
+        let chat = ChatCompletionsCodec::new().decode_response(json!({
+            "id":"r","choices":[{"index":0,"finish_reason":chat_reason,
+                "message":{"role":"assistant","content":"partial","tool_calls":[
+                    {"id":"valid","type":"function","function":{"name":"f","arguments":"{}"}},
+                    {"id":"unfinished","type":"function","function":{"name":"g","arguments":"{\"x\":"}}
+                ]}}],
+            "usage":{"prompt_tokens":1,"completion_tokens":5,"total_tokens":6}
+        }))?;
+        let responses = ResponsesCodec::new().decode_response(json!({
+            "id":"r","status":"incomplete","incomplete_details":{"reason":responses_reason},
+            "output":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]},
+                {"type":"function_call","id":"fc1","call_id":"valid","name":"f","arguments":"{}"},
+                {"type":"function_call","id":"fc2","call_id":"unfinished","name":"g","arguments":"{\"x\":"}
+            ],
+            "usage":{"input_tokens":1,"output_tokens":5,"total_tokens":6}
+        }))?;
+        for ir in [chat, responses] {
+            assert_eq!(ir.finish_reason, Some(expected.clone()));
+            assert_eq!(
+                ir.usage.as_ref().map(|usage| usage.completion_tokens),
+                Some(5)
+            );
+            assert!(ir
+                .content
+                .iter()
+                .any(|content| matches!(content, Content::Text {text,..} if text == "partial")));
+            let calls: Vec<_> = ir
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::ToolCall { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(calls, ["f"]);
+            let out = ResponsesCodec::new().encode_response(&ir)?;
+            assert_eq!(out["status"], "incomplete");
+            assert_eq!(out["incomplete_details"]["reason"], responses_reason);
+            assert_eq!(out["usage"]["output_tokens"], 5);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_completed_nonstream_functions_remain_errors() {
+    assert!(ChatCompletionsCodec::new()
+        .decode_response(json!({
+            "choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[
+                {"id":"call","type":"function","function":{"name":"f","arguments":"{\"x\":"}}
+            ]}}]
+        }))
+        .is_err());
+    assert!(ResponsesCodec::new()
+        .decode_response(json!({
+            "status":"completed","output":[
+                {"type":"function_call","id":"fc","call_id":"call","name":"f","arguments":"{\"x\":"}
+            ]
+        }))
+        .is_err());
+}

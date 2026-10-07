@@ -469,3 +469,63 @@ async fn http_review_fix_gemini_tool_trailing_whitespace() -> Result<(), Box<dyn
     Ok(())
 }
 
+#[tokio::test]
+async fn http_review_fix_nonstream_truncated_tool() -> Result<(), Box<dyn std::error::Error>> {
+    for filter in [false, true] {
+        let chat_reason = if filter { "content_filter" } else { "length" };
+        let responses_reason = if filter {
+            "content_filter"
+        } else {
+            "max_output_tokens"
+        };
+        let chat_body = json!({
+            "id":"r","choices":[{"index":0,"finish_reason":chat_reason,"message":{
+                "role":"assistant","content":"partial","tool_calls":[
+                    {"id":"call","type":"function","function":{"name":"f","arguments":"{\"x\":"}}
+                ]
+            }}],"usage":{"prompt_tokens":1,"completion_tokens":5,"total_tokens":6}
+        });
+        let (_, output, status) = run(
+            ProtocolSuite::OpenAiCompatible,
+            "/v1/responses",
+            json!({"model":"m","input":"hi"}),
+            &chat_body.to_string(),
+            false,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        let body: Value = serde_json::from_str(&output)?;
+        assert_eq!(body["status"], "incomplete");
+        assert_eq!(body["incomplete_details"]["reason"], responses_reason);
+        assert_eq!(body["usage"]["output_tokens"], 5);
+        assert_eq!(body["output"][0]["content"][0]["text"], "partial");
+        assert!(!body["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|item| item["type"] == "function_call"));
+
+        let responses_body = json!({
+            "id":"r","status":"incomplete","incomplete_details":{"reason":responses_reason},
+            "output":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]},
+                {"type":"function_call","id":"fc","call_id":"call","name":"f","arguments":"{\"x\":"}
+            ],"usage":{"input_tokens":1,"output_tokens":5,"total_tokens":6}
+        });
+        let (_, output, status) = run(
+            ProtocolSuite::OpenAiResponses,
+            "/v1/chat/completions",
+            json!({"model":"m","messages":[{"role":"user","content":"hi"}]}),
+            &responses_body.to_string(),
+            false,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        let body: Value = serde_json::from_str(&output)?;
+        assert_eq!(body["choices"][0]["finish_reason"], chat_reason);
+        assert_eq!(body["choices"][0]["message"]["content"], "partial");
+        assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(body["usage"]["completion_tokens"], 5);
+    }
+    Ok(())
+}

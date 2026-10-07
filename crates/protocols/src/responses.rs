@@ -1987,6 +1987,7 @@ impl EndpointCodec for ResponsesCodec {
             )));
         }
         let response_id = body["id"].as_str().map(String::from);
+        let truncated = body["status"].as_str() == Some("incomplete");
         let mut content = Vec::new();
         // Ordered opaque output items (hosted tool results, multi-agent, etc.)
         // for same-protocol re-encode. Modeled content is rebuilt separately;
@@ -2056,10 +2057,17 @@ impl EndpointCodec for ResponsesCodec {
                         });
                     }
                     Some("function_call") => {
-                        let args: Value = crate::tool_arguments::parse_function_arguments(
+                        let Some(args) = crate::tool_arguments::parse_response_arguments(
                             item["arguments"].as_str().unwrap_or("{}"),
                             "Responses tool arguments",
-                        )?;
+                            truncated,
+                        )?
+                        else {
+                            // Native replay can preserve the incomplete wire
+                            // item, while cross-protocol IR omits an unsafe call.
+                            opaque_output_items.push(json!({"index":output_index,"item":item}));
+                            continue;
+                        };
                         // Responses function_call items carry two distinct ids:
                         // `id` (item reference, e.g. `fc_xxx`) and `call_id`
                         // (function-call identifier, e.g. `call_xxx`). Both
