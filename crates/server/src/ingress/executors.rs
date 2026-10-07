@@ -429,24 +429,24 @@ fn parse_nonstream_upstream_body(
 /// retry / try the next target, instead of silently passing the error
 /// body to the client as a success.
 ///
-/// Only triggers when the top-level JSON object has an `"error"` key
-/// and does NOT simultaneously contain normal response fields
-/// (`choices`, `candidates`, `output`, `data`, etc.) that would
-/// indicate a mixed/success response. This avoids false positives on
-/// responses that merely mention "error" in metadata.
+/// Meaningful top-level errors are failures when no normal payload exists.
+/// Responses `status: failed` remains an error even with `output: []`.
+/// Success payloads with `error: null` and metadata mentions are unaffected.
 fn check_nonstream_error_body(
     response_body: &Value,
     status: u16,
     retry_after: Option<String>,
     rate_limit_headers: Vec<(&'static str, String)>,
 ) -> Option<AppError> {
-    let error = response_body.get("error")?;
+    let error = response_body
+        .get("error")
+        .filter(|error| error.is_object())?;
     // Guard against false positives: if the body also contains
     // normal response fields, it's not a pure error response.
     let has_normal_field = ["choices", "candidates", "output", "data", "messages"]
         .iter()
         .any(|k| response_body.get(k).is_some());
-    if has_normal_field {
+    if has_normal_field && response_body["status"].as_str() != Some("failed") {
         return None;
     }
     let message = error["message"]
@@ -454,7 +454,11 @@ fn check_nonstream_error_body(
         .unwrap_or("upstream returned error in 200 response body");
     let code = error["code"].as_str().or_else(|| error["type"].as_str());
     let mut app_err = AppError::new(
-        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+        if (200..300).contains(&status) {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY)
+        },
         format!("Upstream error: {}", message),
     );
     app_err.upstream_status = Some(status);
@@ -1646,6 +1650,15 @@ pub(super) fn get_egress_codec(
     }
 }
 
+fn gemini_api_base(target: &tiygate_core::RoutingTarget) -> String {
+    let base = target.effective_api_base().trim_end_matches('/');
+    if base.ends_with("/v1beta") || base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/v1beta")
+    }
+}
+
 /// Build the non-streaming upstream URL by egress suite, with Gemini support.
 /// Google Gemini's non-streaming URL embeds the model and uses the
 /// `:generateContent` method; the other suites have a fixed path suffix.
@@ -1655,8 +1668,8 @@ pub(super) fn gemini_aware_upstream_url(
 ) -> Option<String> {
     match suite {
         tiygate_core::ProtocolSuite::GoogleGemini => Some(format!(
-            "{}/v1beta/models/{}:generateContent",
-            target.effective_api_base().trim_end_matches('/'),
+            "{}/models/{}:generateContent",
+            gemini_api_base(target),
             target.model_id
         )),
         _ => upstream_url_for_suite(target, suite),
@@ -1697,8 +1710,8 @@ pub(super) fn upstream_stream_url_for_suite(
 ) -> Option<String> {
     match suite {
         tiygate_core::ProtocolSuite::GoogleGemini => Some(format!(
-            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
-            target.effective_api_base().trim_end_matches('/'),
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            gemini_api_base(target),
             target.model_id
         )),
         _ => upstream_url_for_suite(target, suite),

@@ -120,17 +120,16 @@ impl App {
         // -- Quota counter --
         // Prefer the Redis-backed counter when the operator has set
         // `TIYGATE_REDIS_URL` (and the server was built with the
-        // `redis-quota` feature). `RedisQuota::new` already falls
-        // back to `InMemoryQuota` on connection failure, so the
-        // data plane never sees a backend error from the quota
-        // check. We hand the inner counter (not the wrapper) to
+        // `redis-quota` feature). Redis check failures remain fail-open;
+        // missing/disabled Redis uses `InMemoryQuota`, so the data plane
+        // never sees a backend error from the quota check. We hand the inner counter (not the wrapper) to
         // `AppState` to keep the hot path a single trait dispatch.
         let quota: Option<Arc<dyn tiygate_core::quota::QuotaCounter>> =
             control_plane.as_ref().map(|_| {
-                let cfg = tiygate_core::quota::RedisQuotaConfig::from_env();
+                let cfg = tiygate_store::quota::RedisQuotaConfig::from_env();
                 if cfg.url.is_some() {
                     tracing::info!("quota: using RedisQuota (url configured)");
-                    tiygate_core::quota::RedisQuota::new(cfg).into_inner()
+                    tiygate_store::quota::RedisQuota::new(cfg).into_inner()
                 } else {
                     tracing::info!("quota: using InMemoryQuota (no TIYGATE_REDIS_URL)");
                     tiygate_core::quota::InMemoryQuota::new()

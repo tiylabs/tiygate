@@ -15,19 +15,31 @@ permissions:
   contents: write
 
 jobs:
+  checks:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: refs/tags/${{ inputs.release_version || github.ref_name }}
+
   prerelease:
+    needs: checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ inputs.release_version || github.ref_name }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.checks.outputs.sha }}
           fetch-depth: 0
 
       - name: Find previous stable tag
         id: prev_tag
         run: |
-          CURRENT_TAG="${{ github.ref_name }}"
+          CURRENT_TAG="$RELEASE_TAG"
           # List all tags matching X.Y.Z (no suffix), sorted by version descending
           # Exclude the current tag, then take the first match as the previous stable tag
           PREV_TAG=$(git tag -l --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${CURRENT_TAG}$" | head -n 1)
@@ -39,7 +51,7 @@ jobs:
         uses: requarks/changelog-action@v1.10.3
         with:
           token: ${{ github.token }}
-          fromTag: ${{ github.ref_name }}
+          fromTag: ${{ env.RELEASE_TAG }}
           toTag: ${{ steps.prev_tag.outputs.prev_tag }}
           writeToFile: false
 
@@ -50,7 +62,9 @@ jobs:
           draft: false
           prerelease: true
           makeLatest: false
-          name: ${{ github.ref_name }}
+          tag: ${{ env.RELEASE_TAG }}
+          commit: ${{ needs.checks.outputs.sha }}
+          name: ${{ env.RELEASE_TAG }}
           body: ${{ steps.changelog.outputs.changes }}
           # Use a PAT so the release event triggers downstream workflows
           # (events from the default GITHUB_TOKEN do not start new workflow runs).

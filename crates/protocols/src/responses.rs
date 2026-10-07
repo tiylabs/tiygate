@@ -627,8 +627,10 @@ impl EndpointCodec for ResponsesCodec {
                     vec![Content::ToolCall {
                         id: ir_id,
                         name: item["name"].as_str().unwrap_or("").to_string(),
-                        arguments: serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
-                            .unwrap_or(json!({})),
+                        arguments: crate::tool_arguments::parse_function_arguments(
+                            item["arguments"].as_str().unwrap_or("{}"),
+                            "Responses history tool arguments",
+                        )?,
                         call_id: ir_call_id,
                         caller: decode_tool_caller(item),
                         wire_type: None,
@@ -651,6 +653,7 @@ impl EndpointCodec for ResponsesCodec {
                     // can be replayed when re-encoding for Responses HTTP.
                     let item_id = item["id"].as_str().map(|s| s.to_string());
                     vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id,
                         name: String::new(),
                         content: output,
@@ -696,6 +699,7 @@ impl EndpointCodec for ResponsesCodec {
                     };
                     let raw_id = responses_call_id(item).unwrap_or("");
                     vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: raw_id.to_string(),
                         name: String::new(),
                         content: output,
@@ -727,6 +731,7 @@ impl EndpointCodec for ResponsesCodec {
                     };
                     let raw_id = responses_call_id(item).unwrap_or("");
                     vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: raw_id.to_string(),
                         name: String::new(),
                         content: output,
@@ -784,11 +789,13 @@ impl EndpointCodec for ResponsesCodec {
             });
         }
 
+        let mut implicit_function_schemas = serde_json::Map::new();
         let tools: Vec<Tool> = body["tools"]
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|t| {
+                    .enumerate()
+                    .map(|(index, t)| {
                         let tool_type = t["type"].as_str().map(String::from);
                         match tool_type.as_deref() {
                             None | Some("function") => {
@@ -796,10 +803,28 @@ impl EndpointCodec for ResponsesCodec {
                                 for key in ["type", "name", "description", "parameters"] {
                                     config.remove(key);
                                 }
+                                let mut parameters = t["parameters"].as_object().map(|p| json!(p));
+                                if t.get("strict").is_none_or(Value::is_null) {
+                                    let normalized = crate::function_schema::implicit_strict_schema(
+                                        t.get("parameters"),
+                                    );
+                                    let strict = normalized.is_some();
+                                    if let Some(normalized) = normalized {
+                                        parameters = Some(normalized);
+                                    }
+                                    config.insert("strict".into(), json!(strict));
+                                    implicit_function_schemas.insert(
+                                        index.to_string(),
+                                        json!({
+                                            "original":t, "name":t["name"],
+                                            "parameters":parameters, "strict":strict
+                                        }),
+                                    );
+                                }
                                 Tool {
                                     name: t["name"].as_str().unwrap_or("").to_string(),
                                     description: t["description"].as_str().map(String::from),
-                                    parameters: t["parameters"].as_object().map(|p| json!(p)),
+                                    parameters,
                                     required: false,
                                     tool_type: if tool_type.as_deref() == Some("function") {
                                         Some("function".to_string())
@@ -926,8 +951,20 @@ impl EndpointCodec for ResponsesCodec {
         // - text.format: structured output configuration
         // - reasoning.effort: reasoning depth control
         let mut extensions = std::collections::HashMap::new();
+        if !implicit_function_schemas.is_empty() {
+            extensions.insert(
+                "responses_implicit_function_schemas".into(),
+                Value::Object(implicit_function_schemas),
+            );
+        }
+        if let Some(parallel) = body["parallel_tool_calls"].as_bool() {
+            extensions.insert("parallel_tool_calls".to_string(), json!(parallel));
+        }
         if let Some(tc) = body.get("tool_choice") {
-            extensions.insert("tool_choice".to_string(), tc.clone());
+            extensions.insert(
+                "tool_choice".to_string(),
+                crate::tool_choice::normalize(tc)?,
+            );
         }
         if let Some(tf) = body.get("text") {
             extensions.insert("text".to_string(), tf.clone());
@@ -968,6 +1005,7 @@ impl EndpointCodec for ResponsesCodec {
             for key in [
                 "metadata",
                 "previous_response_id",
+                "conversation",
                 "store",
                 "parallel_tool_calls",
                 "service_tier",
@@ -1053,6 +1091,14 @@ impl EndpointCodec for ResponsesCodec {
         if let Some(id) = &ir.response_id {
             response["id"] = json!(id);
         }
+        let status = if matches!(
+            ir.finish_reason,
+            Some(FinishReason::Length | FinishReason::ContentFilter)
+        ) {
+            "incomplete"
+        } else {
+            "completed"
+        };
         let mut output_items = Vec::new();
         let mut pending_text = String::new();
         let flush_text = |pending: &mut String, output: &mut Vec<Value>| {
@@ -1064,6 +1110,7 @@ impl EndpointCodec for ResponsesCodec {
                 "id": format!("{}_msg_{index}", ir.response_id.as_deref().unwrap_or("msg")),
                 "type": "message",
                 "role": "assistant",
+                "status": status,
                 "content": [{"type": "output_text", "text": std::mem::take(pending)}]
             }));
         };
@@ -1141,6 +1188,7 @@ impl EndpointCodec for ResponsesCodec {
                     if let Some(caller) = caller {
                         tc["caller"] = json!(caller);
                     }
+                    tc["status"] = json!(status);
                     output_items.push(tc);
                 }
                 Content::Program {
@@ -1175,7 +1223,14 @@ impl EndpointCodec for ResponsesCodec {
                 }
                 Content::Refusal { text, .. } => {
                     flush_text(&mut pending_text, &mut output_items);
-                    output_items.push(json!({"type": "refusal", "refusal": text}));
+                    let index = output_items.len();
+                    output_items.push(json!({
+                        "id": format!("{}_msg_{index}", ir.response_id.as_deref().unwrap_or("msg")),
+                        "type": "message",
+                        "role": "assistant",
+                        "status": status,
+                        "content": [{"type": "refusal", "refusal": text}],
+                    }));
                 }
                 _ => {}
             }
@@ -1208,6 +1263,13 @@ impl EndpointCodec for ResponsesCodec {
                 FinishReason::ToolCalls => "completed",
                 _ => "completed",
             });
+        }
+        if status == "incomplete" {
+            response["incomplete_details"] = json!({"reason": if ir.finish_reason == Some(FinishReason::ContentFilter) {
+                "content_filter"
+            } else {
+                "max_output_tokens"
+            }});
         }
         if let Some(usage) = &ir.usage {
             // OpenAI Responses 规范：input_tokens 必须含 cache 命中，所以从其他协议流入时
@@ -1473,6 +1535,7 @@ impl EndpointCodec for ResponsesCodec {
                                 id,
                                 caller,
                                 wire_type,
+                                ..
                             } => {
                                 flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 // Cross-protocol Anthropic Messages carries
@@ -1556,6 +1619,7 @@ impl EndpointCodec for ResponsesCodec {
                             id,
                             caller,
                             wire_type,
+                            ..
                         } = c
                         {
                             if wire_type.as_deref() == Some("custom_tool_call_output") {
@@ -1676,7 +1740,8 @@ impl EndpointCodec for ResponsesCodec {
             let tools: Vec<Value> = ir
                 .tools
                 .iter()
-                .map(|t| {
+                .enumerate()
+                .map(|(index, t)| {
                     if t.is_function() {
                         let mut obj = json!({
                             "type": "function",
@@ -1688,6 +1753,34 @@ impl EndpointCodec for ResponsesCodec {
                             if let Some(map) = obj.as_object_mut() {
                                 for (key, value) in config {
                                     map.entry(key.clone()).or_insert_with(|| value.clone());
+                                }
+                            }
+                        }
+                        if obj.get("strict").is_none()
+                            && ir.ingress_protocol.suite != ProtocolSuite::OpenAiResponses
+                        {
+                            obj["strict"] = json!(false);
+                        }
+                        if ir.ingress_protocol.suite == ProtocolSuite::OpenAiResponses {
+                            if let Some(original) = ir
+                                .extensions
+                                .get("responses_implicit_function_schemas")
+                                .and_then(|schemas| schemas.get(index.to_string()))
+                                .filter(|schema| {
+                                    schema["name"] == t.name
+                                        && schema["parameters"] == obj["parameters"]
+                                        && schema["strict"] == obj["strict"]
+                                })
+                                .and_then(|schema| schema["original"].as_object())
+                            {
+                                // Replay omission/null only while the canonical
+                                // schema and strictness still match the decode.
+                                for key in ["parameters", "strict"] {
+                                    if let Some(value) = original.get(key) {
+                                        obj[key] = value.clone();
+                                    } else if let Some(object) = obj.as_object_mut() {
+                                        object.remove(key);
+                                    }
                                 }
                             }
                         }
@@ -1762,9 +1855,12 @@ impl EndpointCodec for ResponsesCodec {
             }
         }
 
+        if let Some(parallel) = ir.extensions.get("parallel_tool_calls") {
+            body["parallel_tool_calls"] = parallel.clone();
+        }
         // Replay modeled Responses extensions captured at decode time.
         if let Some(tc) = ir.extensions.get("tool_choice") {
-            body["tool_choice"] = tc.clone();
+            body["tool_choice"] = crate::tool_choice::responses(tc)?;
         }
         if let Some(tf) = ir.extensions.get("text") {
             body["text"] = tf.clone();
@@ -1884,7 +1980,14 @@ impl EndpointCodec for ResponsesCodec {
     }
 
     fn decode_response(&self, body: Value) -> Result<IrResponse, tiygate_core::Error> {
+        if body["status"].as_str() == Some("failed") {
+            return Err(tiygate_core::Error::Codec(format!(
+                "Responses failed: {}",
+                body["error"]
+            )));
+        }
         let response_id = body["id"].as_str().map(String::from);
+        let truncated = body["status"].as_str() == Some("incomplete");
         let mut content = Vec::new();
         // Ordered opaque output items (hosted tool results, multi-agent, etc.)
         // for same-protocol re-encode. Modeled content is rebuilt separately;
@@ -1896,7 +1999,14 @@ impl EndpointCodec for ResponsesCodec {
                     Some("message") => {
                         if let Some(content_arr) = item["content"].as_array() {
                             for part in content_arr {
-                                if part["type"] == "output_text" {
+                                if part["type"] == "refusal" {
+                                    if let Some(text) = part["refusal"].as_str() {
+                                        content.push(Content::Refusal {
+                                            text: text.to_string(),
+                                            category: None,
+                                        });
+                                    }
+                                } else if part["type"] == "output_text" {
                                     if let Some(text) = part["text"].as_str() {
                                         let annotations = part.get("annotations")
                                             .and_then(|a| a.as_array())
@@ -1947,9 +2057,17 @@ impl EndpointCodec for ResponsesCodec {
                         });
                     }
                     Some("function_call") => {
-                        let args: Value =
-                            serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
-                                .unwrap_or(json!({}));
+                        let Some(args) = crate::tool_arguments::parse_response_arguments(
+                            item["arguments"].as_str().unwrap_or("{}"),
+                            "Responses tool arguments",
+                            truncated,
+                        )?
+                        else {
+                            // Native replay can preserve the incomplete wire
+                            // item, while cross-protocol IR omits an unsafe call.
+                            opaque_output_items.push(json!({"index":output_index,"item":item}));
+                            continue;
+                        };
                         // Responses function_call items carry two distinct ids:
                         // `id` (item reference, e.g. `fc_xxx`) and `call_id`
                         // (function-call identifier, e.g. `call_xxx`). Both
@@ -2063,8 +2181,8 @@ impl EndpointCodec for ResponsesCodec {
                 }
             }
             "incomplete" => {
-                if has_tool_call {
-                    FinishReason::ToolCalls
+                if body["incomplete_details"]["reason"].as_str() == Some("content_filter") {
+                    FinishReason::ContentFilter
                 } else {
                     FinishReason::Length
                 }
@@ -2183,15 +2301,14 @@ pub struct ResponsesStreamEncoder {
     /// Whether a terminal `response.completed` has already been emitted, so we
     /// do not emit it twice when both `Finish` and `ResponseCompleted` arrive.
     completed_sent: bool,
-    /// Status stashed from `Finish` when `pending_usage` was not yet available.
-    /// When the upstream sends `finish_reason` and `usage` as separate SSE
-    /// chunks (OpenAI-compatible: finish chunk → usage chunk → [DONE]), the
-    /// `Finish` part arrives before `Usage`. If we emitted `response.completed`
-    /// immediately on `Finish`, the usage would be lost. Instead we stash the
-    /// status here and defer `completed_event` to `ResponseCompleted` (which
-    /// arrives when the upstream sends `[DONE]`), by which point `Usage` has
-    /// been stashed too.
+    failed: bool,
+    /// Generation status retained until ResponseCompleted. Finish closes item
+    /// content but is not a transport terminator; cumulative usage may still
+    /// be updated before the final response snapshot.
     pending_finish_status: Option<String>,
+    incomplete_reason: Option<&'static str>,
+    refusal_output_index: Option<u32>,
+    refusal_text: String,
     /// output_index assigned to the reasoning item (lazily allocated on the
     /// first ReasoningDelta), mirroring text_output_index.
     reasoning_output_index: Option<u32>,
@@ -2237,7 +2354,11 @@ impl ResponsesStreamEncoder {
             sequence_number: 0,
             pending_usage: None,
             completed_sent: false,
+            failed: false,
             pending_finish_status: None,
+            incomplete_reason: None,
+            refusal_output_index: None,
+            refusal_text: String::new(),
             reasoning_output_index: None,
             reasoning_text: String::new(),
             reasoning_id: None,
@@ -2365,16 +2486,23 @@ impl ResponsesStreamEncoder {
             }
             let idx = self.tool_output_indices.get(&call_id).copied().unwrap_or(0);
             let name = self.tool_names.get(&call_id).cloned().unwrap_or_default();
-            let arguments = self
-                .tool_arguments
-                .get(&call_id)
-                .cloned()
-                .unwrap_or_default();
             let item_type = self
                 .tool_wire_types
                 .get(&call_id)
                 .cloned()
                 .unwrap_or_else(|| "function_call".to_string());
+            // A no-argument call has no argument deltas; the completed payload
+            // must still be a valid JSON object so clients (and the next
+            // request's history) can parse it.
+            let mut arguments = self
+                .tool_arguments
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_default();
+            if item_type == "function_call" && crate::tool_arguments::is_empty_arguments(&arguments)
+            {
+                arguments = "{}".to_string();
+            }
             let wire_item_id = self
                 .tool_item_ids
                 .get(&call_id)
@@ -2412,6 +2540,10 @@ impl ResponsesStreamEncoder {
     fn completed_event(&mut self, status: &str) -> String {
         let id = self.response_id.clone().unwrap_or_default();
         let mut response = json!({"id": id, "status": status});
+        if status == "incomplete" {
+            response["incomplete_details"] =
+                json!({"reason": self.incomplete_reason.unwrap_or("max_output_tokens")});
+        }
         if let Some(usage) = self.pending_usage.take() {
             // IR prompt_tokens is cache-free; Responses requires input_tokens
             // to include cache. Re-add so streamed usage stays consistent.
@@ -2476,6 +2608,12 @@ impl ResponsesStreamEncoder {
                     }]
                 }),
             ));
+        }
+        if let Some(index) = self.refusal_output_index {
+            indexed_output.push((index, json!({
+                "id": format!("{id}_refusal"), "type": "message", "role": "assistant", "status": status,
+                "content": [{"type": "refusal", "refusal": self.refusal_text}]
+            })));
         }
         for (index, item) in &self.program_items {
             indexed_output.push((*index, item.clone()));
@@ -2545,13 +2683,56 @@ impl ResponsesStreamEncoder {
             response["output"] = json!(output);
         }
         self.completed_sent = true;
-        self.event(json!({"type": "response.completed", "response": response}))
+        let event_type = if status == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        self.event(json!({"type": event_type, "response": response}))
     }
 }
 
 impl StreamEncoder for ResponsesStreamEncoder {
     fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
+        if self.failed || self.completed_sent {
+            return Ok(vec![]);
+        }
+        if self.pending_finish_status.is_some()
+            && !matches!(
+                part,
+                StreamPart::Usage { .. }
+                    | StreamPart::ResponseCompleted { .. }
+                    | StreamPart::Finish { .. }
+                    | StreamPart::Error { .. }
+            )
+        {
+            return Err(tiygate_core::Error::Codec(
+                "semantic content after generation finished".into(),
+            ));
+        }
         let chunk = match part {
+            StreamPart::RefusalDelta { text } => {
+                let item_id = format!("{}_refusal", self.response_id.as_deref().unwrap_or(""));
+                let mut out = String::new();
+                let index = if let Some(index) = self.refusal_output_index {
+                    index
+                } else {
+                    let index = self.next_output_index;
+                    self.next_output_index += 1;
+                    self.refusal_output_index = Some(index);
+                    out.push_str(&self.event(json!({"type":"response.output_item.added", "output_index":index,
+                        "item":{"id":item_id,"type":"message","role":"assistant","status":"in_progress","content":[]}})));
+                    out.push_str(&self.event(json!({"type":"response.content_part.added", "output_index":index,
+                        "item_id":item_id,"content_index":0,"part":{"type":"refusal","refusal":""}})));
+                    index
+                };
+                self.refusal_text.push_str(text);
+                out.push_str(&self.event(
+                    json!({"type":"response.refusal.delta", "output_index":index,
+                    "item_id":item_id,"content_index":0,"delta":text}),
+                ));
+                out
+            }
             StreamPart::ResponseStarted { id } => {
                 self.response_id = Some(id.clone());
                 let created = self.event(json!({"type": "response.created", "response": {"id": id, "object": "response", "status": "in_progress"}}));
@@ -2708,21 +2889,12 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 out
             }
             StreamPart::Usage { usage } => {
-                // Stash usage for the terminal response.completed instead of
-                // emitting it early. If a Finish already arrived first (Gemini
-                // can decode `finishReason` before same-frame `usageMetadata`,
-                // and OpenAI-compatible streams may send finish before usage),
-                // we now have both pieces and can safely complete immediately.
+                // Retain the latest cumulative usage until ResponseCompleted,
+                // including updates delivered after generation finished.
                 self.pending_usage = Some(usage.clone());
-                if !self.completed_sent {
-                    if let Some(status) = self.pending_finish_status.take() {
-                        self.completed_event(&status)
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                }
+                // Usage may be cumulative, including after Finish. Only the
+                // actual response terminator seals the accounting snapshot.
+                String::new()
             }
             StreamPart::Finish { reason } => {
                 if self.completed_sent || self.pending_finish_status.is_some() {
@@ -2735,8 +2907,31 @@ impl StreamEncoder for ResponsesStreamEncoder {
                         FinishReason::ToolCalls => "completed",
                         _ => "completed",
                     };
+                    self.incomplete_reason = match reason {
+                        FinishReason::Length => Some("max_output_tokens"),
+                        FinishReason::ContentFilter => Some("content_filter"),
+                        _ => None,
+                    };
                     // Close the open text item's lifecycle before completing.
                     let mut out = String::new();
+                    if let Some(index) = self.refusal_output_index {
+                        let item_id =
+                            format!("{}_refusal", self.response_id.as_deref().unwrap_or(""));
+                        let text = self.refusal_text.clone();
+                        let content = json!({"type":"refusal","refusal":text});
+                        out.push_str(
+                            &self.event(
+                                json!({"type":"response.refusal.done", "output_index":index,
+                            "item_id":item_id,"content_index":0,"refusal":text}),
+                            ),
+                        );
+                        out.push_str(&self.event(
+                            json!({"type":"response.content_part.done", "output_index":index,
+                            "item_id":item_id,"content_index":0,"part":content}),
+                        ));
+                        out.push_str(&self.event(json!({"type":"response.output_item.done", "output_index":index,
+                            "item":{"id":item_id,"type":"message","role":"assistant","status":status,"content":[content]}})));
+                    }
                     // Close reasoning item lifecycle first (reasoning precedes
                     // text in the output sequence).
                     if let Some(idx) = self.reasoning_output_index {
@@ -2763,29 +2958,33 @@ impl StreamEncoder for ResponsesStreamEncoder {
                         let text = self.text.clone();
                         out.push_str(&self.event(json!({"type": "response.output_text.done", "output_index": idx, "item_id": item_id, "content_index": 0, "text": text})));
                         out.push_str(&self.event(json!({"type": "response.content_part.done", "output_index": idx, "item_id": item_id, "content_index": 0, "part": {"type": "output_text", "text": text, "annotations": []}})));
-                        out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": item_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}})));
+                        out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": item_id, "type": "message", "role": "assistant", "status": status, "content": [{"type": "output_text", "text": text, "annotations": []}]}})));
                     }
                     out.push_str(&self.close_tool_calls(status));
-                    // When usage is already stashed (same-chunk finish+usage),
-                    // emit response.completed immediately. Otherwise defer to
-                    // ResponseCompleted so a late-arriving Usage is included.
-                    if self.pending_usage.is_some() {
-                        out.push_str(&self.completed_event(status));
-                    } else {
-                        self.pending_finish_status = Some(status.to_string());
-                    }
+                    // Content is finished; transport completion still owns the
+                    // terminal snapshot so late usage cannot be overwritten.
+                    self.pending_finish_status = Some(status.to_string());
                     out
                 }
             }
-            StreamPart::ResponseCompleted { .. } => {
+            StreamPart::ResponseCompleted {
+                status: terminal_status,
+                usage,
+                ..
+            } => {
                 // If no Finish arrived, emit the terminal completed now so the
                 // usage is not lost; then end the stream.
                 let mut out = String::new();
+                if let Some(usage) = usage {
+                    self.pending_usage = Some(usage.clone());
+                }
                 if !self.completed_sent {
-                    let status = self
-                        .pending_finish_status
-                        .take()
-                        .unwrap_or_else(|| "completed".to_string());
+                    let pending = self.pending_finish_status.take();
+                    let status = if terminal_status == "incomplete" {
+                        "incomplete".to_string()
+                    } else {
+                        pending.unwrap_or_else(|| terminal_status.clone())
+                    };
                     out.push_str(&self.close_tool_calls(&status));
                     out.push_str(&self.completed_event(&status));
                 }
@@ -2797,6 +2996,7 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 class,
                 upstream_code,
             } => {
+                self.failed = true;
                 let mut err = json!({"message": message, "type": error_type_for_class(*class)});
                 if let Some(c) = upstream_code {
                     err["code"] = json!(c);
@@ -2812,6 +3012,7 @@ impl StreamEncoder for ResponsesStreamEncoder {
         class: ErrorClass,
         upstream_code: Option<&str>,
     ) -> Vec<u8> {
+        self.failed = true;
         let mut err = json!({"message": message, "type": error_type_for_class(class)});
         if let Some(c) = upstream_code {
             err["code"] = json!(c);
@@ -2855,6 +3056,9 @@ pub struct ResponsesStreamDecoder {
     /// complete input, so this lets us forward only a suffix that was not
     /// already delivered via `.delta`.
     custom_tool_inputs: HashMap<String, String>,
+    function_arguments: HashMap<String, String>,
+    refusals: HashMap<(String, u64), String>,
+    terminal: bool,
 }
 impl Default for ResponsesStreamDecoder {
     fn default() -> Self {
@@ -2872,15 +3076,89 @@ impl ResponsesStreamDecoder {
             pending_reasoning_id: None,
             pending_reasoning_encrypted: None,
             custom_tool_inputs: HashMap::new(),
+            function_arguments: HashMap::new(),
+            refusals: HashMap::new(),
+            terminal: false,
         }
+    }
+
+    fn finish_function_arguments(
+        &mut self,
+        event: &Value,
+        arguments: &str,
+        parts: &mut Vec<StreamPart>,
+    ) -> Result<(), tiygate_core::Error> {
+        let id = event["item_id"]
+            .as_str()
+            .and_then(|item_id| self.function_calls.get(item_id))
+            .map(|(id, _)| id.clone())
+            .or_else(|| self.current_call_id.clone())
+            .ok_or_else(|| {
+                tiygate_core::Error::Codec(
+                    "complete arguments reference unknown function call".into(),
+                )
+            })?;
+        if !crate::tool_arguments::is_empty_arguments(arguments) {
+            serde_json::from_str::<Value>(arguments).map_err(|error| {
+                tiygate_core::Error::Codec(format!("invalid completed tool arguments: {error}"))
+            })?;
+        };
+        let delivered = self.function_arguments.entry(id.clone()).or_default();
+        let remaining = arguments.strip_prefix(delivered.as_str()).ok_or_else(|| {
+            tiygate_core::Error::Codec(
+                "completed tool arguments disagree with streamed deltas".into(),
+            )
+        })?;
+        if !remaining.is_empty() {
+            parts.push(StreamPart::ToolCallDelta {
+                id,
+                name: None,
+                arguments: remaining.to_string(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
+            });
+        }
+        *delivered = arguments.to_string();
+        Ok(())
+    }
+
+    fn finish_refusal(
+        &mut self,
+        event: &Value,
+        text: &str,
+        parts: &mut Vec<StreamPart>,
+    ) -> Result<(), tiygate_core::Error> {
+        let key = (
+            event["item_id"].as_str().unwrap_or("").to_string(),
+            event["content_index"].as_u64().unwrap_or(0),
+        );
+        let delivered = self.refusals.entry(key).or_default();
+        let remaining = text.strip_prefix(delivered.as_str()).ok_or_else(|| {
+            tiygate_core::Error::Codec("completed refusal disagrees with streamed deltas".into())
+        })?;
+        if !remaining.is_empty() {
+            parts.push(StreamPart::RefusalDelta {
+                text: remaining.to_string(),
+            });
+        }
+        *delivered = text.to_string();
+        Ok(())
     }
 }
 
 impl StreamDecoder for ResponsesStreamDecoder {
     fn feed(&mut self, line: &str) -> Result<Vec<StreamPart>, tiygate_core::Error> {
+        if self.terminal {
+            return Ok(vec![]);
+        }
         let line = line.trim();
-        if line.is_empty() || line == "data: [DONE]" {
-            if line == "data: [DONE]" {
+        let is_done = line
+            .strip_prefix("data:")
+            .is_some_and(|data| data.trim() == "[DONE]");
+        if line.is_empty() || is_done {
+            if is_done {
+                self.terminal = true;
                 return Ok(vec![StreamPart::ResponseCompleted {
                     id: self.response_id.clone().unwrap_or_default(),
                     status: "completed".to_string(),
@@ -2890,7 +3168,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
             }
             return Ok(vec![]);
         }
-        let data = if let Some(s) = line.strip_prefix("data: ") {
+        let data = if let Some(s) = line.strip_prefix("data:") {
             s
         } else {
             return Ok(vec![]);
@@ -2911,6 +3189,23 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     parts.push(StreamPart::TextDelta {
                         text: text.to_string(),
                     });
+                }
+            }
+            Some("response.refusal.delta") => {
+                if let Some(text) = event["delta"].as_str() {
+                    let key = (
+                        event["item_id"].as_str().unwrap_or("").to_string(),
+                        event["content_index"].as_u64().unwrap_or(0),
+                    );
+                    self.refusals.entry(key).or_default().push_str(text);
+                    parts.push(StreamPart::RefusalDelta {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            Some("response.refusal.done") => {
+                if let Some(text) = event["refusal"].as_str() {
+                    self.finish_refusal(&event, text, &mut parts)?;
                 }
             }
             Some("response.reasoning_text.delta")
@@ -2946,10 +3241,13 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     self.function_calls
                         .insert(item_id, (call_id.clone(), name.clone()));
                     self.current_call_id = Some(call_id.clone());
+                    let arguments = item["arguments"].as_str().unwrap_or("").to_string();
+                    self.function_arguments
+                        .insert(call_id.clone(), arguments.clone());
                     parts.push(StreamPart::ToolCallDelta {
                         id: call_id,
                         name,
-                        arguments: String::new(),
+                        arguments,
                         wire_type: None,
                         item_id: dual_item_id,
                         caller: decode_tool_caller(item),
@@ -3043,6 +3341,10 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         .map(|(call_id, _)| call_id.clone())
                         .or_else(|| self.current_call_id.clone())
                         .unwrap_or_default();
+                    self.function_arguments
+                        .entry(id.clone())
+                        .or_default()
+                        .push_str(args);
                     // Argument fragment: `name: None` so cross-protocol
                     // encoders route this to their argument-delta event.
                     parts.push(StreamPart::ToolCallDelta {
@@ -3053,6 +3355,11 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         item_id: None,
                         caller: None,
                     });
+                }
+            }
+            Some("response.function_call_arguments.done") => {
+                if let Some(arguments) = event["arguments"].as_str() {
+                    self.finish_function_arguments(&event, arguments, &mut parts)?;
                 }
             }
             Some("response.custom_tool_call_input.delta") => {
@@ -3127,11 +3434,14 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     // Already emitted on output_item.added; ignore done to
                     // avoid duplicate ProgramDelta / ProgramOutputDelta.
                 }
-                if item["type"] == "function_call" || item["type"] == "custom_tool_call" {
-                    if let Some(item_id) = item["id"].as_str() {
-                        self.function_calls.remove(item_id);
+                if item["type"] == "function_call" {
+                    if let Some(arguments) = item["arguments"].as_str() {
+                        let event = json!({"item_id": item["id"]});
+                        self.finish_function_arguments(&event, arguments, &mut parts)?;
                     }
                 }
+                // Keep bindings until the response ends: arguments.done and
+                // output_item.done may repeat the same complete payload.
                 self.current_call_id = None;
             }
             // Lifecycle / bookkeeping events that carry no IR-relevant payload.
@@ -3143,7 +3453,6 @@ impl StreamDecoder for ResponsesStreamDecoder {
             | Some("response.content_part.done")
             | Some("response.output_text.done")
             | Some("response.output_text.annotation.added")
-            | Some("response.function_call_arguments.done")
             | Some("response.reasoning_text.done")
             | Some("response.reasoning_summary_text.done")
             | Some("response.reasoning_summary_part.added")
@@ -3152,6 +3461,29 @@ impl StreamDecoder for ResponsesStreamDecoder {
                 // no-op: lifecycle marker
             }
             Some("response.completed") | Some("response.done") => {
+                self.terminal = true;
+                if let Some(id) = event["response"]["id"].as_str() {
+                    self.response_id = Some(id.to_string());
+                }
+                if let Some(output) = event["response"]["output"].as_array() {
+                    for item in output {
+                        if let Some(content) = item["content"].as_array() {
+                            for (index, part) in content.iter().enumerate() {
+                                if let Some(text) = part["refusal"].as_str() {
+                                    // Compatible backends sometimes omit final item ids.
+                                    // In that case the terminal snapshot cannot safely be
+                                    // paired to a prior delta; avoid replaying it twice.
+                                    if item["id"].as_str().is_none() && !self.refusals.is_empty() {
+                                        continue;
+                                    }
+                                    let event =
+                                        json!({"item_id": item["id"], "content_index": index});
+                                    self.finish_refusal(&event, text, &mut parts)?;
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(usage) = event["response"]["usage"].as_object() {
                     let cache_read = usage
                         .get("input_tokens_details")
@@ -3201,8 +3533,10 @@ impl StreamDecoder for ResponsesStreamDecoder {
                         }
                     }
                     "incomplete" => {
-                        if self.saw_function_call {
-                            FinishReason::ToolCalls
+                        if event["response"]["incomplete_details"]["reason"].as_str()
+                            == Some("content_filter")
+                        {
+                            FinishReason::ContentFilter
                         } else {
                             FinishReason::Length
                         }
@@ -3220,18 +3554,19 @@ impl StreamDecoder for ResponsesStreamDecoder {
                 // which pushes `ResponseCompleted` on `message_stop`.
                 parts.push(StreamPart::ResponseCompleted {
                     id: self.response_id.clone().unwrap_or_default(),
-                    status: "completed".to_string(),
+                    status: status.to_string(),
                     usage: None,
                     extensions: HashMap::new(),
                 });
             }
             Some("error") | Some("response.failed") => {
+                self.terminal = true;
                 let err = if event.get("error").is_some() {
                     &event["error"]
                 } else {
                     &event["response"]["error"]
                 };
-                let code = err["type"].as_str();
+                let code = err["code"].as_str().or_else(|| err["type"].as_str());
                 let class = tiygate_core::classify_upstream_error(None, code);
                 parts.push(StreamPart::Error {
                     message: err["message"].as_str().unwrap_or("Unknown").to_string(),
@@ -3240,8 +3575,30 @@ impl StreamDecoder for ResponsesStreamDecoder {
                 });
             }
             Some("response.incomplete") => {
-                let reason = if self.saw_function_call {
-                    FinishReason::ToolCalls
+                self.terminal = true;
+                if let Some(usage) = event["response"].get("usage").filter(|u| u.is_object()) {
+                    let cache_read = usage["input_tokens_details"]["cached_tokens"].as_u64();
+                    let cache_write = usage["input_tokens_details"]["cache_write_tokens"].as_u64();
+                    parts.push(StreamPart::Usage {
+                        usage: Usage {
+                            prompt_tokens: usage["input_tokens"]
+                                .as_u64()
+                                .unwrap_or(0)
+                                .saturating_sub(cache_read.unwrap_or(0))
+                                .saturating_sub(cache_write.unwrap_or(0)),
+                            completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+                            total_tokens: usage["total_tokens"].as_u64().unwrap_or(0),
+                            reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
+                                .as_u64(),
+                            cache_read_tokens: cache_read,
+                            cache_write_tokens: cache_write,
+                        },
+                    });
+                }
+                let reason = if event["response"]["incomplete_details"]["reason"].as_str()
+                    == Some("content_filter")
+                {
+                    FinishReason::ContentFilter
                 } else {
                     FinishReason::Length
                 };
@@ -3437,14 +3794,21 @@ mod tests {
                 reason: FinishReason::ToolCalls,
             })
             .unwrap();
-        // Finish defers response.completed when usage hasn't arrived yet.
-        // Feed Usage so completed_event fires and includes the output array.
+        // Finish and Usage are not transport terminators; complete explicitly.
         let bytes2 = encoder
             .encode_part(&StreamPart::Usage {
                 usage: Usage::default(),
             })
             .unwrap();
-        let combined = [bytes.as_slice(), bytes2.as_slice()].concat();
+        let terminal = encoder
+            .encode_part(&StreamPart::ResponseCompleted {
+                id: "resp_1".into(),
+                status: "completed".into(),
+                usage: None,
+                extensions: HashMap::new(),
+            })
+            .unwrap();
+        let combined = [bytes.as_slice(), bytes2.as_slice(), terminal.as_slice()].concat();
         let s = String::from_utf8_lossy(&combined);
         // The terminal response.completed must carry both PTC items in output.
         assert!(
@@ -3505,17 +3869,26 @@ mod tests {
                 reason: FinishReason::ToolCalls,
             })
             .unwrap();
+        assert!(encoder
+            .encode_part(&StreamPart::Usage {
+                usage: Usage::default()
+            })
+            .unwrap()
+            .is_empty());
         let completed = String::from_utf8(
             encoder
-                .encode_part(&StreamPart::Usage {
-                    usage: Usage::default(),
+                .encode_part(&StreamPart::ResponseCompleted {
+                    id: "resp_1".into(),
+                    status: "completed".into(),
+                    usage: None,
+                    extensions: HashMap::new(),
                 })
                 .unwrap(),
         )
         .unwrap();
         let event: Value = completed
             .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| line.strip_prefix("data:"))
             .filter_map(|payload| serde_json::from_str(payload).ok())
             .find(|event: &Value| event["type"] == "response.completed")
             .expect("response.completed event");
@@ -4158,7 +4531,7 @@ mod tests {
 
     #[test]
     fn test_stream_encoder_usage_deferred_to_completed() {
-        // 高影响回归:Usage 不再提前发 response.completed;只在 Finish 发一次。
+        // Usage and Finish must wait for the actual response terminator.
         let mut enc = ResponsesStreamEncoder::new();
         let usage_bytes = enc
             .encode_part(&StreamPart::Usage {
@@ -4177,7 +4550,16 @@ mod tests {
                 reason: FinishReason::Stop,
             })
             .unwrap();
-        let s = String::from_utf8_lossy(&finish_bytes);
+        assert!(!String::from_utf8_lossy(&finish_bytes).contains("response.completed"));
+        let terminal = enc
+            .encode_part(&StreamPart::ResponseCompleted {
+                id: "r".into(),
+                status: "completed".into(),
+                usage: None,
+                extensions: HashMap::new(),
+            })
+            .unwrap();
+        let s = String::from_utf8_lossy(&terminal);
         assert!(s.contains("response.completed"));
         assert!(s.contains("\"input_tokens\":10"));
         assert!(s.contains("sequence_number"));
@@ -4207,7 +4589,16 @@ mod tests {
                 },
             })
             .unwrap();
-        let s = String::from_utf8_lossy(&usage_bytes);
+        assert!(usage_bytes.is_empty());
+        let terminal = enc
+            .encode_part(&StreamPart::ResponseCompleted {
+                id: "r".into(),
+                status: "completed".into(),
+                usage: None,
+                extensions: HashMap::new(),
+            })
+            .unwrap();
+        let s = String::from_utf8_lossy(&terminal);
         assert!(s.contains("\"type\":\"response.completed\""), "{s}");
         assert!(s.contains("\"input_tokens\":146050"), "{s}");
         assert!(s.contains("\"cached_tokens\":141123"), "{s}");
@@ -4485,10 +4876,19 @@ mod tests {
             "output_item.done must contain accumulated reasoning text: {sf}"
         );
 
+        let terminal = enc
+            .encode_part(&StreamPart::ResponseCompleted {
+                id: "r".into(),
+                status: "completed".into(),
+                usage: None,
+                extensions: HashMap::new(),
+            })
+            .unwrap();
+        let sf = String::from_utf8_lossy(&terminal);
         // response.completed with output array and reasoning_tokens
         assert!(
             sf.contains("\"type\":\"response.completed\""),
-            "finish must emit response.completed: {sf}"
+            "response terminator must emit response.completed: {sf}"
         );
         assert!(
             sf.contains("\"type\":\"reasoning\""),
@@ -4773,6 +5173,7 @@ mod tests {
                 Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: "call_1".to_string(),
                         name: "get_weather".to_string(),
                         content: "cloudy".to_string(),
@@ -5240,7 +5641,6 @@ mod tests {
             id,
             name,
             arguments,
-            call_id: _,
             ..
         } = tool_call
         {
@@ -5272,7 +5672,6 @@ mod tests {
             id,
             name,
             arguments,
-            call_id: _,
             ..
         } = tool_call
         {
@@ -5690,8 +6089,8 @@ mod tests {
 
         let (chat_encoded, _) = chat.encode_request(&ir).unwrap();
         assert_eq!(chat_encoded["tools"][0]["type"], "custom");
-        assert_eq!(chat_encoded["tools"][0]["name"], "code_exec");
-        assert_eq!(chat_encoded["tools"][0]["format"]["type"], "text");
+        assert_eq!(chat_encoded["tools"][0]["custom"]["name"], "code_exec");
+        assert_eq!(chat_encoded["tools"][0]["custom"]["format"]["type"], "text");
     }
 
     #[test]

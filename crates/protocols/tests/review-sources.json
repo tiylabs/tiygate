@@ -1,0 +1,240 @@
+{
+  "schema_version": 1,
+  "review_head": "6db40e54663455fb99d675bd8985e4dc50f68a14",
+  "origin": "original synthetic JSON/SSE written for the 2026-10-02 review; no copied third-party implementation or fixture",
+  "test_target": "review_regressions",
+  "official_local_sources": [
+    "protocol-specs/api-wire/openai/openapi.yaml",
+    "protocol-specs/api-wire/gemini/v1beta.discovery.json",
+    "protocol-specs/api-wire/lock.json",
+    "protocol-specs/structured-output/gemini.toml"
+  ],
+  "official_sdk": {
+    "repository": "anthropics/anthropic-sdk-typescript",
+    "commit": "d49bdab458000bcdffe77bd84b03293f31824fb3",
+    "path": "src/resources/messages/messages.ts",
+    "use": "read-only field and replay contract evidence"
+  },
+  "findings": {
+    "TG-PROTO-001": "chat_interleaved_tools_to_messages_keep_argument_identity",
+    "TG-PROTO-003": "chat_error_followed_by_done_does_not_become_responses_success",
+    "TG-PROTO-004": "gemini_schema_constraints_preserved_or_rejected",
+    "TG-PROTO-005": "chat_array_tool_result_preserves_reference",
+    "TG-PROTO-006": "gemini_repeated_same_name_calls_have_unique_ids",
+    "TG-PROTO-007": "gemini_usage_before_finish_does_not_complete_early",
+    "TG-PROTO-008": "gemini_thinking_usage_maps_to_openai_total_output",
+    "TG-PROTO-009": "inline_audio_to_messages_guard_rejects",
+    "TG-PROTO-010": "gemini_camelcase_system_instruction_survives_conversion",
+    "TG-PROTO-011": "gemini_response_json_schema_does_not_degrade_to_json_object",
+    "TG-PROTO-012": "gemini_allowlist_keeps_all_allowed_tools_or_rejects",
+    "TG-PROTO-013": "messages_redacted_thinking_replay_survives",
+    "TG-PROTO-014": "messages_tool_error_flag_preserved_or_rejected",
+    "TG-PROTO-015": "gemini_request_signature_replayed_verbatim",
+    "TG-PROTO-016": "gemini_multiple_candidates_not_concatenated",
+    "TG-PROTO-017": "responses_nested_refusal_is_preserved",
+    "TG-PROTO-018": "responses_incomplete_preserves_usage",
+    "TG-PROTO-019": "sse_data_without_optional_space_is_accepted",
+    "TG-PROTO-021": "gemini_native_function_ids_survive_reencode"
+  },
+  "http_tests": {
+    "path": "crates/server/tests/protocol_review.rs",
+    "TG-PROTO-001": "http_interleaved_tools_preserve_block_references",
+    "TG-PROTO-002": "http_utf8_byte_split_preserves_text",
+    "TG-PROTO-003": "http_chat_error_done_has_no_success_completion",
+    "TG-PROTO-019": "http_multiline_sse_data_is_one_event"
+  },
+  "oracle": "inspect native output JSON fields and SSE lifecycle references, not target decoder roundtrips",
+  "limitations": [
+    "matrix test covers basic text for 16 directions, not every capability/profile",
+    "codec regressions do not replace real HTTP framing",
+    "HTTP tests use a local synthetic upstream and do not prove production provider/account compatibility",
+    "is_error=true to Chat/Responses is rejected because the native failure flag cannot be preserved"
+  ],
+  "followup": {
+    "review_head": "a11d4cc521791eec6de7f158d2b82fe7c7095498",
+    "origin": "original synthetic JSON/SSE; no reference implementation or fixtures copied",
+    "report": "/tmp/tiygate-protocol-review-WU3xRZZ6/report.md",
+    "findings": {
+      "TG-PROTO-023": "review_followup::chat_string_stop_preserved_or_rejected",
+      "TG-PROTO-024": "review_followup::strict_function_responses_to_chat_preserved_or_rejected",
+      "TG-PROTO-025": "review_followup::previous_response_id_crossing_requires_rejection",
+      "TG-PROTO-026": "review_lifecycle::refusal_text_survives_every_target_once",
+      "TG-PROTO-027": "review_followup::chat_multiple_stream_choices_not_merged",
+      "TG-PROTO-028": "review_followup::incomplete_response_uses_native_incomplete_event",
+      "TG-PROTO-029": "review_followup::malformed_nonstream_tool_arguments_not_replaced_with_empty_object",
+      "TG-PROTO-030": "review_media_state::chat_parallel_false_to_messages_preserved_or_rejected",
+      "TG-PROTO-031": "review_lifecycle::tool_done_payload_completes_a_prefix_without_duplication",
+      "TG-PROTO-032": "review_lifecycle::all_encoders_stop_semantic_content_after_terminal",
+      "TG-PROTO-033": "review_late_usage::earlier_usage_does_not_seal_response_before_final_usage",
+      "TG-PROTO-034": "review_media_state::messages_document_preserved_or_rejected",
+      "TG-PROTO-035": "server::protocol_review_followup::http_failed_response_with_output_not_accepted",
+      "TG-PROTO-036": "review_media_state::responses_conversation_preserved_on_reencode"
+    },
+    "http_target": "crates/server/tests/protocol_review_followup.rs"
+  },
+  "final_review": {
+    "review_head": "adcb4487f29d6ebd1d3a0dd110408932edc21b56",
+    "origin": "original synthetic JSON/SSE; no copied third-party implementation or fixture",
+    "report": "/tmp/tiygate-protocol-review-9SsMLKSA/report.md",
+    "codec_target": "review_final",
+    "http_target": "protocol_review_final",
+    "findings": {
+      "TG-PROTO-029": "malformed_responses_history_not_replaced_with_empty_object",
+      "TG-PROTO-037": "chat_specific_tool_to_responses_uses_flat_name / responses_specific_tool_to_messages_preserves_name",
+      "TG-PROTO-038": "responses_tool_result_to_gemini_matches_call_id",
+      "TG-PROTO-039": "gemini_response_schema_normalizes_enum_and_nullable / gemini_native_parameters_normalized_to_json_schema",
+      "TG-PROTO-040": "gemini_code_execution_to_chat_rejects_instead_of_dropping",
+      "TG-PROTO-041": "messages_tool_image_to_responses_preserved_or_rejected / multimodal_tool_result_survives_messages_reencode",
+      "TG-PROTO-042": "chat_stream_incomplete_tool_json_not_completed_successfully",
+      "TG-PROTO-043": "chat_custom_tool_definition_has_native_nested_carrier / responses_custom_tool_definition_to_chat_uses_custom_object",
+      "TG-PROTO-044": "chat_custom_tool_stream_preserves_freeform_input / custom_stream_both_directions_preserve_input",
+      "TG-PROTO-045": "chat_repeated_tool_name_does_not_reopen_same_call / chat_late_tool_id_is_buffered_until_identity_available",
+      "TG-PROTO-046": "gemini_nonstream_refusal_text_survives",
+      "TG-PROTO-047": "messages_stream_refusal_stop_reason_survives / content_filter_to_messages_stream_does_not_become_end_turn",
+      "TG-PROTO-048": "enormous_chat_tool_index_errors_without_panic / enormous_messages_tool_index_errors_without_panic",
+      "TG-PROTO-049": "gemini_tool_result_text_order_to_chat_preserved",
+      "TG-PROTO-050": "http_gemini_versioned_base_uses_one_version"
+    },
+    "official_local_sources": [
+      "protocol-specs/api-wire/openai/openapi.yaml",
+      "protocol-specs/api-wire/gemini/v1beta.discovery.json"
+    ],
+    "official_sdk": {
+      "repository": "anthropics/anthropic-sdk-typescript",
+      "commit": "d49bdab458000bcdffe77bd84b03293f31824fb3",
+      "path": "src/resources/messages/messages.ts",
+      "use": "read-only field and replay contract evidence"
+    },
+    "oracle": "native JSON fields, media refusal, call/result refs, SSE block identity/terminal and no-success-on-invalid semantics",
+    "limitations": [
+      "Messages multimodal tool results cross-protocol are rejected until canonical content carrier is modeled",
+      "Chat index 0-255/16MiB args and Messages content index 0-1023 are gateway bounds",
+      "temporary reports may be cleaned by host",
+      "no live provider calls"
+    ],
+    "supplemental_tests": [
+      "schema_nullable_enum_and_instance_values_preserved",
+      "native_hosted_tool_survives_gemini_reencode",
+      "multimodal_tool_result_survives_messages_reencode",
+      "gemini_allowlist_does_not_hide_hosted_tools_from_guard",
+      "sparse_and_invalid_tool_indices_are_bounded",
+      "tool_arguments_memory_is_bounded",
+      "duplicate_ids_on_different_indices_are_rejected",
+      "length_truncated_tool_preserves_incomplete",
+      "http_named_function_to_messages_never_panics",
+      "http_large_indices_emit_error_without_success",
+      "http_late_identity_is_buffered_until_open",
+      "http_gemini_result_text_order_survives"
+    ]
+  },
+  "d7f_fix_round": {
+    "review_head": "d7ffb80195f52751c3368628c72e11a0948c353b",
+    "origin": "original synthetic JSON/SSE written for the TG-PROTO-051/052 fix round; no reference implementation or fixtures copied",
+    "report": "/tmp/tiygate-protocol-review-fix-d7f/report.md",
+    "codec_target": "review_final",
+    "http_target": "protocol_review_final",
+    "findings": {
+      "TG-PROTO-051": "chat_stream_noarg_tool_empty_first_chunk_completes / chat_stream_noarg_tool_missing_arguments_key_completes / chat_stream_noarg_tool_to_responses_emits_empty_object / chat_response_empty_arguments_defaults_to_object / chat_request_history_empty_arguments_defaults_to_object / responses_history_empty_arguments_defaults_to_object",
+      "TG-PROTO-052": "messages_duplicate_tool_use_id_is_rejected"
+    },
+    "http_tests": {
+      "path": "crates/server/tests/protocol_review_final.rs",
+      "TG-PROTO-051": "http_noarg_tool_stream_completes"
+    },
+    "guard_tests": {
+      "TG-PROTO-042": "chat_stream_malformed_tool_arguments_still_rejected"
+    },
+    "fixture_restored": {
+      "path": "crates/protocols/tests/streaming_robustness.rs",
+      "test": "chat_final_chunk_finish_and_usage_transcodes_to_responses_completed_usage",
+      "note": "restored the OpenAI-documented arguments:\"\" first chunk weakened by d7ffb80"
+    },
+    "official_local_sources": [
+      "protocol-specs/api-wire/openai/openapi.yaml"
+    ],
+    "oracle": "native Messages/Responses SSE lifecycle, empty-object argument payloads and duplicate-id rejection",
+    "limitations": [
+      "offline synthetic upstream only; no live provider calls",
+      "empty arguments normalization does not loosen non-empty malformed JSON rejection"
+    ]
+  },
+  "contract_fix_round": {
+    "review_head": "f130a224355d5e6f08a80bb20a397e69998e8a78",
+    "report": "/tmp/tiygate-protocol-fix-5T8hAWGb/report.md",
+    "origin": "original synthetic native JSON/SSE; no third-party code/fixtures copied",
+    "codec_target": "review_contracts",
+    "http_target": "protocol_review_contracts",
+    "findings": {
+      "TG-PROTO-053": "messages_malformed_stream_tool_cannot_complete_successfully",
+      "TG-PROTO-054": "responses_incomplete_tool_preserves_reason",
+      "TG-PROTO-055": "messages_nonstream_refusal_preserves_text",
+      "TG-PROTO-056": "responses_nonstream_refusal_uses_message_content",
+      "TG-PROTO-057": "responses_system_and_developer_keep_instruction_level",
+      "TG-PROTO-058": "messages_hosted_tool_keeps_native_config_and_rejects_crossings",
+      "TG-PROTO-059": "messages_native_thinking_modes_survive_reencode",
+      "TG-PROTO-060": "messages_native_cache_breakpoints_keep_position_and_ttl",
+      "TG-PROTO-061": "gemini_native_uppercase_thinking_levels_map_to_effort",
+      "TG-PROTO-062": "store::quota plus scripts/verify-deps.sh"
+    },
+    "official_sources": [
+      "protocol-specs/api-wire/openai/openapi.yaml",
+      "protocol-specs/api-wire/gemini/v1beta.discovery.json",
+      {
+        "repository": "anthropics/anthropic-sdk-typescript",
+        "commit": "d49bdab458000bcdffe77bd84b03293f31824fb3",
+        "path": "src/resources/messages/messages.ts"
+      }
+    ],
+    "oracle": "native wire fields, tool JSON validity, terminal status, instruction carrier and pre-upstream rejection",
+    "limitations": [
+      "no live Provider requests",
+      "Messages native thinking/cache IR extensions are separate from raw passthrough",
+      "TG-PROTO-063 through 069 remain unconfirmed/outside this fix",
+      "TG-PROTO-020 CI gate remains open"
+    ]
+  },
+  "branch_delta_fix": {
+    "review_head": "22a1559a5ecb078302b701eef4c41a666a3da4dd",
+    "comparison_base": "6db40e54663455fb99d675bd8985e4dc50f68a14",
+    "finding_scope": "2026-10-07 branch delta review; IDs are local to that report, separate from contract_fix_round",
+    "origin": "original synthetic JSON/SSE; no third-party implementation or fixtures copied",
+    "codec_target": "review_fixes",
+    "http_target": "protocol_review_final",
+    "findings": {
+      "TG-PROTO-062": {
+        "codec": "implicit_strict_normalizes_nested_function_schemas",
+        "http": "http_review_fix_implicit_strict_schema"
+      },
+      "TG-PROTO-063": {
+        "codec": "gemini_without_id_completes_once_with_latest_usage",
+        "http": "http_review_fix_gemini_completion_without_id"
+      },
+      "TG-PROTO-064": {
+        "codec": "gemini_tools_accept_separate_trailing_whitespace",
+        "http": "http_review_fix_gemini_tool_trailing_whitespace"
+      },
+      "TG-PROTO-065": {
+        "codec": "truncated_nonstream_functions_preserve_turn_without_executable_tail",
+        "http": "http_review_fix_nonstream_truncated_tool"
+      }
+    },
+    "official_sources": [
+      "protocol-specs/api-wire/openai/openapi.yaml",
+      "protocol-specs/api-wire/gemini/v1beta.discovery.json",
+      {
+        "url": "https://developers.openai.com/api/docs/guides/function-calling",
+        "retrieved_on": "2026-10-07"
+      },
+      {
+        "url": "https://developers.openai.com/api/docs/guides/structured-outputs",
+        "retrieved_on": "2026-10-07"
+      }
+    ],
+    "oracle": "strict schema constraints and native omission, exactly one terminal with final usage, one tool call with legal trailing whitespace, truncation reason/text/usage without executable malformed tails",
+    "limitations": [
+      "offline synthetic HTTP upstreams; no live Provider requests",
+      "implicit strict inference uses a conservative supported subset",
+      "unsupported or unclassified implicit schemas keep original constraints in non-strict mode"
+    ]
+  }
+}

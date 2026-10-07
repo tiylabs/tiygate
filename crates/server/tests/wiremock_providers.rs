@@ -1527,7 +1527,7 @@ async fn test_streaming_large_tool_use_anthropic_egress_not_truncated() {
     assert!(
         body_str.contains("chat.completion.chunk"),
         "expected OpenAI chunks, got first 500 bytes: {}",
-        &body_str.chars().take(500).collect::<String>()
+        body_str.chars().take(500).collect::<String>()
     );
     // First fragment marker must be present.
     assert!(
@@ -1551,7 +1551,7 @@ async fn test_streaming_large_tool_use_anthropic_egress_not_truncated() {
     assert!(
         !body_str.contains("upstream stream truncated by gateway"),
         "gateway must NOT inject a truncation error on a complete upstream stream: {}",
-        &body_str.chars().rev().take(500).collect::<String>()
+        body_str.chars().rev().take(500).collect::<String>()
     );
 }
 
@@ -1724,7 +1724,7 @@ async fn test_slow_large_stream_not_capped_by_request_read_timeout() {
         !body_str.contains("operation timed out")
             && !body_str.contains("upstream stream truncated by gateway"),
         "gateway must not inject a timeout/truncation error on a healthy slow stream: {}",
-        &body_str.chars().rev().take(400).collect::<String>()
+        body_str.chars().rev().take(400).collect::<String>()
     );
 }
 

@@ -33,18 +33,10 @@ fn error_status_for_class(class: ErrorClass) -> &'static str {
 /// Maximum value for Gemini's `thinkingBudget` field (0–24576).
 const GEMINI_THINKING_BUDGET_MAX: u32 = 24576;
 
-/// Synthesize a deterministic tool-call id for Gemini function calls.
-///
-/// Gemini's `functionCall` / `functionResponse` parts have no explicit call
-/// id; they are paired by function name. To let cross-protocol targets
-/// (OpenAI/Anthropic) pair a call with its result, we derive a stable id from
-/// the name. Using a fixed prefix keeps it recognizable in logs.
-fn synth_gemini_call_id(name: &str) -> String {
-    if name.is_empty() {
-        String::new()
-    } else {
-        format!("gemini_call_{name}")
-    }
+/// Length-prefix the function name so suffixes cannot collide with another
+/// function's name (e.g. the second f call versus the first f_1 call).
+fn unique_gemini_call_id(name: &str, ordinal: usize) -> String {
+    format!("gemini_call_{}_{name}_{ordinal}", name.len())
 }
 
 /// Recover the Gemini function name for a tool result.
@@ -60,8 +52,11 @@ fn lookup_tool_call_name(messages: &[Message], tool_call_id: &str) -> Option<Str
                 continue;
             }
             for content in &msg.content {
-                if let Content::ToolCall { id, name, .. } = content {
-                    if id == tool_call_id && !name.is_empty() {
+                if let Content::ToolCall {
+                    id, call_id, name, ..
+                } = content
+                {
+                    if call_id.as_deref().unwrap_or(id) == tool_call_id && !name.is_empty() {
                         return Some(name.clone());
                     }
                 }
@@ -69,10 +64,7 @@ fn lookup_tool_call_name(messages: &[Message], tool_call_id: &str) -> Option<Str
         }
     }
 
-    tool_call_id
-        .strip_prefix("gemini_call_")
-        .filter(|name| !name.is_empty())
-        .map(String::from)
+    None
 }
 
 /// Sentinel value injected as `thoughtSignature` when a Gemini 3 model
@@ -117,6 +109,70 @@ fn supports_gemini_thinking_level(model: &str) -> bool {
 /// - `anyOf` containing a `null` type → collapse to `nullable: true` on the
 ///   non-null schema (or `anyOf` of non-null schemas + `nullable: true`)
 /// - Recursive handling of `properties`, `items`, `allOf`, `anyOf`, `oneOf`
+fn uses_json_schema_carrier(schema: &Value) -> bool {
+    match schema {
+        Value::Object(object) => {
+            object.keys().any(|k| {
+                matches!(
+                    k.as_str(),
+                    "additionalProperties" | "$defs" | "$ref" | "prefixItems"
+                )
+            }) || object.values().any(uses_json_schema_carrier)
+        }
+        Value::Array(values) => values.iter().any(uses_json_schema_carrier),
+        _ => false,
+    }
+}
+
+/// Decode Google's Schema dialect without walking JSON instance values such
+/// as enum/default. JSON Schema carriers bypass this transformation.
+fn decode_gemini_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema.clone();
+    };
+    let mut result = object.clone();
+    if let Some(kind) = object.get("type").and_then(Value::as_str) {
+        result.insert("type".into(), json!(kind.to_ascii_lowercase()));
+    }
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(children) = object.get(key).and_then(Value::as_object) {
+            result.insert(
+                key.into(),
+                Value::Object(
+                    children
+                        .iter()
+                        .map(|(name, child)| (name.clone(), decode_gemini_schema(child)))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    for key in ["items", "additionalProperties"] {
+        if let Some(child) = object.get(key) {
+            result.insert(key.into(), decode_gemini_schema(child));
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(children) = object.get(key).and_then(Value::as_array) {
+            result.insert(
+                key.into(),
+                json!(children
+                    .iter()
+                    .map(decode_gemini_schema)
+                    .collect::<Vec<_>>()),
+            );
+        }
+    }
+    let nullable = result.remove("nullable").and_then(|v| v.as_bool()) == Some(true);
+    if nullable {
+        // Wrap the complete constraints: merely adding null to `type` would
+        // still exclude null when enum/anyOf is present on the same node.
+        json!({"anyOf":[Value::Object(result), {"type":"null"}]})
+    } else {
+        Value::Object(result)
+    }
+}
+
 fn convert_json_schema_to_openapi(schema: &Value) -> Value {
     match schema {
         Value::Null => Value::Null,
@@ -137,7 +193,10 @@ fn convert_json_schema_to_openapi(schema: &Value) -> Value {
                     .get("properties")
                     .map(|p| p.as_object().map(|o| o.is_empty()).unwrap_or(true))
                     .unwrap_or(true)
-                && !obj.contains_key("additionalProperties");
+                && !obj.contains_key("additionalProperties")
+                && obj
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "type" | "description" | "properties"));
             if is_empty_object {
                 if let Some(desc) = obj.get("description") {
                     return json!({"type": "object", "description": desc});
@@ -147,7 +206,24 @@ fn convert_json_schema_to_openapi(schema: &Value) -> Value {
 
             let mut result = serde_json::Map::new();
 
-            // Pass through description, required, format, minLength.
+            // Preserve every constraint supported by Gemini's Schema carrier.
+            for key in [
+                "minimum",
+                "maximum",
+                "minItems",
+                "maxItems",
+                "minLength",
+                "maxLength",
+                "pattern",
+                "minProperties",
+                "maxProperties",
+                "title",
+                "propertyOrdering",
+            ] {
+                if let Some(value) = obj.get(key) {
+                    result.insert(key.into(), value.clone());
+                }
+            }
             if let Some(desc) = obj.get("description") {
                 result.insert("description".to_string(), desc.clone());
             }
@@ -353,15 +429,23 @@ impl EndpointCodec for GeminiCodec {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let system = body["system_instruction"]["parts"].as_array().map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| p["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        });
+        let system = body
+            .get("systemInstruction")
+            .or_else(|| body.get("system_instruction"))
+            .and_then(|system| system["parts"].as_array())
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
 
         let mut messages = Vec::new();
+        let mut call_counts = std::collections::HashMap::<String, usize>::new();
+        let mut pending_calls =
+            std::collections::HashMap::<String, std::collections::VecDeque<String>>::new();
+        let mut signatures = serde_json::Map::new();
         if let Some(contents) = body["contents"].as_array() {
             for item in contents {
                 let role = match item["role"].as_str().unwrap_or("user") {
@@ -391,6 +475,20 @@ impl EndpointCodec for GeminiCodec {
                             });
                         } else if let Some(fc) = part.get("functionCall") {
                             let name = fc["name"].as_str().unwrap_or("").to_string();
+                            let count = call_counts.entry(name.clone()).or_default();
+                            let id = fc["id"]
+                                .as_str()
+                                .filter(|id| !id.is_empty())
+                                .map(String::from)
+                                .unwrap_or_else(|| unique_gemini_call_id(&name, *count));
+                            *count += 1;
+                            pending_calls
+                                .entry(name.clone())
+                                .or_default()
+                                .push_back(id.clone());
+                            if let Some(signature) = part.get("thoughtSignature") {
+                                signatures.insert(id.clone(), signature.clone());
+                            }
                             cp.push(Content::ToolCall {
                                 // Prefer Gemini's native call id when present
                                 // (Gemini 3); otherwise synthesize a
@@ -398,11 +496,7 @@ impl EndpointCodec for GeminiCodec {
                                 // cross-protocol targets (OpenAI/Anthropic) can
                                 // pair the call with its result. Gemini itself
                                 // pairs functionCall/functionResponse by name.
-                                id: fc["id"]
-                                    .as_str()
-                                    .filter(|s| !s.is_empty())
-                                    .map(String::from)
-                                    .unwrap_or_else(|| synth_gemini_call_id(&name)),
+                                id,
                                 name,
                                 arguments: fc["args"].clone(),
                                 call_id: None,
@@ -411,12 +505,23 @@ impl EndpointCodec for GeminiCodec {
                             });
                         } else if let Some(fr) = part.get("functionResponse") {
                             let name = fr["name"].as_str().unwrap_or("").to_string();
+                            let native_id = fr["id"].as_str().filter(|id| !id.is_empty());
+                            let tool_call_id = if let Some(id) = native_id {
+                                if let Some(queue) = pending_calls.get_mut(&name) {
+                                    if let Some(position) =
+                                        queue.iter().position(|candidate| candidate == id)
+                                    {
+                                        queue.remove(position);
+                                    }
+                                }
+                                id.to_string()
+                            } else {
+                                pending_calls.get_mut(&name).and_then(std::collections::VecDeque::pop_front)
+                                    .ok_or_else(|| tiygate_core::Error::Codec(format!("Gemini functionResponse has no matching call for {name:?}")))?
+                            };
                             cp.push(Content::ToolResult {
-                                tool_call_id: fr["id"]
-                                    .as_str()
-                                    .filter(|s| !s.is_empty())
-                                    .map(String::from)
-                                    .unwrap_or_else(|| synth_gemini_call_id(&name)),
+                                is_error: fr["response"].get("error").map(|_| true),
+                                tool_call_id,
                                 name: name.clone(),
                                 content: fr["response"]
                                     .as_object()
@@ -464,7 +569,7 @@ impl EndpointCodec for GeminiCodec {
             }
         }
 
-        let tools: Vec<Tool> = if let Some(tools_arr) = body["tools"].as_array() {
+        let mut tools: Vec<Tool> = if let Some(tools_arr) = body["tools"].as_array() {
             tools_arr
                 .iter()
                 .flat_map(|t| {
@@ -475,7 +580,10 @@ impl EndpointCodec for GeminiCodec {
                                 .map(|fd| Tool {
                                     name: fd["name"].as_str().unwrap_or("").to_string(),
                                     description: fd["description"].as_str().map(String::from),
-                                    parameters: fd["parameters"].as_object().map(|p| json!(p)),
+                                    parameters: fd
+                                        .get("parametersJsonSchema")
+                                        .cloned()
+                                        .or_else(|| fd.get("parameters").map(decode_gemini_schema)),
                                     required: false,
                                     ..Default::default()
                                 })
@@ -487,6 +595,22 @@ impl EndpointCodec for GeminiCodec {
         } else {
             Vec::new()
         };
+
+        if let Some(definitions) = body["tools"].as_array() {
+            for definition in definitions {
+                if let Some(object) = definition.as_object() {
+                    for (kind, config) in object {
+                        if kind != "functionDeclarations" {
+                            tools.push(Tool {
+                                tool_type: Some(kind.clone()),
+                                config: Some(config.clone()),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         let gc = &body["generationConfig"];
         let params = tiygate_core::GenerationParams {
@@ -515,7 +639,7 @@ impl EndpointCodec for GeminiCodec {
             // Gemini supports minimal/low/medium/high (4 levels).
             let effort = tc["thinkingLevel"].as_str().and_then(|s| {
                 use tiygate_core::ThinkingEffort;
-                match s {
+                match s.to_ascii_lowercase().as_str() {
                     "none" => Some(ThinkingEffort::None),
                     "minimal" => Some(ThinkingEffort::Minimal),
                     "low" => Some(ThinkingEffort::Low),
@@ -555,11 +679,15 @@ impl EndpointCodec for GeminiCodec {
 
         // Parse inbound structured-output config. Gemini carries it in
         // generationConfig.responseSchema (+ responseMimeType=application/json).
-        let response_format = if let Some(schema) = gc.get("responseSchema") {
+        let native_schema = gc
+            .get("responseJsonSchema")
+            .cloned()
+            .or_else(|| gc.get("responseSchema").map(decode_gemini_schema));
+        let response_format = if let Some(schema) = native_schema {
             if !schema.is_null() {
                 Some(tiygate_core::ResponseFormat::JsonSchema {
                     name: "response".to_string(),
-                    schema: schema.clone(),
+                    schema,
                     strict: None,
                 })
             } else {
@@ -574,6 +702,9 @@ impl EndpointCodec for GeminiCodec {
         // Preserve Google-specific top-level fields the IR does not model so a
         // same-protocol re-encode is lossless. Stored under a prefixed key.
         let mut extensions = std::collections::HashMap::new();
+        if !signatures.is_empty() {
+            extensions.insert("gemini_call_signatures".into(), json!(signatures));
+        }
         {
             let mut extra = serde_json::Map::new();
             for key in ["safetySettings", "toolConfig", "cachedContent", "labels"] {
@@ -600,12 +731,14 @@ impl EndpointCodec for GeminiCodec {
                 "NONE" => Some(json!("none")),
                 "ANY" => {
                     if let Some(names) = allowed {
-                        // Specific function pinning: use the first name.
-                        if let Some(first) = names.first().and_then(|n| n.as_str()) {
-                            Some(json!({"type": "function", "function": {"name": first}}))
-                        } else {
-                            Some(json!("required"))
+                        let allowed: Vec<_> = names.iter().filter_map(Value::as_str).collect();
+                        if allowed.is_empty() {
+                            return Err(tiygate_core::Error::Codec(
+                                "required tool allowlist is empty".into(),
+                            ));
                         }
+                        extensions.insert("allowed_tool_names".into(), json!(allowed));
+                        Some(json!("required"))
                     } else {
                         Some(json!("required"))
                     }
@@ -614,6 +747,22 @@ impl EndpointCodec for GeminiCodec {
             };
             if let Some(n) = normalized {
                 extensions.insert("tool_choice".to_string(), n);
+            }
+        }
+
+        if let Some(allowed) = extensions
+            .get("allowed_tool_names")
+            .and_then(Value::as_array)
+        {
+            // Keep native hosted carriers visible to the loss guard even
+            // when the function allowlist narrows callable declarations.
+            tools.retain(|tool| {
+                tool.is_hosted() || allowed.iter().any(|name| name.as_str() == Some(&tool.name))
+            });
+            if !tools.iter().any(Tool::is_function) {
+                return Err(tiygate_core::Error::Codec(
+                    "required tool allowlist has no declared functions".into(),
+                ));
             }
         }
 
@@ -639,7 +788,9 @@ impl EndpointCodec for GeminiCodec {
         let mut parts = Vec::new();
         for c in &ir.content {
             match c {
-                Content::Text { text, .. } => parts.push(json!({"text": text})),
+                Content::Text { text, .. } | Content::Refusal { text, .. } => {
+                    parts.push(json!({"text": text}))
+                }
                 Content::Reasoning { text, .. } => {
                     // Gemini's standard "thought" format is a text part flagged
                     // with `thought: true`, not `{"thought": text}`. Emit the
@@ -648,12 +799,13 @@ impl EndpointCodec for GeminiCodec {
                     parts.push(json!({"text": text, "thought": true}))
                 }
                 Content::ToolCall {
-                    id: _,
+                    id,
                     name,
                     arguments,
+                    call_id,
                     ..
                 } => {
-                    parts.push(json!({"functionCall": {"name": name, "args": arguments}}));
+                    parts.push(json!({"functionCall": {"id":call_id.as_deref().unwrap_or(id), "name": name, "args": arguments}}));
                 }
                 _ => {}
             }
@@ -681,7 +833,7 @@ impl EndpointCodec for GeminiCodec {
             let prompt_for_gemini = usage.prompt_tokens + cache_read + cache_write;
             response["usageMetadata"] = json!({
                 "promptTokenCount": prompt_for_gemini,
-                "candidatesTokenCount": usage.completion_tokens,
+                "candidatesTokenCount": usage.completion_tokens.saturating_sub(usage.reasoning_tokens.unwrap_or(0)),
                 "totalTokenCount": prompt_for_gemini + usage.completion_tokens,
             });
             if let Some(rt) = usage.reasoning_tokens {
@@ -695,7 +847,7 @@ impl EndpointCodec for GeminiCodec {
     }
 
     fn stream_encoder(&self) -> Box<dyn StreamEncoder> {
-        Box::new(GeminiStreamEncoder)
+        Box::new(GeminiStreamEncoder::default())
     }
     fn stream_decoder(&self) -> Box<dyn StreamDecoder> {
         Box::new(GeminiStreamDecoder::new())
@@ -707,10 +859,19 @@ impl EndpointCodec for GeminiCodec {
             self.id(),
         )
         .map_err(|error| tiygate_core::Error::Codec(error.to_string()))?;
+        for tool in &ir.tools {
+            if let Some(schema) = &tool.parameters {
+                tiygate_core::protocol::structured_output::validate_schema_for_target(
+                    schema,
+                    self.id(),
+                )
+                .map_err(|error| tiygate_core::Error::Codec(error.to_string()))?;
+            }
+        }
 
         let mut body = json!({});
         if let Some(sys) = &ir.system {
-            body["system_instruction"] = json!({"parts": [{"text": sys}]});
+            body["systemInstruction"] = json!({"parts": [{"text": sys}]});
         }
         let mut contents = Vec::new();
         // Gemini 3 requires the `thoughtSignature` collected on a prior
@@ -726,6 +887,23 @@ impl EndpointCodec for GeminiCodec {
             .unwrap_or_default();
         let mut sig_idx = 0usize;
         for msg in &ir.messages {
+            if msg.role == Role::System {
+                let mut instructions = body["systemInstruction"]["parts"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                for content in &msg.content {
+                    if let Content::Text { text, .. } = content {
+                        instructions.push(json!({"text":text}));
+                    } else {
+                        return Err(tiygate_core::Error::Codec(
+                            "Gemini system instructions support only text".into(),
+                        ));
+                    }
+                }
+                body["systemInstruction"] = json!({"parts":instructions});
+                continue;
+            }
             let role_str = match msg.role {
                 Role::User => "user",
                 Role::Assistant => "model",
@@ -742,14 +920,22 @@ impl EndpointCodec for GeminiCodec {
                         parts.push(json!({"text": text, "thought": true}));
                     }
                     Content::ToolCall {
-                        id: _,
+                        id,
                         name,
                         arguments,
+                        call_id,
                         ..
                     } => {
-                        let mut part = json!({"functionCall": {"name": name, "args": arguments}});
-                        // Replay the next stashed thoughtSignature, if any.
-                        if let Some(sig) = thought_signatures.get(sig_idx) {
+                        let mut part = json!({"functionCall": {"id":call_id.as_deref().unwrap_or(id), "name": name, "args": arguments}});
+                        // Prefer signatures bound to the actual call id. Legacy
+                        // response bags remain supported for older stored IR.
+                        if let Some(sig) = ir
+                            .extensions
+                            .get("gemini_call_signatures")
+                            .and_then(|s| s.get(id))
+                        {
+                            part["thoughtSignature"] = sig.clone();
+                        } else if let Some(sig) = thought_signatures.get(sig_idx) {
                             part["thoughtSignature"] = sig.clone();
                             sig_idx += 1;
                         } else if is_gemini3_model(&ir.model) {
@@ -767,10 +953,17 @@ impl EndpointCodec for GeminiCodec {
                         tool_call_id,
                         name,
                         content,
+                        is_error,
                         ..
                     } => {
-                        let response_obj: Value =
-                            serde_json::from_str(content).unwrap_or(json!({"output": content}));
+                        let parsed: Option<Value> = serde_json::from_str(content).ok();
+                        let response_obj: Value = if *is_error == Some(true) {
+                            parsed
+                                .filter(|value| value.get("error").is_some())
+                                .unwrap_or_else(|| json!({"error":content}))
+                        } else {
+                            parsed.unwrap_or_else(|| json!({"output":content}))
+                        };
                         let resolved_name = if name.is_empty() {
                             lookup_tool_call_name(&ir.messages, tool_call_id).ok_or_else(|| {
                                 tiygate_core::Error::Codec(format!(
@@ -782,6 +975,7 @@ impl EndpointCodec for GeminiCodec {
                         };
                         parts.push(json!({
                             "functionResponse": {
+                                "id": tool_call_id,
                                 "name": resolved_name,
                                 "response": response_obj
                             }
@@ -894,7 +1088,11 @@ impl EndpointCodec for GeminiCodec {
         // https://ai.google.dev/gemini-api/docs/structured-output
         match &ir.response_format {
             Some(tiygate_core::ResponseFormat::JsonSchema { schema, .. }) => {
-                gc["responseSchema"] = convert_json_schema_to_openapi(schema);
+                if uses_json_schema_carrier(schema) {
+                    gc["responseJsonSchema"] = schema.clone();
+                } else {
+                    gc["responseSchema"] = convert_json_schema_to_openapi(schema);
+                }
                 gc["responseMimeType"] = json!("application/json");
                 has_gc = true;
             }
@@ -914,16 +1112,32 @@ impl EndpointCodec for GeminiCodec {
                 .iter()
                 .filter(|t| t.is_function())
                 .map(|t| {
-                    let params = t
-                        .parameters
-                        .as_ref()
-                        .map(convert_json_schema_to_openapi)
-                        .unwrap_or(Value::Null);
-                    json!({"name": t.name, "description": t.description, "parameters": params})
+                    let mut declaration = json!({"name":t.name, "description":t.description});
+                    if let Some(schema) = &t.parameters {
+                        if uses_json_schema_carrier(schema) {
+                            declaration["parametersJsonSchema"] = schema.clone();
+                        } else {
+                            declaration["parameters"] = convert_json_schema_to_openapi(schema);
+                        }
+                    }
+                    declaration
                 })
                 .collect();
+            let mut tools = Vec::new();
             if !declarations.is_empty() {
-                body["tools"] = json!([{"functionDeclarations": declarations}]);
+                tools.push(json!({"functionDeclarations": declarations}));
+            }
+            if ir.ingress_protocol.suite == ProtocolSuite::GoogleGemini {
+                for tool in ir.tools.iter().filter(|tool| tool.is_hosted()) {
+                    if let Some(kind) = &tool.tool_type {
+                        let mut definition = serde_json::Map::new();
+                        definition.insert(kind.clone(), tool.config.clone().unwrap_or(json!({})));
+                        tools.push(json!(definition));
+                    }
+                }
+            }
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
             }
         }
 
@@ -964,7 +1178,10 @@ impl EndpointCodec for GeminiCodec {
                 } else {
                     None
                 };
-                if let Some(fcc) = fcc {
+                if let Some(mut fcc) = fcc {
+                    if let Some(allowed) = ir.extensions.get("allowed_tool_names") {
+                        fcc["allowedFunctionNames"] = allowed.clone();
+                    }
                     body["toolConfig"] = json!({"functionCallingConfig": fcc});
                 }
             }
@@ -1002,8 +1219,14 @@ impl EndpointCodec for GeminiCodec {
     }
 
     fn decode_response(&self, body: Value) -> Result<IrResponse, tiygate_core::Error> {
+        if body["candidates"].as_array().is_some_and(|c| c.len() > 1) {
+            return Err(tiygate_core::Error::Codec(
+                "multiple Gemini candidates cannot be represented by the canonical response".into(),
+            ));
+        }
         let response_id = body["responseId"].as_str().map(String::from);
         let mut content = Vec::new();
+        let mut call_counts = std::collections::HashMap::<String, usize>::new();
         // Collect thoughtSignatures for Gemini 3 multi-turn preservation.
         // Gemini 3 requires thoughtSignature on functionCalls;
         // missing signatures cause 400 errors.
@@ -1055,11 +1278,13 @@ impl EndpointCodec for GeminiCodec {
                                 });
                             } else if let Some(fc) = part.get("functionCall") {
                                 let name = fc["name"].as_str().unwrap_or("").to_string();
+                                let count = call_counts.entry(name.clone()).or_default();
                                 let id = fc["id"]
                                     .as_str()
-                                    .filter(|s| !s.is_empty())
+                                    .filter(|id| !id.is_empty())
                                     .map(String::from)
-                                    .unwrap_or_else(|| synth_gemini_call_id(&name));
+                                    .unwrap_or_else(|| unique_gemini_call_id(&name, *count));
+                                *count += 1;
                                 content.push(Content::ToolCall {
                                     id,
                                     name,
@@ -1179,7 +1404,10 @@ impl EndpointCodec for GeminiCodec {
                 let raw_prompt = u["promptTokenCount"].as_u64().unwrap_or(0);
                 Usage {
                     prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
-                    completion_tokens: u["candidatesTokenCount"].as_u64().unwrap_or(0),
+                    completion_tokens: u["candidatesTokenCount"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(u["thoughtsTokenCount"].as_u64().unwrap_or(0)),
                     total_tokens: u["totalTokenCount"].as_u64().unwrap_or(0),
                     reasoning_tokens: u["thoughtsTokenCount"].as_u64(),
                     cache_read_tokens: cache_read,
@@ -1209,11 +1437,56 @@ impl EndpointCodec for GeminiCodec {
     }
 }
 
-pub struct GeminiStreamEncoder;
+#[derive(Default)]
+pub struct GeminiStreamEncoder {
+    calls: std::collections::BTreeMap<String, (Option<String>, String)>,
+    finished: std::collections::HashSet<String>,
+    terminal: bool,
+}
+
+impl GeminiStreamEncoder {
+    fn call_frame(id: &str, name: &str, arguments: &str) -> Result<String, tiygate_core::Error> {
+        let args: Value = if arguments.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(arguments).map_err(|error| {
+                tiygate_core::Error::Codec(format!(
+                    "incomplete Gemini tool arguments for {id}: {error}"
+                ))
+            })?
+        };
+        Ok(format!(
+            "data: {}\n\n",
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"id":id,"name":name,"args":args}}]}}]})
+        ))
+    }
+
+    fn flush_calls(&mut self) -> Result<String, tiygate_core::Error> {
+        let mut output = String::new();
+        for (id, (name, arguments)) in std::mem::take(&mut self.calls) {
+            let name = name.ok_or_else(|| {
+                tiygate_core::Error::Codec(format!("missing Gemini tool name for {id}"))
+            })?;
+            output.push_str(&Self::call_frame(&id, &name, &arguments)?);
+            self.finished.insert(id);
+        }
+        Ok(output)
+    }
+}
+
 impl StreamEncoder for GeminiStreamEncoder {
     fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
+        if self.terminal {
+            return Ok(Vec::new());
+        }
+        if matches!(
+            part,
+            StreamPart::ResponseCompleted { .. } | StreamPart::Error { .. }
+        ) {
+            self.terminal = true;
+        }
         let chunk = match part {
-            StreamPart::TextDelta { text } => format!(
+            StreamPart::TextDelta { text } | StreamPart::RefusalDelta { text } => format!(
                 "data: {}\n\n",
                 json!({"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}}]})
             ),
@@ -1222,27 +1495,47 @@ impl StreamEncoder for GeminiStreamEncoder {
                 json!({"candidates": [{"content": {"parts": [{"text": text, "thought": true}]}}]})
             ),
             StreamPart::ToolCallDelta {
-                name, arguments, ..
+                id,
+                name,
+                arguments,
+                ..
             } => {
-                // Gemini's streaming `functionCall` parts carry both the name
-                // and the full `args` object in a single chunk; there is no
-                // incremental argument-delta channel like OpenAI's. Parse the
-                // accumulated `arguments` string into a JSON object (falling
-                // back to an empty object only when it is empty / unparseable)
-                // so the call's arguments are not lost.
-                let args: Value = if arguments.trim().is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(arguments).unwrap_or_else(|_| json!({}))
-                };
-                let mut fc = json!({ "args": args });
-                if let Some(n) = name {
-                    fc["name"] = json!(n);
+                if self.finished.contains(id) {
+                    if name.is_none()
+                        && arguments
+                            .bytes()
+                            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                    {
+                        return Ok(Vec::new());
+                    }
+                    return Err(tiygate_core::Error::Codec(format!(
+                        "tool delta after completed Gemini call {id}"
+                    )));
                 }
-                format!(
-                    "data: {}\n\n",
-                    json!({"candidates": [{"content": {"parts": [{"functionCall": fc}]}}]})
-                )
+                let call = self.calls.entry(id.clone()).or_default();
+                if let Some(name) = name {
+                    call.0 = Some(name.clone());
+                }
+                if call.1.len().saturating_add(arguments.len()) > 16 * 1024 * 1024 {
+                    return Err(tiygate_core::Error::Codec(
+                        "Gemini tool arguments exceed 16 MiB".into(),
+                    ));
+                }
+                call.1.push_str(arguments);
+                if !call.1.is_empty()
+                    && serde_json::from_str::<Value>(&call.1).is_ok()
+                    && call.0.is_some()
+                {
+                    let (name, arguments) = self
+                        .calls
+                        .remove(id)
+                        .ok_or_else(|| tiygate_core::Error::Codec("missing tool state".into()))?;
+                    let output = Self::call_frame(id, name.as_deref().unwrap_or(""), &arguments)?;
+                    self.finished.insert(id.clone());
+                    output
+                } else {
+                    String::new()
+                }
             }
             // PTC is Responses-only; no Gemini wire carrier.
             StreamPart::ProgramDelta { .. } | StreamPart::ProgramOutputDelta { .. } => {
@@ -1258,7 +1551,7 @@ impl StreamEncoder for GeminiStreamEncoder {
                 let prompt_for_gemini = usage.prompt_tokens + cache_read + cache_write;
                 let mut um = json!({
                     "promptTokenCount": prompt_for_gemini,
-                    "candidatesTokenCount": usage.completion_tokens,
+                    "candidatesTokenCount": usage.completion_tokens.saturating_sub(usage.reasoning_tokens.unwrap_or(0)),
                     "totalTokenCount": prompt_for_gemini + usage.completion_tokens,
                 });
                 if let Some(rt) = usage.reasoning_tokens {
@@ -1281,10 +1574,12 @@ impl StreamEncoder for GeminiStreamEncoder {
                     FinishReason::ToolCalls => "STOP",
                     FinishReason::Other(_) => "STOP",
                 };
-                format!(
+                let mut output = self.flush_calls()?;
+                output.push_str(&format!(
                     "data: {}\n\n",
-                    json!({"candidates": [{"finishReason": fr}]})
-                )
+                    json!({"candidates":[{"finishReason":fr}]})
+                ));
+                output
             }
             StreamPart::Error {
                 message,
@@ -1301,7 +1596,12 @@ impl StreamEncoder for GeminiStreamEncoder {
                 format!("data: {}\n\n", json!({"responseId": id}))
             }
             StreamPart::ResponseCompleted { id, .. } => {
-                format!("data: {}\n\n", json!({"responseId": id, "done": true}))
+                let mut output = self.flush_calls()?;
+                output.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"responseId": id, "done": true})
+                ));
+                output
             }
         };
         Ok(chunk.into_bytes())
@@ -1312,6 +1612,7 @@ impl StreamEncoder for GeminiStreamEncoder {
         class: ErrorClass,
         _upstream_code: Option<&str>,
     ) -> Vec<u8> {
+        self.terminal = true;
         let status = error_status_for_class(class);
         format!(
             "data: {}\n\n",
@@ -1326,12 +1627,8 @@ impl StreamEncoder for GeminiStreamEncoder {
 
 pub struct GeminiStreamDecoder {
     response_id: Option<String>,
-    /// Whether a real terminal signal (`candidates[].finishReason`) was seen
-    /// in-band. Used to drive the `usageMetadata` completion fallback: some
-    /// proxies strip `finishReason` and only deliver `usageMetadata` on the
-    /// final chunk, so without this fallback the stream would carry no
-    /// `Finish` and the cross-protocol ingress encoder would never emit its
-    /// protocol-native terminator.
+    /// Whether an actual candidates[].finishReason arrived. Usage is not
+    /// sufficient evidence that generation completed.
     saw_finish: bool,
     /// Whether any `functionCall` part appeared during this response. Latches
     /// for the whole stream so the `usageMetadata` completion fallback can be
@@ -1345,6 +1642,8 @@ pub struct GeminiStreamDecoder {
     /// pipeline can carry them into the next request's IR extensions for
     /// Gemini 3 multi-turn thought-signature replay.
     thought_signatures: Vec<Value>,
+    call_counts: std::collections::HashMap<String, usize>,
+    completed: bool,
 }
 impl Default for GeminiStreamDecoder {
     fn default() -> Self {
@@ -1359,17 +1658,22 @@ impl GeminiStreamDecoder {
             saw_finish: false,
             saw_tool_calls: false,
             thought_signatures: Vec::new(),
+            call_counts: std::collections::HashMap::new(),
+            completed: false,
         }
     }
 }
 
 impl StreamDecoder for GeminiStreamDecoder {
     fn feed(&mut self, line: &str) -> Result<Vec<StreamPart>, tiygate_core::Error> {
+        if self.completed {
+            return Ok(vec![]);
+        }
         let line = line.trim();
         if line.is_empty() {
             return Ok(vec![]);
         }
-        let data = if let Some(s) = line.strip_prefix("data: ") {
+        let data = if let Some(s) = line.strip_prefix("data:") {
             s
         } else {
             return Ok(vec![]);
@@ -1399,6 +1703,7 @@ impl StreamDecoder for GeminiStreamDecoder {
             .and_then(Value::as_object)
             .filter(|error| !error.is_empty())
         {
+            self.completed = true;
             let code = error.get("status").and_then(Value::as_str);
             let class = tiygate_core::classify_upstream_error(None, code);
             parts.push(StreamPart::Error {
@@ -1413,6 +1718,15 @@ impl StreamDecoder for GeminiStreamDecoder {
             return Ok(parts);
         }
         if let Some(candidates) = event["candidates"].as_array() {
+            if candidates.len() > 1
+                || candidates
+                    .iter()
+                    .any(|c| c["index"].as_u64().is_some_and(|index| index != 0))
+            {
+                return Err(tiygate_core::Error::Codec(
+                    "multiple Gemini streaming candidates are unsupported".into(),
+                ));
+            }
             for c in candidates {
                 if let Some(parts_arr) = c["content"]["parts"].as_array() {
                     for p in parts_arr {
@@ -1456,15 +1770,14 @@ impl StreamDecoder for GeminiStreamDecoder {
                             // Prefer Gemini's native call id when present; else
                             // synthesize a deterministic id from the name so a
                             // cross-protocol target can pair call/result.
+                            let call_name = name.as_deref().unwrap_or("");
+                            let count = self.call_counts.entry(call_name.to_string()).or_default();
                             let id = fc["id"]
                                 .as_str()
-                                .filter(|s| !s.is_empty())
+                                .filter(|id| !id.is_empty())
                                 .map(String::from)
-                                .unwrap_or_else(|| {
-                                    name.as_deref()
-                                        .map(synth_gemini_call_id)
-                                        .unwrap_or_default()
-                                });
+                                .unwrap_or_else(|| unique_gemini_call_id(call_name, *count));
+                            *count += 1;
                             let arguments = if fc.get("args").is_some_and(|args| !args.is_null()) {
                                 serde_json::to_string(&fc["args"]).unwrap_or_default()
                             } else {
@@ -1514,54 +1827,40 @@ impl StreamDecoder for GeminiStreamDecoder {
                 usage: Usage {
                     // promptTokenCount includes cache; IR keeps it cache-free.
                     prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
-                    completion_tokens: usage["candidatesTokenCount"].as_u64().unwrap_or(0),
+                    completion_tokens: usage["candidatesTokenCount"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(usage["thoughtsTokenCount"].as_u64().unwrap_or(0)),
                     total_tokens: usage["totalTokenCount"].as_u64().unwrap_or(0),
                     reasoning_tokens: usage["thoughtsTokenCount"].as_u64(),
                     cache_read_tokens: cache_read,
                     ..Default::default()
                 },
             });
-            // Completion fallback: Gemini has no protocol-native end frame,
-            // and some proxies strip `candidates[].finishReason`, leaving
-            // `usageMetadata` as the only terminal signal. When we see usage
-            // but never saw a `finishReason`, synthesize a terminator so the
-            // cross-protocol ingress encoder still emits one. Prefer
-            // `ToolCalls` when a `functionCall` was seen — mapping a tool-call
-            // turn to `Stop` would make the client stop instead of running the
-            // tool. Mark `saw_finish` so a later `finish()` bridge does not
-            // double-count.
-            if !self.saw_finish {
-                parts.push(StreamPart::Finish {
-                    reason: if self.saw_tool_calls {
-                        FinishReason::ToolCalls
-                    } else {
-                        FinishReason::Stop
-                    },
-                });
-                self.saw_finish = true;
-            }
+            // Usage may be cumulative and arrive before more content. It is
+            // never a generation terminator; require an actual finishReason.
         }
         Ok(parts)
     }
 
     fn finish(&mut self) -> Result<Vec<StreamPart>, tiygate_core::Error> {
-        if let Some(id) = self.response_id.take() {
-            let mut extensions = std::collections::HashMap::new();
-            if !self.thought_signatures.is_empty() {
-                extensions.insert(
-                    "gemini_thought_signatures".to_string(),
-                    json!(std::mem::take(&mut self.thought_signatures)),
-                );
-            }
-            Ok(vec![StreamPart::ResponseCompleted {
-                id,
-                status: "completed".to_string(),
-                usage: None,
-                extensions,
-            }])
-        } else {
-            Ok(vec![])
+        if !self.saw_finish || self.completed {
+            return Ok(vec![]);
         }
+        self.completed = true;
+        let mut extensions = std::collections::HashMap::new();
+        if !self.thought_signatures.is_empty() {
+            extensions.insert(
+                "gemini_thought_signatures".to_string(),
+                json!(std::mem::take(&mut self.thought_signatures)),
+            );
+        }
+        Ok(vec![StreamPart::ResponseCompleted {
+            id: self.response_id.take().unwrap_or_default(),
+            status: "completed".to_string(),
+            usage: None,
+            extensions,
+        }])
     }
 }
 
@@ -1628,7 +1927,7 @@ mod tests {
 
     #[test]
     fn test_stream_encoder_error_frame() {
-        let mut encoder = GeminiStreamEncoder;
+        let mut encoder = GeminiStreamEncoder::default();
         let err = encoder.encode_error("rate limit", ErrorClass::RateLimited, None);
         let s = String::from_utf8_lossy(&err);
         assert!(s.contains("error"));
@@ -1641,7 +1940,7 @@ mod tests {
 
     #[test]
     fn test_stream_encoder_all_variants() {
-        let mut encoder = GeminiStreamEncoder;
+        let mut encoder = GeminiStreamEncoder::default();
         let variants: &[StreamPart] = &[
             StreamPart::ResponseStarted {
                 id: "r1".to_string(),
@@ -1826,7 +2125,7 @@ mod tests {
     #[test]
     fn test_stream_usage_includes_total_and_cached() {
         // Gemini 流式 Usage 帧带 totalTokenCount / thoughtsTokenCount / cachedContentTokenCount
-        let mut enc = GeminiStreamEncoder;
+        let mut enc = GeminiStreamEncoder::default();
         let usage = Usage {
             prompt_tokens: 10,
             completion_tokens: 5,
@@ -1848,7 +2147,7 @@ mod tests {
     #[test]
     fn test_stream_tool_call_args_preserved() {
         // 致命项1 回归:流式 functionCall 必须带完整 args,而非硬编码 {}。
-        let mut enc = GeminiStreamEncoder;
+        let mut enc = GeminiStreamEncoder::default();
         let part = StreamPart::ToolCallDelta {
             id: "gemini_call_get_weather".to_string(),
             name: Some("get_weather".to_string()),
@@ -1859,7 +2158,7 @@ mod tests {
         };
         let bytes = enc.encode_part(&part).unwrap();
         let s = String::from_utf8_lossy(&bytes);
-        let json_part = s.strip_prefix("data: ").unwrap().trim();
+        let json_part = s.strip_prefix("data:").unwrap().trim();
         let v: Value = serde_json::from_str(json_part).unwrap();
         let fc = &v["candidates"][0]["content"]["parts"][0]["functionCall"];
         assert_eq!(fc["name"], "get_weather");
@@ -1901,7 +2200,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(tc.0, "gemini_call_lookup");
+        assert_eq!(tc.0, unique_gemini_call_id("lookup", 0));
         assert_eq!(tc.1.as_deref(), Some("lookup"));
         assert!(tc.2.contains("\"q\":\"x\""));
     }
@@ -1945,7 +2244,7 @@ mod tests {
         // The stream decoder must collect thoughtSignature values from
         // functionCall parts and emit them via ResponseCompleted.extensions.
         let mut dec = GeminiStreamDecoder::new();
-        let line = r#"data: {"responseId":"resp_1","candidates":[{"content":{"parts":[{"functionCall":{"name":"f","args":{}},"thoughtSignature":"sig_123"}]}}]}"#;
+        let line = r#"data: {"responseId":"resp_1","candidates":[{"content":{"parts":[{"functionCall":{"name":"f","args":{}},"thoughtSignature":"sig_123"}]},"finishReason":"STOP"}]}"#;
         let _ = dec.feed(line).unwrap();
         let parts = dec.finish().unwrap();
         let ext = parts
@@ -2289,12 +2588,11 @@ mod tests {
         let body = json!({
             "model": "gemini-2.0-flash",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "tools": [{"functionDeclarations":[{"name":"f","parameters":{"type":"object"}}]}],
             "toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["f"]}}
         });
         let ir = codec.decode_request(body, &env).unwrap();
-        assert_eq!(
-            ir.extensions.get("tool_choice"),
-            Some(&json!({"type": "function", "function": {"name": "f"}}))
-        );
+        assert_eq!(ir.extensions.get("tool_choice"), Some(&json!("required")));
+        assert_eq!(ir.extensions.get("allowed_tool_names"), Some(&json!(["f"])));
     }
 }

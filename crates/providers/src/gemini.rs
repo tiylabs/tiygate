@@ -21,10 +21,9 @@ pub const GEMINI_VENDOR_ID: &str = "gemini";
 
 /// Default upstream base URL for the Google AI for Developers Public Gemini
 /// endpoint. The full request path is `…/v1beta/models/{model}:generateContent`
-/// (or `:streamGenerateContent?alt=sse`) — the trailing `/v1beta` is
-/// intentionally part of the base so that `target.effective_api_base()` is a
-/// drop-in for the `gemini_aware_upstream_url` / `upstream_stream_url_for_suite`
-/// helpers in `crates/server/src/ingress.rs`.
+/// (or `:streamGenerateContent?alt=sse`). The server URL builders accept both
+/// this versioned base and an unversioned proxy base, adding the version only
+/// when it is absent.
 pub const GEMINI_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 /// Header name used by the official Public Gemini API for static API keys.

@@ -689,6 +689,7 @@ fn orphan_tool_result_to_gemini_returns_codec_error() {
     ir.messages.push(Message {
         role: Role::Tool,
         content: vec![Content::ToolResult {
+            is_error: None,
             tool_call_id: "missing_call".to_string(),
             name: String::new(),
             content: "{}".to_string(),

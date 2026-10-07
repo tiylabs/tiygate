@@ -8,7 +8,16 @@ permissions:
   contents: write
 
 jobs:
+  checks:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: refs/tags/${{ github.event.release.tag_name }}
+
   build:
+    needs: checks
+    timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -28,8 +37,10 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     steps:
-      - name: Checkout
+      - name: Checkout validated release commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.checks.outputs.sha }}
 
       - name: Get release tag
         id: get-tag
@@ -64,7 +75,7 @@ jobs:
           TAG="${{ steps.get-tag.outputs.tag }}"
           VERSION=${TAG#v}
           # MSI requires pure numeric version (no pre-release suffix like -rc.1)
-          BUNDLE_VERSION=$(echo "$VERSION" | sed 's/-.*//')
+          BUNDLE_VERSION=${VERSION%%-*}
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "BUNDLE_VERSION=$BUNDLE_VERSION" >> "$GITHUB_ENV"
 

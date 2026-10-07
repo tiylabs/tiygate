@@ -67,3 +67,5 @@ Thumbs.db
 
 # pi coding agent tooling artifacts (local session state, fusion output, task logs)
 .pi/
+
+.agents/

@@ -35,7 +35,7 @@ RUN if [ -n "$APP_VERSION" ]; then \
     fi
 
 # Build a production all-in-one gateway with embedded WebUI and Redis-backed quota support.
-# Bedrock remains opt-in to keep the image smaller; pass --build-arg SERVER_FEATURES="webui tiygate-core/redis-quota tiygate-admin/redis bedrock" if needed.
+# Bedrock remains opt-in to keep the image smaller; pass --build-arg SERVER_FEATURES="webui redis-quota bedrock" if needed.
 ARG SERVER_FEATURES="webui redis-quota"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

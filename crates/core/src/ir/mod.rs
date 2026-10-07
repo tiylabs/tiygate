@@ -64,6 +64,8 @@ pub struct IrResponse {
 pub enum StreamPart {
     /// An incremental text delta.
     TextDelta { text: String },
+    /// Incremental refusal text, kept separate from the visible answer.
+    RefusalDelta { text: String },
     /// An incremental reasoning/thinking delta.
     ReasoningDelta {
         text: String,
@@ -234,6 +236,10 @@ pub enum Content {
         tool_call_id: String,
         name: String,
         content: String,
+        /// Whether the tool execution failed. Protocols without an explicit
+        /// error flag carry a structured error result instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
         /// Responses-specific item reference id for `function_call_output`.
         /// Required by the Responses HTTP API so each output item has a
         /// unique id that can be matched via `item_reference`.
@@ -604,7 +610,8 @@ pub enum ResponseFormat {
 pub struct Usage {
     /// Prompt / input tokens.
     pub prompt_tokens: u64,
-    /// Completion / output tokens.
+    /// Completion / output tokens, including reasoning tokens. Gemini's
+    /// separate candidate and thought counts are combined on decode.
     pub completion_tokens: u64,
     /// Reasoning / thinking tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -823,7 +830,7 @@ impl UsageAccumulator {
     /// Rough heuristic: ~4 chars per token for normal text,
     /// ~2 chars per token for structured/control output.
     pub fn estimate_usage(&self) -> Usage {
-        let completion_tokens = (self.chars_received / 4).max(1) + (self.control_chars / 2).max(0);
+        let completion_tokens = (self.chars_received / 4).max(1) + (self.control_chars / 2);
         Usage {
             completion_tokens: completion_tokens as u64,
             total_tokens: completion_tokens as u64,

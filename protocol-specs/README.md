@@ -25,12 +25,17 @@ loaded by the request hot path.
 ```bash
 make sync-protocol-specs
 make check-protocol-specs
+make check-protocol-specs-offline
 ```
 
 `sync-protocol-specs` refreshes the OpenAI OpenAPI and Gemini Discovery
 snapshots and rewrites `api-wire/lock.json` with their SHA-256 digests.
 `check-protocol-specs` downloads to a temporary file and fails if either
 snapshot differs from the committed lock. It never edits the working tree.
+`check-protocol-specs-offline` verifies the committed files' SHA-256 digests,
+source URLs, resource inventory and Gemini revision against that lock without
+network access. CI uses the offline check so changes upstream do not make an
+unrelated PR fail. Neither check proves codec or provider compatibility.
 
 When a source changes, review the diff, update the relevant structured-output
 profile if its documented semantics changed, and add or update contract tests.

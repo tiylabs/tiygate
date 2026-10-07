@@ -31,13 +31,9 @@ fn error_type_for_class(class: ErrorClass) -> &'static str {
     }
 }
 
-/// Flatten an Anthropic `tool_result.content` value into a plain string.
-///
-/// Anthropic accepts either a bare string OR an array of content blocks
-/// (e.g. `[{"type":"text","text":"..."}]`). The previous implementation only
-/// handled the string form and silently dropped array payloads. We now also
-/// concatenate the `text` of any text blocks so multi-turn tool results
-/// survive the round-trip.
+/// Flatten text tool results into the canonical string carrier.
+/// Non-text blocks are additionally retained in `messages_tool_result_content`
+/// for native replay; the loss guard rejects their cross-protocol conversion.
 fn flatten_anthropic_content(value: &Value) -> String {
     if let Some(s) = value.as_str() {
         return s.to_string();
@@ -172,6 +168,9 @@ impl EndpointCodec for MessagesCodec {
         let stream = body["stream"].as_bool().unwrap_or(false);
 
         let mut messages = Vec::new();
+        let mut opaque_tool_results = serde_json::Map::new();
+        let mut seen_tool_results = std::collections::HashSet::new();
+        let mut cache_controls = serde_json::Map::new();
 
         // System prompt (can be string or array of text blocks)
         let system = if let Some(sys) = body.get("system") {
@@ -192,7 +191,7 @@ impl EndpointCodec for MessagesCodec {
 
         // Parse messages
         if let Some(arr) = body["messages"].as_array() {
-            for msg in arr {
+            for (message_index, msg) in arr.iter().enumerate() {
                 let role = match msg["role"].as_str().unwrap_or("user") {
                     "user" => Role::User,
                     "assistant" => Role::Assistant,
@@ -202,6 +201,7 @@ impl EndpointCodec for MessagesCodec {
                 let content = if let Some(arr) = msg["content"].as_array() {
                     let mut parts = Vec::new();
                     for block in arr {
+                        let content_index = parts.len();
                         match block["type"].as_str() {
                             Some("text") => {
                                 parts.push(Content::Text {
@@ -226,10 +226,10 @@ impl EndpointCodec for MessagesCodec {
                                 // rather than plain text; keep it as reasoning
                                 // so the block survives the round-trip.
                                 parts.push(Content::Reasoning {
-                                    text: block["data"].as_str().unwrap_or("").to_string(),
+                                    text: String::new(),
                                     signature: None,
                                     id: None,
-                                    encrypted_content: None,
+                                    encrypted_content: block["data"].as_str().map(String::from),
                                 });
                             }
                             Some("tool_use") => {
@@ -250,7 +250,36 @@ impl EndpointCodec for MessagesCodec {
                                 });
                             }
                             Some("tool_result") => {
+                                // One tool_result per tool_use id: duplicates are
+                                // invalid Anthropic wire and would cross-attribute
+                                // opaque (multimodal) content on re-encode.
+                                if let Some(id) =
+                                    block["tool_use_id"].as_str().filter(|id| !id.is_empty())
+                                {
+                                    if !seen_tool_results.insert(id.to_string()) {
+                                        return Err(tiygate_core::Error::Codec(
+                                            "duplicate tool_result tool_use_id".into(),
+                                        ));
+                                    }
+                                }
+                                if block["content"].as_array().is_some_and(|blocks| {
+                                    blocks
+                                        .iter()
+                                        .any(|part| part["type"].as_str() != Some("text"))
+                                }) {
+                                    let id = block["tool_use_id"]
+                                        .as_str()
+                                        .filter(|id| !id.is_empty())
+                                        .ok_or_else(|| {
+                                            tiygate_core::Error::Codec(
+                                                "multimodal tool_result requires tool_use_id"
+                                                    .into(),
+                                            )
+                                        })?;
+                                    opaque_tool_results.insert(id.into(), block["content"].clone());
+                                }
                                 parts.push(Content::ToolResult {
+                                    is_error: block["is_error"].as_bool(),
                                     tool_call_id: block["tool_use_id"]
                                         .as_str()
                                         .unwrap_or("")
@@ -262,8 +291,18 @@ impl EndpointCodec for MessagesCodec {
                                     wire_type: None,
                                 });
                             }
-                            Some("image") => {
+                            Some("image") | Some("document") => {
                                 let source = block["source"].clone();
+                                if block["type"] == "document"
+                                    && !matches!(
+                                        source["type"].as_str(),
+                                        Some("base64") | Some("url")
+                                    )
+                                {
+                                    return Err(tiygate_core::Error::Codec(
+                                        "unsupported Messages document source".into(),
+                                    ));
+                                }
                                 if source["type"] == "url" {
                                     parts.push(Content::Media {
                                         source: tiygate_core::ir::MediaSource::Url {
@@ -271,7 +310,11 @@ impl EndpointCodec for MessagesCodec {
                                         },
                                         mime_type: source["media_type"]
                                             .as_str()
-                                            .unwrap_or("image/*")
+                                            .unwrap_or(if block["type"] == "document" {
+                                                "application/pdf"
+                                            } else {
+                                                "image/*"
+                                            })
                                             .to_string(),
                                         metadata: Default::default(),
                                         prompt_cache_breakpoint: None,
@@ -283,7 +326,11 @@ impl EndpointCodec for MessagesCodec {
                                         },
                                         mime_type: source["media_type"]
                                             .as_str()
-                                            .unwrap_or("image/*")
+                                            .unwrap_or(if block["type"] == "document" {
+                                                "application/pdf"
+                                            } else {
+                                                "image/*"
+                                            })
                                             .to_string(),
                                         metadata: Default::default(),
                                         prompt_cache_breakpoint: None,
@@ -291,6 +338,14 @@ impl EndpointCodec for MessagesCodec {
                                 }
                             }
                             _ => {}
+                        }
+                        if parts.len() > content_index {
+                            if let Some(cache) = block.get("cache_control") {
+                                cache_controls.insert(
+                                    format!("{message_index}/{content_index}"),
+                                    cache.clone(),
+                                );
+                            }
                         }
                     }
                     parts
@@ -313,12 +368,23 @@ impl EndpointCodec for MessagesCodec {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|t| Tool {
-                        name: t["name"].as_str().unwrap_or("").to_string(),
-                        description: t["description"].as_str().map(|s| s.to_string()),
-                        parameters: Some(t["input_schema"].clone()),
-                        required: false,
-                        ..Default::default()
+                    .map(|t| {
+                        let native_type = t["type"].as_str().filter(|kind| *kind != "custom");
+                        let mut config = t.as_object().cloned().unwrap_or_default();
+                        for key in ["name", "description", "input_schema"] {
+                            config.remove(key);
+                        }
+                        if native_type.is_some() {
+                            config.remove("type");
+                        }
+                        Tool {
+                            name: t["name"].as_str().unwrap_or("").to_string(),
+                            description: t["description"].as_str().map(String::from),
+                            parameters: t.get("input_schema").cloned(),
+                            tool_type: native_type.map(String::from),
+                            config: (!config.is_empty()).then_some(Value::Object(config)),
+                            ..Default::default()
+                        }
                     })
                     .collect()
             })
@@ -343,24 +409,27 @@ impl EndpointCodec for MessagesCodec {
                 // output_config is a sibling of thinking, not a child.
                 // We also check the legacy nested path
                 // (thinking.output_config.effort) for backward compat.
-                let effort = body
-                    .get("output_config")
-                    .and_then(|oc| oc.get("effort"))
-                    .or_else(|| t.get("output_config").and_then(|oc| oc.get("effort")))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| {
-                        use tiygate_core::ThinkingEffort;
-                        match s {
-                            "none" => Some(ThinkingEffort::None),
-                            "minimal" => Some(ThinkingEffort::Minimal),
-                            "low" => Some(ThinkingEffort::Low),
-                            "medium" => Some(ThinkingEffort::Medium),
-                            "high" => Some(ThinkingEffort::High),
-                            "xhigh" => Some(ThinkingEffort::XHigh),
-                            "max" => Some(ThinkingEffort::Max),
-                            _ => None,
-                        }
-                    });
+                let effort = if t["type"] == "disabled" {
+                    Some(tiygate_core::ThinkingEffort::None)
+                } else {
+                    body.get("output_config")
+                        .and_then(|oc| oc.get("effort"))
+                        .or_else(|| t.get("output_config").and_then(|oc| oc.get("effort")))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| {
+                            use tiygate_core::ThinkingEffort;
+                            match s {
+                                "none" => Some(ThinkingEffort::None),
+                                "minimal" => Some(ThinkingEffort::Minimal),
+                                "low" => Some(ThinkingEffort::Low),
+                                "medium" => Some(ThinkingEffort::Medium),
+                                "high" => Some(ThinkingEffort::High),
+                                "xhigh" => Some(ThinkingEffort::XHigh),
+                                "max" => Some(ThinkingEffort::Max),
+                                _ => None,
+                            }
+                        })
+                };
                 let budget_tokens = t["budget_tokens"].as_u64().map(|v| v as u32);
                 let display = t["display"].as_str().map(|s| match s {
                     "summarized" => tiygate_core::ThinkingDisplay::Summarized,
@@ -408,9 +477,30 @@ impl EndpointCodec for MessagesCodec {
             }),
             extensions: {
                 let mut ext = std::collections::HashMap::new();
+                if let Some(thinking) = body.get("thinking") {
+                    ext.insert("messages_thinking".into(), thinking.clone());
+                }
+                if let Some(system) = body.get("system").filter(|value| value.is_array()) {
+                    ext.insert("messages_system_blocks".into(), system.clone());
+                }
+                if !cache_controls.is_empty() {
+                    ext.insert(
+                        "messages_cache_controls".into(),
+                        Value::Object(cache_controls),
+                    );
+                }
+                if !opaque_tool_results.is_empty() {
+                    ext.insert(
+                        "messages_tool_result_content".into(),
+                        json!(opaque_tool_results),
+                    );
+                }
                 // Parse Anthropic native tool_choice into normalized extensions
                 // format so cross-protocol targets can interpret it.
                 if let Some(tc) = body.get("tool_choice") {
+                    if let Some(disable) = tc["disable_parallel_tool_use"].as_bool() {
+                        ext.insert("parallel_tool_calls".into(), json!(!disable));
+                    }
                     if let Some(tc_type) = tc["type"].as_str() {
                         let normalized = match tc_type {
                             "auto" => json!("auto"),
@@ -445,7 +535,7 @@ impl EndpointCodec for MessagesCodec {
 
         for c in &ir.content {
             match c {
-                Content::Text { text, .. } => {
+                Content::Text { text, .. } | Content::Refusal { text, .. } => {
                     content_blocks.push(json!({
                         "type": "text",
                         "text": text,
@@ -501,7 +591,7 @@ impl EndpointCodec for MessagesCodec {
                 FinishReason::Stop => "end_turn",
                 FinishReason::Length => "max_tokens",
                 FinishReason::ToolCalls => "tool_use",
-                FinishReason::ContentFilter => "content_filter",
+                FinishReason::ContentFilter => "refusal",
                 FinishReason::Other(_) => "end_turn",
             });
         }
@@ -588,10 +678,34 @@ impl EndpointCodec for MessagesCodec {
         // 还会走 PassThrough 原样透传）。
         let inject_cache = ir.ingress_protocol.suite != ProtocolSuite::AnthropicMessages;
 
+        // Native system blocks keep their cache boundaries. Ordered canonical
+        // system messages from other codecs remain instructions, never user data.
+        let mut system_blocks = Vec::new();
+        if let Some(sys) = &ir.system {
+            let native_blocks = ir
+                .extensions
+                .get("messages_system_blocks")
+                .and_then(Value::as_array)
+                .filter(|blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| block["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        == *sys
+                });
+            if !inject_cache {
+                if let Some(blocks) = native_blocks {
+                    system_blocks.extend(blocks.clone());
+                }
+            }
+        }
         // System prompt
         if let Some(sys) = &ir.system {
             // 空文本块不可缓存；仅在非空时注入断点。
-            if inject_cache && !sys.is_empty() {
+            if !system_blocks.is_empty() {
+                body["system"] = json!(system_blocks);
+            } else if inject_cache && !sys.is_empty() {
                 body["system"] = json!([{
                     "type": "text",
                     "text": sys,
@@ -604,28 +718,29 @@ impl EndpointCodec for MessagesCodec {
 
         // Messages
         //
-        // Anthropic requires messages to strictly alternate user/assistant and
-        // forbids consecutive same-role messages. The IR uses four roles
-        // (System/User/Assistant/Tool); Anthropic has only `user`/`assistant`
-        // on the wire (System lives in the top-level `system` field, Tool
-        // results are carried inside a `user` message). Mapping Tool/System to
-        // `user` can therefore produce consecutive `user` messages (e.g.
-        // user → assistant(tool_use) → tool(result) → tool(result)), which
-        // Anthropic rejects with a 400. To stay valid we merge adjacent
-        // messages that map to the same wire role by concatenating their
-        // content blocks.
+        // Messages uses user/assistant roles. System content is lifted into
+        // the instruction field below; tool results are user content. Merge
+        // adjacent turns with the same wire role while keeping block order.
         fn wire_role(role: Role) -> &'static str {
             match role {
                 Role::Assistant => "assistant",
-                // user / tool / system → user on the wire
+                // System messages are handled separately before emission.
                 _ => "user",
             }
         }
 
-        fn blocks_for(msg: &Message) -> Vec<Value> {
+        fn blocks_for(
+            msg: &Message,
+            anthropic_ingress: bool,
+            tool_results: Option<&Value>,
+            cache_controls: Option<&Value>,
+            message_index: usize,
+        ) -> Vec<Value> {
             msg.content
                 .iter()
-                .filter_map(|c| match c {
+                .enumerate()
+                .filter_map(|(content_index, c)| {
+                    let mut block = match c {
                     Content::Text { text, .. } => Some(json!({"type": "text", "text": text})),
                     // Preserve reasoning as an Anthropic thinking block ONLY
                     // when it carries the provider's `signature`. Anthropic
@@ -634,11 +749,13 @@ impl EndpointCodec for MessagesCodec {
                     // originated from another protocol (OpenAI/Gemini) — which
                     // has no Anthropic signature — is dropped on the request
                     // side rather than replayed.
-                    Content::Reasoning {
-                        text, signature, ..
-                    } => signature
-                        .as_ref()
-                        .map(|sig| json!({"type": "thinking", "thinking": text, "signature": sig})),
+                    Content::Reasoning { text, signature, encrypted_content, .. } => {
+                        if let Some(data) = encrypted_content.as_ref().filter(|_| anthropic_ingress) {
+                            Some(json!({"type":"redacted_thinking", "data":data}))
+                        } else {
+                            signature.as_ref().map(|sig| json!({"type":"thinking", "thinking":text, "signature":sig}))
+                        }
+                    },
                     Content::ToolCall {
                         id,
                         name,
@@ -655,36 +772,65 @@ impl EndpointCodec for MessagesCodec {
                         tool_call_id,
                         name: _,
                         content,
+                        is_error,
                         ..
-                    } => Some(json!({
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id,
-                        "content": content,
-                    })),
+                    } => {
+                        let mut result = json!({"type":"tool_result", "tool_use_id":tool_call_id, "content":content});
+                        if let Some(original) = tool_results.and_then(|items| items.get(tool_call_id)) {
+                            result["content"] = original.clone();
+                        }
+                        if let Some(error) = is_error { result["is_error"] = json!(error); }
+                        Some(result)
+                    },
                     Content::Media {
                         source, mime_type, ..
                     } => match source {
                         tiygate_core::ir::MediaSource::Url { url } => Some(json!({
-                            "type": "image",
+                            "type": if mime_type.starts_with("image/") { "image" } else { "document" },
                             "source": {"type": "url", "url": url, "media_type": mime_type}
                         })),
                         tiygate_core::ir::MediaSource::Inline { data } => Some(json!({
-                            "type": "image",
+                            "type": if mime_type.starts_with("image/") { "image" } else { "document" },
                             "source": {"type": "base64", "media_type": mime_type, "data": data}
                         })),
                         _ => None,
                     },
                     Content::Refusal { text, .. } => Some(json!({"type": "text", "text": text})),
                     Content::Program { .. } | Content::ProgramOutput { .. } => None,
+                    }?;
+                    if let Some(cache) = cache_controls.and_then(|controls| controls.get(format!("{message_index}/{content_index}"))) {
+                        block["cache_control"] = cache.clone();
+                    }
+                    Some(block)
                 })
                 .collect()
         }
 
         // First, fold the IR messages into merged (wire_role, blocks) groups.
         let mut merged: Vec<(&'static str, Vec<Value>)> = Vec::new();
-        for msg in &ir.messages {
+        for (message_index, msg) in ir.messages.iter().enumerate() {
             let role = wire_role(msg.role);
-            let mut blocks = blocks_for(msg);
+            let mut blocks = blocks_for(
+                msg,
+                ir.ingress_protocol.suite == ProtocolSuite::AnthropicMessages,
+                ir.extensions.get("messages_tool_result_content"),
+                (!inject_cache)
+                    .then(|| ir.extensions.get("messages_cache_controls"))
+                    .flatten(),
+                message_index,
+            );
+            if msg.role == Role::System {
+                let mut instructions = if body["system"].is_array() {
+                    body["system"].as_array().cloned().unwrap_or_default()
+                } else if let Some(text) = body["system"].as_str() {
+                    vec![json!({"type":"text", "text":text})]
+                } else {
+                    Vec::new()
+                };
+                instructions.append(&mut blocks);
+                body["system"] = json!(instructions);
+                continue;
+            }
             if blocks.is_empty() {
                 continue;
             }
@@ -719,9 +865,13 @@ impl EndpointCodec for MessagesCodec {
 
         body["messages"] = json!(messages);
 
-        // Tools — only emit function tools; hosted tools are Responses-only.
+        // Native hosted tools retain their provider-owned type/configuration.
         if !ir.tools.is_empty() {
-            let function_tools: Vec<_> = ir.tools.iter().filter(|t| t.is_function()).collect();
+            let function_tools: Vec<_> = ir
+                .tools
+                .iter()
+                .filter(|t| t.is_function() || (!inject_cache && t.is_hosted()))
+                .collect();
             let tool_count = function_tools.len();
             if tool_count > 0 {
                 let tools: Vec<Value> = function_tools
@@ -733,6 +883,20 @@ impl EndpointCodec for MessagesCodec {
                             "description": t.description,
                             "input_schema": t.parameters,
                         });
+                        if t.is_hosted() {
+                            tool = json!({"type":t.tool_type, "name":t.name});
+                            if let Some(description) = &t.description {
+                                tool["description"] = json!(description);
+                            }
+                            if let Some(parameters) = &t.parameters {
+                                tool["input_schema"] = parameters.clone();
+                            }
+                        }
+                        if let Some(config) = t.config.as_ref().and_then(Value::as_object) {
+                            for (key, value) in config {
+                                tool[key] = value.clone();
+                            }
+                        }
                         // 在最后一个 tool 上打断点即可缓存整段 tools 前缀
                         // （Anthropic 缓存层级中 tools 是第一级）。
                         if inject_cache && idx + 1 == tool_count {
@@ -827,6 +991,11 @@ impl EndpointCodec for MessagesCodec {
                 body["thinking"] = t;
             }
         }
+        if !inject_cache {
+            if let Some(thinking) = ir.extensions.get("messages_thinking") {
+                body["thinking"] = thinking.clone();
+            }
+        }
         if !output_config.is_empty() {
             body["output_config"] = Value::Object(output_config);
         }
@@ -842,7 +1011,17 @@ impl EndpointCodec for MessagesCodec {
             } else if let Some(obj) = tc.as_object() {
                 // Object form: {"type": "function", "function": {"name": "x"}}
                 if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
-                    let name = obj["function"]["name"].as_str().unwrap_or("");
+                    let name = obj
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .or_else(|| obj.get("name"))
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| {
+                            tiygate_core::Error::Codec(
+                                "function tool_choice requires a nonempty name".into(),
+                            )
+                        })?;
                     json!({"type": "tool", "name": name})
                 } else {
                     tc.clone()
@@ -851,6 +1030,18 @@ impl EndpointCodec for MessagesCodec {
                 json!({"type": "auto"})
             };
             body["tool_choice"] = anthropic_tc;
+        }
+        if let Some(parallel) = ir
+            .extensions
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+        {
+            if !body["tool_choice"].is_object() {
+                body["tool_choice"] = json!({"type": "auto"});
+            }
+            if body["tool_choice"]["type"] != "none" {
+                body["tool_choice"]["disable_parallel_tool_use"] = json!(!parallel);
+            }
         }
         // Metadata: Anthropic only supports user_id
         if let Some(ref metadata) = ir.metadata {
@@ -1043,6 +1234,8 @@ pub struct MessagesStreamEncoder {
     /// still carries real cache/read token counts.
     last_usage: Option<Usage>,
     pending_stop_reason: Option<&'static str>,
+    tool_indices: std::collections::HashMap<String, usize>,
+    terminal: bool,
 }
 
 impl Default for MessagesStreamEncoder {
@@ -1060,6 +1253,8 @@ impl MessagesStreamEncoder {
             next_index: 0,
             last_usage: None,
             pending_stop_reason: None,
+            tool_indices: std::collections::HashMap::new(),
+            terminal: false,
         }
     }
 
@@ -1108,6 +1303,20 @@ impl MessagesStreamEncoder {
             serde_json::to_string(&data).unwrap_or_default()
         )
     }
+    fn close_tools(&mut self) -> String {
+        let mut indices: Vec<_> = self.tool_indices.drain().map(|(_, index)| index).collect();
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .map(|index| {
+                format!(
+                    "event: content_block_stop\ndata: {}\n\n",
+                    json!({"type":"content_block_stop", "index":index})
+                )
+            })
+            .collect()
+    }
+
     fn usage_delta(&self, usage: &Usage, stop_reason: Option<&str>) -> String {
         let mut usage_obj = json!({"output_tokens": usage.completion_tokens});
         if usage.prompt_tokens > 0 {
@@ -1133,6 +1342,15 @@ impl MessagesStreamEncoder {
 
 impl StreamEncoder for MessagesStreamEncoder {
     fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
+        if self.terminal {
+            return Ok(Vec::new());
+        }
+        if matches!(
+            part,
+            StreamPart::ResponseCompleted { .. } | StreamPart::Error { .. }
+        ) {
+            self.terminal = true;
+        }
         let event = match part {
             StreamPart::ResponseStarted { id } => {
                 let data = json!({
@@ -1145,7 +1363,7 @@ impl StreamEncoder for MessagesStreamEncoder {
                     serde_json::to_string(&data).unwrap_or_default()
                 )
             }
-            StreamPart::TextDelta { text } => {
+            StreamPart::TextDelta { text } | StreamPart::RefusalDelta { text } => {
                 // Open (or keep) a text block at the correct index, then emit
                 // the delta against that same index.
                 let mut out = self.ensure_block("text", json!({"type": "text", "text": ""}));
@@ -1182,44 +1400,45 @@ impl StreamEncoder for MessagesStreamEncoder {
                 arguments,
                 ..
             } => {
-                // The opener carries `name`: always close any prior block and
-                // open a FRESH tool_use block. Two consecutive openers (e.g.
-                // parallel tool calls) both have kind "tool_use", so we cannot
-                // rely on `ensure_block`'s same-kind short-circuit — that would
-                // merge two distinct calls into one block. Force the
-                // close+open here. Argument-only fragments (`name == None`)
-                // append to the currently-open tool_use block.
+                let mut out = String::new();
                 if let Some(n) = name {
-                    let mut out = self.close_block();
-                    out.push_str(&self.open_block(
-                        "tool_use",
-                        json!({"type": "tool_use", "id": id, "name": n, "input": {}}),
-                    ));
-                    if !arguments.is_empty() {
-                        let idx = self.current_index.unwrap_or(0);
-                        let data = json!({
-                            "type": "content_block_delta",
-                            "index": idx,
-                            "delta": {"type": "input_json_delta", "partial_json": arguments},
-                        });
-                        out.push_str(&format!(
-                            "event: content_block_delta\ndata: {}\n\n",
-                            serde_json::to_string(&data).unwrap_or_default()
+                    if id.is_empty() || self.tool_indices.contains_key(id) {
+                        return Err(tiygate_core::Error::Codec(
+                            "missing or duplicate streamed tool id".into(),
                         ));
                     }
-                    out
-                } else {
-                    let idx = self.current_index.unwrap_or(0);
-                    let data = json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "input_json_delta", "partial_json": arguments},
-                    });
-                    format!(
-                        "event: content_block_delta\ndata: {}\n\n",
-                        serde_json::to_string(&data).unwrap_or_default()
-                    )
+                    if self.tool_indices.len() >= 256 {
+                        return Err(tiygate_core::Error::Codec(
+                            "too many streamed tool calls".into(),
+                        ));
+                    }
+                    out.push_str(&self.close_block());
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    self.tool_indices.insert(id.clone(), index);
+                    out.push_str(&format!(
+                        "event: content_block_start\ndata: {}\n\n",
+                        json!({
+                            "type":"content_block_start", "index":index,
+                            "content_block":{"type":"tool_use","id":id,"name":n,"input":{}}
+                        })
+                    ));
                 }
+                let index = self.tool_indices.get(id).ok_or_else(|| {
+                    tiygate_core::Error::Codec(format!(
+                        "tool arguments reference unknown call {id:?}"
+                    ))
+                })?;
+                if !arguments.is_empty() {
+                    out.push_str(&format!(
+                        "event: content_block_delta\ndata: {}\n\n",
+                        json!({
+                            "type":"content_block_delta", "index":index,
+                            "delta":{"type":"input_json_delta","partial_json":arguments}
+                        })
+                    ));
+                }
+                out
             }
             // PTC is Responses-only; no Anthropic wire carrier.
             StreamPart::ProgramDelta { .. } | StreamPart::ProgramOutputDelta { .. } => {
@@ -1235,11 +1454,13 @@ impl StreamEncoder for MessagesStreamEncoder {
                     FinishReason::Stop => "end_turn",
                     FinishReason::Length => "max_tokens",
                     FinishReason::ToolCalls => "tool_use",
+                    FinishReason::ContentFilter => "refusal",
                     _ => "end_turn",
                 };
                 // Close any open content block before signalling the stop
                 // reason, per the Anthropic streaming contract.
                 let mut out = self.close_block();
+                out.push_str(&self.close_tools());
                 if let Some(u) = &self.last_usage {
                     out.push_str(&self.usage_delta(u, Some(stop_reason)));
                 } else {
@@ -1252,6 +1473,7 @@ impl StreamEncoder for MessagesStreamEncoder {
             }
             StreamPart::ResponseCompleted { .. } => {
                 let mut out = self.close_block();
+                out.push_str(&self.close_tools());
                 if let Some(stop_reason) = self.pending_stop_reason.take() {
                     let data = json!({
                         "type": "message_delta",
@@ -1292,6 +1514,7 @@ impl StreamEncoder for MessagesStreamEncoder {
         class: ErrorClass,
         _upstream_code: Option<&str>,
     ) -> Vec<u8> {
+        self.terminal = true;
         let err = json!({"type": error_type_for_class(class), "message": message});
         format!(
             "event: error\ndata: {}\n\n",
@@ -1309,6 +1532,21 @@ impl StreamEncoder for MessagesStreamEncoder {
 
 // --- Stream Decoder (explicit state machine) ---
 
+fn bounded_content_index(event: &Value) -> Result<usize, tiygate_core::Error> {
+    let index = match event.get("index").filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| tiygate_core::Error::Codec("invalid content index".into()))?,
+        None => 0,
+    };
+    if index >= 1024 {
+        return Err(tiygate_core::Error::Codec(
+            "Messages content index exceeds 1023".into(),
+        ));
+    }
+    usize::try_from(index).map_err(|_| tiygate_core::Error::Codec("invalid content index".into()))
+}
+
 pub struct MessagesStreamDecoder {
     response_id: Option<String>,
     current_block_type: Option<String>,
@@ -1319,6 +1557,10 @@ pub struct MessagesStreamDecoder {
     /// `Option<String>` mis-attributed fragments when more than one tool_use
     /// block streamed.
     tool_use_ids: Vec<String>,
+    tool_arguments: Vec<String>,
+    tool_argument_bytes: usize,
+    incomplete: bool,
+    terminal: bool,
     /// Whether a `message_delta.stop_reason` produced a `Finish` in-band. Used
     /// to synthesize a `Finish(Stop)` on `message_stop` when an older
     /// Anthropic version / proxy omits the `message_delta` stop_reason.
@@ -1349,6 +1591,10 @@ impl MessagesStreamDecoder {
             response_id: None,
             current_block_type: None,
             tool_use_ids: Vec::new(),
+            tool_arguments: Vec::new(),
+            tool_argument_bytes: 0,
+            incomplete: false,
+            terminal: false,
             saw_finish: false,
             saw_tool_use: false,
             usage_acc: None,
@@ -1359,6 +1605,7 @@ impl MessagesStreamDecoder {
     fn set_tool_use_id(&mut self, index: usize, id: String) {
         if self.tool_use_ids.len() <= index {
             self.tool_use_ids.resize_with(index + 1, String::new);
+            self.tool_arguments.resize_with(index + 1, String::new);
         }
         self.tool_use_ids[index] = id;
     }
@@ -1366,6 +1613,18 @@ impl MessagesStreamDecoder {
     /// Look up the tool_use id previously recorded for a content block `index`.
     fn tool_use_id(&self, index: usize) -> String {
         self.tool_use_ids.get(index).cloned().unwrap_or_default()
+    }
+
+    fn validate_tools(&self) -> Result<(), tiygate_core::Error> {
+        for (id, arguments) in self.tool_use_ids.iter().zip(&self.tool_arguments) {
+            if !id.is_empty() {
+                crate::tool_arguments::parse_function_arguments(
+                    arguments,
+                    "completed Messages tool arguments",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn merge_usage(&mut self, incoming: Usage) -> Usage {
@@ -1397,11 +1656,11 @@ impl MessagesStreamDecoder {
 impl StreamDecoder for MessagesStreamDecoder {
     fn feed(&mut self, line: &str) -> Result<Vec<StreamPart>, tiygate_core::Error> {
         let line = line.trim();
-        if line.is_empty() || !line.starts_with("data: ") {
+        if self.terminal || line.is_empty() || !line.starts_with("data:") {
             return Ok(vec![]);
         }
 
-        let data = line.strip_prefix("data: ").unwrap_or("");
+        let data = line.strip_prefix("data:").unwrap_or("");
         let event: Value = serde_json::from_str(data).map_err(|e| {
             tiygate_core::Error::Codec(format!("Failed to parse Anthropic SSE: {}", e))
         })?;
@@ -1449,13 +1708,22 @@ impl StreamDecoder for MessagesStreamDecoder {
             }
             Some("content_block_start") => {
                 let block = &event["content_block"];
-                let index = event["index"].as_u64().unwrap_or(0) as usize;
+                let index = bounded_content_index(&event)?;
                 self.current_block_type = block["type"].as_str().map(String::from);
                 match block["type"].as_str() {
                     Some("tool_use") => {
                         self.saw_tool_use = true;
                         let id = block["id"].as_str().unwrap_or("").to_string();
                         let name = block["name"].as_str().map(String::from);
+                        if id.is_empty()
+                            || name.as_deref().is_none_or(str::is_empty)
+                            || !self.tool_use_id(index).is_empty()
+                            || self.tool_use_ids.iter().any(|existing| existing == &id)
+                        {
+                            return Err(tiygate_core::Error::Codec(
+                                "missing or duplicate Messages tool identity".into(),
+                            ));
+                        }
                         self.set_tool_use_id(index, id.clone());
                         parts.push(StreamPart::ToolCallDelta {
                             id,
@@ -1498,7 +1766,7 @@ impl StreamDecoder for MessagesStreamDecoder {
             }
             Some("content_block_delta") => {
                 let delta = &event["delta"];
-                let index = event["index"].as_u64().unwrap_or(0) as usize;
+                let index = bounded_content_index(&event)?;
                 match delta["type"].as_str() {
                     Some("text_delta") => {
                         if let Some(text) = delta["text"].as_str() {
@@ -1518,6 +1786,19 @@ impl StreamDecoder for MessagesStreamDecoder {
                     }
                     Some("input_json_delta") => {
                         if let Some(json) = delta["partial_json"].as_str() {
+                            if self.tool_use_id(index).is_empty() {
+                                return Err(tiygate_core::Error::Codec(
+                                    "Messages arguments reference unknown tool block".into(),
+                                ));
+                            }
+                            self.tool_argument_bytes =
+                                self.tool_argument_bytes.saturating_add(json.len());
+                            if self.tool_argument_bytes > 16 * 1024 * 1024 {
+                                return Err(tiygate_core::Error::Codec(
+                                    "Messages tool arguments exceed 16 MiB".into(),
+                                ));
+                            }
+                            self.tool_arguments[index].push_str(json);
                             // Argument fragment: emit `name: None` so
                             // cross-protocol encoders that key on the opener
                             // (name present) vs. fragments (name absent) route
@@ -1592,13 +1873,23 @@ impl StreamDecoder for MessagesStreamDecoder {
                         "stop_sequence" => FinishReason::Stop,
                         "max_tokens" => FinishReason::Length,
                         "tool_use" => FinishReason::ToolCalls,
+                        "refusal" | "content_filter" => FinishReason::ContentFilter,
                         other => FinishReason::Other(other.to_string()),
                     };
+                    self.incomplete =
+                        matches!(fr, FinishReason::Length | FinishReason::ContentFilter);
+                    if !self.incomplete {
+                        self.validate_tools()?;
+                    }
                     parts.push(StreamPart::Finish { reason: fr });
                     self.saw_finish = true;
                 }
             }
             Some("message_stop") => {
+                if !self.incomplete {
+                    self.validate_tools()?;
+                }
+                self.terminal = true;
                 // Fallback: some older Anthropic versions / proxies end with
                 // `message_stop` without a preceding `message_delta.stop_reason`
                 // (notably on truncation). Without a `Finish` the IR carries no
@@ -1617,12 +1908,18 @@ impl StreamDecoder for MessagesStreamDecoder {
                 }
                 parts.push(StreamPart::ResponseCompleted {
                     id: self.response_id.clone().unwrap_or_default(),
-                    status: "completed".to_string(),
+                    status: if self.incomplete {
+                        "incomplete"
+                    } else {
+                        "completed"
+                    }
+                    .to_string(),
                     usage: None,
                     extensions: std::collections::HashMap::new(),
                 });
             }
             Some("error") => {
+                self.terminal = true;
                 let code = event["error"]["type"].as_str();
                 let class = tiygate_core::classify_upstream_error(None, code);
                 parts.push(StreamPart::Error {
@@ -2226,6 +2523,7 @@ mod tests {
                 Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: "t1".to_string(),
                         name: "f".to_string(),
                         content: "r1".to_string(),
@@ -2237,6 +2535,7 @@ mod tests {
                 Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: "t2".to_string(),
                         name: "f".to_string(),
                         content: "r2".to_string(),
@@ -2336,11 +2635,20 @@ mod tests {
         ] {
             all.push_str(&String::from_utf8(enc.encode_part(&part).unwrap()).unwrap());
         }
-        // Two distinct content_block_start with index 0 and 1, and a
-        // content_block_stop between them.
+        // Distinct blocks stay open until all interleaved fragments arrive.
         assert!(all.contains("\"index\":0"));
         assert!(all.contains("\"index\":1"));
-        assert!(all.contains("content_block_stop"));
+        assert!(!all.contains("content_block_stop"));
+        all.push_str(
+            &String::from_utf8(
+                enc.encode_part(&StreamPart::Finish {
+                    reason: FinishReason::ToolCalls,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(all.matches("event: content_block_stop").count(), 2);
     }
 
     #[test]
@@ -2362,7 +2670,7 @@ mod tests {
         assert!(out.contains("input_json_delta"));
         let delta = out
             .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| line.strip_prefix("data:"))
             .filter_map(|data| serde_json::from_str::<Value>(data).ok())
             .find(|event| event["type"] == "content_block_delta")
             .expect("content_block_delta");
@@ -2398,7 +2706,7 @@ mod tests {
         }
         let deltas: Vec<Value> = all
             .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| line.strip_prefix("data:"))
             .filter_map(|data| serde_json::from_str::<Value>(data).ok())
             .filter(|event| event["type"] == "content_block_delta")
             .collect();

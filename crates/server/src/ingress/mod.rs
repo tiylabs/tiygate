@@ -14,6 +14,7 @@ mod handlers;
 mod headers;
 pub(crate) mod observability;
 mod response_model;
+mod sse_framing;
 mod streaming;
 
 use handlers::{

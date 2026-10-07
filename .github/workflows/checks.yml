@@ -1,0 +1,144 @@
+name: Reusable checks
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or tag to validate
+        required: true
+        type: string
+    outputs:
+      sha:
+        description: Validated commit SHA for release builds
+        value: ${{ jobs.gate.outputs.sha }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  INSTA_UPDATE: "no"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  revision:
+    name: Resolve checked commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Record checked commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  protocols:
+    name: Protocol and HTTP regressions
+    needs: revision
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.revision.outputs.sha }}
+      - name: Lint workflow syntax and expressions
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: protocols
+      - name: Test CI failure propagation and snapshot checks
+        run: python3 -B -m unittest discover -s scripts/tests -v
+      - name: Verify committed wire snapshots (offline)
+        run: python3 scripts/check-protocol-specs.py
+      - name: Verify dependency layering
+        run: bash scripts/verify-deps.sh
+      - name: Run core and codec tests
+        run: cargo test --locked -p tiygate-core -p tiygate-protocols
+      - name: Run all server tests with default features
+        run: cargo test --locked -p tiygate-server
+      - name: Save test counterexamples
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-counterexamples
+          path: "**/proptest-regressions/**"
+          if-no-files-found: ignore
+          retention-days: 14
+
+  workspace:
+    name: Full workspace tests and lint
+    needs: revision
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.revision.outputs.sha }}
+      - name: Install Tauri platform dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: workspace-all-features
+      - name: Prepare WebUI
+        working-directory: webui
+        run: |
+          npm ci
+          npm run lint
+          npm run build
+      - name: Prepare compile-only Tauri sidecar placeholder
+        # These checks never bundle or execute the sidecar. Release workflows
+        # build and replace their own placeholder with the real binary.
+        run: |
+          target=$(rustc -vV | awk '/^host:/ {print $2}')
+          test -n "$target"
+          mkdir -p src-tauri/binaries
+          touch "src-tauri/binaries/tiygate-$target"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint every workspace member and feature
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Test every workspace member and feature
+        run: make test CARGO="cargo --locked"
+      - name: Save test counterexamples
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-counterexamples
+          path: "**/proptest-regressions/**"
+          if-no-files-found: ignore
+          retention-days: 14
+
+  gate:
+    name: CI gate
+    if: always()
+    needs: [revision, protocols, workspace]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ needs.revision.outputs.sha }}
+    steps:
+      - name: Require all checks to succeed
+        env:
+          REVISION_RESULT: ${{ needs.revision.result }}
+          PROTOCOLS_RESULT: ${{ needs.protocols.result }}
+          WORKSPACE_RESULT: ${{ needs.workspace.result }}
+        run: |
+          test "$REVISION_RESULT" = success
+          test "$PROTOCOLS_RESULT" = success
+          test "$WORKSPACE_RESULT" = success

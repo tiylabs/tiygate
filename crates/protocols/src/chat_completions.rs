@@ -148,18 +148,29 @@ impl EndpointCodec for ChatCompletionsCodec {
                     // (upstream 400 invalid_params). The content may also be an
                     // array of content parts in newer OpenAI variants, which
                     // `parse_content_array` already handles for Role::Tool.
-                    if let Some(arr) = msg["content"].as_array() {
-                        parse_content_array(arr, &role)
+                    let result = if let Some(arr) = msg["content"].as_array() {
+                        let mut text = String::new();
+                        for part in arr {
+                            if part["type"].as_str() != Some("text") {
+                                return Err(tiygate_core::Error::Codec(
+                                    "Chat tool results support only text content parts".into(),
+                                ));
+                            }
+                            text.push_str(part["text"].as_str().unwrap_or(""));
+                        }
+                        text
                     } else {
-                        vec![Content::ToolResult {
-                            tool_call_id: msg["tool_call_id"].as_str().unwrap_or("").to_string(),
-                            name: msg["name"].as_str().unwrap_or("").to_string(),
-                            content: msg["content"].as_str().unwrap_or("").to_string(),
-                            id: None,
-                            caller: None,
-                            wire_type: None,
-                        }]
-                    }
+                        msg["content"].as_str().unwrap_or("").to_string()
+                    };
+                    vec![Content::ToolResult {
+                        is_error: None,
+                        tool_call_id: msg["tool_call_id"].as_str().unwrap_or("").to_string(),
+                        name: msg["name"].as_str().unwrap_or("").to_string(),
+                        content: result,
+                        id: None,
+                        caller: None,
+                        wire_type: None,
+                    }]
                 } else if let Some(text) = msg["content"].as_str() {
                     // A non-empty assistant text alongside tool_calls is common;
                     // skip empty strings to avoid emitting blank text blocks.
@@ -227,6 +238,13 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 // object. If it is not valid JSON, preserve the raw
                                 // string as a JSON string value rather than dropping
                                 // it to `{}`, so non-standard payloads survive.
+                                // An empty payload is the documented no-argument
+                                // representation and normalizes to `{}`.
+                                serde_json::Value::String(s)
+                                    if crate::tool_arguments::is_empty_arguments(s) =>
+                                {
+                                    json!({})
+                                }
                                 serde_json::Value::String(s) => serde_json::from_str(s)
                                     .unwrap_or_else(|_| serde_json::Value::String(s.clone())),
                                 // Some compatible providers may already send an object.
@@ -354,12 +372,12 @@ impl EndpointCodec for ChatCompletionsCodec {
                     .map(|t| {
                         let tool_type = t["type"].as_str().unwrap_or("function");
                         if tool_type == "custom" {
-                            // OpenAI custom tools: type + remaining fields
-                            // (name/description/format/...) live at the top
-                            // level. Stash non-standard fields in config so a
-                            // same-protocol re-encode restores the wire shape.
+                            // Native Chat tools nest their definition inside `custom`.
+                            // Accept the historical flat compatible shape on input,
+                            // and always emit the native carrier on output.
+                            let custom = t.get("custom").unwrap_or(t);
                             let mut config = serde_json::Map::new();
-                            if let Some(obj) = t.as_object() {
+                            if let Some(obj) = custom.as_object() {
                                 for (k, v) in obj {
                                     if k != "type"
                                         && k != "name"
@@ -371,9 +389,9 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 }
                             }
                             Tool {
-                                name: t["name"].as_str().unwrap_or("").to_string(),
-                                description: t["description"].as_str().map(|s| s.to_string()),
-                                parameters: t.get("parameters").cloned(),
+                                name: custom["name"].as_str().unwrap_or("").to_string(),
+                                description: custom["description"].as_str().map(String::from),
+                                parameters: custom.get("parameters").cloned(),
                                 required: mark_required,
                                 tool_type: Some("custom".to_string()),
                                 config: if config.is_empty() {
@@ -392,6 +410,13 @@ impl EndpointCodec for ChatCompletionsCodec {
                                     .map(|s| s.to_string()),
                                 parameters: Some(t["function"]["parameters"].clone()),
                                 required: mark_required,
+                                config: t["function"].as_object().and_then(|function| {
+                                    let mut config = function.clone();
+                                    for key in ["name", "description", "parameters"] {
+                                        config.remove(key);
+                                    }
+                                    (!config.is_empty()).then_some(Value::Object(config))
+                                }),
                                 ..Default::default()
                             }
                         }
@@ -404,11 +429,20 @@ impl EndpointCodec for ChatCompletionsCodec {
         // https://developers.openai.com/api/docs/guides/function-calling#tool-choice
         // Allowed forms: "none", "auto", "required", {"type":"function","function":{"name":"x"}}
         let mut extensions = std::collections::HashMap::new();
+        if let Some(parallel) = body["parallel_tool_calls"].as_bool() {
+            extensions.insert("parallel_tool_calls".to_string(), json!(parallel));
+        }
+        if let Some(n) = body["n"].as_u64() {
+            extensions.insert("choice_count".to_string(), json!(n));
+        }
         if let Some(tc) = body.get("tool_choice") {
             if let Some(s) = tc.as_str() {
                 extensions.insert("tool_choice".to_string(), json!(s));
             } else if tc.is_object() {
-                extensions.insert("tool_choice".to_string(), tc.clone());
+                extensions.insert(
+                    "tool_choice".to_string(),
+                    crate::tool_choice::normalize(tc)?,
+                );
             }
         }
 
@@ -486,14 +520,19 @@ impl EndpointCodec for ChatCompletionsCodec {
             frequency_penalty: body["frequency_penalty"].as_f64().map(|v| v as f32),
             presence_penalty: body["presence_penalty"].as_f64().map(|v| v as f32),
             seed: body["seed"].as_i64(),
-            stop: body["stop"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            stop: if let Some(stop) = body["stop"].as_str() {
+                vec![stop.to_string()]
+            } else {
+                body["stop"]
+                    .as_array()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
             thinking: body["reasoning_effort"].as_str().and_then(|s| {
                 use tiygate_core::ThinkingEffort;
                 let effort = match s {
@@ -606,7 +645,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         }
                     }
                 }
-                Content::Reasoning { text: _, .. } => {
+                Content::Reasoning { .. } => {
                     // OpenAI doesn't natively expose reasoning text in the content field
                     // (it goes into a separate reasoning_tokens field)
                 }
@@ -872,10 +911,20 @@ impl EndpointCodec for ChatCompletionsCodec {
                         content,
                         ..
                     } => {
-                        // Tool results are a separate message in OpenAI format;
-                        // emit them as their own {role:"tool", tool_call_id, content}
-                        // object. This branch intentionally produces a full
-                        // message, not a content part.
+                        // Flush text before the result so ordered user content
+                        // does not move behind every tool result in the turn.
+                        if !text_parts.is_empty() {
+                            let text = std::mem::take(&mut text_parts);
+                            let wire_content = if text.len() == 1
+                                && text[0].get("text").is_some()
+                                && text[0].get("prompt_cache_breakpoint").is_none()
+                            {
+                                text[0]["text"].clone()
+                            } else {
+                                json!(text)
+                            };
+                            messages.push(json!({"role":msg_json["role"], "content":wire_content}));
+                        }
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
@@ -948,7 +997,6 @@ impl EndpointCodec for ChatCompletionsCodec {
                 .map(|t| {
                     if t.is_custom() {
                         let mut obj = serde_json::Map::new();
-                        obj.insert("type".to_string(), json!("custom"));
                         if !t.name.is_empty() {
                             obj.insert("name".to_string(), json!(t.name));
                         }
@@ -963,16 +1011,21 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 obj.entry(k.clone()).or_insert_with(|| v.clone());
                             }
                         }
-                        Value::Object(obj)
+                        json!({"type":"custom", "custom":obj})
                     } else {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": t.name,
-                                "description": t.description,
-                                "parameters": t.parameters,
+                        let mut function = json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        });
+                        if let Some(Value::Object(config)) = &t.config {
+                            if let Some(object) = function.as_object_mut() {
+                                for (key, value) in config {
+                                    object.entry(key.clone()).or_insert_with(|| value.clone());
+                                }
                             }
-                        })
+                        }
+                        json!({"type": "function", "function": function})
                     }
                 })
                 .collect();
@@ -1042,6 +1095,13 @@ impl EndpointCodec for ChatCompletionsCodec {
             });
         }
 
+        if let Some(choice) = ir.extensions.get("tool_choice") {
+            body["tool_choice"] = crate::tool_choice::normalize(choice)?;
+        }
+
+        if let Some(parallel) = ir.extensions.get("parallel_tool_calls") {
+            body["parallel_tool_calls"] = parallel.clone();
+        }
         // Metadata: output from ir.metadata as JSON object
         if let Some(ref metadata) = ir.metadata {
             if !metadata.is_empty() {
@@ -1142,8 +1202,21 @@ impl EndpointCodec for ChatCompletionsCodec {
         let mut content = Vec::new();
 
         if let Some(choices) = body["choices"].as_array() {
+            if choices.len() > 1
+                || choices
+                    .iter()
+                    .any(|choice| choice["index"].as_u64().is_some_and(|index| index != 0))
+            {
+                return Err(tiygate_core::Error::Codec(
+                    "multiple Chat choices are unsupported by IR conversion".into(),
+                ));
+            }
             if let Some(choice) = choices.first() {
                 let msg = &choice["message"];
+                let truncated = matches!(
+                    choice["finish_reason"].as_str(),
+                    Some("length" | "content_filter")
+                );
 
                 // Text content
                 if let Some(text) = msg["content"].as_str() {
@@ -1202,10 +1275,14 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 wire_type: Some("custom".to_string()),
                             });
                         } else {
-                            let args: serde_json::Value = serde_json::from_str(
+                            let Some(args) = crate::tool_arguments::parse_response_arguments(
                                 tc["function"]["arguments"].as_str().unwrap_or("{}"),
-                            )
-                            .unwrap_or(json!({}));
+                                "Chat tool arguments",
+                                truncated,
+                            )?
+                            else {
+                                continue;
+                            };
                             content.push(Content::ToolCall {
                                 id: tc["id"].as_str().unwrap_or("").to_string(),
                                 name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
@@ -1340,6 +1417,7 @@ pub struct ChatCompletionsStreamEncoder {
     /// `tool_calls[].index`. OpenAI clients reassemble streamed tool calls by
     /// this index, so two distinct tool calls must NOT share index 0.
     tool_call_indices: std::collections::HashMap<String, usize>,
+    terminal: bool,
 }
 
 impl Default for ChatCompletionsStreamEncoder {
@@ -1353,6 +1431,7 @@ impl ChatCompletionsStreamEncoder {
         Self {
             response_id: None,
             tool_call_indices: std::collections::HashMap::new(),
+            terminal: false,
         }
     }
 
@@ -1371,7 +1450,23 @@ impl ChatCompletionsStreamEncoder {
 
 impl StreamEncoder for ChatCompletionsStreamEncoder {
     fn encode_part(&mut self, part: &StreamPart) -> Result<Vec<u8>, tiygate_core::Error> {
+        if self.terminal {
+            return Ok(Vec::new());
+        }
+        if matches!(
+            part,
+            StreamPart::ResponseCompleted { .. } | StreamPart::Error { .. }
+        ) {
+            self.terminal = true;
+        }
         let chunk = match part {
+            StreamPart::RefusalDelta { text } => format!(
+                "data: {}\n\n",
+                json!({
+                    "id": self.response_id.as_deref().unwrap_or(""), "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"refusal": text}, "finish_reason": null}]
+                })
+            ),
             StreamPart::ResponseStarted { id } => {
                 self.response_id = Some(id.clone());
                 String::new() // OpenAI SSE doesn't need a start event
@@ -1414,23 +1509,22 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                 id,
                 name,
                 arguments,
+                wire_type,
                 ..
             } => {
                 let tc_index = self.tool_call_index(id);
                 let resp_id = self.response_id.clone().unwrap_or_default();
-                let mut delta = json!({
-                    "tool_calls": [{
-                        "index": tc_index,
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "arguments": arguments,
-                        }
-                    }]
-                });
+                let custom = is_openai_custom_tool_call(wire_type.as_deref());
+                let carrier = if custom { "custom" } else { "function" };
+                let field = if custom { "input" } else { "arguments" };
+                let mut payload = serde_json::Map::new();
+                payload.insert(field.into(), json!(arguments));
                 if let Some(n) = name {
-                    delta["tool_calls"][0]["function"]["name"] = json!(n);
+                    payload.insert("name".into(), json!(n));
                 }
+                let mut tool = json!({"index":tc_index, "id":id, "type":if custom {"custom"} else {"function"}});
+                tool[carrier] = json!(payload);
+                let delta = json!({"tool_calls":[tool]});
                 format!(
                     "data: {}\n\n",
                     json!({
@@ -1542,6 +1636,7 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
         class: ErrorClass,
         upstream_code: Option<&str>,
     ) -> Vec<u8> {
+        self.terminal = true;
         let mut err = json!({"message": message, "type": error_type_for_class(class)});
         if let Some(c) = upstream_code {
             err["code"] = json!(c);
@@ -1556,20 +1651,30 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
 
 // --- Stream Decoder (structure-dispatched via `object` field) ---
 
+#[derive(Default)]
+struct StreamedToolCall {
+    id: String,
+    name: String,
+    custom: Option<bool>,
+    arguments: String,
+    delivered: usize,
+    opened: bool,
+}
+
 pub struct ChatCompletionsStreamDecoder {
     response_id: Option<String>,
-    /// Per-index tool-call state `(id, name)`, tracked by the OpenAI
-    /// `tool_calls[].index` field so that parallel tool calls keep their
-    /// argument fragments bound to the correct call id. Earlier code used a
-    /// single `Option<String>` which mis-attributed arg deltas when more than
-    /// one tool call streamed concurrently.
-    tool_calls: Vec<(String, String)>,
+    /// Bounded index slots retain identity until both id and name arrive.
+    tool_calls: Vec<StreamedToolCall>,
+    arguments_bytes: usize,
+    incomplete: bool,
     /// Whether a `choices[].finish_reason` produced a `Finish` in-band.
     saw_finish: bool,
     /// Whether any `tool_calls` delta was observed. Used to infer
     /// `Finish(ToolCalls)` on `[DONE]` when a proxy ends a tool-call turn
     /// without sending `finish_reason: "tool_calls"`.
     saw_tool_calls: bool,
+    saw_error: bool,
+    completed: bool,
 }
 
 impl Default for ChatCompletionsStreamDecoder {
@@ -1583,27 +1688,184 @@ impl ChatCompletionsStreamDecoder {
         Self {
             response_id: None,
             tool_calls: Vec::new(),
+            arguments_bytes: 0,
+            incomplete: false,
             saw_finish: false,
             saw_tool_calls: false,
+            saw_error: false,
+            completed: false,
         }
     }
 
-    /// Ensure `self.tool_calls` has a slot for `index`, then return a mutable
-    /// reference to it.
-    fn slot(&mut self, index: usize) -> &mut (String, String) {
+    fn tool_delta(
+        &mut self,
+        tool: &Value,
+        parts: &mut Vec<StreamPart>,
+    ) -> Result<(), tiygate_core::Error> {
+        let index = match tool.get("index").filter(|value| !value.is_null()) {
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| tiygate_core::Error::Codec("invalid tool index".into()))?,
+            None => 0,
+        };
+        if index >= 256 {
+            return Err(tiygate_core::Error::Codec(
+                "Chat tool index exceeds 255".into(),
+            ));
+        }
+        let index = usize::try_from(index)
+            .map_err(|_| tiygate_core::Error::Codec("invalid tool index".into()))?;
+        let custom = match tool["type"].as_str() {
+            Some("custom") => Some(true),
+            Some("function") => Some(false),
+            None => None,
+            Some(kind) => {
+                return Err(tiygate_core::Error::Codec(format!(
+                    "unsupported streamed tool type {kind}"
+                )))
+            }
+        };
         if self.tool_calls.len() <= index {
             self.tool_calls
-                .resize_with(index + 1, || (String::new(), String::new()));
+                .resize_with(index + 1, StreamedToolCall::default);
         }
-        &mut self.tool_calls[index]
+        if let Some(id) = tool["id"].as_str().filter(|id| !id.is_empty()) {
+            if self
+                .tool_calls
+                .iter()
+                .enumerate()
+                .any(|(slot, call)| slot != index && call.id == id)
+            {
+                return Err(tiygate_core::Error::Codec(
+                    "streamed tool id reused at another index".into(),
+                ));
+            }
+        }
+        let call = &mut self.tool_calls[index];
+        if let Some(kind) = custom {
+            if call.custom.is_some_and(|previous| previous != kind) {
+                return Err(tiygate_core::Error::Codec(
+                    "streamed tool type changed".into(),
+                ));
+            }
+            call.custom = Some(kind);
+        }
+        if call.custom.is_none() {
+            call.custom = if tool.get("custom").is_some() {
+                Some(true)
+            } else if tool.get("function").is_some() {
+                Some(false)
+            } else {
+                None
+            };
+        }
+        let is_custom = call.custom == Some(true);
+        let payload = if is_custom {
+            &tool["custom"]
+        } else {
+            &tool["function"]
+        };
+        for (target, incoming) in [
+            (&mut call.id, tool["id"].as_str()),
+            (&mut call.name, payload["name"].as_str()),
+        ] {
+            if let Some(value) = incoming.filter(|value| !value.is_empty()) {
+                if value.len() > 1024 {
+                    return Err(tiygate_core::Error::Codec(
+                        "streamed tool identity exceeds 1 KiB".into(),
+                    ));
+                }
+                if !target.is_empty() && target != value {
+                    return Err(tiygate_core::Error::Codec(
+                        "streamed tool identity changed".into(),
+                    ));
+                }
+                *target = value.to_string();
+            }
+        }
+        if let Some(fragment) = payload[if is_custom { "input" } else { "arguments" }].as_str() {
+            if fragment.len() > (16 * 1024 * 1024usize).saturating_sub(self.arguments_bytes) {
+                return Err(tiygate_core::Error::Codec(
+                    "streamed tool arguments exceed 16 MiB".into(),
+                ));
+            }
+            self.arguments_bytes += fragment.len();
+            call.arguments.push_str(fragment);
+        }
+        if call.id.is_empty() || call.name.is_empty() {
+            return Ok(());
+        }
+        let wire_type = is_custom.then(|| "custom_tool_call".to_string());
+        if !call.opened {
+            parts.push(StreamPart::ToolCallDelta {
+                id: call.id.clone(),
+                name: Some(call.name.clone()),
+                arguments: String::new(),
+                wire_type: wire_type.clone(),
+                item_id: None,
+                caller: None,
+            });
+            call.opened = true;
+        }
+        if call.arguments.len() > call.delivered {
+            parts.push(StreamPart::ToolCallDelta {
+                id: call.id.clone(),
+                name: None,
+                arguments: call.arguments[call.delivered..].to_string(),
+                wire_type,
+                item_id: None,
+                caller: None,
+            });
+            call.delivered = call.arguments.len();
+        }
+        Ok(())
+    }
+
+    fn validate_tools(&self) -> Result<(), tiygate_core::Error> {
+        for call in &self.tool_calls {
+            // Unused sparse slots are not calls.
+            if call.custom.is_none() && call.id.is_empty() && call.name.is_empty() {
+                continue;
+            }
+            if !call.opened {
+                return Err(tiygate_core::Error::Codec(
+                    "stream ended before tool id/name arrived".into(),
+                ));
+            }
+            if call.custom != Some(true)
+                && !crate::tool_arguments::is_empty_arguments(&call.arguments)
+            {
+                // A non-empty payload must be valid JSON: a truncated call can
+                // never complete as success. An empty payload is the documented
+                // no-argument representation (OpenAI streams the first tool
+                // chunk as `arguments: ""`), so it completes with no arguments.
+                serde_json::from_str::<Value>(&call.arguments).map_err(|error| {
+                    tiygate_core::Error::Codec(format!("invalid completed tool arguments: {error}"))
+                })?;
+            }
+        }
+        Ok(())
     }
 }
 
 impl StreamDecoder for ChatCompletionsStreamDecoder {
     fn feed(&mut self, line: &str) -> Result<Vec<StreamPart>, tiygate_core::Error> {
         let line = line.trim();
-        if line.is_empty() || line == "data: [DONE]" {
-            if line == "data: [DONE]" {
+        if self.completed {
+            return Ok(vec![]);
+        }
+        let is_done = line
+            .strip_prefix("data:")
+            .is_some_and(|data| data.trim() == "[DONE]");
+        if line.is_empty() || is_done {
+            if is_done {
+                self.completed = true;
+                if self.saw_error {
+                    return Ok(vec![]);
+                }
+                if !self.incomplete {
+                    self.validate_tools()?;
+                }
                 let mut parts = Vec::new();
                 // Tool-call turn fallback: some OpenAI-compatible proxies end a
                 // tool-call turn with `[DONE]` but never send the
@@ -1619,7 +1881,12 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                 }
                 parts.push(StreamPart::ResponseCompleted {
                     id: self.response_id.clone().unwrap_or_default(),
-                    status: "completed".to_string(),
+                    status: if self.incomplete {
+                        "incomplete"
+                    } else {
+                        "completed"
+                    }
+                    .to_string(),
                     usage: None,
                     extensions: std::collections::HashMap::new(),
                 });
@@ -1628,7 +1895,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
             return Ok(vec![]);
         }
 
-        let data = if let Some(stripped) = line.strip_prefix("data: ") {
+        let data = if let Some(stripped) = line.strip_prefix("data:") {
             stripped
         } else {
             return Ok(vec![]);
@@ -1658,6 +1925,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                     .and_then(|value| value.as_object())
                     .filter(|error| !error.is_empty())
                 {
+                    self.saw_error = true;
                     let error = Value::Object(error.clone());
                     let code = error["code"].as_str().or_else(|| error["type"].as_str());
                     let upstream_code = code.map(String::from);
@@ -1676,6 +1944,16 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                 // Handle choices
                 let mut pending_finishes = Vec::new();
                 if let Some(choices) = chunk["choices"].as_array() {
+                    if choices.len() > 1
+                        || choices
+                            .iter()
+                            .any(|choice| choice["index"].as_u64().is_some_and(|index| index != 0))
+                    {
+                        return Err(tiygate_core::Error::Codec(
+                            "multiple Chat streaming choices are unsupported by IR conversion"
+                                .into(),
+                        ));
+                    }
                     for choice in choices {
                         let delta = &choice["delta"];
 
@@ -1687,6 +1965,13 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                             }
                         }
 
+                        if let Some(text) =
+                            delta["refusal"].as_str().filter(|text| !text.is_empty())
+                        {
+                            parts.push(StreamPart::RefusalDelta {
+                                text: text.to_string(),
+                            });
+                        }
                         // Deepseek thinking mode streams `reasoning_content` as
                         // a sibling of `content` inside `delta`. DeepSeek v4-pro
                         // uses just `reasoning`. OpenAI's Responses API uses
@@ -1716,77 +2001,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                         if let Some(tool_calls) = delta["tool_calls"].as_array() {
                             for tc in tool_calls {
                                 self.saw_tool_calls = true;
-                                // OpenAI streams parallel tool calls
-                                // interleaved, distinguished by `index`. Track
-                                // id/name per index so argument fragments are
-                                // bound to the right call.
-                                let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                                if let Some(tc_id) = tc["id"].as_str() {
-                                    if !tc_id.is_empty() {
-                                        self.slot(index).0 = tc_id.to_string();
-                                    }
-                                }
-                                let tc_name = tc["function"]["name"]
-                                    .as_str()
-                                    .filter(|s| !s.is_empty())
-                                    .map(String::from);
-                                if let Some(ref n) = tc_name {
-                                    self.slot(index).1 = n.clone();
-                                }
-                                let tc_args =
-                                    tc["function"]["arguments"].as_str().map(String::from);
-                                let id = self.slot(index).0.clone();
-                                // Emit the opener (name present) and argument
-                                // fragments (name absent) as DISTINCT deltas so
-                                // cross-protocol encoders that key on
-                                // `name == None` (Anthropic `input_json_delta`,
-                                // Responses `function_call_arguments.delta`)
-                                // receive the argument stream. The retained
-                                // name must NOT leak onto arg-only deltas — that
-                                // suppresses the argument frames.
-                                match (tc_name, tc_args) {
-                                    (Some(n), Some(args)) => {
-                                        parts.push(StreamPart::ToolCallDelta {
-                                            id: id.clone(),
-                                            name: Some(n),
-                                            arguments: String::new(),
-                                            wire_type: None,
-                                            item_id: None,
-                                            caller: None,
-                                        });
-                                        if !args.is_empty() {
-                                            parts.push(StreamPart::ToolCallDelta {
-                                                id,
-                                                name: None,
-                                                arguments: args,
-                                                wire_type: None,
-                                                item_id: None,
-                                                caller: None,
-                                            });
-                                        }
-                                    }
-                                    (Some(n), None) => {
-                                        parts.push(StreamPart::ToolCallDelta {
-                                            id,
-                                            name: Some(n),
-                                            arguments: String::new(),
-                                            wire_type: None,
-                                            item_id: None,
-                                            caller: None,
-                                        });
-                                    }
-                                    (None, Some(args)) => {
-                                        parts.push(StreamPart::ToolCallDelta {
-                                            id,
-                                            name: None,
-                                            arguments: args,
-                                            wire_type: None,
-                                            item_id: None,
-                                            caller: None,
-                                        });
-                                    }
-                                    (None, None) => {}
-                                }
+                                self.tool_delta(tc, &mut parts)?;
                             }
                         }
 
@@ -1800,6 +2015,13 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                     "function_call" => FinishReason::ToolCalls,
                                     other => FinishReason::Other(other.to_string()),
                                 };
+                                self.incomplete = matches!(
+                                    reason,
+                                    FinishReason::Length | FinishReason::ContentFilter
+                                );
+                                if !self.incomplete {
+                                    self.validate_tools()?;
+                                }
                                 pending_finishes.push(StreamPart::Finish { reason });
                                 self.saw_finish = true;
                             }
@@ -1858,6 +2080,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                 parts.extend(pending_finishes);
             }
             Some("error") => {
+                self.saw_error = true;
                 let error = &chunk["error"];
                 let code = error["code"].as_str().or_else(|| error["type"].as_str());
                 let upstream_code = code.map(String::from);
@@ -1927,6 +2150,7 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
             Some("tool_use") | Some("tool_result") => {
                 if *role == Role::Tool {
                     Content::ToolResult {
+                        is_error: None,
                         tool_call_id: item["tool_call_id"].as_str().unwrap_or("").to_string(),
                         name: String::new(),
                         content: item["content"].as_str().unwrap_or("").to_string(),
@@ -2795,6 +3019,7 @@ mod tests {
                 Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
+                        is_error: None,
                         tool_call_id: "call_1".to_string(),
                         name: "get_weather".to_string(),
                         content: "sunny".to_string(),
@@ -3018,8 +3243,8 @@ mod tests {
         );
         let (encoded, _) = codec.encode_request(&ir).unwrap();
         assert_eq!(encoded["tools"][0]["type"], "custom");
-        assert_eq!(encoded["tools"][0]["name"], "code_exec");
-        assert_eq!(encoded["tools"][0]["format"]["type"], "text");
+        assert_eq!(encoded["tools"][0]["custom"]["name"], "code_exec");
+        assert_eq!(encoded["tools"][0]["custom"]["format"]["type"], "text");
     }
 
     #[test]

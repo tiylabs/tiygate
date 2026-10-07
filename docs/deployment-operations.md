@@ -48,7 +48,7 @@ TiyGate 配置分为两层:
 | `TIYGATE_DATABASE_URL` | 未设置 | 数据库连接串(SQLite 或 Postgres)。未设置时回退到内存 ConfigStore(无 Admin API)。 |
 | `TIYGATE_ADMIN_TOKEN` | 未设置 | Admin API 要求的 bearer 鉴权 token。未设置时 Admin API 请求会被拒绝。 |
 | `TIYGATE_MASTER_KEY` | 未设置 | AES-256-GCM 主密钥,用于静态加密 provider key、OAuth token、S3 凭证。接受 64 位 hex 或标准 base64。未设置时 secret 明文存储(服务会打印 warning,仅适合本地开发)。 |
-| `TIYGATE_REDIS_URL` | 未设置 | 设置后(且以 `redis-quota` feature 编译),配额计数器通过 Redis 跨副本共享,替代单副本内存计数。 |
+| `TIYGATE_REDIS_URL` | 未设置 | 设置后(且以 server `redis-quota` feature 编译),配额计数器通过 Redis 跨副本共享,替代单副本内存计数。具体 Redis 后端位于 `tiygate-store::quota`，core 仅保留配额 trait/内存计数。 |
 | `RUST_LOG` | `info` | `tracing` / `tracing-subscriber` 过滤器。示例:`info`、`tiygate=debug`、`tiygate_server::ingress=trace`。 |
 
 **2. 运行时可调设置** —— 通过管理控制台 **`/admin/ui/settings`** 管理(底层为 `settings` 表,API 为 `GET/PUT /admin/v1/settings`)。这些参数热加载:数据面轮询变更并原子切换到新快照,无需重启。

@@ -38,8 +38,8 @@ hex.workspace = true
 rand.workspace = true
 # Optional Redis client. Pulled in only when the `redis` feature is
 # enabled so the admin crate builds without a Redis dependency by
-# default. Mirrors the `redis` definition in `crates/core/Cargo.toml`.
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "script"], optional = true }
+# default. Uses the same workspace client as the store quota adapter.
+redis = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
