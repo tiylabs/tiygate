@@ -204,6 +204,14 @@
       "TG-PROTO-062": {
         "codec": "implicit_strict_normalizes_nested_function_schemas",
         "http": "http_review_fix_implicit_strict_schema"
+      },
+      "TG-PROTO-063": {
+        "codec": "gemini_without_id_completes_once_with_latest_usage",
+        "http": "http_review_fix_gemini_completion_without_id"
+      },
+      "TG-PROTO-064": {
+        "codec": "gemini_tools_accept_separate_trailing_whitespace",
+        "http": "http_review_fix_gemini_tool_trailing_whitespace"
       }
     },
     "official_sources": [
@@ -218,7 +226,7 @@
         "retrieved_on": "2026-10-07"
       }
     ],
-    "oracle": "strict schema constraints and native omission",
+    "oracle": "strict schema constraints and native omission, exactly one terminal with final usage, one tool call with legal trailing whitespace",
     "limitations": [
       "offline synthetic HTTP upstreams; no live Provider requests",
       "implicit strict inference uses a conservative supported subset",

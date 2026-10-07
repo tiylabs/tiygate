@@ -406,3 +406,66 @@ async fn http_review_fix_implicit_strict_schema() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+#[tokio::test]
+async fn http_review_fix_gemini_completion_without_id() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, output, status) = run(
+        ProtocolSuite::GoogleGemini,
+        "/v1/responses",
+        json!({"model":"m","input":"hi","stream":true}),
+        concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}\n\n",
+            "data: {\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":7,\"totalTokenCount\":8}}\n\n"
+        ),
+        true,
+    ).await?;
+    assert_eq!(status, StatusCode::OK);
+    let completed: Vec<_> = events(&output)
+        .into_iter()
+        .filter(|event| event["type"] == "response.completed")
+        .collect();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["response"]["usage"]["output_tokens"], 7);
+    assert!(output.ends_with("data: [DONE]\n\n"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_review_fix_gemini_tool_trailing_whitespace() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_, output, status) = run(
+        ProtocolSuite::OpenAiCompatible,
+        "/v1beta/models/m:streamGenerateContent",
+        json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]}),
+        concat!(
+            "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\n\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        true,
+    ).await?;
+    assert_eq!(status, StatusCode::OK);
+    let frames = events(&output);
+    let calls: Vec<_> = frames
+        .iter()
+        .filter(|event| {
+            event["candidates"][0]["content"]["parts"][0]
+                .get("functionCall")
+                .is_some()
+        })
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]["candidates"][0]["content"]["parts"][0]["functionCall"]["args"],
+        json!({})
+    );
+    assert!(frames
+        .iter()
+        .any(|event| event["candidates"][0]["finishReason"] == "STOP"));
+    assert!(
+        !frames.iter().any(|event| event.get("error").is_some()),
+        "{output}"
+    );
+    Ok(())
+}
+

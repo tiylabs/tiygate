@@ -1501,6 +1501,13 @@ impl StreamEncoder for GeminiStreamEncoder {
                 ..
             } => {
                 if self.finished.contains(id) {
+                    if name.is_none()
+                        && arguments
+                            .bytes()
+                            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                    {
+                        return Ok(Vec::new());
+                    }
                     return Err(tiygate_core::Error::Codec(format!(
                         "tool delta after completed Gemini call {id}"
                     )));
@@ -1636,6 +1643,7 @@ pub struct GeminiStreamDecoder {
     /// Gemini 3 multi-turn thought-signature replay.
     thought_signatures: Vec<Value>,
     call_counts: std::collections::HashMap<String, usize>,
+    completed: bool,
 }
 impl Default for GeminiStreamDecoder {
     fn default() -> Self {
@@ -1651,12 +1659,16 @@ impl GeminiStreamDecoder {
             saw_tool_calls: false,
             thought_signatures: Vec::new(),
             call_counts: std::collections::HashMap::new(),
+            completed: false,
         }
     }
 }
 
 impl StreamDecoder for GeminiStreamDecoder {
     fn feed(&mut self, line: &str) -> Result<Vec<StreamPart>, tiygate_core::Error> {
+        if self.completed {
+            return Ok(vec![]);
+        }
         let line = line.trim();
         if line.is_empty() {
             return Ok(vec![]);
@@ -1691,6 +1703,7 @@ impl StreamDecoder for GeminiStreamDecoder {
             .and_then(Value::as_object)
             .filter(|error| !error.is_empty())
         {
+            self.completed = true;
             let code = error.get("status").and_then(Value::as_str);
             let class = tiygate_core::classify_upstream_error(None, code);
             parts.push(StreamPart::Error {
@@ -1831,26 +1844,23 @@ impl StreamDecoder for GeminiStreamDecoder {
     }
 
     fn finish(&mut self) -> Result<Vec<StreamPart>, tiygate_core::Error> {
-        if !self.saw_finish {
+        if !self.saw_finish || self.completed {
             return Ok(vec![]);
         }
-        if let Some(id) = self.response_id.take() {
-            let mut extensions = std::collections::HashMap::new();
-            if !self.thought_signatures.is_empty() {
-                extensions.insert(
-                    "gemini_thought_signatures".to_string(),
-                    json!(std::mem::take(&mut self.thought_signatures)),
-                );
-            }
-            Ok(vec![StreamPart::ResponseCompleted {
-                id,
-                status: "completed".to_string(),
-                usage: None,
-                extensions,
-            }])
-        } else {
-            Ok(vec![])
+        self.completed = true;
+        let mut extensions = std::collections::HashMap::new();
+        if !self.thought_signatures.is_empty() {
+            extensions.insert(
+                "gemini_thought_signatures".to_string(),
+                json!(std::mem::take(&mut self.thought_signatures)),
+            );
         }
+        Ok(vec![StreamPart::ResponseCompleted {
+            id: self.response_id.take().unwrap_or_default(),
+            status: "completed".to_string(),
+            usage: None,
+            extensions,
+        }])
     }
 }
 
