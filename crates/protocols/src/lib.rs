@@ -12,5 +12,6 @@ pub mod images;
 pub mod messages;
 pub mod responses;
 
+mod function_schema;
 mod tool_arguments;
 mod tool_choice;

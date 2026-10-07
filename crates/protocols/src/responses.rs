@@ -789,11 +789,13 @@ impl EndpointCodec for ResponsesCodec {
             });
         }
 
+        let mut implicit_function_schemas = serde_json::Map::new();
         let tools: Vec<Tool> = body["tools"]
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|t| {
+                    .enumerate()
+                    .map(|(index, t)| {
                         let tool_type = t["type"].as_str().map(String::from);
                         match tool_type.as_deref() {
                             None | Some("function") => {
@@ -801,12 +803,28 @@ impl EndpointCodec for ResponsesCodec {
                                 for key in ["type", "name", "description", "parameters"] {
                                     config.remove(key);
                                 }
-                                // Responses defaults to strict, unlike Chat.
-                                config.entry("strict").or_insert(json!(true));
+                                let mut parameters = t["parameters"].as_object().map(|p| json!(p));
+                                if t.get("strict").is_none_or(Value::is_null) {
+                                    let normalized = crate::function_schema::implicit_strict_schema(
+                                        t.get("parameters"),
+                                    );
+                                    let strict = normalized.is_some();
+                                    if let Some(normalized) = normalized {
+                                        parameters = Some(normalized);
+                                    }
+                                    config.insert("strict".into(), json!(strict));
+                                    implicit_function_schemas.insert(
+                                        index.to_string(),
+                                        json!({
+                                            "original":t, "name":t["name"],
+                                            "parameters":parameters, "strict":strict
+                                        }),
+                                    );
+                                }
                                 Tool {
                                     name: t["name"].as_str().unwrap_or("").to_string(),
                                     description: t["description"].as_str().map(String::from),
-                                    parameters: t["parameters"].as_object().map(|p| json!(p)),
+                                    parameters,
                                     required: false,
                                     tool_type: if tool_type.as_deref() == Some("function") {
                                         Some("function".to_string())
@@ -933,6 +951,12 @@ impl EndpointCodec for ResponsesCodec {
         // - text.format: structured output configuration
         // - reasoning.effort: reasoning depth control
         let mut extensions = std::collections::HashMap::new();
+        if !implicit_function_schemas.is_empty() {
+            extensions.insert(
+                "responses_implicit_function_schemas".into(),
+                Value::Object(implicit_function_schemas),
+            );
+        }
         if let Some(parallel) = body["parallel_tool_calls"].as_bool() {
             extensions.insert("parallel_tool_calls".to_string(), json!(parallel));
         }
@@ -1716,7 +1740,8 @@ impl EndpointCodec for ResponsesCodec {
             let tools: Vec<Value> = ir
                 .tools
                 .iter()
-                .map(|t| {
+                .enumerate()
+                .map(|(index, t)| {
                     if t.is_function() {
                         let mut obj = json!({
                             "type": "function",
@@ -1735,6 +1760,29 @@ impl EndpointCodec for ResponsesCodec {
                             && ir.ingress_protocol.suite != ProtocolSuite::OpenAiResponses
                         {
                             obj["strict"] = json!(false);
+                        }
+                        if ir.ingress_protocol.suite == ProtocolSuite::OpenAiResponses {
+                            if let Some(original) = ir
+                                .extensions
+                                .get("responses_implicit_function_schemas")
+                                .and_then(|schemas| schemas.get(index.to_string()))
+                                .filter(|schema| {
+                                    schema["name"] == t.name
+                                        && schema["parameters"] == obj["parameters"]
+                                        && schema["strict"] == obj["strict"]
+                                })
+                                .and_then(|schema| schema["original"].as_object())
+                            {
+                                // Replay omission/null only while the canonical
+                                // schema and strictness still match the decode.
+                                for key in ["parameters", "strict"] {
+                                    if let Some(value) = original.get(key) {
+                                        obj[key] = value.clone();
+                                    } else if let Some(object) = obj.as_object_mut() {
+                                        object.remove(key);
+                                    }
+                                }
+                            }
                         }
                         obj
                     } else if t.is_custom() {

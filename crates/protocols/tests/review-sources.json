@@ -192,5 +192,37 @@
       "TG-PROTO-063 through 069 remain unconfirmed/outside this fix",
       "TG-PROTO-020 CI gate remains open"
     ]
+  },
+  "branch_delta_fix": {
+    "review_head": "22a1559a5ecb078302b701eef4c41a666a3da4dd",
+    "comparison_base": "6db40e54663455fb99d675bd8985e4dc50f68a14",
+    "finding_scope": "2026-10-07 branch delta review; IDs are local to that report, separate from contract_fix_round",
+    "origin": "original synthetic JSON/SSE; no third-party implementation or fixtures copied",
+    "codec_target": "review_fixes",
+    "http_target": "protocol_review_final",
+    "findings": {
+      "TG-PROTO-062": {
+        "codec": "implicit_strict_normalizes_nested_function_schemas",
+        "http": "http_review_fix_implicit_strict_schema"
+      }
+    },
+    "official_sources": [
+      "protocol-specs/api-wire/openai/openapi.yaml",
+      "protocol-specs/api-wire/gemini/v1beta.discovery.json",
+      {
+        "url": "https://developers.openai.com/api/docs/guides/function-calling",
+        "retrieved_on": "2026-10-07"
+      },
+      {
+        "url": "https://developers.openai.com/api/docs/guides/structured-outputs",
+        "retrieved_on": "2026-10-07"
+      }
+    ],
+    "oracle": "strict schema constraints and native omission",
+    "limitations": [
+      "offline synthetic HTTP upstreams; no live Provider requests",
+      "implicit strict inference uses a conservative supported subset",
+      "unsupported or unclassified implicit schemas keep original constraints in non-strict mode"
+    ]
   }
 }

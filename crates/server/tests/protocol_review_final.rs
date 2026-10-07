@@ -384,3 +384,25 @@ async fn http_noarg_tool_stream_completes() -> Result<(), Box<dyn std::error::Er
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn http_review_fix_implicit_strict_schema() -> Result<(), Box<dyn std::error::Error>> {
+    let (request, _, status) = run(
+        ProtocolSuite::OpenAiCompatible,
+        "/v1/responses",
+        json!({"model":"m","input":"hi","tools":[
+            {"type":"function","name":"f","parameters":{
+                "type":"object","properties":{"x":{"type":"string"}}
+            }}
+        ]}),
+        r#"{"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        false,
+    ).await?;
+    assert_eq!(status, StatusCode::OK);
+    let function = &request["tools"][0]["function"];
+    assert_eq!(function["strict"], true);
+    assert_eq!(function["parameters"]["additionalProperties"], false);
+    assert_eq!(function["parameters"]["required"], json!(["x"]));
+    Ok(())
+}
+

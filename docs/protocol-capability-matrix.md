@@ -305,7 +305,7 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 ### 14.1 Follow-up 修复契约（TG-PROTO-023～036）
 
 - Chat 字符串 `stop` 归一为一个停止序列，数组保留全部序列。
-- OpenAI 函数工具的 `strict:true/false` 双向保留；Chat→Responses 缺省时显式发送 `strict:false`，Responses→Chat 缺省时显式发送 `strict:true`，避免协议默认值差异。Messages 支持 native `strict`；严格工具转换到无 carrier 的 Gemini 时拒绝。
+- OpenAI 函数工具的显式 `strict:true/false` 双向保留；Chat→Responses 缺省时显式发送 `strict:false`。Responses 省略或设置 `strict:null` 时，按 §14.4 生成有效 schema/strictness，同协议回放保留缺省字段。Messages 支持 native `strict`；严格工具转换到无 carrier 的 Gemini 时拒绝。
 - `parallel_tool_calls:false` ↔ Messages `tool_choice.disable_parallel_tool_use:true`；未知/未指定与 false 分开。向 Gemini 转换禁用并行时拒绝。
 - Responses `conversation` 在同协议 IR 重编码保活；带 `previous_response_id` 或 `conversation` 的跨协议请求明确拒绝，网关不下载或猜测历史上下文。同协议账号/模型作用域仍由目标 Provider 管理，不承诺跨账号 fallback 可续接。
 - 当前 IR 只支持一个候选。跨协议 `n>1`、多 Chat choices 或非零 choice index 明确拒绝；同协议 raw 响应可保留多个候选，IR 不合并答案。
@@ -345,3 +345,9 @@ OpenAI Responses Multi-agent Beta（`OpenAI-Beta: responses_multi_agent=v1`）�
 - **Gemini thinkingLevel**：入口接受官方 `MINIMAL/LOW/MEDIUM/HIGH` 与兼容小写形式，映射 canonical effort；`THINKING_LEVEL_UNSPECIFIED` 维持模型默认，不伪造 effort。
 
 回归为自有合成原生 JSON/SSE，见 `crates/protocols/tests/review_contracts.rs`、`crates/server/tests/protocol_review_contracts.rs`；HTTP 工具流以每字节分片验证。未确认的 final snapshot、dynamic budget、非空工具 opener 等候选未纳入本次支持承诺。
+
+### 14.4 分支差异审查回归修复（2026-10-07）
+
+- **Responses 隐式 strict**：省略 `strict` 或设置 `null` 时，对可确认兼容的函数 schema 子集递归补齐对象的 `additionalProperties:false` 和全部属性的 `required`，包括数组、`anyOf`、`$defs`/`definitions` 中的 schema；不遍历 enum/const 等实例值。已知不兼容或未分类的 schema 保留原约束，并使用 `strict:false`，不删除约束来强行获得严格模式。检查严格 schema 的深度、属性/枚举数量、字符串总量和 format 限制。显式 `strict:true/false` 不由网关改写。原始 parameters 与 strict 的省略/null 状态保存在 IR extensions 中，同协议重编码仅在 canonical schema 和 strictness 未被修改时回放；跨协议输出使用有效 schema/strictness。模型及 Provider 的具体支持范围仍需独立核验。
+
+原始输入与独立断言见 `crates/protocols/tests/review_fixes.rs`；一项真实 HTTP 转换回归见 `crates/server/tests/protocol_review_final.rs` 中的 `http_review_fix_*`。以上覆盖不包含真实账号或全部 Provider/model profile。
